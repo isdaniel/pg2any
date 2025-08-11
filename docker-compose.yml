@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  # PostgreSQL source database
+  postgres:
+    image: postgres:15-alpine
+    container_name: cdc_postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test.123
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "7777:5432"
+    networks:
+      - cdc_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres 
+      -c wal_level=logical 
+      -c max_replication_slots=10 
+      -c max_wal_senders=10
+      -c max_connections=100
+
+  # MySQL destination database
+  mysql:
+    image: mysql:8.0
+    container_name: cdc_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test.123 
+      MYSQL_DATABASE: cdc_db
+      MYSQL_USER: cdc_user
+      MYSQL_PASSWORD: test.123
+    ports:
+      - "3306:3306"
+    networks:
+      - cdc_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # # CDC Application
+  # cdc_app:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: cdc_application
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     mysql:
+  #       condition: service_healthy
+  #   environment:
+  #     # Rust logging
+  #     RUST_LOG: debug
+  #     RUST_BACKTRACE: 1
+      
+  #     # Source PostgreSQL configuration
+  #     CDC_SOURCE_HOST: postgres
+  #     CDC_SOURCE_PORT: 5432
+  #     CDC_SOURCE_DB: postgres
+  #     CDC_SOURCE_USER: postgres
+  #     CDC_SOURCE_PASSWORD: postgres
+      
+  #     # Destination MySQL configuration
+  #     CDC_DEST_TYPE: MySQL
+  #     CDC_DEST_HOST: mysql
+  #     CDC_DEST_PORT: 3306
+  #     CDC_DEST_DB: cdc_target
+  #     CDC_DEST_USER: cdc_user
+  #     CDC_DEST_PASSWORD: cdc_password
+      
+  #     # CDC configuration
+  #     CDC_REPLICATION_SLOT: cdc_slot
+  #     CDC_PUBLICATION: cdc_pub
+  #     CDC_AUTO_CREATE_TABLES: "true"
+  #     CDC_PROTOCOL_VERSION: "1"
+  #     CDC_BINARY_FORMAT: "false"
+  #     CDC_STREAMING: "true"
+      
+  #     # Timeouts (in seconds)
+  #     CDC_CONNECTION_TIMEOUT: "30"
+  #     CDC_QUERY_TIMEOUT: "10"
+  #     CDC_HEARTBEAT_INTERVAL: "10"
+      
+  #   volumes:
+  #     - ./logs:/app/logs
+  #   networks:
+  #     - cdc_network
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "pgrep", "-f", "pg2any"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 60s
+
+networks:
+  cdc_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

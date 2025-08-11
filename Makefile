@@ -1,0 +1,101 @@
+# PostgreSQL CDC Makefile
+# Provides convenient commands for development and deployment
+
+.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean
+
+# Default target
+help:
+	@echo "PostgreSQL CDC Development Commands"
+	@echo ""
+	@echo "Development:"
+	@echo "  build          Build the Rust application"
+	@echo "  check          Check code with cargo check"
+	@echo "  test           Run tests"
+	@echo "  format         Format code with rustfmt"
+	@echo "  run            Run the application locally"
+	@echo ""
+	@echo "Docker:"
+	@echo "  docker-build   Build Docker services"
+	@echo "  docker-start   Start Docker services"
+	@echo "  docker-stop    Stop Docker services" 
+	@echo "  docker-restart Restart Docker services"
+	@echo "  docker-clean   Clean Docker resources"
+	@echo "  docker-logs    Show Docker logs"
+	@echo "  docker-status  Show Docker service status"
+	@echo ""
+	@echo "Database:"
+	@echo "  psql           Connect to PostgreSQL"
+	@echo "  mysql          Connect to MySQL"
+	@echo "  test-data      Insert test data"
+	@echo "  show-data      Show data in both databases"
+	@echo ""
+
+# Development commands
+build:
+	cargo build --release
+
+check:
+	cargo check
+	cargo clippy -- -D warnings
+
+test:
+	cargo test
+
+format:
+	cargo fmt
+
+run:
+	cargo run
+
+# Docker commands
+docker-build:
+	docker-compose build
+
+docker-start:
+	docker-compose up -d postgres mysql
+
+docker-stop:
+	docker-compose down
+
+docker-restart: docker-stop docker-start
+
+docker-clean:
+	docker-compose down -v
+	docker system prune -f
+
+docker-logs:
+	docker-compose logs -f
+
+docker-status:
+	docker-compose ps
+
+# Database connection shortcuts
+psql:
+	docker-compose exec postgres psql -U postgres -d postgres
+
+mysql:
+	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db
+
+# Database utilities  
+test-data:
+	@echo "Inserting test data into PostgreSQL..."
+	docker-compose exec postgres psql -U postgres -d postgres -c "INSERT INTO users (username, email, full_name) VALUES ('test_user_$(shell date +%s)', 'test@example.com', 'Test User') ON CONFLICT (username) DO NOTHING;"
+
+show-data:
+	@echo "=== PostgreSQL Data ==="
+	docker-compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM users ORDER BY created_at DESC LIMIT 5;"
+	@echo ""
+	@echo "=== MySQL Data ==="
+	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db -e "SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema='cdc_db';"
+	
+# Development workflow
+dev-setup: check format test docker-build
+	@echo "Development setup completed!"
+
+# Full cleanup and fresh start
+reset: docker-clean docker-build docker-start
+	@echo "System reset completed!"
+
+clean:
+	cargo clean
+	docker-compose down -v

@@ -3,6 +3,7 @@
 //! This module provides high-level management of logical replication streams,
 //! including connection management, slot creation, and message processing.
 
+use crate::buffer::BufferReader;
 use crate::config::Config;
 use crate::error::{CdcError, Result};
 use crate::logical_parser::{parse_keepalive_message, LogicalReplicationParser};
@@ -162,34 +163,36 @@ impl LogicalReplicationStream {
 
     /// Process a WAL data message
     fn process_wal_message(&mut self, data: &[u8]) -> Result<Option<ChangeEvent>> {
+        // Use BufferReader for safe parsing of WAL message
+        let mut reader = BufferReader::new(data);
+        
+        // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
         if data.len() < 25 {
             return Err(CdcError::protocol("WAL message too short".to_string()));
         }
 
+        // Skip the message type ('w')
+        let _msg_type = reader.skip_message_type()?;
+
         // Parse WAL message header
         // Format: 'w' + start_lsn (8) + end_lsn (8) + send_time (8) + message_data
-        let start_lsn = u64::from_be_bytes([
-            data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-        ]);
-        let _end_lsn = u64::from_be_bytes([
-            data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
-        ]);
-        let _send_time = i64::from_be_bytes([
-            data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
-        ]);
+        let start_lsn = reader.read_u64()?;
+        let _end_lsn = reader.read_u64()?;
+        let _send_time = reader.read_i64()?;
 
         // Update LSN tracking
         if start_lsn > 0 {
             self.state.update_lsn(start_lsn);
         }
 
-        // Parse the logical replication message
-        let message_data = &data[25..];
-        if message_data.is_empty() {
+        // Check if there's message data remaining
+        if reader.remaining() == 0 {
             return Ok(None);
         }
 
-        let replication_message = self.parser.parse_wal_message(message_data)?;
+        // Get the remaining bytes for message parsing
+        let message_data = reader.read_bytes(reader.remaining())?;
+        let replication_message = self.parser.parse_wal_message(&message_data)?;
         self.convert_to_change_event(replication_message, start_lsn)
     }
 

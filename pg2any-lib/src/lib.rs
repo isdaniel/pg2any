@@ -46,22 +46,19 @@ pub mod types;
 // Low-level PostgreSQL replication using libpq-sys
 pub mod buffer;
 pub mod pg_replication;
-pub mod replication_messages;
-pub mod logical_parser;
-pub mod logical_stream;
 
-// Temporarily commented out modules with compilation issues
+// Unified replication protocol implementation
+pub mod logical_stream;
+pub mod replication_protocol;
+
+// High-level client interface
 pub mod client;
 pub mod connection;
-pub mod message;
-pub mod parser;
-pub mod replication;
 
 // Public API exports
 pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
 pub use error::CdcError;
-pub use replication::{ReplicationManager, ReplicationStream};
 
 /// Result type for CDC operations
 pub type CdcResult<T> = Result<T, CdcError>;
@@ -76,4 +73,8 @@ pub use crate::destinations::MySQLDestination;
 pub use crate::destinations::SqlServerDestination;
 
 pub use crate::destinations::{DestinationFactory, DestinationHandler};
+pub use crate::replication_protocol::{
+    ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
+    ReplicationState, TupleData,
+};
 pub use crate::types::DestinationType;

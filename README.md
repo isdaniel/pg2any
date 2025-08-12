@@ -294,6 +294,8 @@ make mysql     # MySQL destination
 # Insert test data and watch CDC processing
 make test-data
 make show-data
+
+set -a; source .env; set +a
 ```
 
 ## Local Development
@@ -342,13 +344,11 @@ When you run the application, you'll see structured logging output like this:
 - `tiberius`: Native SQL Server async client
 - `serde` & `serde_json`: Serialization framework
 - `chrono`: Date and time handling with timezone support
-- `uuid`: UUID generation and handling
 - `tracing` & `tracing-subscriber`: Structured logging and observability
 - `thiserror`: Ergonomic error handling and propagation
 - `anyhow`: Flexible application-level error handling
 - `async-trait`: Async trait definitions
 - `bytes`: Byte buffer manipulation
-- `futures-util`: Future utilities and combinators
 
 ## Contributing
 
@@ -370,6 +370,7 @@ This project provides a **complete architectural foundation** for PostgreSQL to 
 - **Development Environment**: Complete Docker setup for immediate local development
 
 ### 🚀 Getting Started Contributing
+
 ```bash
 # Set up development environment
 git clone https://github.com/isdaniel/pg2any
@@ -391,6 +392,7 @@ make mysql          # Connect to MySQL
 ```
 
 ### 📚 Implementation Resources
+
 For core implementation, refer to:
 - [PostgreSQL Logical Replication Protocol Documentation](https://www.postgresql.org/docs/current/protocol-logical-replication.html)
 - [PostgreSQL WAL Internals](https://www.postgresql.org/docs/current/wal-internals.html)

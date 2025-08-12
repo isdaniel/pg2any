@@ -1,5 +1,5 @@
 //! Buffer utilities for reading and writing replication protocol messages
-//! 
+//!
 //! This module provides safe wrappers for reading and writing binary data
 //! in PostgreSQL's logical replication protocol format using the bytes crate.
 
@@ -7,7 +7,7 @@ use crate::error::{CdcError, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Buffer reader for parsing binary protocol messages
-/// 
+///
 /// This implementation uses the `bytes` crate for efficient, zero-copy buffer operations.
 pub struct BufferReader {
     data: Bytes,
@@ -101,7 +101,7 @@ impl BufferReader {
     pub fn read_cstring(&mut self) -> Result<String> {
         let mut bytes_to_read = 0;
         let data_slice = self.data.chunk();
-        
+
         // Find the null terminator
         for (i, &byte) in data_slice.iter().enumerate() {
             if byte == 0 {
@@ -109,21 +109,21 @@ impl BufferReader {
                 break;
             }
         }
-        
+
         if bytes_to_read == 0 && !data_slice.is_empty() && data_slice[0] != 0 {
             return Err(CdcError::protocol(
                 "Unterminated string in buffer".to_string(),
             ));
         }
-        
+
         // Read the string bytes
         let string_bytes = self.data.copy_to_bytes(bytes_to_read);
         let result = String::from_utf8(string_bytes.to_vec())
             .map_err(|e| CdcError::protocol(format!("Invalid UTF-8 in string: {}", e)))?;
-        
+
         // Skip null terminator
         self.data.advance(1);
-        
+
         Ok(result)
     }
 
@@ -164,7 +164,7 @@ impl BufferReader {
 }
 
 /// Buffer writer for creating binary protocol messages
-/// 
+///
 /// This implementation uses BytesMut from the bytes crate for efficient buffer operations.
 pub struct BufferWriter {
     data: BytesMut,
@@ -322,7 +322,7 @@ mod tests {
         writer.write_u8(0x01).unwrap();
         writer.write_u16(0x0203).unwrap();
         writer.write_u32(0x04050607).unwrap();
-        
+
         assert_eq!(writer.bytes_written(), 7);
 
         let data = writer.freeze();

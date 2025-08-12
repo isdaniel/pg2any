@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 
 /// Comprehensive error types for CDC operations

@@ -1,9 +1,13 @@
 //! Low-level PostgreSQL connection using libpq-sys
-//! 
+//!
 //! This module provides safe wrappers around libpq functions for logical replication.
 
 use crate::buffer::BufferWriter;
+use crate::config::Config;
+use crate::connection::PostgresConnection;
 use crate::error::{CdcError, Result};
+use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
+use crate::types::{ChangeEvent, Lsn};
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -34,7 +38,7 @@ impl PgReplicationConnection {
             let library_version = PQlibVersion();
             debug!("Using libpq version: {}", library_version);
         }
-        
+
         let c_conninfo = CString::new(conninfo)
             .map_err(|e| CdcError::connection(format!("Invalid connection string: {}", e)))?;
 
@@ -53,9 +57,7 @@ impl PgReplicationConnection {
                 if error_ptr.is_null() {
                     "Unknown connection error".to_string()
                 } else {
-                    CStr::from_ptr(error_ptr)
-                        .to_string_lossy()
-                        .into_owned()
+                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
                 }
             };
             unsafe { PQfinish(conn) };
@@ -99,14 +101,20 @@ impl PgReplicationConnection {
         let pg_result = PgResult::new(result);
         // Check for errors
         let status = pg_result.status();
-        info!("query : {}, pg_result.status() : {:?}",query, pg_result.status());
+        info!(
+            "query : {}, pg_result.status() : {:?}",
+            query,
+            pg_result.status()
+        );
         if !matches!(
             status,
-            ExecStatusType::PGRES_TUPLES_OK | 
-            ExecStatusType::PGRES_COMMAND_OK | 
-            ExecStatusType::PGRES_COPY_BOTH 
+            ExecStatusType::PGRES_TUPLES_OK
+                | ExecStatusType::PGRES_COMMAND_OK
+                | ExecStatusType::PGRES_COPY_BOTH
         ) {
-            let error_msg = pg_result.error_message().unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = pg_result
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
             return Err(CdcError::protocol(format!(
                 "Query execution failed: {}",
                 error_msg
@@ -138,7 +146,11 @@ impl PgReplicationConnection {
     }
 
     /// Create a replication slot
-    pub fn create_replication_slot(&self, slot_name: &str, output_plugin: &str) -> Result<PgResult> {
+    pub fn create_replication_slot(
+        &self,
+        slot_name: &str,
+        output_plugin: &str,
+    ) -> Result<PgResult> {
         let create_slot_sql = format!(
             "CREATE_REPLICATION_SLOT \"{}\" LOGICAL {} NOEXPORT_SNAPSHOT;",
             slot_name, output_plugin
@@ -157,7 +169,12 @@ impl PgReplicationConnection {
     }
 
     /// Start logical replication
-    pub fn start_replication(&mut self, slot_name: &str, start_lsn: XLogRecPtr, options: &[(&str, &str)]) -> Result<()> {
+    pub fn start_replication(
+        &mut self,
+        slot_name: &str,
+        start_lsn: XLogRecPtr,
+        options: &[(&str, &str)],
+    ) -> Result<()> {
         let mut options_str = String::new();
         for (i, (key, value)) in options.iter().enumerate() {
             if i > 0 {
@@ -232,7 +249,13 @@ impl PgReplicationConnection {
     }
 
     /// Send feedback to the server (standby status update)
-    pub fn send_standby_status_update(&self, received_lsn: XLogRecPtr, flushed_lsn: XLogRecPtr, applied_lsn: XLogRecPtr, reply_requested: bool) -> Result<()> {
+    pub fn send_standby_status_update(
+        &self,
+        received_lsn: XLogRecPtr,
+        flushed_lsn: XLogRecPtr,
+        applied_lsn: XLogRecPtr,
+        reply_requested: bool,
+    ) -> Result<()> {
         if !self.is_replication_conn {
             return Err(CdcError::protocol(
                 "Connection is not in replication mode".to_string(),
@@ -240,17 +263,17 @@ impl PgReplicationConnection {
         }
 
         let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
-        
+
         // Build the standby status update message using BufferWriter
         let mut buffer = BufferWriter::with_capacity(34); // 1 + 8 + 8 + 8 + 8 + 1
-        
+
         buffer.write_u8(b'r')?; // Message type
         buffer.write_u64(received_lsn)?;
         buffer.write_u64(flushed_lsn)?;
         buffer.write_u64(applied_lsn)?;
         buffer.write_i64(timestamp)?;
         buffer.write_u8(if reply_requested { 1 } else { 0 })?;
-        
+
         let reply_data = buffer.freeze();
 
         let result = unsafe {
@@ -281,9 +304,12 @@ impl PgReplicationConnection {
 
         debug!(
             "Sent standby status update: received={:X}/{:X}, flushed={:X}/{:X}, applied={:X}/{:X}",
-            received_lsn >> 32, received_lsn & 0xFFFFFFFF,
-            flushed_lsn >> 32, flushed_lsn & 0xFFFFFFFF,
-            applied_lsn >> 32, applied_lsn & 0xFFFFFFFF
+            received_lsn >> 32,
+            received_lsn & 0xFFFFFFFF,
+            flushed_lsn >> 32,
+            flushed_lsn & 0xFFFFFFFF,
+            applied_lsn >> 32,
+            applied_lsn & 0xFFFFFFFF
         );
 
         Ok(())
@@ -296,9 +322,7 @@ impl PgReplicationConnection {
             if error_ptr.is_null() {
                 "Unknown error".to_string()
             } else {
-                CStr::from_ptr(error_ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
             }
         }
     }
@@ -308,7 +332,7 @@ impl PgReplicationConnection {
         if self.conn.is_null() {
             return false;
         }
-        
+
         unsafe { PQstatus(self.conn) == ConnStatusType::CONNECTION_OK }
     }
 
@@ -375,13 +399,7 @@ impl PgResult {
         if value_ptr.is_null() {
             None
         } else {
-            unsafe {
-                Some(
-                    CStr::from_ptr(value_ptr)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            }
+            unsafe { Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned()) }
         }
     }
 
@@ -391,13 +409,7 @@ impl PgResult {
         if error_ptr.is_null() {
             None
         } else {
-            unsafe {
-                Some(
-                    CStr::from_ptr(error_ptr)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            }
+            unsafe { Some(CStr::from_ptr(error_ptr).to_string_lossy().into_owned()) }
         }
     }
 }
@@ -409,6 +421,91 @@ impl Drop for PgResult {
                 PQclear(self.result);
             }
         }
+    }
+}
+
+pub struct ReplicationStream {
+    logical_stream: LogicalReplicationStream,
+    config: Config,
+    last_received_lsn: Option<Lsn>,
+    last_feedback_time: SystemTime,
+}
+
+impl ReplicationStream {
+    pub async fn new(_connection: PostgresConnection, config: Config) -> Result<Self> {
+        let stream_config = ReplicationStreamConfig::from(&config);
+        let logical_stream =
+            LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
+
+        Ok(Self {
+            logical_stream,
+            config,
+            last_received_lsn: None,
+            last_feedback_time: SystemTime::now(),
+        })
+    }
+
+    pub async fn start(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
+        info!("Starting PostgreSQL logical replication stream");
+
+        // Initialize the logical stream
+        self.logical_stream.initialize().await?;
+
+        // Start replication from the specified LSN
+        let start_xlog = start_lsn.map(|lsn| lsn.0);
+        self.logical_stream.start(start_xlog).await?;
+
+        info!("Logical replication stream started successfully");
+        Ok(())
+    }
+
+    pub async fn next_batch(&mut self) -> Result<Option<Vec<ChangeEvent>>> {
+        debug!("Fetching next batch of changes");
+
+        let batch_size = self.config.batch_size;
+        let events = self.logical_stream.next_batch(batch_size).await?;
+
+        if !events.is_empty() {
+            debug!("Received {} change events", events.len());
+
+            // Update last received LSN
+            if let Some(last_event) = events.last() {
+                if let Some(lsn_str) = &last_event.lsn {
+                    if let Ok(lsn_value) = crate::pg_replication::parse_lsn(lsn_str) {
+                        self.last_received_lsn = Some(Lsn(lsn_value));
+                    }
+                }
+            }
+
+            Ok(Some(events))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        info!("Stopping logical replication stream");
+        self.logical_stream.stop().await?;
+        Ok(())
+    }
+
+    pub fn current_lsn(&self) -> Option<Lsn> {
+        self.last_received_lsn
+    }
+}
+
+pub struct ReplicationManager {
+    config: Config,
+}
+
+impl ReplicationManager {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    pub async fn create_stream_async(&mut self) -> Result<ReplicationStream> {
+        let connection = PostgresConnection::placeholder();
+        ReplicationStream::new(connection, self.config.clone()).await
     }
 }
 
@@ -429,7 +526,7 @@ pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
 pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
     let unix_micros = timestamp + PG_EPOCH_OFFSET_SECS * 1_000_000;
     let unix_secs = unix_micros / 1_000_000;
-    
+
     match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs as u64)) {
         Some(_) => {
             // Simple formatting without external dependencies

@@ -31,31 +31,31 @@ pub enum DestinationType {
 pub struct ChangeEvent {
     /// Type of the event
     pub event_type: EventType,
-    
+
     /// Transaction ID
     pub transaction_id: Option<u32>,
-    
+
     /// Commit timestamp
     pub commit_timestamp: Option<DateTime<Utc>>,
-    
+
     /// Schema name
     pub schema_name: Option<String>,
-    
+
     /// Table name
     pub table_name: Option<String>,
-    
+
     /// Relation OID
     pub relation_oid: Option<u32>,
-    
+
     /// Column data before the change (for UPDATE and DELETE)
     pub old_data: Option<HashMap<String, serde_json::Value>>,
-    
+
     /// Column data after the change (for INSERT and UPDATE)
     pub new_data: Option<HashMap<String, serde_json::Value>>,
-    
+
     /// LSN (Log Sequence Number) position
     pub lsn: Option<String>,
-    
+
     /// Additional metadata
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
@@ -163,50 +163,15 @@ impl ChangeEvent {
 pub struct ReplicationMessage {
     /// The raw message type byte
     pub message_type: u8,
-    
+
     /// The decoded message payload
     pub payload: Vec<u8>,
-    
+
     /// WAL position
     pub wal_position: u64,
-    
+
     /// Server clock when message was created
     pub server_time: DateTime<Utc>,
-}
-
-/// Table relationship information from PostgreSQL
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelationInfo {
-    /// Relation OID
-    pub relation_oid: u32,
-    
-    /// Namespace (schema) name
-    pub namespace: String,
-    
-    /// Relation (table) name 
-    pub relation_name: String,
-    
-    /// Replica identity setting
-    pub replica_identity: ReplicaIdentity,
-    
-    /// Column information
-    pub columns: Vec<ColumnInfo>,
-}
-
-/// Column information from relation message
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnInfo {
-    /// Column name
-    pub name: String,
-    
-    /// PostgreSQL type OID
-    pub type_oid: u32,
-    
-    /// Type modifier
-    pub type_modifier: i32,
-    
-    /// Whether column is part of the key
-    pub is_key: bool,
 }
 
 /// PostgreSQL replica identity settings
@@ -214,15 +179,28 @@ pub struct ColumnInfo {
 pub enum ReplicaIdentity {
     /// Default replica identity (primary key)
     Default,
-    
+
     /// No replica identity  
     Nothing,
-    
+
     /// Full replica identity (all columns)
     Full,
-    
+
     /// Index-based replica identity
     Index,
+}
+
+impl ReplicaIdentity {
+    /// Create replica identity from byte
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            b'd' => Some(ReplicaIdentity::Default),
+            b'n' => Some(ReplicaIdentity::Nothing),
+            b'f' => Some(ReplicaIdentity::Full),
+            b'i' => Some(ReplicaIdentity::Index),
+            _ => None,
+        }
+    }
 }
 
 /// PostgreSQL type information
@@ -230,10 +208,10 @@ pub enum ReplicaIdentity {
 pub struct TypeInfo {
     /// Type OID
     pub type_oid: u32,
-    
+
     /// Type name
     pub type_name: String,
-    
+
     /// Namespace name
     pub namespace: String,
 }
@@ -243,13 +221,13 @@ pub struct TypeInfo {
 pub struct TransactionInfo {
     /// Transaction ID
     pub xid: u32,
-    
+
     /// Commit timestamp
     pub commit_timestamp: DateTime<Utc>,
-    
+
     /// Transaction start LSN
     pub start_lsn: u64,
-    
+
     /// Transaction commit LSN
     pub commit_lsn: u64,
 }
@@ -263,27 +241,27 @@ impl Lsn {
     pub fn new(value: u64) -> Self {
         Self(value)
     }
-    
+
     /// Get the raw u64 value
     pub fn value(&self) -> u64 {
         self.0
     }
-    
+
     /// Parse LSN from PostgreSQL string format (e.g., "16/B374D848")
     pub fn from_str(s: &str) -> Result<Self, crate::error::CdcError> {
         let parts: Vec<&str> = s.split('/').collect();
         if parts.len() != 2 {
             return Err(crate::error::CdcError::protocol("Invalid LSN format"));
         }
-        
+
         let high = u64::from_str_radix(parts[0], 16)
             .map_err(|_| crate::error::CdcError::protocol("Invalid LSN high part"))?;
         let low = u64::from_str_radix(parts[1], 16)
             .map_err(|_| crate::error::CdcError::protocol("Invalid LSN low part"))?;
-        
+
         Ok(Self((high << 32) | low))
     }
-    
+
     /// Convert LSN to PostgreSQL string format
     pub fn to_string(&self) -> String {
         format!("{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFFFFFF)

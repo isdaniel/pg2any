@@ -20,10 +20,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Utilities
-uuid = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
-futures-util = { workspace = true }
 async-trait = { workspace = true }
 
 # Error handling

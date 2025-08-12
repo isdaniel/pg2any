@@ -1,8 +1,8 @@
 use crate::config::Config;
+use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
-use crate::replication::{ReplicationManager, ReplicationStream};
+use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, EventType, Lsn};
-use crate::destinations::{DestinationHandler, DestinationFactory};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -23,18 +23,18 @@ impl CdcClient {
     /// Create a new CDC client
     pub async fn new(config: Config) -> Result<Self> {
         info!("Creating CDC client");
-        
+
         // Create destination handler
         let destination_handler = DestinationFactory::create(config.destination_type.clone())?;
 
         let replication_manager = ReplicationManager::new(config.clone());
 
         // Create event channel
-        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);  
+        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);
 
         Ok(Self {
             config,
-            replication_manager:  Some(replication_manager),
+            replication_manager: Some(replication_manager),
             destination_handler: Some(destination_handler),
             event_sender: Some(event_sender),
             event_receiver: Some(event_receiver),
@@ -48,7 +48,9 @@ impl CdcClient {
 
         // Connect to destination database
         if let Some(ref mut handler) = self.destination_handler {
-            handler.connect(&self.config.destination_connection_string).await?;
+            handler
+                .connect(&self.config.destination_connection_string)
+                .await?;
         }
 
         info!("CDC client initialized successfully");
@@ -76,7 +78,9 @@ impl CdcClient {
         }
 
         // Create replication stream using async method
-        let mut replication_manager = self.replication_manager.take()
+        let mut replication_manager = self
+            .replication_manager
+            .take()
             .ok_or_else(|| CdcError::generic("Replication manager not available"))?;
 
         let mut replication_stream = replication_manager.create_stream_async().await?;
@@ -85,27 +89,39 @@ impl CdcClient {
         replication_stream.start(start_lsn).await?;
 
         // Start the producer task (reads from PostgreSQL)
-        let event_sender = self.event_sender.take()
+        let event_sender = self
+            .event_sender
+            .take()
             .ok_or_else(|| CdcError::generic("Event sender not available"))?;
-        
+
         let is_running_producer = Arc::clone(&self.is_running);
         let batch_size = self.config.batch_size;
-        
+
         let producer_handle = tokio::spawn(async move {
-            Self::run_producer(replication_stream, event_sender, is_running_producer, batch_size).await
+            Self::run_producer(
+                replication_stream,
+                event_sender,
+                is_running_producer,
+                batch_size,
+            )
+            .await
         });
 
         // Start the consumer task (writes to destination)
-        let event_receiver = self.event_receiver.take()
+        let event_receiver = self
+            .event_receiver
+            .take()
             .ok_or_else(|| CdcError::generic("Event receiver not available"))?;
-        
-        let destination_handler = self.destination_handler.take()
+
+        let destination_handler = self
+            .destination_handler
+            .take()
             .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
-        
+
         let is_running_consumer = Arc::clone(&self.is_running);
         let auto_create_tables = self.config.auto_create_tables;
         let consumer_batch_size = self.config.batch_size;
-        
+
         let consumer_handle = tokio::spawn(async move {
             Self::run_consumer(
                 event_receiver,
@@ -113,7 +129,8 @@ impl CdcClient {
                 is_running_consumer,
                 auto_create_tables,
                 consumer_batch_size,
-            ).await
+            )
+            .await
         });
 
         info!("CDC replication started successfully");
@@ -150,7 +167,7 @@ impl CdcClient {
             match replication_stream.next_batch().await {
                 Ok(Some(events)) => {
                     debug!("Producer received {} events", events.len());
-                    
+
                     for event in events {
                         if let Err(e) = event_sender.send(event).await {
                             error!("Failed to send event to consumer: {}", e);
@@ -191,11 +208,11 @@ impl CdcClient {
         while *is_running.lock().await || event_receiver.len() > 0 {
             // Collect events into a batch
             event_batch.clear();
-            
+
             // Get the first event (blocking if necessary)
             if let Some(event) = event_receiver.recv().await {
                 event_batch.push(event);
-                
+
                 // Try to get more events up to batch size (non-blocking)
                 while event_batch.len() < batch_size {
                     match event_receiver.try_recv() {
@@ -210,19 +227,22 @@ impl CdcClient {
 
             if !event_batch.is_empty() {
                 debug!("Consumer processing batch of {} events", event_batch.len());
-       
+
                 // Process the batch
                 for event in &event_batch {
                     info!("event info: {:?}", event);
                     // Auto-create tables if needed
                     if auto_create_tables && Self::is_dml_event(event) {
-                        let table_key = format!("{}.{}", 
+                        let table_key = format!(
+                            "{}.{}",
                             event.schema_name.as_deref().unwrap_or("public"),
                             event.table_name.as_deref().unwrap_or("unknown")
                         );
-                        
+
                         if !created_tables.contains(&table_key) {
-                            if let Err(e) = destination_handler.create_table_if_not_exists(event).await {
+                            if let Err(e) =
+                                destination_handler.create_table_if_not_exists(event).await
+                            {
                                 warn!("Failed to create table {}: {}", table_key, e);
                             } else {
                                 created_tables.insert(table_key);
@@ -230,7 +250,7 @@ impl CdcClient {
                         }
                     }
                 }
-                
+
                 // Process the batch
                 if let Err(e) = destination_handler.process_batch(&event_batch).await {
                     error!("Failed to process event batch: {}", e);
@@ -245,13 +265,16 @@ impl CdcClient {
 
     /// Check if an event is a DML event that affects tables
     fn is_dml_event(event: &ChangeEvent) -> bool {
-        matches!(event.event_type, EventType::Insert | EventType::Update | EventType::Delete)
+        matches!(
+            event.event_type,
+            EventType::Insert | EventType::Update | EventType::Delete
+        )
     }
 
     /// Stop the CDC replication process
     pub async fn stop(&mut self) -> Result<()> {
         info!("Stopping CDC replication");
-        
+
         {
             let mut running = self.is_running.lock().await;
             *running = false;

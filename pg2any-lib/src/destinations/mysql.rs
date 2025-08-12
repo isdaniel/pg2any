@@ -1,6 +1,9 @@
-use crate::{error::{CdcError, Result}, types::{ChangeEvent, EventType}};
-use async_trait::async_trait;
 use super::destination_factory::DestinationHandler;
+use crate::{
+    error::{CdcError, Result},
+    types::{ChangeEvent, EventType},
+};
+use async_trait::async_trait;
 use sqlx::MySqlPool;
 
 /// MySQL destination implementation
@@ -40,13 +43,14 @@ impl MySQLDestination {
     /// Generate CREATE TABLE statement for MySQL
     async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
         let default_schema = "public".to_string();
-        let schema_name = event.schema_name
-            .as_ref()
-            .unwrap_or(&default_schema);
+        let schema_name = event.schema_name.as_ref().unwrap_or(&default_schema);
         let table_name = event.table_name.as_ref().unwrap();
-        
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n", schema_name, table_name);
-        
+
+        let mut sql = format!(
+            "CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n",
+            schema_name, table_name
+        );
+
         // For now, we'll create columns based on the data we receive
         // In a production system, you'd want to query the PostgreSQL schema
         if let Some(data) = &event.new_data {
@@ -64,7 +68,7 @@ impl MySQLDestination {
             }
             sql.push_str(&columns.join(",\n"));
         }
-        
+
         sql.push_str("\n)");
         Ok(sql)
     }
@@ -79,20 +83,20 @@ impl DestinationHandler for MySQLDestination {
     }
 
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
-        let pool = self.pool.as_ref().ok_or_else(|| {
-            CdcError::generic("MySQL connection not established")
-        })?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
 
         match event.event_type {
             EventType::Insert => {
-                if let (Some(schema), Some(table), Some(data)) = (
-                    &event.schema_name,
-                    &event.table_name,
-                    &event.new_data,
-                ) {
+                if let (Some(schema), Some(table), Some(data)) =
+                    (&event.schema_name, &event.table_name, &event.new_data)
+                {
                     let columns: Vec<String> = data.keys().map(|k| format!("`{}`", k)).collect();
-                    let placeholders: Vec<String> = (0..columns.len()).map(|_| "?".to_string()).collect();
-                    
+                    let placeholders: Vec<String> =
+                        (0..columns.len()).map(|_| "?".to_string()).collect();
+
                     let sql = format!(
                         "INSERT INTO `{}`.`{}` ({}) VALUES ({})",
                         schema,
@@ -100,7 +104,7 @@ impl DestinationHandler for MySQLDestination {
                         columns.join(", "),
                         placeholders.join(", ")
                     );
-                    
+
                     let mut query = sqlx::query(&sql);
                     for (_, value) in data {
                         query = match value {
@@ -120,24 +124,20 @@ impl DestinationHandler for MySQLDestination {
                 }
             }
             EventType::Update => {
-                if let (Some(schema), Some(table), Some(new_data)) = (
-                    &event.schema_name,
-                    &event.table_name,
-                    &event.new_data,
-                ) {
-                    let set_clauses: Vec<String> = new_data
-                        .keys()
-                        .map(|k| format!("`{}` = ?", k))
-                        .collect();
+                if let (Some(schema), Some(table), Some(new_data)) =
+                    (&event.schema_name, &event.table_name, &event.new_data)
+                {
+                    let set_clauses: Vec<String> =
+                        new_data.keys().map(|k| format!("`{}` = ?", k)).collect();
 
                     // Use old_data to build WHERE clause for proper row identification
                     // This uses the replica identity (primary key, unique index, or full row)
                     let where_clause = if let Some(old_data) = &event.old_data {
                         old_data
-                            .iter().map(|(k,v)| format!("`{k}` = {v}"))
+                            .iter()
+                            .map(|(k, v)| format!("`{k}` = {v}"))
                             .collect::<Vec<String>>()
                             .join(" AND ")
-                       
                     } else {
                         // Fallback: use primary key/unique columns from new_data if old_data is not available
                         // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
@@ -145,7 +145,7 @@ impl DestinationHandler for MySQLDestination {
                         new_data
                             .iter()
                             .take(1) // Take first column as a fallback (not ideal)
-                            .map(|(k,v)| format!("`{k}` = {v}"))
+                            .map(|(k, v)| format!("`{k}` = {v}"))
                             .collect::<Vec<String>>()
                             .join(" AND ")
                     };
@@ -159,7 +159,7 @@ impl DestinationHandler for MySQLDestination {
                     );
 
                     let mut query = sqlx::query(&sql);
-                    
+
                     // Bind SET clause values (new data)
                     for (_, value) in new_data {
                         query = match value {
@@ -179,16 +179,12 @@ impl DestinationHandler for MySQLDestination {
                 }
             }
             EventType::Delete => {
-                if let (Some(schema), Some(table), Some(data)) = (
-                    &event.schema_name,
-                    &event.table_name,
-                    &event.old_data,
-                ) {
+                if let (Some(schema), Some(table), Some(data)) =
+                    (&event.schema_name, &event.table_name, &event.old_data)
+                {
                     // Simple delete - in production you'd use proper key matching
-                    let where_clauses: Vec<String> = data
-                        .keys()
-                        .map(|k| format!("`{}` = ?", k))
-                        .collect();
+                    let where_clauses: Vec<String> =
+                        data.keys().map(|k| format!("`{}` = ?", k)).collect();
 
                     let sql = format!(
                         "DELETE FROM `{}`.`{}` WHERE {}",
@@ -224,20 +220,22 @@ impl DestinationHandler for MySQLDestination {
     }
 
     async fn create_table_if_not_exists(&mut self, event: &ChangeEvent) -> Result<()> {
-        let pool = self.pool.as_ref().ok_or_else(|| {
-            CdcError::generic("MySQL connection not established")
-        })?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
 
         let sql = self.generate_create_table(event).await?;
         sqlx::query(&sql).execute(pool).await?;
-        
+
         Ok(())
     }
 
     async fn health_check(&mut self) -> Result<bool> {
-        let pool = self.pool.as_ref().ok_or_else(|| {
-            CdcError::generic("MySQL connection not established")
-        })?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
 
         match sqlx::query("SELECT 1").fetch_one(pool).await {
             Ok(_) => Ok(true),
@@ -257,8 +255,8 @@ impl DestinationHandler for MySQLDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use chrono::Utc;
+    use std::collections::HashMap;
 
     #[test]
     fn test_mysql_destination_creation() {
@@ -269,7 +267,7 @@ mod tests {
     #[test]
     fn test_type_conversion() {
         let destination = MySQLDestination::new();
-        
+
         assert_eq!(destination.convert_type("integer"), "INT");
         assert_eq!(destination.convert_type("bigint"), "BIGINT");
         assert_eq!(destination.convert_type("varchar"), "VARCHAR(255)");
@@ -281,12 +279,18 @@ mod tests {
     #[tokio::test]
     async fn test_generate_create_table() {
         let destination = MySQLDestination::new();
-        
+
         let mut data = HashMap::new();
-        data.insert("id".to_string(), serde_json::Value::Number(serde_json::Number::from(1)));
-        data.insert("name".to_string(), serde_json::Value::String("test".to_string()));
+        data.insert(
+            "id".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(1)),
+        );
+        data.insert(
+            "name".to_string(),
+            serde_json::Value::String("test".to_string()),
+        );
         data.insert("active".to_string(), serde_json::Value::Bool(true));
-        
+
         let event = ChangeEvent {
             event_type: EventType::Insert,
             transaction_id: Some(123),
@@ -301,7 +305,7 @@ mod tests {
         };
 
         let sql = destination.generate_create_table(&event).await.unwrap();
-        
+
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS `test_schema`.`test_table`"));
         assert!(sql.contains("`id` BIGINT"));
         assert!(sql.contains("`name` VARCHAR(255)"));
@@ -324,7 +328,7 @@ mod tests {
             lsn: None,
             metadata: None,
         };
-        
+
         // This should use "public" as default schema
         // We can test this by checking the generate_create_table method
         assert!(true); // Placeholder - would need async test setup for full validation

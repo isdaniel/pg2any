@@ -6,9 +6,13 @@
 use crate::buffer::BufferReader;
 use crate::config::Config;
 use crate::error::{CdcError, Result};
-use crate::logical_parser::{parse_keepalive_message, LogicalReplicationParser};
-use crate::pg_replication::{format_lsn, PgReplicationConnection, XLogRecPtr, INVALID_XLOG_REC_PTR};
-use crate::replication_messages::{LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage};
+use crate::pg_replication::{
+    format_lsn, PgReplicationConnection, XLogRecPtr, INVALID_XLOG_REC_PTR,
+};
+use crate::replication_protocol::{parse_keepalive_message, LogicalReplicationParser};
+use crate::replication_protocol::{
+    LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage,
+};
 use crate::types::{ChangeEvent, EventType};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -37,7 +41,7 @@ impl LogicalReplicationStream {
     /// Create a new logical replication stream
     pub async fn new(connection_string: &str, config: ReplicationStreamConfig) -> Result<Self> {
         info!("Creating logical replication stream");
-        
+
         let connection = PgReplicationConnection::connect(connection_string)?;
         let parser = LogicalReplicationParser::new();
         let state = ReplicationState::new();
@@ -73,8 +77,11 @@ impl LogicalReplicationStream {
         }
 
         info!("Creating replication slot: {}", self.config.slot_name);
-        
-        match self.connection.create_replication_slot(&self.config.slot_name, "pgoutput") {
+
+        match self
+            .connection
+            .create_replication_slot(&self.config.slot_name, "pgoutput")
+        {
             Ok(_) => {
                 info!("Replication slot created successfully");
                 self.slot_created = true;
@@ -98,7 +105,7 @@ impl LogicalReplicationStream {
         info!("Starting logical replication stream");
 
         let start_lsn = start_lsn.unwrap_or(INVALID_XLOG_REC_PTR);
-        
+
         // Build replication options
         let proto_version = self.config.protocol_version.to_string();
         let publication_names = format!("\"{}\"", self.config.publication_name);
@@ -112,9 +119,13 @@ impl LogicalReplicationStream {
         }
 
         // Start replication
-        self.connection.start_replication(&self.config.slot_name, start_lsn, &options)?;
+        self.connection
+            .start_replication(&self.config.slot_name, start_lsn, &options)?;
 
-        info!("Logical replication started with LSN: {}", format_lsn(start_lsn));
+        info!(
+            "Logical replication started with LSN: {}",
+            format_lsn(start_lsn)
+        );
         Ok(())
     }
 
@@ -123,13 +134,14 @@ impl LogicalReplicationStream {
         let mut events = Vec::with_capacity(batch_size);
         let start_time = Instant::now();
         let timeout = Duration::from_millis(100); // Short timeout to allow periodic checks
-        
+
         while events.len() < batch_size && start_time.elapsed() < timeout {
             // Check if we should send feedback
             self.maybe_send_feedback()?;
 
             // Try to get data from the replication stream
-            match self.connection.get_copy_data(0)? { // 10ms timeout
+            match self.connection.get_copy_data(0)? {
+                // 10ms timeout
                 Some(data) => {
                     if data.is_empty() {
                         continue;
@@ -165,7 +177,7 @@ impl LogicalReplicationStream {
     fn process_wal_message(&mut self, data: &[u8]) -> Result<Option<ChangeEvent>> {
         // Use BufferReader for safe parsing of WAL message
         let mut reader = BufferReader::new(data);
-        
+
         // Check minimum message length (1 + 8 + 8 + 8 = 25 bytes)
         if data.len() < 25 {
             return Err(CdcError::protocol("WAL message too short".to_string()));
@@ -199,9 +211,12 @@ impl LogicalReplicationStream {
     /// Process a keepalive message
     fn process_keepalive_message(&mut self, data: &[u8]) -> Result<()> {
         let keepalive = parse_keepalive_message(data)?;
-        
-        debug!("Received keepalive: wal_end={}, reply_requested={}", 
-               format_lsn(keepalive.wal_end), keepalive.reply_requested);
+
+        debug!(
+            "Received keepalive: wal_end={}, reply_requested={}",
+            format_lsn(keepalive.wal_end),
+            keepalive.reply_requested
+        );
 
         self.state.update_lsn(keepalive.wal_end);
 
@@ -213,23 +228,33 @@ impl LogicalReplicationStream {
     }
 
     /// Convert a logical replication message to a ChangeEvent
-    fn convert_to_change_event(&mut self, message: StreamingReplicationMessage, lsn: XLogRecPtr) -> Result<Option<ChangeEvent>> {
+    fn convert_to_change_event(
+        &mut self,
+        message: StreamingReplicationMessage,
+        lsn: XLogRecPtr,
+    ) -> Result<Option<ChangeEvent>> {
         let event = match message.message {
-            LogicalReplicationMessage::Relation { relation_id, namespace, relation_name, replica_identity, columns } => {
-                let relation_info = crate::replication_messages::RelationInfo::new(
+            LogicalReplicationMessage::Relation {
+                relation_id,
+                namespace,
+                relation_name,
+                replica_identity,
+                columns,
+            } => {
+                let relation_info = crate::replication_protocol::RelationInfo::new(
                     relation_id,
                     namespace.clone(),
                     relation_name.clone(),
                     replica_identity,
                     columns,
                 );
-                
+
                 self.state.add_relation(relation_info);
-                
+
                 // Don't generate events for relation messages
                 return Ok(None);
             }
-            
+
             LogicalReplicationMessage::Insert { relation_id, tuple } => {
                 if let Some(relation) = self.state.get_relation(relation_id) {
                     let full_name = relation.full_name();
@@ -240,7 +265,7 @@ impl LogicalReplicationStream {
                         ("public".to_string(), relation.full_name())
                     };
                     let data = self.convert_tuple_to_data(&tuple, relation)?;
-                    
+
                     ChangeEvent {
                         event_type: EventType::Insert,
                         transaction_id: None,
@@ -258,8 +283,13 @@ impl LogicalReplicationStream {
                     return Ok(None);
                 }
             }
-            
-            LogicalReplicationMessage::Update { relation_id, old_tuple, new_tuple, .. } => {
+
+            LogicalReplicationMessage::Update {
+                relation_id,
+                old_tuple,
+                new_tuple,
+                ..
+            } => {
                 if let Some(relation) = self.state.get_relation(relation_id) {
                     let full_name = relation.full_name();
                     let parts: Vec<&str> = full_name.split('.').collect();
@@ -274,7 +304,7 @@ impl LogicalReplicationStream {
                         None
                     };
                     let new_data = Some(self.convert_tuple_to_data(&new_tuple, relation)?);
-                    
+
                     ChangeEvent {
                         event_type: EventType::Update,
                         transaction_id: None,
@@ -292,8 +322,12 @@ impl LogicalReplicationStream {
                     return Ok(None);
                 }
             }
-            
-            LogicalReplicationMessage::Delete { relation_id, old_tuple, .. } => {
+
+            LogicalReplicationMessage::Delete {
+                relation_id,
+                old_tuple,
+                ..
+            } => {
                 if let Some(relation) = self.state.get_relation(relation_id) {
                     let full_name = relation.full_name();
                     let parts: Vec<&str> = full_name.split('.').collect();
@@ -303,7 +337,7 @@ impl LogicalReplicationStream {
                         ("public".to_string(), relation.full_name())
                     };
                     let old_data = Some(self.convert_tuple_to_data(&old_tuple, relation)?);
-                    
+
                     ChangeEvent {
                         event_type: EventType::Delete,
                         transaction_id: None,
@@ -321,17 +355,17 @@ impl LogicalReplicationStream {
                     return Ok(None);
                 }
             }
-            
+
             LogicalReplicationMessage::Begin { xid, .. } => {
                 debug!("Transaction begin: xid={}", xid);
                 return Ok(None);
             }
-            
+
             LogicalReplicationMessage::Commit { .. } => {
                 debug!("Transaction commit");
                 return Ok(None);
             }
-            
+
             LogicalReplicationMessage::Truncate { relation_ids, .. } => {
                 // For now, just log truncate operations
                 for relation_id in relation_ids {
@@ -341,7 +375,7 @@ impl LogicalReplicationStream {
                 }
                 return Ok(None);
             }
-            
+
             _ => {
                 debug!("Ignoring message type: {:?}", message.message);
                 return Ok(None);
@@ -354,8 +388,8 @@ impl LogicalReplicationStream {
     /// Convert tuple data to a HashMap for ChangeEvent
     fn convert_tuple_to_data(
         &self,
-        tuple: &crate::replication_messages::TupleData,
-        relation: &crate::replication_messages::RelationInfo,
+        tuple: &crate::replication_protocol::TupleData,
+        relation: &crate::replication_protocol::RelationInfo,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
         let mut data = std::collections::HashMap::new();
 
@@ -370,7 +404,7 @@ impl LogicalReplicationStream {
                     let hex_string = hex::encode(column_data.as_bytes());
                     serde_json::Value::String(format!("\\x{}", hex_string))
                 };
-                
+
                 data.insert(column_info.name.clone(), value);
             }
         }
@@ -380,7 +414,10 @@ impl LogicalReplicationStream {
 
     /// Check if feedback should be sent and send it
     fn maybe_send_feedback(&mut self) -> Result<()> {
-        if self.state.should_send_feedback(self.config.feedback_interval) {
+        if self
+            .state
+            .should_send_feedback(self.config.feedback_interval)
+        {
             self.send_feedback()?;
             self.state.mark_feedback_sent();
         }
@@ -400,7 +437,10 @@ impl LogicalReplicationStream {
             false, // Don't request reply
         )?;
 
-        debug!("Sent feedback: received={}", format_lsn(self.state.last_received_lsn));
+        debug!(
+            "Sent feedback: received={}",
+            format_lsn(self.state.last_received_lsn)
+        );
         Ok(())
     }
 
@@ -435,20 +475,18 @@ impl From<&Config> for ReplicationStreamConfig {
 // Note: This is a simple hex encoding implementation to avoid adding another dependency
 mod hex {
     pub fn encode(data: &[u8]) -> String {
-        data.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        data.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::types::DestinationType;
-    use crate::config::Config;
     use super::*;
+    use crate::config::Config;
+    use crate::types::DestinationType;
 
     #[test]
-    fn test_replication_stream_config_from_cdc_config() {  
+    fn test_replication_stream_config_from_cdc_config() {
         let cdc_config = Config::builder()
             .source_connection_string("postgresql://user:pass@host:5432/db".to_string())
             .destination_type(DestinationType::MySQL)
@@ -467,6 +505,9 @@ mod tests {
         assert_eq!(replication_config.publication_name, "test_pub");
         assert_eq!(replication_config.protocol_version, 2);
         assert!(replication_config.streaming_enabled);
-        assert_eq!(replication_config.connection_timeout, Duration::from_secs(30));
+        assert_eq!(
+            replication_config.connection_timeout,
+            Duration::from_secs(30)
+        );
     }
 }

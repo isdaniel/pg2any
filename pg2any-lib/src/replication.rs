@@ -87,28 +87,18 @@ impl ReplicationStream {
 }
 
 pub struct ReplicationManager {
-    config: Config,
-    connection: Option<PostgresConnection>,
-    is_running: bool,
+    config: Config
 }
 
 impl ReplicationManager {
     pub fn new(config: Config) -> Self {
         Self {
-            config,
-            connection: None,
-            is_running: false,
+            config
         }
     }
 
-    pub async fn init(&mut self) -> Result<()> {
-        info!("Initializing replication manager with libpq-sys");
-        // Connection will be created by the logical stream
-        Ok(())
-    }
-
     pub async fn create_stream_async(&mut self) -> Result<ReplicationStream> {
-        let _connection = PostgresConnection::placeholder();
-        ReplicationStream::new(_connection, self.config.clone()).await
+        let connection = PostgresConnection::placeholder();
+        ReplicationStream::new(connection, self.config.clone()).await
     }
 }

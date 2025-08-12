@@ -9,19 +9,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize comprehensive logging
     init_logging();
     
-    tracing::info!("🚀 Starting PostgreSQL CDC Application");
-    tracing::info!("📋 Loading configuration from environment variables");
+    tracing::info!("Starting PostgreSQL CDC Application");
+    tracing::info!("Loading configuration from environment variables");
     
     // Load configuration from environment variables
     let config = load_config_from_env()?;
     
-    tracing::info!("🔗 Configuration loaded successfully");
+    tracing::info!("Configuration loaded successfully");
     
     // Create and initialize CDC client
-    tracing::info!("⚙️  Initializing CDC client");
+    tracing::info!("Initializing CDC client");
     let mut client = CdcClient::new(config).await?;
     
-    tracing::info!("🔧 Performing CDC client initialization");
+    tracing::info!("Performing CDC client initialization");
     client.init().await?;
     
     tracing::info!("✅ CDC client initialized successfully");
@@ -31,9 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Start the CDC replication process
     tracing::info!("🔄 Starting CDC replication stream");
-    tracing::info!("   This will continuously monitor PostgreSQL changes");
-    tracing::info!("   and replicate them to the MySQL destination");
-    
+    tracing::info!("This will continuously monitor PostgreSQL changes");
+
     // Run CDC replication with graceful shutdown
     tokio::select! {
         result = client.start_replication() => {
@@ -73,8 +72,8 @@ fn init_logging() {
         .with(env_filter)
         .with(fmt_layer)
         .init();
-    
-    tracing::info!("📝 Logging initialized with level filtering");
+
+    tracing::info!("Logging initialized with level filtering");
 }
 
 /// Load configuration from environment variables

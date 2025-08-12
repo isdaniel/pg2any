@@ -312,7 +312,6 @@ impl ReplicationState {
     pub fn update_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_received_lsn {
             self.last_received_lsn = lsn;
-            // For simplicity, treat received as flushed and applied
             self.last_flushed_lsn = lsn;
             self.last_applied_lsn = lsn;
         }

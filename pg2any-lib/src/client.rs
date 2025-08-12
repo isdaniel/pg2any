@@ -26,13 +26,15 @@ impl CdcClient {
         
         // Create destination handler
         let destination_handler = DestinationFactory::create(config.destination_type.clone())?;
-        
+
+        let replication_manager = ReplicationManager::new(config.clone());
+
         // Create event channel
-        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);
-        
+        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);  
+
         Ok(Self {
             config,
-            replication_manager: None,
+            replication_manager:  Some(replication_manager),
             destination_handler: Some(destination_handler),
             event_sender: Some(event_sender),
             event_receiver: Some(event_receiver),
@@ -43,11 +45,6 @@ impl CdcClient {
     /// Initialize the CDC client
     pub async fn init(&mut self) -> Result<()> {
         info!("Initializing CDC client");
-
-        // Initialize replication manager
-        let mut replication_manager = ReplicationManager::new(self.config.clone());
-        replication_manager.init().await?;
-        self.replication_manager = Some(replication_manager);
 
         // Connect to destination database
         if let Some(ref mut handler) = self.destination_handler {
@@ -72,7 +69,7 @@ impl CdcClient {
             self.init().await?;
         }
 
-        // Set running flag
+        // todo this could be state machine support more state
         {
             let mut running = self.is_running.lock().await;
             *running = true;

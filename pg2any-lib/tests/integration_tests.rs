@@ -9,23 +9,18 @@ use pg2any_lib::replication_messages::{ColumnData, ColumnInfo, TupleData};
 #[test]
 fn test_buffer_operations() {
     // Test basic buffer operations
-    let mut buffer = [0u8; 16];
-    let bytes_written;
+    let mut writer = BufferWriter::new();
     
-    {
-        let mut writer = BufferWriter::new(&mut buffer);
-        
-        // Write test data
-        writer.write_u8(0x42).unwrap();
-        writer.write_u16(0x1234).unwrap();
-        writer.write_u32(0x12345678).unwrap();
-        writer.write_u64(0x123456789ABCDEF0).unwrap();
-        
-        bytes_written = writer.bytes_written();
-    }
+    // Write test data
+    writer.write_u8(0x42).unwrap();
+    writer.write_u16(0x1234).unwrap();
+    writer.write_u32(0x12345678).unwrap();
+    writer.write_u64(0x123456789ABCDEF0).unwrap();
+    
+    let buffer = writer.freeze();
     
     // Read it back
-    let mut reader = BufferReader::new(&buffer[..bytes_written]);
+    let mut reader = BufferReader::new(&buffer);
     
     assert_eq!(reader.read_u8().unwrap(), 0x42);
     assert_eq!(reader.read_u16().unwrap(), 0x1234);

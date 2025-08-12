@@ -2,6 +2,7 @@
 //! 
 //! This module provides safe wrappers around libpq functions for logical replication.
 
+use crate::buffer::BufferWriter;
 use crate::error::{CdcError, Result};
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
@@ -239,21 +240,24 @@ impl PgReplicationConnection {
         }
 
         let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
-        let mut reply_buf = [0u8; 34]; // 1 + 8 + 8 + 8 + 8 + 1
-
-        // Build the standby status update message
-        reply_buf[0] = b'r'; // Message type
-        reply_buf[1..9].copy_from_slice(&received_lsn.to_be_bytes());
-        reply_buf[9..17].copy_from_slice(&flushed_lsn.to_be_bytes());
-        reply_buf[17..25].copy_from_slice(&applied_lsn.to_be_bytes());
-        reply_buf[25..33].copy_from_slice(&timestamp.to_be_bytes());
-        reply_buf[33] = if reply_requested { 1 } else { 0 };
+        
+        // Build the standby status update message using BufferWriter
+        let mut buffer = BufferWriter::with_capacity(34); // 1 + 8 + 8 + 8 + 8 + 1
+        
+        buffer.write_u8(b'r')?; // Message type
+        buffer.write_u64(received_lsn)?;
+        buffer.write_u64(flushed_lsn)?;
+        buffer.write_u64(applied_lsn)?;
+        buffer.write_i64(timestamp)?;
+        buffer.write_u8(if reply_requested { 1 } else { 0 })?;
+        
+        let reply_data = buffer.freeze();
 
         let result = unsafe {
             PQputCopyData(
                 self.conn,
-                reply_buf.as_ptr() as *const std::os::raw::c_char,
-                reply_buf.len() as i32,
+                reply_data.as_ptr() as *const std::os::raw::c_char,
+                reply_data.len() as i32,
             )
         };
 

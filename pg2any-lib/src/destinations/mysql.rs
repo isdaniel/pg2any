@@ -120,27 +120,48 @@ impl DestinationHandler for MySQLDestination {
                 }
             }
             EventType::Update => {
-                if let (Some(schema), Some(table), Some(data)) = (
+                if let (Some(schema), Some(table), Some(new_data)) = (
                     &event.schema_name,
                     &event.table_name,
                     &event.new_data,
                 ) {
-                    // For updates, we need to identify the row. This is a simplified approach.
-                    // In production, you'd use the replica identity or primary key.
-                    let set_clauses: Vec<String> = data
+                    let set_clauses: Vec<String> = new_data
                         .keys()
                         .map(|k| format!("`{}` = ?", k))
                         .collect();
 
+                    // Use old_data to build WHERE clause for proper row identification
+                    // This uses the replica identity (primary key, unique index, or full row)
+                    let where_clause = if let Some(old_data) = &event.old_data {
+                        old_data
+                            .iter().map(|(k,v)| format!("`{k}` = {v}"))
+                            .collect::<Vec<String>>()
+                            .join(" AND ")
+                       
+                    } else {
+                        // Fallback: use primary key/unique columns from new_data if old_data is not available
+                        // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
+                        // todo handle this via replica identity
+                        new_data
+                            .iter()
+                            .take(1) // Take first column as a fallback (not ideal)
+                            .map(|(k,v)| format!("`{k}` = {v}"))
+                            .collect::<Vec<String>>()
+                            .join(" AND ")
+                    };
+
                     let sql = format!(
-                        "UPDATE `{}`.`{}` SET {} WHERE 1=1",
+                        "UPDATE `{}`.`{}` SET {} WHERE {}",
                         schema,
                         table,
-                        set_clauses.join(", ")
+                        set_clauses.join(", "),
+                        where_clause
                     );
 
                     let mut query = sqlx::query(&sql);
-                    for (_, value) in data {
+                    
+                    // Bind SET clause values (new data)
+                    for (_, value) in new_data {
                         query = match value {
                             serde_json::Value::String(s) => query.bind(s),
                             serde_json::Value::Number(n) if n.is_i64() => {

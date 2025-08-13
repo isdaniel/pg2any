@@ -340,7 +340,7 @@ When you run the application, you'll see structured logging output like this:
 
 - `tokio`: Async runtime and ecosystem
 - `tokio-postgres`: PostgreSQL async client with logical replication support
-- `sqlx`: Multi-database async client (MySQL, SQL Server)
+- `sqlx`: Multi-database async client (MySQL)
 - `tiberius`: Native SQL Server async client
 - `serde` & `serde_json`: Serialization framework
 - `chrono`: Date and time handling with timezone support

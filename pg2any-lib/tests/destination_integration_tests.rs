@@ -47,10 +47,12 @@ async fn test_destination_handler_interface() {
     {
         let mut destination = DestinationFactory::create(DestinationType::MySQL).unwrap();
 
-        // Test batch processing interface
-        let batch_result = destination.process_batch(&events).await;
-        // Should fail due to no connection, but not panic
-        assert!(batch_result.is_err());
+        // Test single event processing interface
+        for event in &events {
+            let event_result = destination.process_event(event).await;
+            // Should fail due to no connection, but not panic
+            assert!(event_result.is_err());
+        }
 
         // Test close method
         let close_result = destination.close().await;
@@ -61,10 +63,12 @@ async fn test_destination_handler_interface() {
     {
         let mut destination = DestinationFactory::create(DestinationType::SqlServer).unwrap();
 
-        // Test batch processing interface
-        let batch_result = destination.process_batch(&events).await;
-        // Should fail due to no connection, but not panic
-        assert!(batch_result.is_err());
+        // Test single event processing interface
+        for event in &events {
+            let event_result = destination.process_event(event).await;
+            // Should fail due to no connection, but not panic
+            assert!(event_result.is_err());
+        }
 
         // Test close method
         let close_result = destination.close().await;

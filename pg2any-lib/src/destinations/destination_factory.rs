@@ -1,6 +1,6 @@
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, DestinationType},
+    types::{ChangeEvent, DestinationType, EventType},
 };
 use async_trait::async_trait;
 
@@ -19,14 +19,6 @@ pub trait DestinationHandler: Send + Sync {
 
     /// Process a single change event
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()>;
-
-    /// Process a batch of change events
-    async fn process_batch(&mut self, events: &[ChangeEvent]) -> Result<()> {
-        for event in events {
-            self.process_event(event).await?;
-        }
-        Ok(())
-    }
 
     /// Create a table if it doesn't exist
     async fn create_table_if_not_exists(&mut self, event: &ChangeEvent) -> Result<()>;
@@ -59,6 +51,13 @@ impl DestinationFactory {
     }
 }
 
+pub fn is_dml_event(event: &ChangeEvent) -> bool {
+    matches!(
+        event.event_type,
+        EventType::Insert | EventType::Update | EventType::Delete
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +80,51 @@ mod tests {
         // Test unsupported destination type
         let result = DestinationFactory::create(DestinationType::PostgreSQL);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_dml_event() {
+        let insert_event = ChangeEvent {
+            event_type: EventType::Insert,
+            transaction_id: None,
+            commit_timestamp: None,
+            schema_name: Some("public".to_string()),
+            table_name: Some("test_table".to_string()),
+            relation_oid: Some(1234),
+            old_data: None,
+            new_data: None,
+            lsn: None,
+            metadata: None,
+        };
+        assert!(is_dml_event(&insert_event));
+
+        let update_event = ChangeEvent {
+            event_type: EventType::Update,
+            transaction_id: None,
+            commit_timestamp: None,
+            schema_name: Some("public".to_string()),
+            table_name: Some("test_table".to_string()),
+            relation_oid: Some(1234),
+            old_data: None,
+            new_data: None,
+            lsn: None,
+            metadata: None,
+        };
+        assert!(is_dml_event(&update_event));
+
+        let delete_event = ChangeEvent {
+            event_type: EventType::Delete,
+            transaction_id: None,
+            commit_timestamp: None,
+            schema_name: Some("public".to_string()),
+            table_name: Some("test_table".to_string()),
+            relation_oid: Some(1234),
+            old_data: None,
+            new_data: None,
+            lsn: None,
+            metadata: None,
+        };
+        assert!(is_dml_event(&delete_event));
     }
 
     #[test]

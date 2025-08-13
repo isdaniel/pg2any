@@ -1,13 +1,14 @@
 use crate::config::Config;
+use crate::destinations::destination_factory::is_dml_event;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::types::{ChangeEvent, EventType, Lsn};
+use crate::types::{ChangeEvent, Lsn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Main CDC client for coordinating replication and destination writes
 pub struct CdcClient {
@@ -67,9 +68,7 @@ impl CdcClient {
         info!("Starting CDC replication");
 
         // Ensure we're initialized
-        if self.replication_manager.is_none() {
-            self.init().await?;
-        }
+        self.init().await?;
 
         // todo this could be state machine support more state
         {
@@ -95,14 +94,12 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Event sender not available"))?;
 
         let is_running_producer = Arc::clone(&self.is_running);
-        let batch_size = self.config.batch_size;
 
         let producer_handle = tokio::spawn(async move {
             Self::run_producer(
                 replication_stream,
                 event_sender,
-                is_running_producer,
-                batch_size,
+                is_running_producer
             )
             .await
         });
@@ -120,7 +117,6 @@ impl CdcClient {
 
         let is_running_consumer = Arc::clone(&self.is_running);
         let auto_create_tables = self.config.auto_create_tables;
-        let consumer_batch_size = self.config.batch_size;
 
         let consumer_handle = tokio::spawn(async move {
             Self::run_consumer(
@@ -128,7 +124,6 @@ impl CdcClient {
                 destination_handler,
                 is_running_consumer,
                 auto_create_tables,
-                consumer_batch_size,
             )
             .await
         });
@@ -158,31 +153,28 @@ impl CdcClient {
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         event_sender: mpsc::Sender<ChangeEvent>,
-        is_running: Arc<Mutex<bool>>,
-        _batch_size: usize,
+        is_running: Arc<Mutex<bool>>
     ) -> Result<()> {
-        info!("Starting replication producer");
+        info!("Starting replication producer (single event mode)");
 
         while *is_running.lock().await {
-            match replication_stream.next_batch().await {
-                Ok(Some(events)) => {
-                    debug!("Producer received {} events", events.len());
-
-                    for event in events {
-                        if let Err(e) = event_sender.send(event).await {
-                            error!("Failed to send event to consumer: {}", e);
-                            break;
-                        }
+            match replication_stream.next_event().await {
+                Ok(Some(event)) => {
+                    debug!("Producer received single event: {:?}", event.event_type);
+                    if let Err(e) = event_sender.send(event).await {
+                        error!("Failed to send event to consumer: {}", e);
+                        break;
                     }
                 }
                 Ok(None) => {
-                    // No events, wait a bit before trying again
-                    sleep(Duration::from_millis(100)).await;
+                    // No event available, wait a bit before trying again
+                    sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => {
                     error!("Error reading from replication stream: {}", e);
+                    break;
                     // Try to reconnect after a delay
-                    sleep(Duration::from_secs(5)).await;
+                    //sleep(Duration::from_secs(5)).await;
                     // In a production system, you'd want more sophisticated retry logic
                 }
             }
@@ -198,77 +190,42 @@ impl CdcClient {
         mut destination_handler: Box<dyn DestinationHandler>,
         is_running: Arc<Mutex<bool>>,
         auto_create_tables: bool,
-        batch_size: usize,
     ) -> Result<()> {
-        info!("Starting replication consumer");
+        info!("Starting replication consumer (single event mode)");
 
-        let mut event_batch = Vec::with_capacity(batch_size);
-        let mut created_tables = std::collections::HashSet::new();
-
-        while *is_running.lock().await || event_receiver.len() > 0 {
-            // Collect events into a batch
-            event_batch.clear();
-
-            // Get the first event (blocking if necessary)
-            if let Some(event) = event_receiver.recv().await {
-                event_batch.push(event);
-
-                // Try to get more events up to batch size (non-blocking)
-                while event_batch.len() < batch_size {
-                    match event_receiver.try_recv() {
-                        Ok(event) => event_batch.push(event),
-                        Err(_) => break, // No more events available
-                    }
-                }
-            } else {
-                // Channel closed
+        loop {
+            let has_pending = event_receiver.len() > 0;
+            if !*is_running.lock().await && !has_pending {
                 break;
             }
 
-            if !event_batch.is_empty() {
-                debug!("Consumer processing batch of {} events", event_batch.len());
+            // Wait for a single event
+            match event_receiver.recv().await {
+                Some(event) => {
+                    debug!("Consumer processing event: {:?}", event.event_type);
 
-                // Process the batch
-                for event in &event_batch {
-                    info!("event info: {:?}", event);
-                    // Auto-create tables if needed
-                    if auto_create_tables && Self::is_dml_event(event) {
-                        let table_key = format!(
-                            "{}.{}",
-                            event.schema_name.as_deref().unwrap_or("public"),
-                            event.table_name.as_deref().unwrap_or("unknown")
-                        );
-
-                        if !created_tables.contains(&table_key) {
-                            if let Err(e) =
-                                destination_handler.create_table_if_not_exists(event).await
-                            {
-                                warn!("Failed to create table {}: {}", table_key, e);
-                            } else {
-                                created_tables.insert(table_key);
-                            }
+                    // Auto-create table if needed and enabled
+                    if auto_create_tables && is_dml_event(&event) {
+                        if let Err(e) = destination_handler.create_table_if_not_exists(&event).await {
+                            error!("Failed to auto-create table for event: {}", e);
                         }
                     }
-                }
 
-                // Process the batch
-                if let Err(e) = destination_handler.process_batch(&event_batch).await {
-                    error!("Failed to process event batch: {}", e);
-                    // In a production system, you might want to retry or handle this differently
+                    // Process the single event immediately
+                    if let Err(e) = destination_handler.process_event(&event).await {
+                        error!("Failed to process single event: {}", e);
+                        // Continue processing other events even if one fails
+                    }
+                }
+                None => {
+                    // Channel closed, exit the loop
+                    break;
                 }
             }
         }
 
         info!("Replication consumer stopped");
         Ok(())
-    }
-
-    /// Check if an event is a DML event that affects tables
-    fn is_dml_event(event: &ChangeEvent) -> bool {
-        matches!(
-            event.event_type,
-            EventType::Insert | EventType::Update | EventType::Delete
-        )
     }
 
     /// Stop the CDC replication process

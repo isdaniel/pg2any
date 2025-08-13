@@ -48,10 +48,7 @@ pub struct Config {
     /// Heartbeat interval for sending feedback to PostgreSQL
     pub heartbeat_interval: Duration,
 
-    /// Maximum batch size for processing events
-    pub batch_size: usize,
-
-    /// Buffer size for the event channel
+    /// Buffer size for the event channel (kept for channel capacity)
     pub buffer_size: usize,
 
     /// Whether to create missing destination tables automatically
@@ -149,8 +146,7 @@ impl Default for Config {
             connection_timeout: Duration::from_secs(30),
             query_timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10),
-            batch_size: 1000,
-            buffer_size: 10000,
+            buffer_size: 1000,
             auto_create_tables: true,
             table_mappings: HashMap::new(),
             extra_options: HashMap::new(),
@@ -256,12 +252,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set batch size
-    pub fn batch_size(mut self, size: usize) -> Self {
-        self.config.batch_size = size;
-        self
-    }
-
     /// Set buffer size
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.config.buffer_size = size;
@@ -333,10 +323,6 @@ impl ConfigBuilder {
             return Err(CdcError::config(
                 "Two-phase commit requires protocol version 3 or higher",
             ));
-        }
-
-        if self.config.batch_size == 0 {
-            return Err(CdcError::config("Batch size must be greater than 0"));
         }
 
         if self.config.buffer_size == 0 {

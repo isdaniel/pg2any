@@ -459,28 +459,25 @@ impl ReplicationStream {
         Ok(())
     }
 
-    pub async fn next_batch(&mut self) -> Result<Option<Vec<ChangeEvent>>> {
-        debug!("Fetching next batch of changes");
+    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
+        debug!("Fetching next single change event");
 
-        let batch_size = self.config.batch_size;
-        let events = self.logical_stream.next_batch(batch_size).await?;
+        let event = self.logical_stream.next_event().await?;
 
-        if !events.is_empty() {
-            debug!("Received {} change events", events.len());
+        if let Some(ref event) = event {
+            debug!("Received single change event: {:?}", event.event_type);
 
             // Update last received LSN
-            if let Some(last_event) = events.last() {
-                if let Some(lsn_str) = &last_event.lsn {
-                    if let Ok(lsn_value) = crate::pg_replication::parse_lsn(lsn_str) {
-                        self.last_received_lsn = Some(Lsn(lsn_value));
-                    }
-                }
-            }
-
-            Ok(Some(events))
-        } else {
-            Ok(None)
+            self.last_received_lsn = event.lsn.as_ref()
+                .and_then(|lsn_str| crate::pg_replication::parse_lsn(lsn_str).ok())
+                .map(Lsn);
         }
+
+        Ok(event)
+    }
+
+    pub fn send_feedback(&mut self) {
+        self.logical_stream.maybe_send_feedback();
     }
 
     pub async fn stop(&mut self) -> Result<()> {

@@ -5,6 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use sqlx::MySqlPool;
+use tracing::debug;
 
 /// MySQL destination implementation
 pub struct MySQLDestination {
@@ -88,7 +89,7 @@ impl DestinationHandler for MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
 
-        match event.event_type {
+        match &event.event_type {
             EventType::Insert => {
                 if let (Some(schema), Some(table), Some(data)) =
                     (&event.schema_name, &event.table_name, &event.new_data)
@@ -210,6 +211,21 @@ impl DestinationHandler for MySQLDestination {
 
                     query.execute(pool).await?;
                 }
+            }
+            EventType::Truncate(truncate_tables) => {
+                let sql = truncate_tables
+                    .iter()
+                    .map(|table_full_name| {
+                        let mut parts = table_full_name.splitn(2, '.');
+                        match (parts.next(), parts.next()) {
+                            (Some(schema), Some(table)) => format!("TRUNCATE TABLE `{}`.`{}`", schema, table),
+                            _ => format!("TRUNCATE TABLE `{}`", table_full_name),
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join("; ");
+                let query = sqlx::query(&sql);
+                query.execute(pool).await?;
             }
             _ => {
                 // Skip non-DML events for now

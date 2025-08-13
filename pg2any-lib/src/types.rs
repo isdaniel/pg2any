@@ -8,7 +8,7 @@ pub enum EventType {
     Insert,
     Update,
     Delete,
-    Truncate,
+    Truncate(Vec<String>),
     Begin,
     Commit,
     Relation,

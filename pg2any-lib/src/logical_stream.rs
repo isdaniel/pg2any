@@ -14,7 +14,8 @@ use crate::replication_protocol::{
     LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage,
 };
 use crate::types::{ChangeEvent, EventType};
-use std::time::{Duration, Instant};
+use crate::{RelationInfo, TupleData};
+use std::time::{Duration};
 use tracing::{debug, info, warn};
 
 /// PostgreSQL logical replication stream
@@ -129,48 +130,37 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-    /// Process the next batch of replication messages
-    pub async fn next_batch(&mut self, batch_size: usize) -> Result<Vec<ChangeEvent>> {
-        let mut events = Vec::with_capacity(batch_size);
-        let start_time = Instant::now();
-        let timeout = Duration::from_millis(100); // Short timeout to allow periodic checks
-
-        while events.len() < batch_size && start_time.elapsed() < timeout {
-            // Check if we should send feedback
-            self.maybe_send_feedback()?;
-
-            // Try to get data from the replication stream
-            match self.connection.get_copy_data(0)? {
-                // 10ms timeout
-                Some(data) => {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    match data[0] as char {
-                        'w' => {
-                            // WAL data message
-                            if let Some(event) = self.process_wal_message(&data)? {
-                                events.push(event);
-                            }
-                        }
-                        'k' => {
-                            // Keepalive message
-                            self.process_keepalive_message(&data)?;
-                        }
-                        _ => {
-                            debug!("Received unknown message type: {}", data[0] as char);
+    /// Process the next single replication event
+    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
+        match self.connection.get_copy_data(0)? {
+            Some(data) => {
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                match data[0] as char {
+                    'w' => {
+                        // WAL data message
+                        if let Some(event) = self.process_wal_message(&data)? {
+                            return Ok(Some(event));
                         }
                     }
+                    'k' => {
+                        // Keepalive message
+                        self.process_keepalive_message(&data)?;
+                    }
+                    _ => {
+                        debug!("Received unknown message type: {}", data[0] as char);
+                    }
                 }
-                None => {
-                    // No data available, continue
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                }
+            }
+            None => {
+                // No data available, continue
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
 
-        Ok(events)
+        // No event received within timeout
+        Ok(None)
     }
 
     /// Process a WAL data message
@@ -241,7 +231,7 @@ impl LogicalReplicationStream {
                 replica_identity,
                 columns,
             } => {
-                let relation_info = crate::replication_protocol::RelationInfo::new(
+                let relation_info = RelationInfo::new(
                     relation_id,
                     namespace.clone(),
                     relation_name.clone(),
@@ -366,14 +356,27 @@ impl LogicalReplicationStream {
                 return Ok(None);
             }
 
-            LogicalReplicationMessage::Truncate { relation_ids, .. } => {
-                // For now, just log truncate operations
+            LogicalReplicationMessage::Truncate { relation_ids, flags } => {
+                let mut truncate_tables = Vec::with_capacity(relation_ids.len());
                 for relation_id in relation_ids {
                     if let Some(relation) = self.state.get_relation(relation_id) {
                         info!("Table truncated: {}", relation.full_name());
+                        truncate_tables.push(relation.full_name());
                     }
                 }
-                return Ok(None);
+
+                ChangeEvent {
+                    event_type: EventType::Truncate(truncate_tables),
+                    transaction_id: None,
+                    commit_timestamp: Some(chrono::Utc::now()),
+                    schema_name: None,
+                    table_name: None,
+                    relation_oid: None,
+                    old_data: None,
+                    new_data: None,
+                    lsn: Some(format_lsn(lsn)),
+                    metadata: None,
+                }
             }
 
             _ => {
@@ -388,8 +391,8 @@ impl LogicalReplicationStream {
     /// Convert tuple data to a HashMap for ChangeEvent
     fn convert_tuple_to_data(
         &self,
-        tuple: &crate::replication_protocol::TupleData,
-        relation: &crate::replication_protocol::RelationInfo,
+        tuple: &TupleData,
+        relation: &RelationInfo,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
         let mut data = std::collections::HashMap::new();
 
@@ -413,15 +416,16 @@ impl LogicalReplicationStream {
     }
 
     /// Check if feedback should be sent and send it
-    fn maybe_send_feedback(&mut self) -> Result<()> {
+    pub fn maybe_send_feedback(&mut self) {
         if self
             .state
             .should_send_feedback(self.config.feedback_interval)
         {
-            self.send_feedback()?;
+            self.send_feedback().unwrap_or_else(|e| {
+                warn!("Failed to send feedback: {}", e);
+            });
             self.state.mark_feedback_sent();
         }
-        Ok(())
     }
 
     /// Send feedback to the server

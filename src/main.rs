@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Performing CDC client initialization");
     client.init().await?;
-
+    
     tracing::info!("✅ CDC client initialized successfully");
 
     // Set up graceful shutdown handling
@@ -47,7 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         _ = shutdown_signal => {
-            tracing::info!("🛑 Shutdown signal received, stopping CDC replication gracefully");
+            tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
+            client.stop().await?;
+            tracing::info!("CDC replication stopped successfully");
         }
     }
 

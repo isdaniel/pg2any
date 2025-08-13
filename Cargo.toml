@@ -19,6 +19,7 @@ pg2any_lib = { path = "pg2any-lib" }
 
 # Dependencies for the binary
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

@@ -1,5 +1,6 @@
 use pg2any_lib::{client::CdcClient, Config, DestinationType};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Main entry point for the CDC application
@@ -26,8 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     tracing::info!("✅ CDC client initialized successfully");
 
-    // Set up graceful shutdown handling
-    let shutdown_signal = setup_shutdown_handler();
+    // Set up graceful shutdown handling with the client's cancellation token
+    let shutdown_handler = setup_shutdown_handler(client.cancellation_token());
 
     // Start the CDC replication process
     tracing::info!("🔄 Starting CDC replication stream");
@@ -46,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        _ = shutdown_signal => {
+        _ = shutdown_handler => {
             tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
             client.stop().await?;
             tracing::info!("CDC replication stopped successfully");
@@ -206,8 +207,8 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
-/// Set up graceful shutdown signal handling
-async fn setup_shutdown_handler() {
+/// Set up graceful shutdown signal handling with CancellationToken
+async fn setup_shutdown_handler(shutdown_token: CancellationToken) {
     use tokio::signal;
 
     #[cfg(unix)]
@@ -220,10 +221,12 @@ async fn setup_shutdown_handler() {
 
         tokio::select! {
             _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM");
+                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                shutdown_token.cancel();
             }
             _ = sigint.recv() => {
-                tracing::info!("Received SIGINT (Ctrl+C)");
+                tracing::info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+                shutdown_token.cancel();
             }
         }
     }
@@ -231,6 +234,7 @@ async fn setup_shutdown_handler() {
     #[cfg(windows)]
     {
         signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
-        tracing::info!("Received Ctrl+C");
+        tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+        shutdown_token.cancel();
     }
 }

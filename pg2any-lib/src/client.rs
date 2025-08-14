@@ -90,12 +90,7 @@ impl CdcClient {
         let producer_token = self.cancellation_token.clone();
 
         let producer_handle = tokio::spawn(async move {
-            Self::run_producer(
-                replication_stream,
-                event_sender,
-                producer_token
-            )
-            .await
+            Self::run_producer(replication_stream, event_sender, producer_token).await
         });
 
         // Start the consumer task (writes to destination)
@@ -147,7 +142,7 @@ impl CdcClient {
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         event_sender: mpsc::Sender<ChangeEvent>,
-        cancellation_token: CancellationToken
+        cancellation_token: CancellationToken,
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
 
@@ -389,7 +384,9 @@ mod tests {
 
     fn create_test_config() -> Config {
         ConfigBuilder::default()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(crate::DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -424,7 +421,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_creation_and_basic_properties() {
         let config = create_test_config();
-        let client = CdcClient::new(config).await.expect("Failed to create client");
+        let client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         // Test that the client is initially not running (not cancelled)
         assert!(client.is_running());
@@ -437,7 +436,9 @@ mod tests {
     #[tokio::test]
     async fn test_cancellation_token_cancellation() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config).await.expect("Failed to create client");
+        let mut client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         let token = client.cancellation_token();
         assert!(!token.is_cancelled());
@@ -453,7 +454,9 @@ mod tests {
     #[tokio::test]
     async fn test_cancellation_token_propagation() {
         let config = create_test_config();
-        let client = CdcClient::new(config).await.expect("Failed to create client");
+        let client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         let token1 = client.cancellation_token();
         let token2 = client.cancellation_token();
@@ -475,9 +478,9 @@ mod tests {
     async fn test_producer_task_cancellation() {
         let (_event_sender, _event_receiver) = mpsc::channel::<ChangeEvent>(10);
         let cancellation_token = CancellationToken::new();
-        
+
         let token_clone = cancellation_token.clone();
-        
+
         let producer_task = tokio::spawn(async move {
             // Simulate the producer loop structure
             loop {
@@ -514,7 +517,7 @@ mod tests {
     async fn test_consumer_task_cancellation() {
         let (_event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
         let cancellation_token = CancellationToken::new();
-        
+
         let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler = Box::new(MockDestinationHandler {
             events_processed: events_processed.clone(),
@@ -523,7 +526,7 @@ mod tests {
         });
 
         let token_clone = cancellation_token.clone();
-        
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
         });
@@ -547,7 +550,7 @@ mod tests {
     async fn test_consumer_processes_remaining_events_on_shutdown() {
         let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
         let cancellation_token = CancellationToken::new();
-        
+
         let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler = Box::new(MockDestinationHandler {
             events_processed: events_processed.clone(),
@@ -563,12 +566,15 @@ mod tests {
         ];
 
         for event in &test_events {
-            event_sender.send(event.clone()).await.expect("Failed to send event");
+            event_sender
+                .send(event.clone())
+                .await
+                .expect("Failed to send event");
         }
 
         let token_clone = cancellation_token.clone();
         let events_clone = events_processed.clone();
-        
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
         });
@@ -589,20 +595,28 @@ mod tests {
 
         // Check that some events were processed
         let processed_events = events_clone.lock().unwrap();
-        assert!(!processed_events.is_empty(), "Consumer should have processed some events before shutdown");
+        assert!(
+            !processed_events.is_empty(),
+            "Consumer should have processed some events before shutdown"
+        );
     }
 
     #[tokio::test]
     async fn test_multiple_shutdown_calls_are_safe() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config).await.expect("Failed to create client");
+        let mut client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         // First stop call
         client.stop().await.expect("First stop call should succeed");
         assert!(!client.is_running());
 
         // Second stop call should also succeed and not panic
-        client.stop().await.expect("Second stop call should succeed");
+        client
+            .stop()
+            .await
+            .expect("Second stop call should succeed");
         assert!(!client.is_running());
 
         // Third stop call should also succeed
@@ -613,7 +627,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_stats_reflect_cancellation_state() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config).await.expect("Failed to create client");
+        let mut client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         // Initially running (not cancelled)
         let stats = client.get_stats();
@@ -630,14 +646,16 @@ mod tests {
     #[tokio::test]
     async fn test_cancellation_token_from_external_source() {
         let config = create_test_config();
-        let client = CdcClient::new(config).await.expect("Failed to create client");
+        let client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
 
         // Get the client's token
         let client_token = client.cancellation_token();
-        
+
         // Create an external cancellation token
         let external_token = CancellationToken::new();
-        
+
         // Create a task that links external cancellation to client cancellation
         let client_token_clone = client_token.clone();
         let external_token_clone = external_token.clone();

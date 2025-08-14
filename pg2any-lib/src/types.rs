@@ -262,15 +262,11 @@ impl Lsn {
         Ok(Self((high << 32) | low))
     }
 
-    /// Convert LSN to PostgreSQL string format
-    pub fn to_string(&self) -> String {
-        format!("{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFFFFFF)
-    }
 }
 
 impl std::fmt::Display for Lsn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFFFFFF)
     }
 }
 

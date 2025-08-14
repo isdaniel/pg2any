@@ -218,7 +218,9 @@ impl DestinationHandler for MySQLDestination {
                     .map(|table_full_name| {
                         let mut parts = table_full_name.splitn(2, '.');
                         match (parts.next(), parts.next()) {
-                            (Some(schema), Some(table)) => format!("TRUNCATE TABLE `{}`.`{}`", schema, table),
+                            (Some(schema), Some(table)) => {
+                                format!("TRUNCATE TABLE `{}`.`{}`", schema, table)
+                            }
                             _ => format!("TRUNCATE TABLE `{}`", table_full_name),
                         }
                     })

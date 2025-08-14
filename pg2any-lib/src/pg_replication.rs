@@ -9,13 +9,13 @@ use crate::error::{CdcError, Result};
 use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
 use crate::types::{ChangeEvent, Lsn};
 use libpq_sys::*;
-use tokio_util::sync::CancellationToken;
 use std::ffi::{CStr, CString};
-use std::ptr;
 use std::os::unix::io::RawFd;
+use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
 use tokio::io::unix::AsyncFd;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 // PostgreSQL constants
 const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800; // Seconds from 1970-01-01 to 2000-01-01
@@ -207,10 +207,10 @@ impl PgReplicationConnection {
         let _result = self.exec(&start_replication_sql)?;
 
         self.is_replication_conn = true;
-        
+
         // Initialize async socket for non-blocking operations
         self.initialize_async_socket()?;
-        
+
         debug!("Replication started successfully");
         Ok(())
     }
@@ -337,20 +337,25 @@ impl PgReplicationConnection {
 
         let async_fd = AsyncFd::new(sock)
             .map_err(|e| CdcError::protocol(format!("Failed to create AsyncFd: {}", e)))?;
-        
+
         self.async_fd = Some(async_fd);
         Ok(())
     }
 
     /// Get copy data from replication stream (async non-blocking version)
-    pub async fn get_copy_data_async(&mut self, cancellation_token: &CancellationToken) -> Result<Option<Vec<u8>>> {
+    pub async fn get_copy_data_async(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<Vec<u8>>> {
         if !self.is_replication_conn {
             return Err(CdcError::protocol(
                 "Connection is not in replication mode".to_string(),
             ));
         }
 
-        let async_fd = self.async_fd.as_ref()
+        let async_fd = self
+            .async_fd
+            .as_ref()
             .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
 
         loop {
@@ -359,8 +364,9 @@ impl PgReplicationConnection {
             }
 
             // Wait for socket to be readable
-            let mut guard = async_fd.readable().await
-                .map_err(|e| CdcError::protocol(format!("Failed to wait for socket readability: {}", e)))?;
+            let mut guard = async_fd.readable().await.map_err(|e| {
+                CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
+            })?;
 
             if let Some(data) = self.try_read_copy_data()? {
                 return Ok(Some(data));
@@ -371,50 +377,47 @@ impl PgReplicationConnection {
     }
 
     fn try_read_copy_data(&self) -> Result<Option<Vec<u8>>> {
-        loop {
-            // Read libpq socket buffer
-            let consumed = unsafe { PQconsumeInput(self.conn) };
-            if consumed == 0 {
-                return Err(CdcError::protocol(self.last_error_message()));
-            }
-    
-            if unsafe { PQisBusy(self.conn) } != 0 {
-                break; // Buffer not complete, wait for next socket readable event
-            }
-    
-            let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
-            let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
-    
-            match result {
-                len if len > 0 => {
-                    if buffer.is_null() {
-                        return Err(CdcError::buffer(
-                            "Received null buffer from PQgetCopyData".to_string(),
-                        ));
-                    }
-    
-                    let data = unsafe {
-                        std::slice::from_raw_parts(buffer as *const u8, len as usize).to_vec()
-                    };
-    
-                    unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
-                    return Ok(Some(data));
-                }
-                0 | -2 => break, // No complete data available, continue waiting
-                -1 => {
-                    // COPY finished or channel closed
-                    debug!("COPY finished or channel closed");
-                    return Ok(None);
-                }
-                _ => return Err(CdcError::protocol(format!(
-                    "Unexpected PQgetCopyData result: {}",
-                    result
-                ))),
-            }
+        // Read libpq socket buffer
+        let consumed = unsafe { PQconsumeInput(self.conn) };
+        if consumed == 0 {
+            return Err(CdcError::protocol(self.last_error_message()));
         }
-        Ok(None)
+
+        if unsafe { PQisBusy(self.conn) } != 0 {
+            return Ok(None); // Buffer not complete, wait for next socket readable event
+        }
+
+        let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
+        let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
+
+        match result {
+            len if len > 0 => {
+                if buffer.is_null() {
+                    return Err(CdcError::buffer(
+                        "Received null buffer from PQgetCopyData".to_string(),
+                    ));
+                }
+
+                let data = unsafe {
+                    std::slice::from_raw_parts(buffer as *const u8, len as usize).to_vec()
+                };
+
+                unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
+                Ok(Some(data))
+            }
+            0 | -2 => Ok(None), // No complete data available, continue waiting
+            -1 => {
+                // COPY finished or channel closed
+                debug!("COPY finished or channel closed");
+                Ok(None)
+            }
+            _ => Err(CdcError::protocol(format!(
+                "Unexpected PQgetCopyData result: {}",
+                result
+            ))),
+        }
     }
-    
+
     /// Get the last error message from the connection
     fn last_error_message(&self) -> String {
         unsafe {
@@ -559,7 +562,10 @@ impl ReplicationStream {
         Ok(())
     }
 
-    pub async fn next_event(&mut self,cancellation_token : &CancellationToken) -> Result<Option<ChangeEvent>> {
+    pub async fn next_event(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<ChangeEvent>> {
         debug!("Fetching next single change event");
 
         let event = self.logical_stream.next_event(&cancellation_token).await?;
@@ -568,7 +574,9 @@ impl ReplicationStream {
             debug!("Received single change event: {:?}", event.event_type);
 
             // Update last received LSN
-            self.last_received_lsn = event.lsn.as_ref()
+            self.last_received_lsn = event
+                .lsn
+                .as_ref()
                 .and_then(|lsn_str| crate::pg_replication::parse_lsn(lsn_str).ok())
                 .map(Lsn);
         }

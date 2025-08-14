@@ -44,15 +44,27 @@ impl SqlServerDestination {
 
     /// Generate CREATE TABLE statement for SQL Server
     async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
-        let default_schema = "dbo".to_string();
-        let schema_name = event.schema_name.as_ref().unwrap_or(&default_schema);
-        let table_name = event.table_name.as_ref().unwrap();
+        let (schema_name, table_name, data) = match &event.event_type {
+            EventType::Insert { schema, table, data, .. } => {
+                (schema, table, Some(data))
+            }
+            EventType::Update { schema, table, new_data, .. } => {
+                (schema, table, Some(new_data))
+            }
+            EventType::Delete { schema, table, old_data, .. } => {
+                (schema, table, Some(old_data))
+            }
+            _ => return Err(CdcError::generic("Cannot create table for non-DML event".to_string())),
+        };
+
+        let default_schema = "dbo";
+        let schema_name = if schema_name.is_empty() { default_schema } else { schema_name };
 
         let mut sql = format!("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{}' AND xtype='U') CREATE TABLE [{}].[{}] (\n", table_name, schema_name, table_name);
 
         // For now, we'll create columns based on the data we receive
         // In a production system, you'd want to query the PostgreSQL schema
-        if let Some(data) = &event.new_data {
+        if let Some(data) = data {
             let mut columns = Vec::new();
             for (column_name, value) in data {
                 let column_type = match value {
@@ -102,107 +114,95 @@ impl DestinationHandler for SqlServerDestination {
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
-        match event.event_type {
-            EventType::Insert => {
-                if let (Some(schema), Some(table), Some(data)) =
-                    (&event.schema_name, &event.table_name, &event.new_data)
-                {
-                    let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
-                    let placeholders: Vec<String> =
-                        (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
+        match &event.event_type {
+            EventType::Insert { schema, table, data, .. } => {
+                let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
+                let placeholders: Vec<String> =
+                    (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
 
-                    let sql = format!(
-                        "INSERT INTO [{}].[{}] ({}) VALUES ({})",
-                        schema,
-                        table,
-                        columns.join(", "),
-                        placeholders.join(", ")
-                    );
+                let sql = format!(
+                    "INSERT INTO [{}].[{}] ({}) VALUES ({})",
+                    schema,
+                    table,
+                    columns.join(", "),
+                    placeholders.join(", ")
+                );
 
-                    // Note: This is a simplified implementation
-                    // In a real implementation, you'd need to handle parameters properly
-                    let _params: Vec<&dyn tiberius::ToSql> = Vec::new();
-                    let mut value_holders: Vec<String> = Vec::new();
+                // Note: This is a simplified implementation
+                // In a real implementation, you'd need to handle parameters properly
+                let _params: Vec<&dyn tiberius::ToSql> = Vec::new();
+                let mut value_holders: Vec<String> = Vec::new();
 
-                    for (_, _value) in data {
-                        value_holders.push("?".to_string());
-                        // Note: This is a simplified approach
-                        // In a real implementation, you'd need to handle different types properly
-                    }
-
-                    let _sql_with_placeholders = format!(
-                        "INSERT INTO [{schema}].[{table}] ({columns}) VALUES ({values})",
-                        schema = schema,
-                        table = table,
-                        columns = columns.join(", "),
-                        values = value_holders.join(", ")
-                    );
-
-                    // For now, use a simple execute without parameters
-                    // This is a limitation of this simplified implementation
-                    client.execute(&sql, &[]).await.map_err(|e| {
-                        CdcError::generic(format!("SQL Server INSERT failed: {}", e))
-                    })?;
+                for (_, _value) in data {
+                    value_holders.push("?".to_string());
+                    // Note: This is a simplified approach
+                    // In a real implementation, you'd need to handle different types properly
                 }
+
+                let _sql_with_placeholders = format!(
+                    "INSERT INTO [{schema}].[{table}] ({columns}) VALUES ({values})",
+                    schema = schema,
+                    table = table,
+                    columns = columns.join(", "),
+                    values = value_holders.join(", ")
+                );
+
+                // For now, use a simple execute without parameters
+                // This is a limitation of this simplified implementation
+                client.execute(&sql, &[]).await.map_err(|e| {
+                    CdcError::generic(format!("SQL Server INSERT failed: {}", e))
+                })?;
             }
-            EventType::Update => {
-                if let (Some(schema), Some(table), Some(new_data)) =
-                    (&event.schema_name, &event.table_name, &event.new_data)
-                {
-                    let set_clauses: Vec<String> =
-                        new_data.keys().map(|k| format!("[{k}] = ?")).collect();
+            EventType::Update { schema, table, old_data, new_data, .. } => {
+                let set_clauses: Vec<String> =
+                    new_data.keys().map(|k| format!("[{k}] = ?")).collect();
 
-                    // Use old_data to build WHERE clause for proper row identification
-                    // This uses the replica identity (primary key, unique index, or full row)
-                    let (where_clause, _where_values) = if let Some(old_data) = &event.old_data {
-                        let where_clauses: Vec<String> =
-                            old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
-                        (where_clauses.join(" AND "), old_data)
-                    } else {
-                        // Fallback: use primary key/unique columns from new_data if old_data is not available
-                        // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
-                        let where_clauses: Vec<String> = new_data
-                            .keys()
-                            .take(1) // Take first column as a fallback (not ideal)
-                            .map(|k| format!("[{}] = ?", k))
-                            .collect();
-                        (where_clauses.join(" AND "), new_data)
-                    };
-
-                    let sql = format!(
-                        "UPDATE [{}].[{}] SET {} WHERE {}",
-                        schema,
-                        table,
-                        set_clauses.join(", "),
-                        where_clause
-                    );
-
-                    // Note: This is still a simplified implementation without proper parameter binding
-                    // In a real implementation, you'd need to properly handle parameters with tiberius
-                    client.execute(&sql, &[]).await.map_err(|e| {
-                        CdcError::generic(format!("SQL Server UPDATE failed: {}", e))
-                    })?;
-                }
-            }
-            EventType::Delete => {
-                if let (Some(schema), Some(table), Some(data)) =
-                    (&event.schema_name, &event.table_name, &event.old_data)
-                {
+                // Use old_data to build WHERE clause for proper row identification
+                // This uses the replica identity (primary key, unique index, or full row)
+                let (where_clause, _where_values) = if let Some(old_data) = old_data {
                     let where_clauses: Vec<String> =
-                        data.keys().map(|k| format!("[{}] = ?", k)).collect();
+                        old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
+                    (where_clauses.join(" AND "), old_data)
+                } else {
+                    // Fallback: use primary key/unique columns from new_data if old_data is not available
+                    // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
+                    let where_clauses: Vec<String> = new_data
+                        .keys()
+                        .take(1) // Take first column as a fallback (not ideal)
+                        .map(|k| format!("[{}] = ?", k))
+                        .collect();
+                    (where_clauses.join(" AND "), new_data)
+                };
 
-                    let sql = format!(
-                        "DELETE FROM [{}].[{}] WHERE {}",
-                        schema,
-                        table,
-                        where_clauses.join(" AND ")
-                    );
+                let sql = format!(
+                    "UPDATE [{}].[{}] SET {} WHERE {}",
+                    schema,
+                    table,
+                    set_clauses.join(", "),
+                    where_clause
+                );
 
-                    // Simplified implementation - in production you'd handle parameters properly
-                    client.execute(&sql, &[]).await.map_err(|e| {
-                        CdcError::generic(format!("SQL Server DELETE failed: {}", e))
-                    })?;
-                }
+                // Note: This is still a simplified implementation without proper parameter binding
+                // In a real implementation, you'd need to properly handle parameters with tiberius
+                client.execute(&sql, &[]).await.map_err(|e| {
+                    CdcError::generic(format!("SQL Server UPDATE failed: {}", e))
+                })?;
+            }
+            EventType::Delete { schema, table, old_data, .. } => {
+                let where_clauses: Vec<String> =
+                    old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
+
+                let sql = format!(
+                    "DELETE FROM [{}].[{}] WHERE {}",
+                    schema,
+                    table,
+                    where_clauses.join(" AND ")
+                );
+
+                // Simplified implementation - in production you'd handle parameters properly
+                client.execute(&sql, &[]).await.map_err(|e| {
+                    CdcError::generic(format!("SQL Server DELETE failed: {}", e))
+                })?;
             }
             _ => {
                 // Skip non-DML events for now
@@ -287,18 +287,12 @@ mod tests {
         );
         data.insert("active".to_string(), serde_json::Value::Bool(true));
 
-        let event = ChangeEvent {
-            event_type: EventType::Insert,
-            transaction_id: Some(123),
-            commit_timestamp: Some(Utc::now()),
-            schema_name: Some("test_schema".to_string()),
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(456),
-            old_data: None,
-            new_data: Some(data),
-            lsn: None,
-            metadata: None,
-        };
+        let event = ChangeEvent::insert(
+            "test_schema".to_string(),
+            "test_table".to_string(),
+            456,
+            data,
+        );
 
         let sql = destination.generate_create_table(&event).await.unwrap();
 
@@ -312,18 +306,12 @@ mod tests {
     fn test_sqlserver_destination_default_schema() {
         // Test that default schema is handled correctly
         let destination = SqlServerDestination::new();
-        let event = ChangeEvent {
-            event_type: EventType::Insert,
-            transaction_id: Some(123),
-            commit_timestamp: Some(Utc::now()),
-            schema_name: None, // No schema provided
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(456),
-            old_data: None,
-            new_data: Some(HashMap::new()),
-            lsn: None,
-            metadata: None,
-        };
+        let event = ChangeEvent::insert(
+            "".to_string(), // Empty schema should use default
+            "test_table".to_string(),
+            456,
+            HashMap::new(),
+        );
 
         // This should use "dbo" as default schema for SQL Server
         // We can test this by checking the generate_create_table method

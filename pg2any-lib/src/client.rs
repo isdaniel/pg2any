@@ -163,7 +163,8 @@ impl CdcClient {
                         }
                         Ok(None) => {
                             // No event available, wait a bit before trying again
-                            sleep(Duration::from_millis(50)).await;
+                            debug!("No event available, retrying...");
+                            sleep(Duration::from_millis(5)).await;
                         }
                         Err(e) => {
                             error!("Error reading from replication stream: {}", e);
@@ -404,18 +405,12 @@ mod tests {
     }
 
     fn create_test_event() -> ChangeEvent {
-        ChangeEvent {
-            event_type: EventType::Insert,
-            transaction_id: Some(123),
-            commit_timestamp: Some(chrono::Utc::now()),
-            schema_name: Some("public".to_string()),
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(12345),
-            old_data: None,
-            new_data: Some(std::collections::HashMap::new()),
-            lsn: Some("0/1234ABCD".to_string()),
-            metadata: None,
-        }
+        ChangeEvent::insert(
+            "public".to_string(),
+            "test_table".to_string(),
+            12345,
+            std::collections::HashMap::new(),
+        )
     }
 
     #[tokio::test]

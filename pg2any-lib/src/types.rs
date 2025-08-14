@@ -5,12 +5,34 @@ use std::collections::HashMap;
 /// Represents the type of change event
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
-    Insert,
-    Update,
-    Delete,
+    Insert {
+        schema: String,
+        table: String,
+        relation_oid: u32,
+        data: HashMap<String, serde_json::Value>,
+    },
+    Update {
+        schema: String,
+        table: String,
+        relation_oid: u32,
+        old_data: Option<HashMap<String, serde_json::Value>>,
+        new_data: HashMap<String, serde_json::Value>,
+    },
+    Delete {
+        schema: String,
+        table: String,
+        relation_oid: u32,
+        old_data: HashMap<String, serde_json::Value>,
+    },
     Truncate(Vec<String>),
-    Begin,
-    Commit,
+    Begin {
+        transaction_id: u32,
+        commit_timestamp: DateTime<Utc>,
+    },
+    Commit {
+        transaction_id: u32,
+        commit_timestamp: DateTime<Utc>,
+    },
     Relation,
     Type,
     Origin,
@@ -29,29 +51,8 @@ pub enum DestinationType {
 /// Represents a single change event from PostgreSQL logical replication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {
-    /// Type of the event
+    /// Type of the event with embedded data
     pub event_type: EventType,
-
-    /// Transaction ID
-    pub transaction_id: Option<u32>,
-
-    /// Commit timestamp
-    pub commit_timestamp: Option<DateTime<Utc>>,
-
-    /// Schema name
-    pub schema_name: Option<String>,
-
-    /// Table name
-    pub table_name: Option<String>,
-
-    /// Relation OID
-    pub relation_oid: Option<u32>,
-
-    /// Column data before the change (for UPDATE and DELETE)
-    pub old_data: Option<HashMap<String, serde_json::Value>>,
-
-    /// Column data after the change (for INSERT and UPDATE)
-    pub new_data: Option<HashMap<String, serde_json::Value>>,
 
     /// LSN (Log Sequence Number) position
     pub lsn: Option<String>,
@@ -69,14 +70,12 @@ impl ChangeEvent {
         data: HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
-            event_type: EventType::Insert,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some(schema_name),
-            table_name: Some(table_name),
-            relation_oid: Some(relation_oid),
-            old_data: None,
-            new_data: Some(data),
+            event_type: EventType::Insert {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                data,
+            },
             lsn: None,
             metadata: None,
         }
@@ -91,14 +90,13 @@ impl ChangeEvent {
         new_data: HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
-            event_type: EventType::Update,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some(schema_name),
-            table_name: Some(table_name),
-            relation_oid: Some(relation_oid),
-            old_data,
-            new_data: Some(new_data),
+            event_type: EventType::Update {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                old_data,
+                new_data,
+            },
             lsn: None,
             metadata: None,
         }
@@ -112,14 +110,12 @@ impl ChangeEvent {
         old_data: HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
-            event_type: EventType::Delete,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some(schema_name),
-            table_name: Some(table_name),
-            relation_oid: Some(relation_oid),
-            old_data: Some(old_data),
-            new_data: None,
+            event_type: EventType::Delete {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                old_data,
+            },
             lsn: None,
             metadata: None,
         }
@@ -128,14 +124,10 @@ impl ChangeEvent {
     /// Create a BEGIN transaction event
     pub fn begin(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
         Self {
-            event_type: EventType::Begin,
-            transaction_id: Some(transaction_id),
-            commit_timestamp: Some(commit_timestamp),
-            schema_name: None,
-            table_name: None,
-            relation_oid: None,
-            old_data: None,
-            new_data: None,
+            event_type: EventType::Begin {
+                transaction_id,
+                commit_timestamp,
+            },
             lsn: None,
             metadata: None,
         }
@@ -144,17 +136,70 @@ impl ChangeEvent {
     /// Create a COMMIT transaction event
     pub fn commit(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
         Self {
-            event_type: EventType::Commit,
-            transaction_id: Some(transaction_id),
-            commit_timestamp: Some(commit_timestamp),
-            schema_name: None,
-            table_name: None,
-            relation_oid: None,
-            old_data: None,
-            new_data: None,
+            event_type: EventType::Commit {
+                transaction_id,
+                commit_timestamp,
+            },
             lsn: None,
             metadata: None,
         }
+    }
+
+    /// Create a TRUNCATE event
+    pub fn truncate(tables: Vec<String>) -> Self {
+        Self {
+            event_type: EventType::Truncate(tables),
+            lsn: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a RELATION event
+    pub fn relation() -> Self {
+        Self {
+            event_type: EventType::Relation,
+            lsn: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a TYPE event
+    pub fn type_event() -> Self {
+        Self {
+            event_type: EventType::Type,
+            lsn: None,
+            metadata: None,
+        }
+    }
+
+    /// Create an ORIGIN event
+    pub fn origin() -> Self {
+        Self {
+            event_type: EventType::Origin,
+            lsn: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a MESSAGE event
+    pub fn message() -> Self {
+        Self {
+            event_type: EventType::Message,
+            lsn: None,
+            metadata: None,
+        }
+    }
+
+    /// Set the LSN for this event
+    pub fn with_lsn(mut self, lsn: String) -> Self {
+        self.lsn = Some(lsn);
+        self
+    }
+
+    /// Set metadata for this event
+    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 }
 
@@ -261,7 +306,6 @@ impl Lsn {
 
         Ok(Self((high << 32) | low))
     }
-
 }
 
 impl std::fmt::Display for Lsn {

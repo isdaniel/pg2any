@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Performing CDC client initialization");
     client.init().await?;
-    
+
     tracing::info!("✅ CDC client initialized successfully");
 
     // Set up graceful shutdown handling with the client's cancellation token

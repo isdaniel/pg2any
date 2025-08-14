@@ -1,4 +1,3 @@
-use chrono::Utc;
 use pg2any_lib::{
     destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationFactory},
     types::{ChangeEvent, EventType},
@@ -135,18 +134,12 @@ fn create_test_event() -> ChangeEvent {
     );
     data.insert("active".to_string(), serde_json::Value::Bool(true));
 
-    ChangeEvent {
-        event_type: EventType::Insert,
-        transaction_id: Some(123),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("test_table".to_string()),
-        relation_oid: Some(456),
-        old_data: None,
-        new_data: Some(data),
-        lsn: Some("0/1234567".to_string()),
-        metadata: None,
-    }
+    ChangeEvent::insert(
+        "public".to_string(),
+        "test_table".to_string(),
+        456,
+        data,
+    )
 }
 
 fn create_update_event() -> ChangeEvent {
@@ -170,18 +163,13 @@ fn create_update_event() -> ChangeEvent {
         serde_json::Value::String("new_name".to_string()),
     );
 
-    ChangeEvent {
-        event_type: EventType::Update,
-        transaction_id: Some(124),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("test_table".to_string()),
-        relation_oid: Some(456),
-        old_data: Some(old_data),
-        new_data: Some(new_data),
-        lsn: Some("0/1234568".to_string()),
-        metadata: None,
-    }
+    ChangeEvent::update(
+        "public".to_string(),
+        "test_table".to_string(),
+        456,
+        Some(old_data),
+        new_data,
+    )
 }
 
 fn create_delete_event() -> ChangeEvent {
@@ -195,18 +183,12 @@ fn create_delete_event() -> ChangeEvent {
         serde_json::Value::String("deleted_name".to_string()),
     );
 
-    ChangeEvent {
-        event_type: EventType::Delete,
-        transaction_id: Some(125),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("test_table".to_string()),
-        relation_oid: Some(456),
-        old_data: Some(old_data),
-        new_data: None,
-        lsn: Some("0/1234569".to_string()),
-        metadata: None,
-    }
+    ChangeEvent::delete(
+        "public".to_string(),
+        "test_table".to_string(),
+        456,
+        old_data,
+    )
 }
 
 fn create_update_event_without_old_data() -> ChangeEvent {
@@ -220,92 +202,103 @@ fn create_update_event_without_old_data() -> ChangeEvent {
         serde_json::Value::String("new_name".to_string()),
     );
 
-    ChangeEvent {
-        event_type: EventType::Update,
-        transaction_id: Some(126),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("test_table".to_string()),
-        relation_oid: Some(456),
-        old_data: None, // This simulates REPLICA IDENTITY NOTHING
-        new_data: Some(new_data),
-        lsn: Some("0/1234570".to_string()),
-        metadata: None,
-    }
+    ChangeEvent::update(
+        "public".to_string(),
+        "test_table".to_string(),
+        456,
+        None, // This simulates REPLICA IDENTITY NOTHING
+        new_data,
+    )
 }
 
 #[test]
 fn test_mysql_destination_update_with_old_data() {
-    let mut mysql_dest = MySQLDestination::new();
+    let _mysql_dest = MySQLDestination::new();
     let update_event = create_update_event();
 
-    // Verify that we have both old_data and new_data
-    assert!(update_event.old_data.is_some());
-    assert!(update_event.new_data.is_some());
+    // Verify that we have both old_data and new_data using pattern matching
+    match &update_event.event_type {
+        EventType::Update { old_data, new_data, .. } => {
+            assert!(old_data.is_some());
+            assert!(!new_data.is_empty());
+        }
+        _ => panic!("Expected Update event"),
+    }
 
     // The actual connection test would require a real MySQL instance
     // Here we're testing that the event structure is correct for proper WHERE clause generation
-    let old_data = update_event.old_data.as_ref().unwrap();
-    let new_data = update_event.new_data.as_ref().unwrap();
+    if let EventType::Update { old_data, new_data, .. } = &update_event.event_type {
+        let old_data = old_data.as_ref().unwrap();
 
-    // Verify that old_data contains key information for WHERE clause
-    assert!(old_data.contains_key("id"));
-    assert_eq!(
-        old_data.get("id").unwrap(),
-        &serde_json::Value::Number(serde_json::Number::from(1))
-    );
+        // Verify that old_data contains key information for WHERE clause
+        assert!(old_data.contains_key("id"));
+        assert_eq!(
+            old_data.get("id").unwrap(),
+            &serde_json::Value::Number(serde_json::Number::from(1))
+        );
 
-    // Verify that new_data contains updated information
-    assert!(new_data.contains_key("id"));
-    assert!(new_data.contains_key("name"));
-    assert_eq!(
-        new_data.get("name").unwrap(),
-        &serde_json::Value::String("new_name".to_string())
-    );
+        // Verify that new_data contains updated information
+        assert!(new_data.contains_key("id"));
+        assert!(new_data.contains_key("name"));
+        assert_eq!(
+            new_data.get("name").unwrap(),
+            &serde_json::Value::String("new_name".to_string())
+        );
+    } else {
+        panic!("Expected Update event");
+    }
 }
 
 #[test]
 fn test_mysql_destination_update_without_old_data() {
-    let mut mysql_dest = MySQLDestination::new();
+    let _mysql_dest = MySQLDestination::new();
     let update_event = create_update_event_without_old_data();
 
     // Verify that we have no old_data (simulating REPLICA IDENTITY NOTHING)
-    assert!(update_event.old_data.is_none());
-    assert!(update_event.new_data.is_some());
+    match &update_event.event_type {
+        EventType::Update { old_data, new_data, .. } => {
+            assert!(old_data.is_none());
+            assert!(!new_data.is_empty());
 
-    // This tests the fallback behavior when old_data is not available
-    let new_data = update_event.new_data.as_ref().unwrap();
-    assert!(new_data.contains_key("id"));
-    assert!(new_data.contains_key("name"));
+            // This tests the fallback behavior when old_data is not available
+            assert!(new_data.contains_key("id"));
+            assert!(new_data.contains_key("name"));
+        }
+        _ => panic!("Expected Update event"),
+    }
 }
 
 #[test]
 fn test_sqlserver_destination_update_with_old_data() {
-    let mut sqlserver_dest = SqlServerDestination::new();
+    let _sqlserver_dest = SqlServerDestination::new();
     let update_event = create_update_event();
 
     // Verify that we have both old_data and new_data
-    assert!(update_event.old_data.is_some());
-    assert!(update_event.new_data.is_some());
+    match &update_event.event_type {
+        EventType::Update { old_data, new_data, .. } => {
+            assert!(old_data.is_some());
+            assert!(!new_data.is_empty());
 
-    // Similar to MySQL test, verify event structure
-    let old_data = update_event.old_data.as_ref().unwrap();
-    let new_data = update_event.new_data.as_ref().unwrap();
+            // Similar to MySQL test, verify event structure
+            let old_data = old_data.as_ref().unwrap();
 
-    // Verify that old_data contains key information for WHERE clause
-    assert!(old_data.contains_key("id"));
-    assert_eq!(
-        old_data.get("id").unwrap(),
-        &serde_json::Value::Number(serde_json::Number::from(1))
-    );
+            // Verify that old_data contains key information for WHERE clause
+            assert!(old_data.contains_key("id"));
+            assert_eq!(
+                old_data.get("id").unwrap(),
+                &serde_json::Value::Number(serde_json::Number::from(1))
+            );
 
-    // Verify that new_data contains updated information
-    assert!(new_data.contains_key("id"));
-    assert!(new_data.contains_key("name"));
-    assert_eq!(
-        new_data.get("name").unwrap(),
-        &serde_json::Value::String("new_name".to_string())
-    );
+            // Verify that new_data contains updated information
+            assert!(new_data.contains_key("id"));
+            assert!(new_data.contains_key("name"));
+            assert_eq!(
+                new_data.get("name").unwrap(),
+                &serde_json::Value::String("new_name".to_string())
+            );
+        }
+        _ => panic!("Expected Update event"),
+    }
 }
 
 // Test to verify that DELETE operations properly use old_data
@@ -314,14 +307,15 @@ fn test_delete_event_uses_old_data() {
     let delete_event = create_delete_event();
 
     // DELETE operations should have old_data for WHERE clause
-    assert!(delete_event.old_data.is_some());
-    assert!(delete_event.new_data.is_none());
-
-    let old_data = delete_event.old_data.as_ref().unwrap();
-    assert!(old_data.contains_key("id"));
-    assert!(old_data.contains_key("name"));
-    assert_eq!(
-        old_data.get("name").unwrap(),
-        &serde_json::Value::String("deleted_name".to_string())
-    );
+    match &delete_event.event_type {
+        EventType::Delete { old_data, .. } => {
+            assert!(old_data.contains_key("id"));
+            assert!(old_data.contains_key("name"));
+            assert_eq!(
+                old_data.get("name").unwrap(),
+                &serde_json::Value::String("deleted_name".to_string())
+            );
+        }
+        _ => panic!("Expected Delete event"),
+    }
 }

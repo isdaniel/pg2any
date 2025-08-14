@@ -1,8 +1,4 @@
-use chrono::Utc;
-use pg2any_lib::{
-    destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination},
-    types::{ChangeEvent, EventType},
-};
+use pg2any_lib::types::{ChangeEvent, EventType};
 use std::collections::HashMap;
 
 /// Test to demonstrate the fix for UPDATE WHERE clause issue
@@ -38,70 +34,69 @@ fn test_update_where_clause_uses_old_data() {
         serde_json::Value::Number(serde_json::Number::from(30)),
     );
 
-    let event = ChangeEvent {
-        event_type: EventType::Update,
-        transaction_id: Some(1001),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("users".to_string()),
-        relation_oid: Some(16384),
-        old_data: Some(old_data),
-        new_data: Some(new_data),
-        lsn: Some("0/A1B2C3D4".to_string()),
-        metadata: None,
-    };
+    let event = ChangeEvent::update(
+        "public".to_string(),
+        "users".to_string(),
+        16384,
+        Some(old_data),
+        new_data,
+    );
 
     // Test that the event structure correctly supports proper WHERE clause generation
 
     // 1. Verify old_data contains the replica identity information
-    let old_data = event.old_data.as_ref().unwrap();
-    assert!(old_data.contains_key("id"));
-    assert!(old_data.contains_key("email"));
-    assert_eq!(
-        old_data.get("id").unwrap(),
-        &serde_json::Value::Number(serde_json::Number::from(42))
-    );
-    assert_eq!(
-        old_data.get("email").unwrap(),
-        &serde_json::Value::String("old.email@example.com".to_string())
-    );
+    match &event.event_type {
+        EventType::Update { old_data, new_data, .. } => {
+            let old_data = old_data.as_ref().unwrap();
+            assert!(old_data.contains_key("id"));
+            assert!(old_data.contains_key("email"));
+            assert_eq!(
+                old_data.get("id").unwrap(),
+                &serde_json::Value::Number(serde_json::Number::from(42))
+            );
+            assert_eq!(
+                old_data.get("email").unwrap(),
+                &serde_json::Value::String("old.email@example.com".to_string())
+            );
 
-    // 2. Verify new_data contains the updated values
-    let new_data = event.new_data.as_ref().unwrap();
-    assert!(new_data.contains_key("id"));
-    assert!(new_data.contains_key("email"));
-    assert!(new_data.contains_key("name"));
-    assert!(new_data.contains_key("age"));
-    assert_eq!(
-        new_data.get("email").unwrap(),
-        &serde_json::Value::String("new.email@example.com".to_string())
-    );
+            // 2. Verify new_data contains the updated values
+            assert!(new_data.contains_key("id"));
+            assert!(new_data.contains_key("email"));
+            assert!(new_data.contains_key("name"));
+            assert!(new_data.contains_key("age"));
+            assert_eq!(
+                new_data.get("email").unwrap(),
+                &serde_json::Value::String("new.email@example.com".to_string())
+            );
 
-    // 3. Simulate the logic our fixed code should use:
-    // - SET clause should use new_data keys/values
-    // - WHERE clause should use old_data keys/values
+            // 3. Simulate the logic our fixed code should use:
+            // - SET clause should use new_data keys/values
+            // - WHERE clause should use old_data keys/values
 
-    let set_keys: Vec<&String> = new_data.keys().collect();
-    let where_keys: Vec<&String> = old_data.keys().collect();
+            let set_keys: Vec<&String> = new_data.keys().collect();
+            let where_keys: Vec<&String> = old_data.keys().collect();
 
-    // Verify SET clause would include all new columns
-    assert!(set_keys.contains(&&"id".to_string()));
-    assert!(set_keys.contains(&&"email".to_string()));
-    assert!(set_keys.contains(&&"name".to_string()));
-    assert!(set_keys.contains(&&"age".to_string()));
+            // Verify SET clause would include all new columns
+            assert!(set_keys.contains(&&"id".to_string()));
+            assert!(set_keys.contains(&&"email".to_string()));
+            assert!(set_keys.contains(&&"name".to_string()));
+            assert!(set_keys.contains(&&"age".to_string()));
 
-    // Verify WHERE clause would use replica identity (old_data)
-    assert!(where_keys.contains(&&"id".to_string()));
-    assert!(where_keys.contains(&&"email".to_string()));
+            // Verify WHERE clause would use replica identity (old_data)
+            assert!(where_keys.contains(&&"id".to_string()));
+            assert!(where_keys.contains(&&"email".to_string()));
 
-    // The generated SQL should conceptually be:
-    // UPDATE `public`.`users`
-    // SET `id` = ?, `email` = ?, `name` = ?, `age` = ?
-    // WHERE `id` = ? AND `email` = ?
-    //
-    // With values:
-    // SET: (42, "new.email@example.com", "Updated Name", 30)
-    // WHERE: (42, "old.email@example.com")
+            // The generated SQL should conceptually be:
+            // UPDATE `public`.`users`
+            // SET `id` = ?, `email` = ?, `name` = ?, `age` = ?
+            // WHERE `id` = ? AND `email` = ?
+            //
+            // With values:
+            // SET: (42, "new.email@example.com", "Updated Name", 30)
+            // WHERE: (42, "old.email@example.com")
+        }
+        _ => panic!("Expected Update event"),
+    }
 }
 
 /// Test DELETE operations use old_data for WHERE clause  
@@ -117,30 +112,25 @@ fn test_delete_where_clause_uses_old_data() {
         serde_json::Value::String("user_to_delete".to_string()),
     );
 
-    let event = ChangeEvent {
-        event_type: EventType::Delete,
-        transaction_id: Some(1002),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("users".to_string()),
-        relation_oid: Some(16384),
-        old_data: Some(old_data),
-        new_data: None, // DELETE has no new_data
-        lsn: Some("0/A1B2C3D5".to_string()),
-        metadata: None,
-    };
+    let event = ChangeEvent::delete(
+        "public".to_string(),
+        "users".to_string(),
+        16384,
+        old_data,
+    );
 
     // Verify DELETE event structure
-    assert!(event.old_data.is_some());
-    assert!(event.new_data.is_none());
+    match &event.event_type {
+        EventType::Delete { old_data, .. } => {
+            assert!(old_data.contains_key("id"));
+            assert!(old_data.contains_key("username"));
 
-    let old_data = event.old_data.as_ref().unwrap();
-    assert!(old_data.contains_key("id"));
-    assert!(old_data.contains_key("username"));
-
-    // The generated SQL should conceptually be:
-    // DELETE FROM `public`.`users` WHERE `id` = ? AND `username` = ?
-    // With values: (99, "user_to_delete")
+            // The generated SQL should conceptually be:
+            // DELETE FROM `public`.`users` WHERE `id` = ? AND `username` = ?
+            // With values: (99, "user_to_delete")
+        }
+        _ => panic!("Expected Delete event"),
+    }
 }
 
 /// Test UPDATE without old_data (REPLICA IDENTITY NOTHING scenario)
@@ -156,32 +146,32 @@ fn test_update_fallback_when_no_old_data() {
         serde_json::Value::String("New Name".to_string()),
     );
 
-    let event = ChangeEvent {
-        event_type: EventType::Update,
-        transaction_id: Some(1003),
-        commit_timestamp: Some(Utc::now()),
-        schema_name: Some("public".to_string()),
-        table_name: Some("logs".to_string()),
-        relation_oid: Some(16385),
-        old_data: None, // Simulates REPLICA IDENTITY NOTHING
-        new_data: Some(new_data),
-        lsn: Some("0/A1B2C3D6".to_string()),
-        metadata: None,
-    };
+    let event = ChangeEvent::update(
+        "public".to_string(),
+        "logs".to_string(),
+        16385,
+        None, // Simulates REPLICA IDENTITY NOTHING
+        new_data,
+    );
 
     // Verify the fallback scenario
-    assert!(event.old_data.is_none());
-    assert!(event.new_data.is_some());
+    match &event.event_type {
+        EventType::Update { old_data, new_data, .. } => {
+            assert!(old_data.is_none());
+            assert!(!new_data.is_empty());
 
-    let new_data = event.new_data.as_ref().unwrap();
-    assert!(new_data.contains_key("id"));
-    assert!(new_data.contains_key("name"));
+            assert!(new_data.contains_key("id"));
+            assert!(new_data.contains_key("name"));
 
-    // In our fixed implementation, this would fallback to using new_data for WHERE
-    // (taking first column as a fallback), which is not ideal but better than WHERE 1=1
-    // The generated SQL would be something like:
-    // UPDATE `public`.`logs` SET `id` = ?, `name` = ? WHERE `id` = ?
-    // With values: SET: (123, "New Name"), WHERE: (123)
+            // In our fixed implementation, this would fallback to using new_data for WHERE
+            // (taking first column as a fallback), which is not ideal but better than WHERE 1=1
+            
+            // The generated SQL would be something like:
+            // UPDATE `public`.`logs` SET `id` = ?, `name` = ? WHERE `id` = ?
+            // With values: SET: (123, "New Name"), WHERE: (123)
+        }
+        _ => panic!("Expected Update event"),
+    }
 }
 
 /// Test that demonstrates the problem with the old WHERE 1=1 approach

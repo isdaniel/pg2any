@@ -265,14 +265,12 @@ impl LogicalReplicationStream {
                     let data = self.convert_tuple_to_data(&tuple, relation)?;
 
                     ChangeEvent {
-                        event_type: EventType::Insert,
-                        transaction_id: None,
-                        commit_timestamp: Some(chrono::Utc::now()),
-                        schema_name: Some(schema_name),
-                        table_name: Some(table_name),
-                        relation_oid: Some(relation_id),
-                        old_data: None,
-                        new_data: Some(data),
+                        event_type: EventType::Insert {
+                            schema: schema_name,
+                            table: table_name,
+                            relation_oid: relation_id,
+                            data,
+                        },
                         lsn: Some(format_lsn(lsn)),
                         metadata: None,
                     }
@@ -301,17 +299,16 @@ impl LogicalReplicationStream {
                     } else {
                         None
                     };
-                    let new_data = Some(self.convert_tuple_to_data(&new_tuple, relation)?);
+                    let new_data = self.convert_tuple_to_data(&new_tuple, relation)?;
 
                     ChangeEvent {
-                        event_type: EventType::Update,
-                        transaction_id: None,
-                        commit_timestamp: Some(chrono::Utc::now()),
-                        schema_name: Some(schema_name),
-                        table_name: Some(table_name),
-                        relation_oid: Some(relation_id),
-                        old_data,
-                        new_data,
+                        event_type: EventType::Update {
+                            schema: schema_name,
+                            table: table_name,
+                            relation_oid: relation_id,
+                            old_data,
+                            new_data,
+                        },
                         lsn: Some(format_lsn(lsn)),
                         metadata: None,
                     }
@@ -334,17 +331,15 @@ impl LogicalReplicationStream {
                     } else {
                         ("public".to_string(), relation.full_name())
                     };
-                    let old_data = Some(self.convert_tuple_to_data(&old_tuple, relation)?);
+                    let old_data = self.convert_tuple_to_data(&old_tuple, relation)?;
 
                     ChangeEvent {
-                        event_type: EventType::Delete,
-                        transaction_id: None,
-                        commit_timestamp: Some(chrono::Utc::now()),
-                        schema_name: Some(schema_name),
-                        table_name: Some(table_name),
-                        relation_oid: Some(relation_id),
-                        old_data,
-                        new_data: None,
+                        event_type: EventType::Delete {
+                            schema: schema_name,
+                            table: table_name,
+                            relation_oid: relation_id,
+                            old_data,
+                        },
                         lsn: Some(format_lsn(lsn)),
                         metadata: None,
                     }
@@ -378,13 +373,6 @@ impl LogicalReplicationStream {
 
                 ChangeEvent {
                     event_type: EventType::Truncate(truncate_tables),
-                    transaction_id: None,
-                    commit_timestamp: Some(chrono::Utc::now()),
-                    schema_name: None,
-                    table_name: None,
-                    relation_oid: None,
-                    old_data: None,
-                    new_data: None,
                     lsn: Some(format_lsn(lsn)),
                     metadata: None,
                 }

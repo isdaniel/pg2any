@@ -82,8 +82,8 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-${{ matrix.rust }}-target-
 
-    # - name: Check formatting
-    #   run: cargo fmt --all -- --check
+    - name: Check formatting
+      run: cargo fmt --all -- --check
 
     # - name: Run clippy
     #   run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf

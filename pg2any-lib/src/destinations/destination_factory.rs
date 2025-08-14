@@ -54,13 +54,14 @@ impl DestinationFactory {
 pub fn is_dml_event(event: &ChangeEvent) -> bool {
     matches!(
         event.event_type,
-        EventType::Insert | EventType::Update | EventType::Delete
+        EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. }
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_destination_factory_create() {
@@ -84,46 +85,29 @@ mod tests {
 
     #[test]
     fn test_is_dml_event() {
-        let insert_event = ChangeEvent {
-            event_type: EventType::Insert,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some("public".to_string()),
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(1234),
-            old_data: None,
-            new_data: None,
-            lsn: None,
-            metadata: None,
-        };
+        let insert_event = ChangeEvent::insert(
+            "public".to_string(),
+            "test_table".to_string(),
+            1234,
+            HashMap::new(),
+        );
         assert!(is_dml_event(&insert_event));
 
-        let update_event = ChangeEvent {
-            event_type: EventType::Update,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some("public".to_string()),
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(1234),
-            old_data: None,
-            new_data: None,
-            lsn: None,
-            metadata: None,
-        };
+        let update_event = ChangeEvent::update(
+            "public".to_string(),
+            "test_table".to_string(),
+            1234,
+            None, // no old_data
+            HashMap::new(),
+        );
         assert!(is_dml_event(&update_event));
 
-        let delete_event = ChangeEvent {
-            event_type: EventType::Delete,
-            transaction_id: None,
-            commit_timestamp: None,
-            schema_name: Some("public".to_string()),
-            table_name: Some("test_table".to_string()),
-            relation_oid: Some(1234),
-            old_data: None,
-            new_data: None,
-            lsn: None,
-            metadata: None,
-        };
+        let delete_event = ChangeEvent::delete(
+            "public".to_string(),
+            "test_table".to_string(),
+            1234,
+            HashMap::new(),
+        );
         assert!(is_dml_event(&delete_event));
     }
 

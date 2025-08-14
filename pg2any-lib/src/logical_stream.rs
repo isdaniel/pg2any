@@ -16,6 +16,7 @@ use crate::replication_protocol::{
 use crate::types::{ChangeEvent, EventType};
 use crate::{RelationInfo, TupleData};
 use std::time::{Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// PostgreSQL logical replication stream
@@ -131,8 +132,8 @@ impl LogicalReplicationStream {
     }
 
     /// Process the next single replication event
-    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
-        match self.connection.get_copy_data(0)? {
+    pub async fn next_event(&mut self, cancellation_token: &CancellationToken) -> Result<Option<ChangeEvent>> {
+        match self.connection.get_copy_data_async(cancellation_token).await? {
             Some(data) => {
                 if data.is_empty() {
                     return Ok(None);
@@ -154,12 +155,12 @@ impl LogicalReplicationStream {
                 }
             }
             None => {
-                // No data available, continue
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // No data available or cancelled
+                return Ok(None);
             }
         }
 
-        // No event received within timeout
+        // No event received
         Ok(None)
     }
 
@@ -356,7 +357,7 @@ impl LogicalReplicationStream {
                 return Ok(None);
             }
 
-            LogicalReplicationMessage::Truncate { relation_ids, flags } => {
+            LogicalReplicationMessage::Truncate { relation_ids, flags: _ } => {
                 let mut truncate_tables = Vec::with_capacity(relation_ids.len());
                 for relation_id in relation_ids {
                     if let Some(relation) = self.state.get_relation(relation_id) {

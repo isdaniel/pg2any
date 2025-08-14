@@ -157,7 +157,7 @@ impl CdcClient {
                     info!("Producer received cancellation signal");
                     break;
                 }
-                result = replication_stream.next_event() => {
+                result = replication_stream.next_event(&cancellation_token) => {
                     match result {
                         Ok(Some(event)) => {
                             debug!("Producer received single event: {:?}", event.event_type);

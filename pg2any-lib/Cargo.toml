@@ -10,31 +10,18 @@ keywords = ["postgresql", "cdc", "replication", "database", "streaming"]
 categories = ["database", "asynchronous"]
 
 [dependencies]
-# Core dependencies from workspace
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-util = { workspace = true }
-
-# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# Utilities
 chrono = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
-
-# Error handling
 thiserror = { workspace = true }
-
-# Logging
 tracing = { workspace = true }
-
-# PostgreSQL low-level replication
 libpq-sys = { workspace = true }
 libc = { workspace = true }
-
-# Database destinations (optional)
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 

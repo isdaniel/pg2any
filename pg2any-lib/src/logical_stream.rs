@@ -218,7 +218,7 @@ impl LogicalReplicationStream {
     fn process_keepalive_message(&mut self, data: &[u8]) -> Result<()> {
         let keepalive = parse_keepalive_message(data)?;
 
-        debug!(
+        info!(
             "Received keepalive: wal_end={}, reply_requested={}",
             format_lsn(keepalive.wal_end),
             keepalive.reply_requested
@@ -448,7 +448,7 @@ impl LogicalReplicationStream {
             false, // Don't request reply
         )?;
 
-        info!(
+        debug!(
             "Sent feedback: received={}",
             format_lsn(self.state.last_received_lsn)
         );

@@ -314,7 +314,7 @@ impl PgReplicationConnection {
             )));
         }
 
-        debug!(
+        info!(
             "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
             format_lsn(received_lsn),
             format_lsn(flushed_lsn),

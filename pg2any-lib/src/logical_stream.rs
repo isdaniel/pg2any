@@ -26,6 +26,7 @@ pub struct LogicalReplicationStream {
     state: ReplicationState,
     config: ReplicationStreamConfig,
     slot_created: bool,
+    //last_feedback_time: std::time::Instant,
 }
 
 /// Configuration for the replication stream
@@ -54,6 +55,7 @@ impl LogicalReplicationStream {
             state,
             config,
             slot_created: false,
+            //last_feedback_time: std::time::Instant::now(),
         })
     }
 
@@ -136,6 +138,9 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<Option<ChangeEvent>> {
+        // Send proactive feedback if enough time has passed
+        self.maybe_send_feedback();
+
         match self
             .connection
             .get_copy_data_async(cancellation_token)
@@ -149,6 +154,8 @@ impl LogicalReplicationStream {
                     'w' => {
                         // WAL data message
                         if let Some(event) = self.process_wal_message(&data)? {
+                            // Send feedback after processing WAL data
+                            self.maybe_send_feedback();
                             return Ok(Some(event));
                         }
                     }
@@ -162,7 +169,8 @@ impl LogicalReplicationStream {
                 }
             }
             None => {
-                // No data available or cancelled
+                // No data available or cancelled - still send feedback
+                self.maybe_send_feedback();
                 return Ok(None);
             }
         }
@@ -440,7 +448,7 @@ impl LogicalReplicationStream {
             false, // Don't request reply
         )?;
 
-        debug!(
+        info!(
             "Sent feedback: received={}",
             format_lsn(self.state.last_received_lsn)
         );
@@ -468,7 +476,7 @@ impl From<&Config> for ReplicationStreamConfig {
             publication_name: config.publication_name.clone(),
             protocol_version: config.protocol_version,
             streaming_enabled: config.streaming,
-            feedback_interval: Duration::from_secs(1), // Default 1 second
+            feedback_interval: config.heartbeat_interval, 
             connection_timeout: config.connection_timeout,
         }
     }

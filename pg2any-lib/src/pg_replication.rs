@@ -195,10 +195,9 @@ impl PgReplicationConnection {
             )
         } else {
             format!(
-                "START_REPLICATION SLOT \"{}\" LOGICAL {:X}/{:X} ({})",
+                "START_REPLICATION SLOT \"{}\" LOGICAL {} ({})",
                 slot_name,
-                start_lsn >> 32,
-                start_lsn & 0xFFFFFFFF,
+                format_lsn(start_lsn),
                 options_str
             )
         };
@@ -316,13 +315,11 @@ impl PgReplicationConnection {
         }
 
         debug!(
-            "Sent standby status update: received={:X}/{:X}, flushed={:X}/{:X}, applied={:X}/{:X}",
-            received_lsn >> 32,
-            received_lsn & 0xFFFFFFFF,
-            flushed_lsn >> 32,
-            flushed_lsn & 0xFFFFFFFF,
-            applied_lsn >> 32,
-            applied_lsn & 0xFFFFFFFF
+            "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
+            format_lsn(received_lsn),
+            format_lsn(flushed_lsn),
+            format_lsn(applied_lsn),
+            reply_requested
         );
 
         Ok(())

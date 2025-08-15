@@ -164,7 +164,7 @@ impl CdcClient {
                         Ok(None) => {
                             // No event available, wait a bit before trying again
                             debug!("No event available, retrying...");
-                            sleep(Duration::from_millis(5)).await;
+                            sleep(Duration::from_millis(100)).await; // Reduced sleep time for more responsive feedback
                         }
                         Err(e) => {
                             error!("Error reading from replication stream: {}", e);

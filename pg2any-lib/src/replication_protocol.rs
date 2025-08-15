@@ -5,7 +5,7 @@
 
 use crate::buffer::BufferReader;
 use crate::error::{CdcError, Result};
-use crate::pg_replication::{Oid, TimestampTz, XLogRecPtr, Xid};
+use crate::pg_replication::{format_lsn, Oid, TimestampTz, XLogRecPtr, Xid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
@@ -478,9 +478,8 @@ impl LogicalReplicationParser {
         let xid = reader.read_u32()?;
 
         debug!(
-            "BEGIN: final_lsn={:X}/{:X}, timestamp={}, xid={}",
-            final_lsn >> 32,
-            final_lsn & 0xFFFFFFFF,
+            "BEGIN: final_lsn={}, timestamp={}, xid={}",
+            format_lsn(final_lsn),
             timestamp,
             xid
         );
@@ -503,12 +502,10 @@ impl LogicalReplicationParser {
         let timestamp = reader.read_i64()?;
 
         debug!(
-            "COMMIT: flags={}, commit_lsn={:X}/{:X}, end_lsn={:X}/{:X}, timestamp={}",
+            "COMMIT: flags={}, commit_lsn={}, end_lsn={}, timestamp={}",
             flags,
-            commit_lsn >> 32,
-            commit_lsn & 0xFFFFFFFF,
-            end_lsn >> 32,
-            end_lsn & 0xFFFFFFFF,
+            format_lsn(commit_lsn),
+            format_lsn(end_lsn),
             timestamp
         );
 
@@ -698,9 +695,8 @@ impl LogicalReplicationParser {
         let origin_name = reader.read_cstring()?;
 
         debug!(
-            "ORIGIN: lsn={:X}/{:X}, name={}",
-            origin_lsn >> 32,
-            origin_lsn & 0xFFFFFFFF,
+            "ORIGIN: lsn={}, name={}",
+            format_lsn(origin_lsn),
             origin_name
         );
 
@@ -719,10 +715,9 @@ impl LogicalReplicationParser {
         let content = reader.read_bytes(content_length as usize)?;
 
         debug!(
-            "MESSAGE: flags={}, lsn={:X}/{:X}, prefix={}, content_length={}",
+            "MESSAGE: flags={}, lsn={}, prefix={}, content_length={}",
             flags,
-            lsn >> 32,
-            lsn & 0xFFFFFFFF,
+            format_lsn(lsn),
             prefix,
             content_length
         );
@@ -769,13 +764,11 @@ impl LogicalReplicationParser {
         let timestamp = reader.read_i64()?;
 
         debug!(
-            "STREAM COMMIT: xid={}, flags={}, commit_lsn={:X}/{:X}, end_lsn={:X}/{:X}",
+            "STREAM COMMIT: xid={}, flags={}, commit_lsn={}, end_lsn={}",
             xid,
             flags,
-            commit_lsn >> 32,
-            commit_lsn & 0xFFFFFFFF,
-            end_lsn >> 32,
-            end_lsn & 0xFFFFFFFF
+            format_lsn(commit_lsn),
+            format_lsn(end_lsn)
         );
 
         Ok(LogicalReplicationMessage::StreamCommit {

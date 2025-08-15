@@ -145,7 +145,7 @@ impl Default for Config {
             origin: OriginFilter::None,
             connection_timeout: Duration::from_secs(30),
             query_timeout: Duration::from_secs(60),
-            heartbeat_interval: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(10), // Send feedback every 10 seconds to prevent 60s timeout
             buffer_size: 1000,
             auto_create_tables: true,
             table_mappings: HashMap::new(),

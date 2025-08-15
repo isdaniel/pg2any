@@ -45,20 +45,37 @@ impl SqlServerDestination {
     /// Generate CREATE TABLE statement for SQL Server
     async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
         let (schema_name, table_name, data) = match &event.event_type {
-            EventType::Insert { schema, table, data, .. } => {
-                (schema, table, Some(data))
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => (schema, table, Some(data)),
+            EventType::Update {
+                schema,
+                table,
+                new_data,
+                ..
+            } => (schema, table, Some(new_data)),
+            EventType::Delete {
+                schema,
+                table,
+                old_data,
+                ..
+            } => (schema, table, Some(old_data)),
+            _ => {
+                return Err(CdcError::generic(
+                    "Cannot create table for non-DML event".to_string(),
+                ))
             }
-            EventType::Update { schema, table, new_data, .. } => {
-                (schema, table, Some(new_data))
-            }
-            EventType::Delete { schema, table, old_data, .. } => {
-                (schema, table, Some(old_data))
-            }
-            _ => return Err(CdcError::generic("Cannot create table for non-DML event".to_string())),
         };
 
         let default_schema = "dbo";
-        let schema_name = if schema_name.is_empty() { default_schema } else { schema_name };
+        let schema_name = if schema_name.is_empty() {
+            default_schema
+        } else {
+            schema_name
+        };
 
         let mut sql = format!("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{}' AND xtype='U') CREATE TABLE [{}].[{}] (\n", table_name, schema_name, table_name);
 
@@ -115,7 +132,12 @@ impl DestinationHandler for SqlServerDestination {
             .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
         match &event.event_type {
-            EventType::Insert { schema, table, data, .. } => {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
                 let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
                 let placeholders: Vec<String> =
                     (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
@@ -149,11 +171,18 @@ impl DestinationHandler for SqlServerDestination {
 
                 // For now, use a simple execute without parameters
                 // This is a limitation of this simplified implementation
-                client.execute(&sql, &[]).await.map_err(|e| {
-                    CdcError::generic(format!("SQL Server INSERT failed: {}", e))
-                })?;
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
             }
-            EventType::Update { schema, table, old_data, new_data, .. } => {
+            EventType::Update {
+                schema,
+                table,
+                old_data,
+                new_data,
+                ..
+            } => {
                 let set_clauses: Vec<String> =
                     new_data.keys().map(|k| format!("[{k}] = ?")).collect();
 
@@ -184,11 +213,17 @@ impl DestinationHandler for SqlServerDestination {
 
                 // Note: This is still a simplified implementation without proper parameter binding
                 // In a real implementation, you'd need to properly handle parameters with tiberius
-                client.execute(&sql, &[]).await.map_err(|e| {
-                    CdcError::generic(format!("SQL Server UPDATE failed: {}", e))
-                })?;
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
             }
-            EventType::Delete { schema, table, old_data, .. } => {
+            EventType::Delete {
+                schema,
+                table,
+                old_data,
+                ..
+            } => {
                 let where_clauses: Vec<String> =
                     old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
 
@@ -200,9 +235,10 @@ impl DestinationHandler for SqlServerDestination {
                 );
 
                 // Simplified implementation - in production you'd handle parameters properly
-                client.execute(&sql, &[]).await.map_err(|e| {
-                    CdcError::generic(format!("SQL Server DELETE failed: {}", e))
-                })?;
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server DELETE failed: {}", e)))?;
             }
             _ => {
                 // Skip non-DML events for now

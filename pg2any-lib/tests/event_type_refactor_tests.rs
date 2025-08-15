@@ -9,12 +9,7 @@ fn test_new_event_type_insert() {
     data.insert("id".to_string(), json!(1));
     data.insert("name".to_string(), json!("test"));
 
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        123,
-        data.clone(),
-    );
+    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data.clone());
 
     match event.event_type {
         EventType::Insert {
@@ -100,7 +95,7 @@ fn test_new_event_type_delete() {
 #[test]
 fn test_new_event_type_begin_commit() {
     let timestamp = Utc::now();
-    
+
     let begin_event = ChangeEvent::begin(12345, timestamp);
     match begin_event.event_type {
         EventType::Begin {
@@ -128,11 +123,8 @@ fn test_new_event_type_begin_commit() {
 
 #[test]
 fn test_new_event_type_truncate() {
-    let tables = vec![
-        "public.users".to_string(),
-        "public.orders".to_string(),
-    ];
-    
+    let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+
     let event = ChangeEvent::truncate(tables.clone());
     match event.event_type {
         EventType::Truncate(event_tables) => {
@@ -148,22 +140,28 @@ fn test_event_serialization() {
     data.insert("id".to_string(), json!(1));
     data.insert("name".to_string(), json!("test"));
 
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        123,
-        data,
-    );
+    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data);
 
     // Test that the event can be serialized and deserialized
     let serialized = serde_json::to_string(&event).expect("Failed to serialize event");
-    let deserialized: ChangeEvent = serde_json::from_str(&serialized).expect("Failed to deserialize event");
+    let deserialized: ChangeEvent =
+        serde_json::from_str(&serialized).expect("Failed to deserialize event");
 
     // Verify they're equal
     match (&event.event_type, &deserialized.event_type) {
         (
-            EventType::Insert { schema: s1, table: t1, relation_oid: r1, data: d1 },
-            EventType::Insert { schema: s2, table: t2, relation_oid: r2, data: d2 },
+            EventType::Insert {
+                schema: s1,
+                table: t1,
+                relation_oid: r1,
+                data: d1,
+            },
+            EventType::Insert {
+                schema: s2,
+                table: t2,
+                relation_oid: r2,
+                data: d2,
+            },
         ) => {
             assert_eq!(s1, s2);
             assert_eq!(t1, t2);
@@ -182,14 +180,9 @@ fn test_event_with_lsn_and_metadata() {
     let mut metadata = HashMap::new();
     metadata.insert("source".to_string(), json!("postgresql"));
 
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        123,
-        data,
-    )
-    .with_lsn("0/12345678".to_string())
-    .with_metadata(metadata.clone());
+    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data)
+        .with_lsn("0/12345678".to_string())
+        .with_metadata(metadata.clone());
 
     assert_eq!(event.lsn, Some("0/12345678".to_string()));
     assert_eq!(event.metadata, Some(metadata));

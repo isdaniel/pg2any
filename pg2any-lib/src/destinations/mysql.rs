@@ -44,11 +44,13 @@ impl MySQLDestination {
     /// Generate CREATE TABLE statement for MySQL
     async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
         match &event.event_type {
-            EventType::Insert { schema, table, data, .. } => {
-                let mut sql = format!(
-                    "CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n",
-                    schema, table
-                );
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
+                let mut sql = format!("CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n", schema, table);
 
                 // For now, we'll create columns based on the data we receive
                 // In a production system, you'd want to query the PostgreSQL schema
@@ -68,7 +70,9 @@ impl MySQLDestination {
                 sql.push_str("\n)");
                 Ok(sql)
             }
-            _ => Err(CdcError::generic("Cannot generate CREATE TABLE for non-INSERT event")),
+            _ => Err(CdcError::generic(
+                "Cannot generate CREATE TABLE for non-INSERT event",
+            )),
         }
     }
 }
@@ -88,7 +92,12 @@ impl DestinationHandler for MySQLDestination {
             .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
 
         match &event.event_type {
-            EventType::Insert { schema, table, data, .. } => {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
                 let columns: Vec<String> = data.keys().map(|k| format!("`{}`", k)).collect();
                 let placeholders: Vec<String> =
                     (0..columns.len()).map(|_| "?".to_string()).collect();
@@ -118,7 +127,13 @@ impl DestinationHandler for MySQLDestination {
 
                 query.execute(pool).await?;
             }
-            EventType::Update { schema, table, old_data, new_data, .. } => {
+            EventType::Update {
+                schema,
+                table,
+                old_data,
+                new_data,
+                ..
+            } => {
                 let set_clauses: Vec<String> =
                     new_data.keys().map(|k| format!("`{}` = ?", k)).collect();
 
@@ -169,7 +184,12 @@ impl DestinationHandler for MySQLDestination {
 
                 query.execute(pool).await?;
             }
-            EventType::Delete { schema, table, old_data, .. } => {
+            EventType::Delete {
+                schema,
+                table,
+                old_data,
+                ..
+            } => {
                 // Simple delete - in production you'd use proper key matching
                 let where_clauses: Vec<String> =
                     old_data.keys().map(|k| format!("`{}` = ?", k)).collect();

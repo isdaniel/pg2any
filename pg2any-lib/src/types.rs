@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::pg_replication::format_lsn;
+
 /// Represents the type of change event
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
@@ -310,7 +312,7 @@ impl Lsn {
 
 impl std::fmt::Display for Lsn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFFFFFF)
+        write!(f, "{}", format_lsn(self.0))
     }
 }
 

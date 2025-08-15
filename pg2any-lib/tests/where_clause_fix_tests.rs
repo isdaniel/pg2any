@@ -46,7 +46,9 @@ fn test_update_where_clause_uses_old_data() {
 
     // 1. Verify old_data contains the replica identity information
     match &event.event_type {
-        EventType::Update { old_data, new_data, .. } => {
+        EventType::Update {
+            old_data, new_data, ..
+        } => {
             let old_data = old_data.as_ref().unwrap();
             assert!(old_data.contains_key("id"));
             assert!(old_data.contains_key("email"));
@@ -112,12 +114,7 @@ fn test_delete_where_clause_uses_old_data() {
         serde_json::Value::String("user_to_delete".to_string()),
     );
 
-    let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
-        16384,
-        old_data,
-    );
+    let event = ChangeEvent::delete("public".to_string(), "users".to_string(), 16384, old_data);
 
     // Verify DELETE event structure
     match &event.event_type {
@@ -156,7 +153,9 @@ fn test_update_fallback_when_no_old_data() {
 
     // Verify the fallback scenario
     match &event.event_type {
-        EventType::Update { old_data, new_data, .. } => {
+        EventType::Update {
+            old_data, new_data, ..
+        } => {
             assert!(old_data.is_none());
             assert!(!new_data.is_empty());
 
@@ -165,7 +164,7 @@ fn test_update_fallback_when_no_old_data() {
 
             // In our fixed implementation, this would fallback to using new_data for WHERE
             // (taking first column as a fallback), which is not ideal but better than WHERE 1=1
-            
+
             // The generated SQL would be something like:
             // UPDATE `public`.`logs` SET `id` = ?, `name` = ? WHERE `id` = ?
             // With values: SET: (123, "New Name"), WHERE: (123)

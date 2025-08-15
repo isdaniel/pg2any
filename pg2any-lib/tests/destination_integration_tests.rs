@@ -134,12 +134,7 @@ fn create_test_event() -> ChangeEvent {
     );
     data.insert("active".to_string(), serde_json::Value::Bool(true));
 
-    ChangeEvent::insert(
-        "public".to_string(),
-        "test_table".to_string(),
-        456,
-        data,
-    )
+    ChangeEvent::insert("public".to_string(), "test_table".to_string(), 456, data)
 }
 
 fn create_update_event() -> ChangeEvent {
@@ -218,7 +213,9 @@ fn test_mysql_destination_update_with_old_data() {
 
     // Verify that we have both old_data and new_data using pattern matching
     match &update_event.event_type {
-        EventType::Update { old_data, new_data, .. } => {
+        EventType::Update {
+            old_data, new_data, ..
+        } => {
             assert!(old_data.is_some());
             assert!(!new_data.is_empty());
         }
@@ -227,7 +224,10 @@ fn test_mysql_destination_update_with_old_data() {
 
     // The actual connection test would require a real MySQL instance
     // Here we're testing that the event structure is correct for proper WHERE clause generation
-    if let EventType::Update { old_data, new_data, .. } = &update_event.event_type {
+    if let EventType::Update {
+        old_data, new_data, ..
+    } = &update_event.event_type
+    {
         let old_data = old_data.as_ref().unwrap();
 
         // Verify that old_data contains key information for WHERE clause
@@ -256,7 +256,9 @@ fn test_mysql_destination_update_without_old_data() {
 
     // Verify that we have no old_data (simulating REPLICA IDENTITY NOTHING)
     match &update_event.event_type {
-        EventType::Update { old_data, new_data, .. } => {
+        EventType::Update {
+            old_data, new_data, ..
+        } => {
             assert!(old_data.is_none());
             assert!(!new_data.is_empty());
 
@@ -275,7 +277,9 @@ fn test_sqlserver_destination_update_with_old_data() {
 
     // Verify that we have both old_data and new_data
     match &update_event.event_type {
-        EventType::Update { old_data, new_data, .. } => {
+        EventType::Update {
+            old_data, new_data, ..
+        } => {
             assert!(old_data.is_some());
             assert!(!new_data.is_empty());
 

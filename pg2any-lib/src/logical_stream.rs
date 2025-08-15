@@ -476,7 +476,7 @@ impl From<&Config> for ReplicationStreamConfig {
             publication_name: config.publication_name.clone(),
             protocol_version: config.protocol_version,
             streaming_enabled: config.streaming,
-            feedback_interval: config.heartbeat_interval, 
+            feedback_interval: config.heartbeat_interval,
             connection_timeout: config.connection_timeout,
         }
     }

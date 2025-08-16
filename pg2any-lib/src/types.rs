@@ -19,12 +19,16 @@ pub enum EventType {
         relation_oid: u32,
         old_data: Option<HashMap<String, serde_json::Value>>,
         new_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
     },
     Delete {
         schema: String,
         table: String,
         relation_oid: u32,
         old_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
     },
     Truncate(Vec<String>),
     Begin {
@@ -90,6 +94,8 @@ impl ChangeEvent {
         relation_oid: u32,
         old_data: Option<HashMap<String, serde_json::Value>>,
         new_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
     ) -> Self {
         Self {
             event_type: EventType::Update {
@@ -98,6 +104,8 @@ impl ChangeEvent {
                 relation_oid,
                 old_data,
                 new_data,
+                replica_identity,
+                key_columns,
             },
             lsn: None,
             metadata: None,
@@ -110,6 +118,8 @@ impl ChangeEvent {
         table_name: String,
         relation_oid: u32,
         old_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
     ) -> Self {
         Self {
             event_type: EventType::Delete {
@@ -117,6 +127,8 @@ impl ChangeEvent {
                 table: table_name,
                 relation_oid,
                 old_data,
+                replica_identity,
+                key_columns,
             },
             lsn: None,
             metadata: None,
@@ -202,6 +214,28 @@ impl ChangeEvent {
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = Some(metadata);
         self
+    }
+
+    /// Get key columns from UPDATE or DELETE events
+    pub fn get_key_columns(&self) -> Option<&Vec<String>> {
+        match &self.event_type {
+            EventType::Update { key_columns, .. } => Some(key_columns),
+            EventType::Delete { key_columns, .. } => Some(key_columns),
+            _ => None,
+        }
+    }
+
+    /// Get replica identity from UPDATE or DELETE events
+    pub fn get_replica_identity(&self) -> Option<&ReplicaIdentity> {
+        match &self.event_type {
+            EventType::Update {
+                replica_identity, ..
+            } => Some(replica_identity),
+            EventType::Delete {
+                replica_identity, ..
+            } => Some(replica_identity),
+            _ => None,
+        }
     }
 }
 

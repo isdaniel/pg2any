@@ -1,6 +1,6 @@
 use pg2any_lib::{
     destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationFactory},
-    types::{ChangeEvent, EventType},
+    types::{ChangeEvent, EventType, ReplicaIdentity},
     DestinationType,
 };
 use std::collections::HashMap;
@@ -164,6 +164,8 @@ fn create_update_event() -> ChangeEvent {
         456,
         Some(old_data),
         new_data,
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
     )
 }
 
@@ -183,6 +185,8 @@ fn create_delete_event() -> ChangeEvent {
         "test_table".to_string(),
         456,
         old_data,
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
     )
 }
 
@@ -203,6 +207,8 @@ fn create_update_event_without_old_data() -> ChangeEvent {
         456,
         None, // This simulates REPLICA IDENTITY NOTHING
         new_data,
+        ReplicaIdentity::Nothing,
+        vec!["id".to_string()], // fallback key columns
     )
 }
 

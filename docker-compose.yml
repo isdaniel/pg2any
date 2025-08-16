@@ -10,10 +10,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test.123
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    restart: always
     ports:
       - "7777:5432"
-    networks:
-      - cdc_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -30,6 +29,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: cdc_mysql
+    restart: always
     environment:
       MYSQL_ROOT_PASSWORD: test.123 
       MYSQL_DATABASE: cdc_db
@@ -37,8 +37,6 @@ services:
       MYSQL_PASSWORD: test.123
     ports:
       - "3306:3306"
-    networks:
-      - cdc_network
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
       interval: 10s
@@ -91,8 +89,6 @@ services:
       
   #   volumes:
   #     - ./logs:/app/logs
-  #   networks:
-  #     - cdc_network
   #   restart: unless-stopped
   #   healthcheck:
   #     test: ["CMD", "pgrep", "-f", "pg2any"]
@@ -100,10 +96,3 @@ services:
   #     timeout: 10s
   #     retries: 3
   #     start_period: 60s
-
-networks:
-  cdc_network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16

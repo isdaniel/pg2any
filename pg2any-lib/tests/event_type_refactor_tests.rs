@@ -1,5 +1,5 @@
 use chrono::Utc;
-use pg2any_lib::types::{ChangeEvent, EventType};
+use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -43,6 +43,8 @@ fn test_new_event_type_update() {
         123,
         Some(old_data.clone()),
         new_data.clone(),
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
     );
 
     match event.event_type {
@@ -52,12 +54,16 @@ fn test_new_event_type_update() {
             relation_oid,
             old_data: event_old_data,
             new_data: event_new_data,
+            replica_identity,
+            key_columns,
         } => {
             assert_eq!(schema, "public");
             assert_eq!(table, "users");
             assert_eq!(relation_oid, 123);
             assert_eq!(event_old_data, Some(old_data));
             assert_eq!(event_new_data, new_data);
+            assert_eq!(replica_identity, ReplicaIdentity::Default);
+            assert_eq!(key_columns, vec!["id".to_string()]);
         }
         _ => panic!("Expected Update variant"),
     }
@@ -74,6 +80,8 @@ fn test_new_event_type_delete() {
         "users".to_string(),
         123,
         old_data.clone(),
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
     );
 
     match event.event_type {
@@ -82,11 +90,15 @@ fn test_new_event_type_delete() {
             table,
             relation_oid,
             old_data: event_old_data,
+            replica_identity,
+            key_columns,
         } => {
             assert_eq!(schema, "public");
             assert_eq!(table, "users");
             assert_eq!(relation_oid, 123);
             assert_eq!(event_old_data, old_data);
+            assert_eq!(replica_identity, ReplicaIdentity::Default);
+            assert_eq!(key_columns, vec!["id".to_string()]);
         }
         _ => panic!("Expected Delete variant"),
     }

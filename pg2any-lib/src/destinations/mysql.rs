@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use sqlx::MySqlPool;
-use std::{collections::HashMap, ops::Deref};
+use std::collections::HashMap;
 use tracing::debug;
 
 /// MySQL destination implementation
@@ -164,15 +164,15 @@ impl MySQLDestination {
                 let data_source = match old_data {
                     Some(old) => old,
                     None => new_data.ok_or_else(|| {
-                            CdcError::generic(format!(
-                                "No data available to build WHERE clause for {} on {}.{}",
-                                op.name(),
-                                schema,
-                                table
-                            ))
-                        })?
+                        CdcError::generic(format!(
+                            "No data available to build WHERE clause for {} on {}.{}",
+                            op.name(),
+                            schema,
+                            table
+                        ))
+                    })?,
                 };
-                
+
                 for key_column in key_columns {
                     if let Some(value) = data_source.get(key_column) {
                         conditions.push(format!("`{}` = ?", key_column));

@@ -50,25 +50,13 @@ This is a **working CDC implementation** that provides comprehensive PostgreSQL 
 - ✅ **Development Tools**: Makefile, formatting, testing, and linting setup
 
 
-## Quick Start
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-pg2any = "0.1.0"
-tokio = { version = "1.0", features = ["full"] }
-anyhow = "1.0"
-tracing-subscriber = "0.3"
-```
-
 ### Basic Usage
 
 ```rust
 use pg2any_lib::{client::CdcClient, Config, DestinationType};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::init();
 
@@ -375,7 +363,6 @@ When you run the application, you'll see structured logging output like this:
 - `chrono`: Date and time handling with timezone support
 - `tracing` & `tracing-subscriber`: Structured logging and observability
 - `thiserror`: Ergonomic error handling and propagation
-- `anyhow`: Flexible application-level error handling
 - `async-trait`: Async trait definitions
 - `bytes`: Byte buffer manipulation
 - `libpq-sys`: Low-level PostgreSQL C library bindings for replication

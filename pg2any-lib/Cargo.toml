@@ -25,9 +25,6 @@ libc = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
-[dev-dependencies]
-anyhow = { workspace = true }
-
 [features]
 default = ["mysql", "sqlserver"]
 mysql = ["sqlx"]

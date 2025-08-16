@@ -20,7 +20,7 @@
 //! use pg2any_lib::{CdcClient, Config, DestinationType};
 //!
 //! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = Config::builder()
 //!         .source_connection_string("postgresql://user:password@localhost/source_db")
 //!         .destination_type(DestinationType::MySQL)

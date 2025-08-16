@@ -621,7 +621,10 @@ mod tests {
         assert!(client.consumer_handle.is_none());
 
         // Test graceful shutdown without starting tasks
-        client.stop().await.expect("Stop should succeed even without tasks");
+        client
+            .stop()
+            .await
+            .expect("Stop should succeed even without tasks");
         assert!(!client.is_running());
     }
 
@@ -633,7 +636,10 @@ mod tests {
             .expect("Failed to create client");
 
         // Should not fail when no tasks are running
-        client.wait_for_tasks_completion().await.expect("Should succeed with no tasks");
+        client
+            .wait_for_tasks_completion()
+            .await
+            .expect("Should succeed with no tasks");
     }
 
     #[tokio::test]

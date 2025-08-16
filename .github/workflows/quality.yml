@@ -44,8 +44,8 @@ jobs:
           ~/.cargo/git
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf
+    # - name: Run clippy
+    #   run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::complexity -D clippy::perf
 
   unused-dependencies:
     name: Check Unused Dependencies

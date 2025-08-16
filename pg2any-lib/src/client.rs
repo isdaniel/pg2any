@@ -6,6 +6,7 @@ use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, Lsn};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -18,6 +19,8 @@ pub struct CdcClient {
     event_sender: Option<mpsc::Sender<ChangeEvent>>,
     event_receiver: Option<mpsc::Receiver<ChangeEvent>>,
     cancellation_token: CancellationToken,
+    producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl CdcClient {
@@ -40,6 +43,8 @@ impl CdcClient {
             event_sender: Some(event_sender),
             event_receiver: Some(event_receiver),
             cancellation_token: CancellationToken::new(),
+            producer_handle: None,
+            consumer_handle: None,
         })
     }
 
@@ -117,25 +122,12 @@ impl CdcClient {
             .await
         });
 
+        // Store the task handles for graceful shutdown
+        self.producer_handle = Some(producer_handle);
+        self.consumer_handle = Some(consumer_handle);
+        self.wait_for_tasks_completion().await?;
         info!("CDC replication started successfully");
-
-        // Wait for both tasks to complete or cancellation
-        let (producer_result, consumer_result) = tokio::join!(producer_handle, consumer_handle);
-
-        match (producer_result, consumer_result) {
-            (Ok(Ok(())), Ok(Ok(()))) => {
-                info!("CDC replication completed successfully");
-                Ok(())
-            }
-            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
-                error!("CDC replication failed: {}", e);
-                Err(e)
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                error!("CDC task panicked: {}", e);
-                Err(CdcError::generic(format!("Task panic: {}", e)))
-            }
-        }
+        Ok(())
     }
 
     /// Producer task: reads events from PostgreSQL replication stream
@@ -148,6 +140,7 @@ impl CdcClient {
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancellation_token.cancelled() => {
                     info!("Producer received cancellation signal");
                     break;
@@ -257,19 +250,38 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Stop the CDC replication process
+    /// Stop the CDC replication process gracefully
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Stopping CDC replication");
+        info!("Initiating graceful shutdown of CDC replication");
 
-        // Cancel all running tasks
+        // Signal cancellation to all tasks
         self.cancellation_token.cancel();
+
+        // Wait for both tasks to complete gracefully
+        self.wait_for_tasks_completion().await?;
 
         // Close destination connection
         if let Some(ref mut handler) = self.destination_handler {
             handler.close().await?;
         }
 
-        info!("CDC replication stopped");
+        info!("CDC replication stopped gracefully");
+        Ok(())
+    }
+
+    async fn wait_handle(handle: Option<JoinHandle<Result<()>>>, name: &str) -> Result<()> {
+        if let Some(h) = handle {
+            h.await.expect(&format!("{} task panicked", name))?;
+            info!("{} task completed successfully", name);
+        }
+        Ok(())
+    }
+
+    /// Wait for producer and consumer tasks to complete gracefully
+    pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
+        Self::wait_handle(self.producer_handle.take(), "Producer").await?;
+        Self::wait_handle(self.consumer_handle.take(), "Consumer").await?;
+        info!("All CDC tasks completed successfully");
         Ok(())
     }
 
@@ -338,7 +350,7 @@ impl Drop for CdcClient {
 mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
-    use crate::types::{ChangeEvent, EventType};
+    use crate::types::ChangeEvent;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
@@ -480,6 +492,7 @@ mod tests {
             // Simulate the producer loop structure
             loop {
                 tokio::select! {
+                    biased;
                     _ = token_clone.cancelled() => {
                         info!("Producer received cancellation signal");
                         break;
@@ -594,6 +607,33 @@ mod tests {
             !processed_events.is_empty(),
             "Consumer should have processed some events before shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_with_task_handles() {
+        let config = create_test_config();
+        let mut client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
+
+        // Initially no task handles should be set
+        assert!(client.producer_handle.is_none());
+        assert!(client.consumer_handle.is_none());
+
+        // Test graceful shutdown without starting tasks
+        client.stop().await.expect("Stop should succeed even without tasks");
+        assert!(!client.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_tasks_completion_with_no_tasks() {
+        let config = create_test_config();
+        let mut client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
+
+        // Should not fail when no tasks are running
+        client.wait_for_tasks_completion().await.expect("Should succeed with no tasks");
     }
 
     #[tokio::test]

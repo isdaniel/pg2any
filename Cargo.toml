@@ -22,7 +22,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 
 [workspace.package]
 version = "0.1.0"
@@ -41,7 +40,6 @@ chrono = { version = "0.4.41", features = ["serde"] }
 bytes = "1.10.1"
 async-trait = "0.1.88"
 thiserror = "2.0.12"
-anyhow = "1.0.98"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tiberius = { version = "0.12", features = ["tds73", "sql-browser-tokio", "bigdecimal", "rust_decimal", "time", "chrono"] }

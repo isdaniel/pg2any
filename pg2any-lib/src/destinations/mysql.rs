@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use sqlx::MySqlPool;
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 use tracing::debug;
 
 /// MySQL destination implementation
@@ -161,19 +161,20 @@ impl MySQLDestination {
                 let mut conditions = Vec::new();
                 let mut bind_values = Vec::new();
 
-                let data_source = old_data.as_ref();
-
-                let Some(data) = data_source else {
-                    return Err(CdcError::generic(format!(
-                        "Missing data source for {} on {}.{}",
-                        op.name(),
-                        schema,
-                        table
-                    )));
+                let data_source = match old_data {
+                    Some(old) => old,
+                    None => new_data.ok_or_else(|| {
+                            CdcError::generic(format!(
+                                "No data available to build WHERE clause for {} on {}.{}",
+                                op.name(),
+                                schema,
+                                table
+                            ))
+                        })?
                 };
-
+                
                 for key_column in key_columns {
-                    if let Some(value) = data.get(key_column) {
+                    if let Some(value) = data_source.get(key_column) {
                         conditions.push(format!("`{}` = ?", key_column));
                         bind_values.push(value.clone());
                     } else {

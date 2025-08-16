@@ -47,6 +47,8 @@ format:
 run:
 	cargo run
 
+before-git-push: check format test
+
 # Docker commands
 docker-build:
 	docker-compose build
@@ -70,11 +72,17 @@ docker-status:
 	docker-compose ps
 
 # Database connection shortcuts
-psql:
+docker-pg:
 	docker-compose exec postgres psql -U postgres -d postgres
 
-mysql:
+docker-mysql:
 	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db
+
+psql:
+	psql -h 127.0.0.1 -U postgres -p 7777 postgres
+
+mysql:
+	mysql -h 127.0.0.1 -P 3306 -u root -ptest.123 public
 
 # Database utilities  
 test-data:
@@ -98,4 +106,3 @@ reset: docker-clean docker-build docker-start
 
 clean:
 	cargo clean
-	docker-compose down -v

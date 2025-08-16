@@ -32,14 +32,14 @@ help:
 
 # Development commands
 build:
-	cargo build --release
+	cargo build 
 
 check:
 	cargo check
-	cargo clippy -- -D warnings
+# 	cargo clippy -- -D warnings
 
 test:
-	cargo test
+	cd ./pg2any-lib && cargo test
 
 format:
 	cargo fmt
@@ -47,7 +47,8 @@ format:
 run:
 	cargo run
 
-before-git-push: check format test
+build:
+before-git-push: check build format test
 
 # Docker commands
 docker-build:

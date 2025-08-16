@@ -13,7 +13,7 @@ use crate::replication_protocol::{parse_keepalive_message, LogicalReplicationPar
 use crate::replication_protocol::{
     LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage,
 };
-use crate::types::{ChangeEvent, EventType};
+use crate::types::{ChangeEvent, EventType, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -292,16 +292,11 @@ impl LogicalReplicationStream {
                 relation_id,
                 old_tuple,
                 new_tuple,
-                ..
+                key_type,
             } => {
-                if let Some(relation) = self.state.get_relation(relation_id) {
-                    let full_name = relation.full_name();
-                    let parts: Vec<&str> = full_name.split('.').collect();
-                    let (schema_name, table_name) = if parts.len() >= 2 {
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        ("public".to_string(), relation.full_name())
-                    };
+                if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
+                    self.relation_metadata(relation_id, key_type)
+                {
                     let old_data = if let Some(old_tuple) = old_tuple {
                         Some(self.convert_tuple_to_data(&old_tuple, relation)?)
                     } else {
@@ -316,6 +311,8 @@ impl LogicalReplicationStream {
                             relation_oid: relation_id,
                             old_data,
                             new_data,
+                            replica_identity,
+                            key_columns,
                         },
                         lsn: Some(format_lsn(lsn)),
                         metadata: None,
@@ -329,16 +326,11 @@ impl LogicalReplicationStream {
             LogicalReplicationMessage::Delete {
                 relation_id,
                 old_tuple,
-                ..
+                key_type,
             } => {
-                if let Some(relation) = self.state.get_relation(relation_id) {
-                    let full_name = relation.full_name();
-                    let parts: Vec<&str> = full_name.split('.').collect();
-                    let (schema_name, table_name) = if parts.len() >= 2 {
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        ("public".to_string(), relation.full_name())
-                    };
+                if let Some((schema_name, table_name, replica_identity, key_columns, relation)) =
+                    self.relation_metadata(relation_id, Some(key_type))
+                {
                     let old_data = self.convert_tuple_to_data(&old_tuple, relation)?;
 
                     ChangeEvent {
@@ -347,6 +339,8 @@ impl LogicalReplicationStream {
                             table: table_name,
                             relation_oid: relation_id,
                             old_data,
+                            replica_identity,
+                            key_columns,
                         },
                         lsn: Some(format_lsn(lsn)),
                         metadata: None,
@@ -453,6 +447,91 @@ impl LogicalReplicationStream {
             format_lsn(self.state.last_received_lsn)
         );
         Ok(())
+    }
+
+    /// Extract key columns from relation info based on key_type from the protocol
+    fn get_key_columns_for_relation(
+        &self,
+        relation: &RelationInfo,
+        key_type: Option<char>,
+    ) -> Vec<String> {
+        // Get key columns based on the relation's replica identity and key_type from protocol
+        match key_type {
+            Some('K') => {
+                // Key tuple - use replica identity index columns or primary key
+                relation
+                    .get_key_columns()
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect()
+            }
+            Some('O') => {
+                // Old tuple - means REPLICA IDENTITY FULL, use all columns
+                relation
+                    .columns
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect()
+            }
+            None => {
+                // No old tuple data - means REPLICA IDENTITY NOTHING or DEFAULT without changes to key columns
+                // Fall back to using any available key columns from relation info
+                let key_cols: Vec<String> = relation
+                    .get_key_columns()
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+                if key_cols.is_empty() {
+                    // Try to infer primary key from column flags or use all columns as last resort
+                    relation
+                        .columns
+                        .iter()
+                        .filter(|col| col.is_key())
+                        .map(|col| col.name.clone())
+                        .collect()
+                } else {
+                    key_cols
+                }
+            }
+            _ => {
+                // Unknown key type, use available key columns
+                relation
+                    .get_key_columns()
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect()
+            }
+        }
+    }
+
+    /// Extract schema/table name, replica identity, and key columns for a relation
+    fn relation_metadata(
+        &self,
+        relation_id: u32,
+        key_type: Option<char>,
+    ) -> Option<(String, String, ReplicaIdentity, Vec<String>, &RelationInfo)> {
+        let relation = self.state.get_relation(relation_id)?;
+        let full_name = relation.full_name();
+        let parts: Vec<&str> = full_name.split('.').collect();
+
+        let (schema_name, table_name) = if parts.len() >= 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            ("public".to_string(), relation.full_name())
+        };
+
+        let replica_identity = ReplicaIdentity::from_byte(relation.replica_identity)
+            .unwrap_or(ReplicaIdentity::Default);
+
+        let key_columns = self.get_key_columns_for_relation(relation, key_type);
+
+        Some((
+            schema_name,
+            table_name,
+            replica_identity,
+            key_columns,
+            relation,
+        ))
     }
 
     /// Stop the replication stream

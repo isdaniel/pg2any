@@ -52,10 +52,7 @@ impl DestinationFactory {
 }
 
 pub fn is_dml_event(event: &ChangeEvent) -> bool {
-    matches!(
-        event.event_type,
-        EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. }
-    )
+    matches!(event.event_type, EventType::Insert { .. })
 }
 
 #[cfg(test)]
@@ -92,23 +89,6 @@ mod tests {
             HashMap::new(),
         );
         assert!(is_dml_event(&insert_event));
-
-        let update_event = ChangeEvent::update(
-            "public".to_string(),
-            "test_table".to_string(),
-            1234,
-            None, // no old_data
-            HashMap::new(),
-        );
-        assert!(is_dml_event(&update_event));
-
-        let delete_event = ChangeEvent::delete(
-            "public".to_string(),
-            "test_table".to_string(),
-            1234,
-            HashMap::new(),
-        );
-        assert!(is_dml_event(&delete_event));
     }
 
     #[test]

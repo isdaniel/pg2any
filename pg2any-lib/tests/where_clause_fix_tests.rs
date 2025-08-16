@@ -1,4 +1,4 @@
-use pg2any_lib::types::{ChangeEvent, EventType};
+use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
 use std::collections::HashMap;
 
 /// Test to demonstrate the fix for UPDATE WHERE clause issue
@@ -40,6 +40,8 @@ fn test_update_where_clause_uses_old_data() {
         16384,
         Some(old_data),
         new_data,
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
     );
 
     // Test that the event structure correctly supports proper WHERE clause generation
@@ -114,7 +116,14 @@ fn test_delete_where_clause_uses_old_data() {
         serde_json::Value::String("user_to_delete".to_string()),
     );
 
-    let event = ChangeEvent::delete("public".to_string(), "users".to_string(), 16384, old_data);
+    let event = ChangeEvent::delete(
+        "public".to_string(),
+        "users".to_string(),
+        16384,
+        old_data,
+        ReplicaIdentity::Default,
+        vec!["id".to_string()],
+    );
 
     // Verify DELETE event structure
     match &event.event_type {
@@ -149,6 +158,8 @@ fn test_update_fallback_when_no_old_data() {
         16385,
         None, // Simulates REPLICA IDENTITY NOTHING
         new_data,
+        ReplicaIdentity::Nothing,
+        vec!["id".to_string()], // fallback key columns
     );
 
     // Verify the fallback scenario

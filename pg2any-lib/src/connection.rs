@@ -35,7 +35,7 @@ impl PostgresConnection {
             "Connecting to PostgreSQL: {}",
             self.mask_password(&self.connection_string)
         );
-
+        //todo support tls connection
         let (client, connection) = tokio_postgres::connect(&self.connection_string, NoTls).await?;
 
         // Spawn the connection task

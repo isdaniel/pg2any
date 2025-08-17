@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and initialize CDC client
     let mut client = CdcClient::new(config).await?;
     client.init().await?;
-    client.start_replication().await?;
+    client.start_replication_from_lsn(None).await?;
     
     Ok(())
 }

@@ -30,7 +30,7 @@
 //!         .build()?;
 //!     
 //!     let mut client = CdcClient::new(config).await?;
-//!     client.start_replication().await?;
+//!     client.start_replication_from_lsn(None).await?;
 //!     
 //!     Ok(())
 //! }

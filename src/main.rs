@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run CDC replication with graceful shutdown
     tokio::select! {
-        result = client.start_replication() => {
+        result = client.start_replication_from_lsn(None) => {
             match result {
                 Ok(()) => {
                     tracing::info!("✅ CDC replication completed successfully");

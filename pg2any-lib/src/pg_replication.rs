@@ -357,7 +357,8 @@ impl PgReplicationConnection {
 
         loop {
             if cancellation_token.is_cancelled() {
-                return Ok(None);
+                info!("get_copy_data_async received cancellation_token is_cancelled request.");
+                break;
             }
 
             // Wait for socket to be readable
@@ -371,6 +372,7 @@ impl PgReplicationConnection {
 
             guard.clear_ready();
         }
+        Ok(None)
     }
 
     fn try_read_copy_data(&self) -> Result<Option<Vec<u8>>> {
@@ -586,6 +588,10 @@ impl ReplicationStream {
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        if let Some(last_lsn) = self.last_received_lsn {
+            info!("Sending final LSN feedback: {last_lsn}");
+            self.send_feedback();
+        }
         info!("Stopping logical replication stream");
         self.logical_stream.stop().await?;
         Ok(())

@@ -62,12 +62,7 @@ impl CdcClient {
         info!("CDC client initialized successfully");
         Ok(())
     }
-
-    /// Start the CDC replication process
-    pub async fn start_replication(&mut self) -> Result<()> {
-        self.start_replication_from_lsn(None).await
-    }
-
+    
     /// Start CDC replication from a specific LSN
     pub async fn start_replication_from_lsn(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting CDC replication");
@@ -125,8 +120,9 @@ impl CdcClient {
         // Store the task handles for graceful shutdown
         self.producer_handle = Some(producer_handle);
         self.consumer_handle = Some(consumer_handle);
-        self.wait_for_tasks_completion().await?;
+        let tasks = self.wait_for_tasks_completion();
         info!("CDC replication started successfully");
+        tasks.await?;
         Ok(())
     }
 
@@ -167,13 +163,7 @@ impl CdcClient {
                 }
             }
         }
-
-        // Send final feedback to PostgreSQL server with the last processed LSN
-        if let Some(last_lsn) = replication_stream.current_lsn() {
-            info!("Sending final LSN feedback: {:?}", last_lsn);
-            replication_stream.send_feedback();
-        }
-
+        
         // Gracefully stop the replication stream
         if let Err(e) = replication_stream.stop().await {
             warn!("Error stopping replication stream: {}", e);
@@ -213,6 +203,7 @@ impl CdcClient {
                         if let Err(e) = destination_handler.process_event(&event).await {
                             error!("Failed to process single event during shutdown: {}", e);
                         }
+                        remaining_events -= 1;
                     }
                     if remaining_events > 0 {
                         info!("Processed {} remaining events during graceful shutdown", remaining_events);

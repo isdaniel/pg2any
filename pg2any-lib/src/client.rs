@@ -62,7 +62,7 @@ impl CdcClient {
         info!("CDC client initialized successfully");
         Ok(())
     }
-    
+
     /// Start CDC replication from a specific LSN
     pub async fn start_replication_from_lsn(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting CDC replication");
@@ -163,7 +163,7 @@ impl CdcClient {
                 }
             }
         }
-        
+
         // Gracefully stop the replication stream
         if let Err(e) = replication_stream.stop().await {
             warn!("Error stopping replication stream: {}", e);

@@ -236,6 +236,9 @@ std::env::set_var("CDC_DEST_DB", "cdc_db");
 std::env::set_var("CDC_DEST_USER", "cdc_user");
 std::env::set_var("CDC_DEST_PASSWORD", "test.123");
 
+// I/O Thread and SQL Thread configuration
+std::env::set_var("PG2ANY_RELAY_LOG_DIR", "/var/lib/pg2any/relay_logs");
+
 // Or using the builder pattern
 let config = Config::builder()
     .source_connection_string("postgresql://postgres:test.123@localhost:7777/postgres")
@@ -243,6 +246,7 @@ let config = Config::builder()
     .destination_connection_string("mysql://cdc_user:test.123@localhost:3306/cdc_db")
     .replication_slot_name("cdc_slot")
     .publication_name("cdc_pub")
+    .relay_log_directory(Some("/var/lib/pg2any/relay_logs"))
     .protocol_version(1)
     .binary_format(false)
     .streaming(true)
@@ -251,6 +255,69 @@ let config = Config::builder()
     .query_timeout(Duration::from_secs(10))
     .heartbeat_interval(Duration::from_secs(10))
     .build()?;
+```
+
+## Environment Variables Reference
+
+The following environment variables can be used to configure pg2any:
+
+### Source Database (PostgreSQL)
+- `CDC_SOURCE_HOST` - PostgreSQL hostname (default: `localhost`)
+- `CDC_SOURCE_PORT` - PostgreSQL port (default: `5432`)
+- `CDC_SOURCE_DB` - PostgreSQL database name (default: `postgres`)
+- `CDC_SOURCE_USER` - PostgreSQL username (default: `postgres`)
+- `CDC_SOURCE_PASSWORD` - PostgreSQL password (default: `postgres`)
+
+### Destination Database
+- `CDC_DEST_TYPE` - Destination type: `MySQL` or `SqlServer` (default: `MySQL`)
+- `CDC_DEST_HOST` - Destination hostname (default: `localhost`)
+- `CDC_DEST_PORT` - Destination port (default: `3306` for MySQL)
+- `CDC_DEST_DB` - Destination database name (default: `cdc_target`)
+- `CDC_DEST_USER` - Destination username (default: `cdc_user`)
+- `CDC_DEST_PASSWORD` - Destination password (default: `cdc_password`)
+
+### Replication Configuration
+- `CDC_REPLICATION_SLOT` - PostgreSQL replication slot name (default: `cdc_slot`)
+- `CDC_PUBLICATION` - PostgreSQL publication name (default: `cdc_pub`)
+- `CDC_AUTO_CREATE_TABLES` - Auto-create destination tables: `true`/`false` (default: `true`)
+- `CDC_PROTOCOL_VERSION` - Protocol version 1-4 (default: `1`)
+- `CDC_BINARY_FORMAT` - Use binary format: `true`/`false` (default: `false`)
+- `CDC_STREAMING` - Enable streaming: `true`/`false` (default: `false`)
+
+### I/O Thread and Performance
+- `PG2ANY_RELAY_LOG_DIR` - Directory for relay log files (default: `relay_logs`)
+- `CDC_BUFFER_SIZE` - Buffer size for event processing (default: `10000`)
+- `CDC_CONNECTION_TIMEOUT` - Connection timeout in seconds (default: `30`)
+- `CDC_QUERY_TIMEOUT` - Query timeout in seconds (default: `60`)
+- `CDC_HEARTBEAT_INTERVAL` - Heartbeat interval in seconds (default: `10`)
+
+### Example Docker Environment File
+
+Create a `.env` file for Docker:
+
+```bash
+# Source Database
+CDC_SOURCE_HOST=postgres
+CDC_SOURCE_PORT=5432
+CDC_SOURCE_DB=postgres
+CDC_SOURCE_USER=postgres
+CDC_SOURCE_PASSWORD=test.123
+
+# Destination Database
+CDC_DEST_TYPE=MySQL
+CDC_DEST_HOST=mysql
+CDC_DEST_PORT=3306
+CDC_DEST_DB=cdc_db
+CDC_DEST_USER=cdc_user
+CDC_DEST_PASSWORD=test.123
+
+# I/O Thread Configuration
+PG2ANY_RELAY_LOG_DIR=/var/lib/pg2any/relay_logs
+
+# Replication Settings
+CDC_REPLICATION_SLOT=cdc_slot
+CDC_PUBLICATION=cdc_pub
+CDC_AUTO_CREATE_TABLES=true
 ```
 
 ## Development Status

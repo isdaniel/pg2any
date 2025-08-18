@@ -51,6 +51,9 @@ pub struct Config {
     /// Buffer size for the event channel (kept for channel capacity)
     pub buffer_size: usize,
 
+    /// Relay log directory for I/O thread to write events
+    pub relay_log_directory: Option<String>,
+
     /// Whether to create missing destination tables automatically
     pub auto_create_tables: bool,
 
@@ -147,6 +150,7 @@ impl Default for Config {
             query_timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10), // Send feedback every 10 seconds to prevent 60s timeout
             buffer_size: 1000,
+            relay_log_directory: None,
             auto_create_tables: true,
             table_mappings: HashMap::new(),
             extra_options: HashMap::new(),
@@ -255,6 +259,12 @@ impl ConfigBuilder {
     /// Set buffer size
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.config.buffer_size = size;
+        self
+    }
+
+    /// Set relay log directory
+    pub fn relay_log_directory<S: Into<String>>(mut self, directory: Option<S>) -> Self {
+        self.config.relay_log_directory = directory.map(|d| d.into());
         self
     }
 

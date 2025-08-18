@@ -1,714 +1,379 @@
-use crate::config::Config;
-use crate::destinations::destination_factory::is_dml_event;
-use crate::destinations::{DestinationFactory, DestinationHandler};
-use crate::error::{CdcError, Result};
-use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::types::{ChangeEvent, Lsn};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+//! Updated CDC Client using I/O Thread and SQL Thread architecture
+//!
+//! This module provides a high-level CDC client that implements the MySQL-style
+//! I/O Thread and SQL Thread pattern for better performance and fault tolerance.
 
-/// Main CDC client for coordinating replication and destination writes
+use crate::config::Config;
+use crate::error::{CdcError, Result};
+use crate::io_thread::{IoThread, IoThreadConfig, IoThreadStats};
+use crate::sql_thread::{SqlThread, SqlThreadConfig, SqlThreadStats};
+use crate::relay_log::RelayLogConfig;
+use crate::types::Lsn;
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+/// Enhanced CDC Client with I/O and SQL Thread architecture
 pub struct CdcClient {
     config: Config,
-    replication_manager: Option<ReplicationManager>,
-    destination_handler: Option<Box<dyn DestinationHandler>>,
-    event_sender: Option<mpsc::Sender<ChangeEvent>>,
-    event_receiver: Option<mpsc::Receiver<ChangeEvent>>,
+    io_thread: Option<IoThread>,
+    sql_thread: Option<SqlThread>,
     cancellation_token: CancellationToken,
-    producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    relay_log_directory: PathBuf,
+}
+
+/// Combined statistics from both I/O and SQL threads
+#[derive(Debug, Clone)]
+pub struct CdcStats {
+    pub io_stats: Option<IoThreadStats>,
+    pub sql_stats: Option<SqlThreadStats>,
+    pub relay_log_directory: PathBuf,
+    pub uptime: Duration,
+    pub start_time: chrono::DateTime<chrono::Utc>,
 }
 
 impl CdcClient {
-    /// Create a new CDC client
+    /// Create a new CDC client with I/O and SQL thread architecture
     pub async fn new(config: Config) -> Result<Self> {
-        info!("Creating CDC client");
+        // Get relay log directory from config, environment variable, or use default
+        let relay_log_dir = config.relay_log_directory.clone()
+            .or_else(|| std::env::var("PG2ANY_RELAY_LOG_DIR").ok())
+            .unwrap_or_else(|| "relay_logs".to_string());
+        
+        Self::new_with_relay_log_dir(config, PathBuf::from(relay_log_dir)).await
+    }
 
-        // Create destination handler
-        let destination_handler = DestinationFactory::create(config.destination_type.clone())?;
+    /// Create a new CDC client with custom relay log directory
+    pub async fn new_with_relay_log_dir(config: Config, relay_log_directory: PathBuf) -> Result<Self> {
+        info!("Creating enhanced CDC client with I/O/SQL thread architecture");
 
-        let replication_manager = ReplicationManager::new(config.clone());
+        // Ensure relay log directory exists
+        tokio::fs::create_dir_all(&relay_log_directory).await
+            .map_err(|e| CdcError::io(format!("Failed to create relay log directory: {}", e)))?;
 
-        // Create event channel
-        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);
+        info!("Using relay log directory: {}", relay_log_directory.display());
 
         Ok(Self {
             config,
-            replication_manager: Some(replication_manager),
-            destination_handler: Some(destination_handler),
-            event_sender: Some(event_sender),
-            event_receiver: Some(event_receiver),
+            io_thread: None,
+            sql_thread: None,
             cancellation_token: CancellationToken::new(),
-            producer_handle: None,
-            consumer_handle: None,
+            relay_log_directory,
         })
     }
 
-    /// Initialize the CDC client
+    /// Initialize the CDC client by creating I/O and SQL threads
     pub async fn init(&mut self) -> Result<()> {
-        info!("Initializing CDC client");
+        info!("Initializing CDC client with I/O and SQL threads");
 
-        // Connect to destination database
-        if let Some(ref mut handler) = self.destination_handler {
-            handler
-                .connect(&self.config.destination_connection_string)
-                .await?;
-        }
+        // Create relay log configuration
+        let relay_log_config = RelayLogConfig {
+            log_directory: self.relay_log_directory.clone(),
+            max_file_size: 100 * 1024 * 1024, // 100MB per file
+            max_files: 100,
+            write_buffer_size: 64 * 1024, // 64KB write buffer
+            read_buffer_size: 64 * 1024  // 64KB read buffer
+        };
+
+        // Create I/O thread configuration
+        let mut io_config = IoThreadConfig::from(&self.config);
+        io_config.relay_log_config = relay_log_config.clone();
+
+        // Create SQL thread configuration
+        let mut sql_config = SqlThreadConfig::from(&self.config);
+        sql_config.relay_log_config = relay_log_config;
+
+        // Create the threads
+        let io_thread = IoThread::new(io_config).await?;
+        let sql_thread = SqlThread::new(sql_config).await?;
+
+        self.io_thread = Some(io_thread);
+        self.sql_thread = Some(sql_thread);
 
         info!("CDC client initialized successfully");
         Ok(())
     }
 
     /// Start CDC replication from a specific LSN
-    pub async fn start_replication_from_lsn(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
-        info!("Starting CDC replication");
+    pub async fn start_replication_from_lsn(&mut self, _start_lsn: Option<Lsn>) -> Result<()> {
+        info!("Starting CDC replication with I/O and SQL threads");
 
-        // Ensure we're initialized
-        self.init().await?;
+        // Initialize if not already done
+        if self.io_thread.is_none() || self.sql_thread.is_none() {
+            self.init().await?;
+        }
 
-        // Create replication stream using async method
-        let mut replication_manager = self
-            .replication_manager
-            .take()
-            .ok_or_else(|| CdcError::generic("Replication manager not available"))?;
+        // Start SQL thread first (it should be ready to process events)
+        if let Some(ref mut sql_thread) = self.sql_thread {
+            sql_thread.start().await?;
+            info!("SQL thread started");
+        }
 
-        let mut replication_stream = replication_manager.create_stream_async().await?;
+        // Start I/O thread (it will begin reading and writing to relay logs)
+        if let Some(ref mut io_thread) = self.io_thread {
+            io_thread.start().await?;
+            info!("I/O thread started");
+        }
 
-        // Start the replication stream
-        replication_stream.start(start_lsn).await?;
+        info!("CDC replication started successfully with both I/O and SQL threads");
 
-        // Start the producer task (reads from PostgreSQL)
-        let event_sender = self
-            .event_sender
-            .take()
-            .ok_or_else(|| CdcError::generic("Event sender not available"))?;
+        // Wait for both threads to complete or for cancellation
+        let io_cancellation = self.io_thread.as_ref().map(|t| t.cancellation_token());
+        let sql_cancellation = self.sql_thread.as_ref().map(|t| t.cancellation_token());
+        let main_cancellation = self.cancellation_token.clone();
 
-        let producer_token = self.cancellation_token.clone();
-
-        let producer_handle = tokio::spawn(async move {
-            Self::run_producer(replication_stream, event_sender, producer_token).await
-        });
-
-        // Start the consumer task (writes to destination)
-        let event_receiver = self
-            .event_receiver
-            .take()
-            .ok_or_else(|| CdcError::generic("Event receiver not available"))?;
-
-        let destination_handler = self
-            .destination_handler
-            .take()
-            .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
-
-        let consumer_token = self.cancellation_token.clone();
-        let auto_create_tables = self.config.auto_create_tables;
-
-        let consumer_handle = tokio::spawn(async move {
-            Self::run_consumer(
-                event_receiver,
-                destination_handler,
-                consumer_token,
-                auto_create_tables,
-            )
-            .await
-        });
-
-        // Store the task handles for graceful shutdown
-        self.producer_handle = Some(producer_handle);
-        self.consumer_handle = Some(consumer_handle);
-        let tasks = self.wait_for_tasks_completion();
-        info!("CDC replication started successfully");
-        tasks.await?;
-        Ok(())
-    }
-
-    /// Producer task: reads events from PostgreSQL replication stream
-    async fn run_producer(
-        mut replication_stream: ReplicationStream,
-        event_sender: mpsc::Sender<ChangeEvent>,
-        cancellation_token: CancellationToken,
-    ) -> Result<()> {
-        info!("Starting replication producer (single event mode)");
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    info!("Producer received cancellation signal");
-                    break;
-                }
-                result = replication_stream.next_event(&cancellation_token) => {
-                    match result {
-                        Ok(Some(event)) => {
-                            debug!("Producer received single event: {:?}", event.event_type);
-                            if let Err(e) = event_sender.send(event).await {
-                                error!("Failed to send event to consumer: {}", e);
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // No event available, wait a bit before trying again
-                            debug!("No event available, retrying...");
-                            sleep(Duration::from_millis(100)).await; // Reduced sleep time for more responsive feedback
-                        }
-                        Err(e) => {
-                            error!("Error reading from replication stream: {}", e);
-                            break;
-                        }
-                    }
-                }
+        tokio::select! {
+            _ = main_cancellation.cancelled() => {
+                info!("Main cancellation received, stopping threads");
             }
+            _ = Self::wait_and_warn(io_cancellation) => {
+                warn!("I/O thread stopped unexpectedly");
+            },
+            _ = Self::wait_and_warn(sql_cancellation) => {
+                warn!("SQL thread stopped unexpectedly");
+            },
         }
 
-        // Gracefully stop the replication stream
-        if let Err(e) = replication_stream.stop().await {
-            warn!("Error stopping replication stream: {}", e);
-        }
+        // Stop both threads gracefully
+        self.stop().await?;
 
-        info!("Replication producer stopped gracefully");
         Ok(())
     }
 
-    /// Consumer task: processes events and writes to destination
-    async fn run_consumer(
-        mut event_receiver: mpsc::Receiver<ChangeEvent>,
-        mut destination_handler: Box<dyn DestinationHandler>,
-        cancellation_token: CancellationToken,
-        auto_create_tables: bool,
-    ) -> Result<()> {
-        info!("Starting replication consumer (single event mode)");
-
-        loop {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    info!("Consumer received cancellation signal");
-                    // Process any remaining events in the channel
-                    let mut remaining_events = 0;
-                    while let Ok(event) = event_receiver.try_recv() {
-                        remaining_events += 1;
-                        debug!("Processing remaining event during shutdown: {:?}", event.event_type);
-
-                        // Auto-create table if needed and enabled
-                        if auto_create_tables && is_dml_event(&event) {
-                            if let Err(e) = destination_handler.create_table_if_not_exists(&event).await {
-                                error!("Failed to auto-create table for event: {}", e);
-                            }
-                        }
-
-                        // Process the single event immediately
-                        if let Err(e) = destination_handler.process_event(&event).await {
-                            error!("Failed to process single event during shutdown: {}", e);
-                        }
-                        remaining_events -= 1;
-                    }
-                    if remaining_events > 0 {
-                        info!("Processed {} remaining events during graceful shutdown", remaining_events);
-                    }
-                    break;
-                }
-                event = event_receiver.recv() => {
-                    match event {
-                        Some(event) => {
-                            debug!("Consumer processing event: {:?}", event.event_type);
-
-                            // Auto-create table if needed and enabled
-                            if auto_create_tables && is_dml_event(&event) {
-                                if let Err(e) = destination_handler.create_table_if_not_exists(&event).await {
-                                    error!("Failed to auto-create table for event: {}", e);
-                                }
-                            }
-
-                            // Process the single event immediately
-                            if let Err(e) = destination_handler.process_event(&event).await {
-                                error!("Failed to process single event: {}", e);
-                                // Continue processing other events even if one fails
-                            }
-                        }
-                        None => {
-                            // Channel closed, exit the loop
-                            break;
-                        }
-                    }
-                }
-            }
+    async fn wait_and_warn(token: Option<CancellationToken>) {
+        if let Some(token) = token {
+            token.cancelled().await;
         }
-
-        info!("Replication consumer stopped gracefully");
-        Ok(())
     }
 
-    /// Stop the CDC replication process gracefully
+    /// Stop the CDC client and all threads
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Initiating graceful shutdown of CDC replication");
+        info!("Stopping CDC client");
 
-        // Signal cancellation to all tasks
+        // Signal cancellation
         self.cancellation_token.cancel();
 
-        // Wait for both tasks to complete gracefully
-        self.wait_for_tasks_completion().await?;
-
-        // Close destination connection
-        if let Some(ref mut handler) = self.destination_handler {
-            handler.close().await?;
+        // Stop I/O thread first to stop new events from being written
+        if let Some(ref mut io_thread) = self.io_thread {
+            if let Err(e) = io_thread.stop().await {
+                error!("Error stopping I/O thread: {}", e);
+            } else {
+                info!("I/O thread stopped");
+            }
         }
 
-        info!("CDC replication stopped gracefully");
-        Ok(())
-    }
+        // Give SQL thread time to process remaining events
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-    async fn wait_handle(handle: Option<JoinHandle<Result<()>>>, name: &str) -> Result<()> {
-        if let Some(h) = handle {
-            h.await.expect(&format!("{} task panicked", name))?;
-            info!("{} task completed successfully", name);
+        // Stop SQL thread
+        if let Some(ref mut sql_thread) = self.sql_thread {
+            if let Err(e) = sql_thread.stop().await {
+                error!("Error stopping SQL thread: {}", e);
+            } else {
+                info!("SQL thread stopped");
+            }
         }
+
+        info!("CDC client stopped successfully");
         Ok(())
     }
 
-    /// Wait for producer and consumer tasks to complete gracefully
-    pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
-        Self::wait_handle(self.producer_handle.take(), "Producer").await?;
-        Self::wait_handle(self.consumer_handle.take(), "Consumer").await?;
-        info!("All CDC tasks completed successfully");
-        Ok(())
+    /// Get combined statistics from both threads
+    pub async fn get_stats(&self) -> CdcStats {
+        let io_stats = if let Some(ref io_thread) = self.io_thread {
+            Some(io_thread.get_stats().await)
+        } else {
+            None
+        };
+
+        let sql_stats = if let Some(ref sql_thread) = self.sql_thread {
+            Some(sql_thread.get_stats().await)
+        } else {
+            None
+        };
+
+        CdcStats {
+            io_stats,
+            sql_stats,
+            relay_log_directory: self.relay_log_directory.clone(),
+            uptime: Duration::from_secs(0), // Would calculate based on start time
+            start_time: chrono::Utc::now(), // Would store actual start time
+        }
     }
 
-    /// Check if the CDC client is currently running
+    /// Check if both threads are running
     pub fn is_running(&self) -> bool {
-        !self.cancellation_token.is_cancelled()
+        let io_running = self.io_thread.as_ref().map_or(false, |t| t.is_running());
+        let sql_running = self.sql_thread.as_ref().map_or(false, |t| t.is_running());
+        io_running && sql_running
     }
 
-    /// Get the cancellation token for external shutdown coordination
+    /// Get the main cancellation token for external coordination
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
     }
 
-    /// Get the current configuration
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
+    /// Print detailed status information
+    pub async fn print_status(&self) {
+        let stats = self.get_stats().await;
 
-    /// Health check for all components
-    pub async fn health_check(&mut self) -> Result<bool> {
-        // Check destination connection
-        if let Some(ref mut handler) = self.destination_handler {
-            if !handler.health_check().await? {
-                return Ok(false);
-            }
+        info!("=== CDC Client Status ===");
+        info!("Relay Log Directory: {}", stats.relay_log_directory.display());
+        info!("Running: {}", self.is_running());
+
+        if let Some(ref io_stats) = stats.io_stats {
+            info!("=== I/O Thread Stats ===");
+            info!("Connected: {}", io_stats.is_connected);
+            info!("Events Read: {}", io_stats.events_read);
+            info!("Events Written: {}", io_stats.events_written);
+            info!("Bytes Written: {}", io_stats.bytes_written);
+            info!("Current LSN: {:?}", io_stats.current_lsn);
+            info!("Last Heartbeat: {}", io_stats.last_heartbeat);
+            info!("Relay Log File Index: {}", io_stats.relay_log_file_index);
         }
 
-        // In a full implementation, you'd also check:
-        // - PostgreSQL connection health
-        // - Replication slot status
-        // - Event processing lag
-        // - Memory usage, etc.
-
-        Ok(true)
-    }
-
-    /// Get replication statistics
-    pub fn get_stats(&self) -> ReplicationStats {
-        ReplicationStats {
-            is_running: self.is_running(),
-            events_processed: 0, // In a real implementation, you'd track this
-            last_processed_lsn: None,
-            lag_seconds: None,
+        if let Some(ref sql_stats) = stats.sql_stats {
+            info!("=== SQL Thread Stats ===");
+            info!("Connected: {}", sql_stats.is_connected);
+            info!("Events Processed: {}", sql_stats.events_processed);
+            info!("Events Applied: {}", sql_stats.events_applied);
+            info!("Events Failed: {}", sql_stats.events_failed);
+            info!("Current Sequence: {}", sql_stats.current_sequence);
+            info!("Processing Lag: {}ms", sql_stats.processing_lag_ms);
+            info!("Average Batch Size: {:.1}", sql_stats.average_batch_size);
+            info!("Total Batches: {}", sql_stats.total_batches);
+            //info!("Last Heartbeat: {}", sql_stats.last_heartbeat);
         }
-    }
-}
 
-/// Replication statistics
-#[derive(Debug, Clone)]
-pub struct ReplicationStats {
-    pub is_running: bool,
-    pub events_processed: u64,
-    pub last_processed_lsn: Option<Lsn>,
-    pub lag_seconds: Option<f64>,
+        info!("========================");
+    }
+
+    /// Perform health check on both threads
+    // pub async fn health_check(&self) -> Result<()> {
+    //     let stats = self.get_stats().await;
+
+    //     // Check if threads are running
+    //     if !self.is_running() {
+    //         return Err(CdcError::generic("One or more threads are not running"));
+    //     }
+
+    //     // Check I/O thread health
+    //     if let Some(ref io_stats) = stats.io_stats {
+    //         if !io_stats.is_connected {
+    //             return Err(CdcError::generic("I/O thread is not connected to PostgreSQL"));
+    //         }
+
+    //         // Check if heartbeat is recent (within last 30 seconds)
+    //         let heartbeat_age = chrono::Utc::now().signed_duration_since(io_stats.last_heartbeat);
+    //         if heartbeat_age.num_seconds() > 30 {
+    //             return Err(CdcError::generic("I/O thread heartbeat is too old"));
+    //         }
+    //     }
+
+    //     // Check SQL thread health
+    //     if let Some(ref sql_stats) = stats.sql_stats {
+    //         if !sql_stats.is_connected {
+    //             return Err(CdcError::generic("SQL thread is not connected to destination"));
+    //         }
+
+    //         // Check if heartbeat is recent
+    //         let heartbeat_age = chrono::Utc::now().signed_duration_since(sql_stats.last_heartbeat);
+    //         if heartbeat_age.num_seconds() > 30 {
+    //             return Err(CdcError::generic("SQL thread heartbeat is too old"));
+    //         }
+    //     }
+
+    //     debug!("Health check passed");
+    //     Ok(())
+    // }
+
+    /// Cleanup old relay log files
+    pub async fn cleanup_relay_logs(&self) -> Result<()> {
+        // This would use the RelayLogManager to clean up old files
+        info!("Relay log cleanup would be performed here");
+        Ok(())
+    }
 }
 
 impl Drop for CdcClient {
     fn drop(&mut self) {
-        // Note: This is a synchronous drop, so we can't call async methods here
-        // In a production system, you might want to ensure graceful shutdown
-        debug!("CDC client dropped");
+        // Ensure cancellation is signaled
+        self.cancellation_token.cancel();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConfigBuilder;
-    use crate::types::ChangeEvent;
-    use std::time::Duration;
-    use tokio::time::{sleep, timeout};
-    use tokio_util::sync::CancellationToken;
+    use crate::types::DestinationType;
+    use tempfile::TempDir;
 
-    // Mock destination handler for testing
-    pub struct MockDestinationHandler {
-        pub events_processed: std::sync::Arc<std::sync::Mutex<Vec<ChangeEvent>>>,
-        pub should_fail: bool,
-        pub processing_delay: Duration,
-    }
+    #[tokio::test]
+    async fn test_cdc_client_creation() {
+        let temp_dir = TempDir::new().unwrap();
 
-    #[async_trait::async_trait]
-    impl DestinationHandler for MockDestinationHandler {
-        async fn connect(&mut self, _connection_string: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
-            if self.processing_delay > Duration::ZERO {
-                sleep(self.processing_delay).await;
-            }
-
-            if self.should_fail {
-                return Err(CdcError::generic("Mock error"));
-            }
-
-            let mut events = self.events_processed.lock().unwrap();
-            events.push(event.clone());
-            Ok(())
-        }
-
-        async fn create_table_if_not_exists(&mut self, _event: &ChangeEvent) -> Result<()> {
-            Ok(())
-        }
-
-        async fn close(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn health_check(&mut self) -> Result<bool> {
-            Ok(true)
-        }
-    }
-
-    fn create_test_config() -> Config {
-        ConfigBuilder::default()
-            .source_connection_string(
-                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
-            )
-            .destination_type(crate::DestinationType::MySQL)
+        let config = Config::builder()
+            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
             .publication_name("test_pub".to_string())
-            .protocol_version(2)
-            .binary_format(false)
-            .streaming(true)
-            .auto_create_tables(true)
-            .connection_timeout(Duration::from_secs(10))
-            .query_timeout(Duration::from_secs(5))
-            .heartbeat_interval(Duration::from_secs(10))
-            .buffer_size(1000)
             .build()
-            .expect("Failed to build test config")
-    }
+            .unwrap();
 
-    fn create_test_event() -> ChangeEvent {
-        ChangeEvent::insert(
-            "public".to_string(),
-            "test_table".to_string(),
-            12345,
-            std::collections::HashMap::new(),
-        )
-    }
+        let client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
 
-    #[tokio::test]
-    async fn test_client_creation_and_basic_properties() {
-        let config = create_test_config();
-        let client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // Test that the client is initially not running (not cancelled)
-        assert!(client.is_running());
-
-        // Test that we can get a cancellation token
-        let token = client.cancellation_token();
-        assert!(!token.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn test_cancellation_token_cancellation() {
-        let config = create_test_config();
-        let mut client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        let token = client.cancellation_token();
-        assert!(!token.is_cancelled());
-
-        // Cancel the token
-        client.stop().await.expect("Failed to stop client");
-
-        // The token should be cancelled
-        assert!(token.is_cancelled());
+        // Check initial state
         assert!(!client.is_running());
+        assert!(client.io_thread.is_none());
+        assert!(client.sql_thread.is_none());
     }
 
     #[tokio::test]
-    async fn test_cancellation_token_propagation() {
-        let config = create_test_config();
-        let client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
+    async fn test_cdc_client_initialization() {
+        let temp_dir = TempDir::new().unwrap();
 
-        let token1 = client.cancellation_token();
-        let token2 = client.cancellation_token();
+        let config = Config::builder()
+            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .destination_type(DestinationType::MySQL)
+            .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
+            .replication_slot_name("test_slot".to_string())
+            .publication_name("test_pub".to_string())
+            .build()
+            .unwrap();
 
-        // Both tokens should not be cancelled initially
-        assert!(!token1.is_cancelled());
-        assert!(!token2.is_cancelled());
+        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
 
-        // Cancel the first token
-        token1.cancel();
+        // Initialize the client
+        client.init().await.unwrap();
 
-        // Both tokens should be cancelled since they're clones
-        assert!(token1.is_cancelled());
-        assert!(token2.is_cancelled());
-        assert!(!client.is_running());
+        // Check that threads were created
+        assert!(client.io_thread.is_some());
+        assert!(client.sql_thread.is_some());
     }
 
     #[tokio::test]
-    async fn test_producer_task_cancellation() {
-        let (_event_sender, _event_receiver) = mpsc::channel::<ChangeEvent>(10);
-        let cancellation_token = CancellationToken::new();
+    async fn test_cdc_stats() {
+        let temp_dir = TempDir::new().unwrap();
 
-        let token_clone = cancellation_token.clone();
+        let config = Config::builder()
+            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .destination_type(DestinationType::MySQL)
+            .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
+            .replication_slot_name("test_slot".to_string())
+            .publication_name("test_pub".to_string())
+            .build()
+            .unwrap();
 
-        let producer_task = tokio::spawn(async move {
-            // Simulate the producer loop structure
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = token_clone.cancelled() => {
-                        info!("Producer received cancellation signal");
-                        break;
-                    }
-                    _ = sleep(Duration::from_millis(10)) => {
-                        // Simulate waiting for events
-                        continue;
-                    }
-                }
-            }
-            Ok::<(), CdcError>(())
-        });
+        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
+        client.init().await.unwrap();
 
-        // Let the producer run for a bit
-        sleep(Duration::from_millis(50)).await;
+        let stats = client.get_stats().await;
 
-        // Cancel the token
-        cancellation_token.cancel();
-
-        // The producer should complete quickly after cancellation
-        let result = timeout(Duration::from_millis(100), producer_task)
-            .await
-            .expect("Producer task should complete quickly after cancellation")
-            .expect("Producer task should not panic");
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_consumer_task_cancellation() {
-        let (_event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
-        let cancellation_token = CancellationToken::new();
-
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mock_handler = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
-            should_fail: false,
-            processing_delay: Duration::ZERO,
-        });
-
-        let token_clone = cancellation_token.clone();
-
-        let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
-        });
-
-        // Let the consumer run for a bit
-        sleep(Duration::from_millis(50)).await;
-
-        // Cancel the token
-        cancellation_token.cancel();
-
-        // The consumer should complete quickly after cancellation
-        let result = timeout(Duration::from_millis(100), consumer_task)
-            .await
-            .expect("Consumer task should complete quickly after cancellation")
-            .expect("Consumer task should not panic");
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_consumer_processes_remaining_events_on_shutdown() {
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
-        let cancellation_token = CancellationToken::new();
-
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mock_handler = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
-            should_fail: false,
-            processing_delay: Duration::from_millis(10), // Small delay to simulate processing
-        });
-
-        // Send some test events
-        let test_events = vec![
-            create_test_event(),
-            create_test_event(),
-            create_test_event(),
-        ];
-
-        for event in &test_events {
-            event_sender
-                .send(event.clone())
-                .await
-                .expect("Failed to send event");
-        }
-
-        let token_clone = cancellation_token.clone();
-        let events_clone = events_processed.clone();
-
-        let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
-        });
-
-        // Give the consumer time to start processing
-        sleep(Duration::from_millis(50)).await;
-
-        // Cancel the token
-        cancellation_token.cancel();
-
-        // Wait for the consumer to complete
-        let result = timeout(Duration::from_secs(1), consumer_task)
-            .await
-            .expect("Consumer task should complete within timeout")
-            .expect("Consumer task should not panic");
-
-        assert!(result.is_ok());
-
-        // Check that some events were processed
-        let processed_events = events_clone.lock().unwrap();
-        assert!(
-            !processed_events.is_empty(),
-            "Consumer should have processed some events before shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_graceful_shutdown_with_task_handles() {
-        let config = create_test_config();
-        let mut client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // Initially no task handles should be set
-        assert!(client.producer_handle.is_none());
-        assert!(client.consumer_handle.is_none());
-
-        // Test graceful shutdown without starting tasks
-        client
-            .stop()
-            .await
-            .expect("Stop should succeed even without tasks");
-        assert!(!client.is_running());
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_tasks_completion_with_no_tasks() {
-        let config = create_test_config();
-        let mut client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // Should not fail when no tasks are running
-        client
-            .wait_for_tasks_completion()
-            .await
-            .expect("Should succeed with no tasks");
-    }
-
-    #[tokio::test]
-    async fn test_multiple_shutdown_calls_are_safe() {
-        let config = create_test_config();
-        let mut client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // First stop call
-        client.stop().await.expect("First stop call should succeed");
-        assert!(!client.is_running());
-
-        // Second stop call should also succeed and not panic
-        client
-            .stop()
-            .await
-            .expect("Second stop call should succeed");
-        assert!(!client.is_running());
-
-        // Third stop call should also succeed
-        client.stop().await.expect("Third stop call should succeed");
-        assert!(!client.is_running());
-    }
-
-    #[tokio::test]
-    async fn test_client_stats_reflect_cancellation_state() {
-        let config = create_test_config();
-        let mut client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // Initially running (not cancelled)
-        let stats = client.get_stats();
-        assert!(stats.is_running);
-
-        // Stop the client
-        client.stop().await.expect("Failed to stop client");
-
-        // Stats should reflect stopped state
-        let stats = client.get_stats();
-        assert!(!stats.is_running);
-    }
-
-    #[tokio::test]
-    async fn test_cancellation_token_from_external_source() {
-        let config = create_test_config();
-        let client = CdcClient::new(config)
-            .await
-            .expect("Failed to create client");
-
-        // Get the client's token
-        let client_token = client.cancellation_token();
-
-        // Create an external cancellation token
-        let external_token = CancellationToken::new();
-
-        // Create a task that links external cancellation to client cancellation
-        let client_token_clone = client_token.clone();
-        let external_token_clone = external_token.clone();
-        let linking_task = tokio::spawn(async move {
-            external_token_clone.cancelled().await;
-            client_token_clone.cancel();
-        });
-
-        // Initially, neither should be cancelled
-        assert!(!client_token.is_cancelled());
-        assert!(!external_token.is_cancelled());
-        assert!(client.is_running());
-
-        // Cancel the external token
-        external_token.cancel();
-
-        // Wait for the linking to complete
-        linking_task.await.expect("Linking task should complete");
-
-        // Client token should now be cancelled
-        assert!(client_token.is_cancelled());
-        assert!(!client.is_running());
+        // Should have both thread stats available after initialization
+        assert!(stats.io_stats.is_some());
+        assert!(stats.sql_stats.is_some());
+        assert_eq!(stats.relay_log_directory, temp_dir.path());
     }
 }

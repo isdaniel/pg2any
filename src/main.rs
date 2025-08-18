@@ -1,16 +1,17 @@
-use pg2any_lib::{client::CdcClient, Config, DestinationType};
+use pg2any_lib::{CdcClient, Config, DestinationType};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Main entry point for the CDC application
-/// This function sets up a complete CDC pipeline from PostgreSQL to MySQL
+/// Main entry point for the enhanced CDC application using I/O and SQL threads
+/// This function sets up a complete CDC pipeline from PostgreSQL to destination databases
+/// using MySQL-style I/O Thread and SQL Thread pattern for better performance
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize comprehensive logging
     init_logging();
 
-    tracing::info!("Starting PostgreSQL CDC Application");
+    tracing::info!("Starting Enhanced PostgreSQL CDC Application with I/O/SQL Thread Architecture");
     tracing::info!("Loading configuration from environment variables");
 
     // Load configuration from environment variables
@@ -18,44 +19,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Configuration loaded successfully");
 
-    // Create and initialize CDC client
-    tracing::info!("Initializing CDC client");
+    // Create and initialize enhanced CDC client
+    tracing::info!("Initializing enhanced CDC client with I/O and SQL threads");
     let mut client = CdcClient::new(config).await?;
 
     tracing::info!("Performing CDC client initialization");
     client.init().await?;
 
-    tracing::info!("✅ CDC client initialized successfully");
+    tracing::info!("✅ Enhanced CDC client initialized successfully");
 
     // Set up graceful shutdown handling with the client's cancellation token
     let shutdown_handler = setup_shutdown_handler(client.cancellation_token());
 
-    // Start the CDC replication process
-    tracing::info!("🔄 Starting CDC replication stream");
-    tracing::info!("This will continuously monitor PostgreSQL changes");
+    // Start the CDC replication process with I/O and SQL threads
+    tracing::info!("🔄 Starting enhanced CDC replication with I/O and SQL threads");
+    tracing::info!("I/O Thread: Reads from PostgreSQL WAL and writes to relay logs");
+    tracing::info!("SQL Thread: Reads from relay logs and applies to destination database");
+
+    // Create a separate monitoring task with periodic status reporting
+    let monitoring_task = start_monitoring_task();
 
     // Run CDC replication with graceful shutdown
     tokio::select! {
         result = client.start_replication_from_lsn(None) => {
             match result {
                 Ok(()) => {
-                    tracing::info!("✅ CDC replication completed successfully");
+                    tracing::info!("✅ Enhanced CDC replication completed successfully");
                 }
                 Err(e) => {
-                    tracing::error!("❌ CDC replication failed: {}", e);
+                    tracing::error!("❌ Enhanced CDC replication failed: {}", e);
                     return Err(e.into());
                 }
             }
         }
         _ = shutdown_handler => {
-            tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
+            tracing::info!("Shutdown signal received, stopping enhanced CDC replication gracefully");
             client.stop().await?;
-            tracing::info!("CDC replication stopped successfully");
+            tracing::info!("Enhanced CDC replication stopped successfully");
         }
+        // _ = monitoring_task => {
+        //     tracing::info!("Monitoring task completed");
+        // }
     }
 
-    tracing::info!("👋 CDC application stopped");
+    tracing::info!("👋 Enhanced CDC application stopped");
     Ok(())
+}
+
+/// Start a background task to monitor and log CDC statistics
+async fn start_monitoring_task() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        
+        loop {
+            interval.tick().await;
+            
+            tracing::info!("CDC monitoring heartbeat - system is running");
+            
+            // Simple monitoring without accessing client state
+            // More sophisticated monitoring could be added here
+        }
+    })
 }
 
 /// Initialize comprehensive logging configuration
@@ -96,7 +120,7 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
 
     tracing::info!(
         "Source PostgreSQL connection string: {}",
-        source_connection_string
+        source_connection_string.replace(&source_password, "***")
     );
 
     // Destination configuration
@@ -181,12 +205,28 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         .parse::<u64>()
         .unwrap_or(10);
 
+    // Enhanced buffer size for I/O thread performance
+    let buffer_size = std::env::var("CDC_BUFFER_SIZE")
+        .unwrap_or_else(|_| "10000".to_string())
+        .parse::<usize>()
+        .unwrap_or(10000);
+
+    // Relay log directory for I/O thread
+    let relay_log_directory = std::env::var("PG2ANY_RELAY_LOG_DIR").ok();
+
     tracing::info!(
-        "CDC Config - Slot: {}, Publication: {}, Protocol: {}",
+        "CDC Config - Slot: {}, Publication: {}, Protocol: {}, Buffer Size: {}",
         replication_slot,
         publication,
-        protocol_version
+        protocol_version,
+        buffer_size
     );
+
+    if let Some(ref log_dir) = relay_log_directory {
+        tracing::info!("Relay Log Directory: {}", log_dir);
+    } else {
+        tracing::info!("Relay Log Directory: relay_logs (default)");
+    }
 
     // Build the configuration
     let config = Config::builder()
@@ -202,6 +242,8 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
+        .buffer_size(buffer_size)
+        .relay_log_directory(relay_log_directory)
         .build()?;
 
     Ok(config)

@@ -1356,6 +1356,8 @@ name = "pg2any"
 version = "0.1.0"
 dependencies = [
  "pg2any_lib",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1374,6 +1376,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.14",
  "tiberius",
  "tokio",

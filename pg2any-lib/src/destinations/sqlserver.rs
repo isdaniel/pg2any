@@ -287,7 +287,6 @@ impl DestinationHandler for SqlServerDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use std::collections::HashMap;
 
     #[test]
@@ -336,21 +335,5 @@ mod tests {
         assert!(sql.contains("[id] BIGINT"));
         assert!(sql.contains("[name] NVARCHAR(255)"));
         assert!(sql.contains("[active] BIT"));
-    }
-
-    #[test]
-    fn test_sqlserver_destination_default_schema() {
-        // Test that default schema is handled correctly
-        let destination = SqlServerDestination::new();
-        let event = ChangeEvent::insert(
-            "".to_string(), // Empty schema should use default
-            "test_table".to_string(),
-            456,
-            HashMap::new(),
-        );
-
-        // This should use "dbo" as default schema for SQL Server
-        // We can test this by checking the generate_create_table method
-        assert!(true); // Placeholder - would need async test setup for full validation
     }
 }

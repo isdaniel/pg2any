@@ -7,7 +7,8 @@ use crate::buffer::BufferReader;
 use crate::config::Config;
 use crate::error::{CdcError, Result};
 use crate::pg_replication::{
-    format_lsn, PgReplicationConnection, XLogRecPtr, INVALID_XLOG_REC_PTR,
+    format_lsn, postgres_timestamp_to_chrono, PgReplicationConnection, XLogRecPtr,
+    INVALID_XLOG_REC_PTR,
 };
 use crate::replication_protocol::{parse_keepalive_message, LogicalReplicationParser};
 use crate::replication_protocol::{
@@ -351,14 +352,28 @@ impl LogicalReplicationStream {
                 }
             }
 
-            LogicalReplicationMessage::Begin { xid, .. } => {
+            LogicalReplicationMessage::Begin { xid, timestamp, .. } => {
                 debug!("Transaction begin: xid={}", xid);
-                return Ok(None);
+                ChangeEvent {
+                    event_type: EventType::Begin {
+                        transaction_id: xid,
+                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
+                    },
+                    lsn: Some(format_lsn(lsn)),
+                    metadata: None,
+                }
             }
 
-            LogicalReplicationMessage::Commit { .. } => {
+            LogicalReplicationMessage::Commit { timestamp, .. } => {
                 debug!("Transaction commit");
-                return Ok(None);
+                ChangeEvent {
+                    event_type: EventType::Commit {
+                        transaction_id: 0, // We don't have transaction ID in commit message, will be managed by destination
+                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
+                    },
+                    lsn: Some(format_lsn(lsn)),
+                    metadata: None,
+                }
             }
 
             LogicalReplicationMessage::Truncate {

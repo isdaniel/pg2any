@@ -1,5 +1,4 @@
 use crate::error::{CdcError, Result};
-use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 use tracing::{info, warn};
 
@@ -7,16 +6,14 @@ use tracing::{info, warn};
 pub struct PostgresConnection {
     client: Option<Client>,
     connection_string: String,
-    timeout: Duration,
 }
 
 impl PostgresConnection {
     /// Create a new PostgreSQL connection manager
-    pub fn new(connection_string: String, timeout: Duration) -> Self {
+    pub fn new(connection_string: String) -> Self {
         Self {
             client: None,
             connection_string,
-            timeout,
         }
     }
 
@@ -25,7 +22,6 @@ impl PostgresConnection {
         Self {
             client: None,
             connection_string: String::new(),
-            timeout: Duration::from_secs(30),
         }
     }
 

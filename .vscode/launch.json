@@ -1,0 +1,31 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug pg2any binary",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin",
+                    "pg2any"
+                ],
+                "filter": {
+                    "name": "pg2any",
+                    "kind": "bin"
+                }
+            },
+            "program": "${cargo:program}", // tells lldb to run the built binary
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "RUST_LOG": "info" 
+            }
+        }
+    ]
+}

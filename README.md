@@ -30,9 +30,7 @@ This is a **working CDC implementation** that provides comprehensive PostgreSQL 
 - 🚧 **Production-ready error recovery** and automatic reconnection strategies
 - 🚧 **Performance optimizations** for high-throughput scenarios and benchmarking
 - 🚧 **Advanced monitoring** with metrics collection and observability dashboards
-- 🚧 **End-to-end integration testing** with real-world database scenarios
 - 🚧 **Additional destination databases** (Oracle, SQLite, ClickHouse, etc.)
-- 🚧 **Schema evolution handling** for DDL changes
 - 🚧 **Multi-table replication** with table filtering and routing
 
 ## Features

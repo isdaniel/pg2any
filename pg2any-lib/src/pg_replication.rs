@@ -8,6 +8,7 @@ use crate::connection::PostgresConnection;
 use crate::error::{CdcError, Result};
 use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
 use crate::types::{ChangeEvent, Lsn};
+use chrono::{DateTime, Utc};
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
 use std::os::unix::io::RawFd;
@@ -644,6 +645,20 @@ pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
     }
 }
 
+/// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into chrono::DateTime<Utc>.
+pub fn postgres_timestamp_to_chrono(ts: i64) -> DateTime<Utc> {
+    // Convert back to Unix epoch microseconds
+    let unix_micros = ts + PG_EPOCH_OFFSET_SECS * 1_000_000;
+
+    let secs = unix_micros / 1_000_000;
+    let micros = (unix_micros % 1_000_000) as u32;
+
+    // Construct chrono DateTime<Utc>
+    chrono::TimeZone::timestamp_opt(&Utc, secs, micros * 1000)
+        .single()
+        .expect("Invalid timestamp conversion")
+}
+
 /// Parse LSN from string format (e.g., "0/12345678")
 pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
     let parts: Vec<&str> = lsn_str.split('/').collect();
@@ -670,6 +685,8 @@ pub fn format_lsn(lsn: XLogRecPtr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_lsn_parsing() {
@@ -682,5 +699,40 @@ mod tests {
     fn test_lsn_formatting() {
         assert_eq!(format_lsn(0x12345678), "0/12345678");
         assert_eq!(format_lsn(0x100000000 + 0x12345678), "1/12345678");
+    }
+
+    #[test]
+    fn test_postgres_epoch() {
+        let ts = 0; // PostgreSQL epoch (2000-01-01 UTC)
+        let dt = postgres_timestamp_to_chrono(ts);
+        assert_eq!(dt, Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_unix_epoch() {
+        // Unix epoch is 1970-01-01 00:00:00 UTC
+        let unix_epoch = UNIX_EPOCH;
+        let pg_ts = system_time_to_postgres_timestamp(unix_epoch);
+
+        // Convert back
+        let dt = postgres_timestamp_to_chrono(pg_ts);
+        assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_round_trip_now() {
+        let now = SystemTime::now();
+        let pg_ts = system_time_to_postgres_timestamp(now);
+        let dt = postgres_timestamp_to_chrono(pg_ts);
+
+        // Convert SystemTime to chrono for comparison
+        let duration = now.duration_since(UNIX_EPOCH).unwrap();
+        let unix_secs = duration.as_secs() as i64;
+        let unix_nanos = duration.subsec_nanos();
+        let chrono_now = Utc.timestamp_opt(unix_secs, unix_nanos).unwrap();
+
+        // Allow slight difference due to truncation to microseconds
+        let diff = (dt.timestamp_micros() - chrono_now.timestamp_micros()).abs();
+        assert!(diff < 2, "Round trip difference too large: {}", diff);
     }
 }

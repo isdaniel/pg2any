@@ -65,7 +65,7 @@ impl LogicalReplicationStream {
         info!("Initializing replication stream");
 
         // Identify the system
-        let _system_id = self.connection.identify_system()?;
+        let _ = self.connection.identify_system()?;
         info!("System identification successful");
 
         // Create replication slot if it doesn't exist

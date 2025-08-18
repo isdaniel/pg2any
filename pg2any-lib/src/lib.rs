@@ -51,6 +51,11 @@ pub mod pg_replication;
 pub mod logical_stream;
 pub mod replication_protocol;
 
+// I/O and SQL Thread architecture for improved performance
+pub mod io_thread;
+pub mod relay_log;
+pub mod sql_thread;
+
 // High-level client interface
 pub mod client;
 pub mod connection;
@@ -59,6 +64,9 @@ pub mod connection;
 pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
 pub use error::CdcError;
+pub use io_thread::{IoThread, IoThreadConfig, IoThreadStats};
+pub use relay_log::{RelayLogConfig, RelayLogEntry, RelayLogManager, RelayLogStats};
+pub use sql_thread::{SqlThread, SqlThreadConfig, SqlThreadStats};
 
 /// Result type for CDC operations
 pub type CdcResult<T> = Result<T, CdcError>;

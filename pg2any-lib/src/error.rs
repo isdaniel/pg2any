@@ -125,6 +125,11 @@ impl CdcError {
     pub fn unsupported<S: Into<String>>(msg: S) -> Self {
         CdcError::Unsupported(msg.into())
     }
+
+    /// Create a new IO error
+    pub fn io<S: Into<String>>(msg: S) -> Self {
+        CdcError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
+    }
 }
 
 /// Result type for CDC operations

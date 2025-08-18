@@ -7,9 +7,8 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
-use crate::relay_log::{RelayLogWriter, RelayLogConfig, RelayLogManager};
+use crate::relay_log::{RelayLogConfig, RelayLogManager, RelayLogWriter};
 use crate::types::ChangeEvent;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -39,11 +38,20 @@ pub struct IoThreadConfig {
 impl From<&Config> for IoThreadConfig {
     fn from(config: &Config) -> Self {
         let replication_config = ReplicationStreamConfig::from(config);
-        
+
         // Use relay log directory from config, or fall back to environment variable/default
-        let relay_log_dir = config.relay_log_directory
+        let relay_log_dir = config
+            .relay_log_directory
             .clone()
-            .expect("PG2ANY_RELAY_LOG_DIR must be set");
+            .or_else(|| std::env::var("PG2ANY_RELAY_LOG_DIR").ok())
+            .unwrap_or_else(|| {
+                // If neither config nor env var is set, use a temp directory as fallback
+                // This is primarily for tests - in production, this should be explicitly set
+                std::env::temp_dir()
+                    .join("pg2any_relay_logs")
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         let relay_log_config = RelayLogConfig::new(relay_log_dir);
 
@@ -86,9 +94,8 @@ impl IoThread {
         info!("Creating I/O thread for PostgreSQL logical replication");
 
         // Create relay log manager
-        let relay_log_manager = Arc::new(
-            RelayLogManager::new(config.relay_log_config.clone()).await?
-        );
+        let relay_log_manager =
+            Arc::new(RelayLogManager::new(config.relay_log_config.clone()).await?);
 
         let stats = Arc::new(tokio::sync::RwLock::new(IoThreadStats {
             events_read: 0,
@@ -150,7 +157,14 @@ impl IoThread {
             let flush_interval = config.flush_interval;
 
             tokio::spawn(async move {
-                Self::run_writer_loop(relay_writer, &mut buffer_rx, stats, cancellation_token, flush_interval).await
+                Self::run_writer_loop(
+                    relay_writer,
+                    &mut buffer_rx,
+                    stats,
+                    cancellation_token,
+                    flush_interval,
+                )
+                .await
             })
         };
 
@@ -172,7 +186,8 @@ impl IoThread {
                     stats,
                     cancellation_token,
                     heartbeat_interval,
-                ).await
+                )
+                .await
             })
         };
 
@@ -214,11 +229,12 @@ impl IoThread {
         info!("Starting PostgreSQL reader loop");
 
         // Create logical replication stream
-        let mut stream = LogicalReplicationStream::new(&connection_string, replication_config.clone()).await?;
-        
+        let mut stream =
+            LogicalReplicationStream::new(&connection_string, replication_config.clone()).await?;
+
         // Initialize the stream
         stream.initialize().await?;
-        
+
         // Start replication from specified LSN
         stream.start(start_lsn).await?;
 
@@ -237,7 +253,7 @@ impl IoThread {
         loop {
             tokio::select! {
                 biased;
-                
+
                 _ = cancellation_token.cancelled() => {
                     info!("Reader received cancellation signal");
                     break;
@@ -278,7 +294,7 @@ impl IoThread {
                         }
                         Err(e) => {
                             error!("Error reading from PostgreSQL stream: {}", e);
-                            
+
                             // Update connection status
                             {
                                 let mut stats_guard = stats.write().await;
@@ -288,7 +304,7 @@ impl IoThread {
                             // Try to reconnect after a delay
                             warn!("Attempting to reconnect in 5 seconds...");
                             tokio::time::sleep(Duration::from_secs(5)).await;
-                            
+
                             // Attempt reconnection
                             match LogicalReplicationStream::new(&connection_string, replication_config.clone()).await {
                                 Ok(mut new_stream) => {
@@ -301,7 +317,7 @@ impl IoThread {
                                         continue;
                                     }
                                     stream = new_stream;
-                                    
+
                                     // Update connection status
                                     let mut stats_guard = stats.write().await;
                                     stats_guard.is_connected = true;
@@ -349,17 +365,17 @@ impl IoThread {
         loop {
             tokio::select! {
                 biased;
-                
+
                 _ = cancellation_token.cancelled() => {
                     info!("Writer received cancellation signal");
-                    
+
                     // Flush any remaining events
                     for event in event_buffer.drain(..) {
                         if let Err(e) = relay_writer.write_event(event, None).await {
                             error!("Failed to write final event to relay log: {}", e);
                         }
                     }
-                    
+
                     if let Err(e) = relay_writer.flush().await {
                         error!("Failed to flush relay log on shutdown: {}", e);
                     }
@@ -370,7 +386,7 @@ impl IoThread {
                     // Periodic flush
                     if !event_buffer.is_empty() {
                         debug!("Periodic flush of {} events to relay log", event_buffer.len());
-                        
+
                         for event in event_buffer.drain(..) {
                             match relay_writer.write_event(event.clone(), event.lsn.clone()).await {
                                 Ok(_sequence_id) => {
@@ -385,7 +401,7 @@ impl IoThread {
                                 }
                             }
                         }
-                        
+
                         if let Err(e) = relay_writer.flush().await {
                             error!("Failed to flush relay log: {}", e);
                         }
@@ -397,11 +413,11 @@ impl IoThread {
                         Some(event) => {
                             debug!("Writer received event for relay log: {:?}", event.event_type);
                             event_buffer.push(event);
-                            
+
                             // If buffer is getting full, write immediately
                             if event_buffer.len() >= 100 {
                                 debug!("Event buffer full, writing {} events to relay log", event_buffer.len());
-                                
+
                                 for event in event_buffer.drain(..) {
                                     match relay_writer.write_event(event.clone(), event.lsn.clone()).await {
                                         Ok(_sequence_id) => {
@@ -415,7 +431,7 @@ impl IoThread {
                                         }
                                     }
                                 }
-                                
+
                                 if let Err(e) = relay_writer.flush().await {
                                     error!("Failed to flush relay log: {}", e);
                                 }
@@ -484,9 +500,11 @@ mod tests {
     #[tokio::test]
     async fn test_io_thread_creation() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let config = Config::builder()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -498,7 +516,7 @@ mod tests {
         io_config.relay_log_config.log_directory = temp_dir.path().to_path_buf();
 
         let io_thread = IoThread::new(io_config).await.unwrap();
-        
+
         // Check initial state
         let stats = io_thread.get_stats().await;
         assert_eq!(stats.events_read, 0);
@@ -508,8 +526,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_io_thread_config_from_cdc_config() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let relay_log_path = temp_dir.path().to_string_lossy().to_string();
+
         let config = Config::builder()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -518,6 +543,7 @@ mod tests {
             .streaming(true)
             .heartbeat_interval(Duration::from_secs(10))
             .buffer_size(5000)
+            .relay_log_directory(Some(relay_log_path))
             .build()
             .unwrap();
 

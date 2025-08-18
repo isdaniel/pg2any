@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Relay log entry with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,32 +44,17 @@ pub struct RelayLogConfig {
     // pub sync_interval: std::time::Duration,
 }
 
-impl RelayLogConfig{
-    pub fn new(relay_log_dir : String) -> RelayLogConfig{
+impl RelayLogConfig {
+    pub fn new(relay_log_dir: String) -> RelayLogConfig {
         Self {
             log_directory: PathBuf::from(relay_log_dir),
             max_file_size: 100 * 1024 * 1024, // 100MB
             max_files: 100,
             write_buffer_size: 64 * 1024, // 64KB
-            read_buffer_size: 64 * 1024,   // 64KB
+            read_buffer_size: 64 * 1024,  // 64KB
         }
     }
 }
-
-// impl Default for RelayLogConfig {
-//     fn default() -> Self {
-//         let relay_log_dir = std::env::var("PG2ANY_RELAY_LOG_DIR")
-//             .unwrap_or_else(|_| "relay_logs".to_string());
-            
-//         Self {
-//             log_directory: PathBuf::from(relay_log_dir),
-//             max_file_size: 100 * 1024 * 1024, // 100MB
-//             max_files: 100,
-//             write_buffer_size: 64 * 1024, // 64KB
-//             read_buffer_size: 64 * 1024,   // 64KB
-//         }
-//     }
-// }
 
 /// Manages relay log files for replication
 pub struct RelayLogManager {
@@ -188,48 +173,18 @@ impl RelayLogManager {
     }
 
     /// Create a new relay log reader
-    pub async fn create_reader(&self, start_sequence: Option<u64>) -> Result<RelayLogReader> {
+    pub async fn create_reader(
+        &self,
+        file_name: String,
+        start_sequence: u64,
+    ) -> Result<RelayLogReader> {
         RelayLogReader::new(
             self.config.clone(),
             self.reader_state.clone(),
             start_sequence,
+            file_name,
         )
         .await
-    }
-
-    /// Cleanup old log files
-    pub async fn cleanup_old_files(&self) -> Result<()> {
-        let mut entries = tokio::fs::read_dir(&self.log_directory).await?;
-        let mut file_indices = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await? {
-            let file_name = entry.file_name();
-            if let Some(file_str) = file_name.to_str() {
-                if file_str.starts_with("relay-") && file_str.ends_with(".log") {
-                    let index_str = &file_str[6..file_str.len() - 4];
-                    if let Ok(index) = index_str.parse::<u64>() {
-                        file_indices.push(index);
-                    }
-                }
-            }
-        }
-
-        file_indices.sort();
-
-        // Keep only the latest max_files
-        if file_indices.len() > self.config.max_files as usize {
-            let files_to_remove = file_indices.len() - self.config.max_files as usize;
-            for &index in file_indices.iter().take(files_to_remove) {
-                let file_path = Self::get_log_file_path(&self.log_directory, index);
-                if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                    warn!("Failed to remove old relay log file {}: {}", file_path.display(), e);
-                } else {
-                    debug!("Removed old relay log file: {}", file_path.display());
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Get current statistics
@@ -259,10 +214,7 @@ pub struct RelayLogWriter {
 
 impl RelayLogWriter {
     /// Create a new relay log writer
-    async fn new(
-        config: RelayLogConfig,
-        writer_state: Arc<Mutex<WriterState>>,
-    ) -> Result<Self> {
+    async fn new(config: RelayLogConfig, writer_state: Arc<Mutex<WriterState>>) -> Result<Self> {
         Ok(Self {
             config,
             writer_state,
@@ -273,7 +225,7 @@ impl RelayLogWriter {
     /// Write an event to the relay log
     pub async fn write_event(&self, event: ChangeEvent, source_lsn: Option<String>) -> Result<u64> {
         let sequence_id = self.sequence_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        
+
         let entry = RelayLogEntry {
             sequence_id,
             source_lsn,
@@ -282,7 +234,7 @@ impl RelayLogWriter {
         };
 
         let mut state = self.writer_state.lock().await;
-        
+
         // Check if we need to rotate to a new file
         if state.current_file.is_none() || state.current_file_size >= self.config.max_file_size {
             self.rotate_file(&mut state).await?;
@@ -292,15 +244,18 @@ impl RelayLogWriter {
         if let Some(ref mut writer) = state.current_file {
             let json_line = serde_json::to_string(&entry)?;
             let line_size = json_line.len() as u64 + 1;
-            
+
             writer.write_all(json_line.as_bytes()).await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
-            
+
             state.current_file_size += line_size;
         }
 
-        debug!("Wrote relay log entry: sequence={}, lsn={:?}", sequence_id, entry.source_lsn);
+        debug!(
+            "Wrote relay log entry: sequence={}, lsn={:?}",
+            sequence_id, entry.source_lsn
+        );
         Ok(sequence_id)
     }
 
@@ -314,14 +269,17 @@ impl RelayLogWriter {
 
         // Create new file
         state.current_file_index += 1;
-        let file_path = RelayLogManager::get_log_file_path(&self.config.log_directory, state.current_file_index);
-        
+        let file_path = RelayLogManager::get_log_file_path(
+            &self.config.log_directory,
+            state.current_file_index,
+        );
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&file_path)
             .await?;
-            
+
         let writer = BufWriter::with_capacity(self.config.write_buffer_size, file);
         state.current_file = Some(writer);
         state.current_file_size = 0;
@@ -345,6 +303,7 @@ pub struct RelayLogReader {
     config: RelayLogConfig,
     reader_state: Arc<RwLock<ReaderState>>,
     log_directory: PathBuf,
+    file_name: String,
 }
 
 impl RelayLogReader {
@@ -352,62 +311,17 @@ impl RelayLogReader {
     async fn new(
         config: RelayLogConfig,
         reader_state: Arc<RwLock<ReaderState>>,
-        start_sequence: Option<u64>,
+        _start_sequence: u64,
+        file_name: String,
     ) -> Result<Self> {
         let reader = Self {
             log_directory: config.log_directory.clone(),
             config,
             reader_state,
+            file_name,
         };
 
-        // Initialize reader position
-        if let Some(sequence) = start_sequence {
-            reader.seek_to_sequence(sequence).await?;
-        }
-
         Ok(reader)
-    }
-
-    /// Seek to a specific sequence number
-    async fn seek_to_sequence(&self, target_sequence: u64) -> Result<()> {
-        // Find the file containing this sequence
-        let mut file_index = 1u64;
-        
-        loop {
-            let file_path = RelayLogManager::get_log_file_path(&self.log_directory, file_index);
-            if !file_path.exists() {
-                break;
-            }
-
-            // Read through this file to find the sequence
-            let file = File::open(&file_path).await?;
-            let reader = BufReader::new(file);
-            let mut lines = reader.lines();
-            let mut found = false;
-
-            while let Some(line) = lines.next_line().await? {
-                if !line.trim().is_empty() {
-                    if let Ok(entry) = serde_json::from_str::<RelayLogEntry>(&line) {
-                        if entry.sequence_id >= target_sequence {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if found {
-                // Set up reader state for this file
-                let mut state = self.reader_state.write().await;
-                state.current_file_index = file_index;
-                state.current_sequence = target_sequence;
-                break;
-            }
-
-            file_index += 1;
-        }
-
-        Ok(())
     }
 
     /// Read the next event from relay logs (non-blocking)
@@ -416,7 +330,8 @@ impl RelayLogReader {
 
         // Open current file if needed
         if state.current_file.is_none() {
-            let file_path = RelayLogManager::get_log_file_path(&self.log_directory, state.current_file_index);
+            let file_path =
+                RelayLogManager::get_log_file_path(&self.log_directory, state.current_file_index);
             if file_path.exists() {
                 let file = File::open(&file_path).await?;
                 let reader = BufReader::with_capacity(self.config.read_buffer_size, file);
@@ -465,7 +380,7 @@ impl RelayLogReader {
     /// Wait for new events using tokio's async I/O
     pub async fn wait_for_events(&self) -> Result<Vec<RelayLogEntry>> {
         let mut events = Vec::new();
-        
+
         // Use tokio's async file watching or polling
         // For now, implement simple polling
         loop {
@@ -499,12 +414,18 @@ mod tests {
 
         let manager = RelayLogManager::new(config).await.unwrap();
         let writer = manager.create_writer().await.unwrap();
-        let reader = manager.create_reader(None).await.unwrap();
+        let reader = manager.create_reader("".to_string(), 0).await.unwrap();
 
         // Create test event
         let mut data = HashMap::new();
-        data.insert("id".to_string(), serde_json::Value::Number(serde_json::Number::from(1)));
-        data.insert("name".to_string(), serde_json::Value::String("test".to_string()));
+        data.insert(
+            "id".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(1)),
+        );
+        data.insert(
+            "name".to_string(),
+            serde_json::Value::String("test".to_string()),
+        );
 
         let event = ChangeEvent {
             event_type: EventType::Insert {
@@ -518,11 +439,14 @@ mod tests {
         };
 
         // Write event
-        let sequence = writer.write_event(event.clone(), event.lsn.clone()).await.unwrap();
+        let sequence = writer
+            .write_event(event.clone(), event.lsn.clone())
+            .await
+            .unwrap();
         assert_eq!(sequence, 1);
 
         writer.flush().await.unwrap();
-        
+
         // Drop the writer to ensure file is closed and data is flushed
         drop(writer);
 
@@ -545,7 +469,12 @@ mod tests {
 
         // Check event content
         match read_entry.event.event_type {
-            EventType::Insert { schema, table, relation_oid, .. } => {
+            EventType::Insert {
+                schema,
+                table,
+                relation_oid,
+                ..
+            } => {
                 assert_eq!(schema, "public");
                 assert_eq!(table, "test_table");
                 assert_eq!(relation_oid, 12345);
@@ -557,7 +486,13 @@ mod tests {
     #[tokio::test]
     async fn test_relay_log_file_rotation() {
         let temp_dir = TempDir::new().unwrap();
-        let config =  RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
+        let config = RelayLogConfig {
+            log_directory: temp_dir.path().to_path_buf(),
+            max_file_size: 512, // Very small file size to trigger rotation
+            max_files: 10,
+            write_buffer_size: 1024,
+            read_buffer_size: 1024,
+        };
 
         let manager = RelayLogManager::new(config).await.unwrap();
         let writer = manager.create_writer().await.unwrap();
@@ -565,7 +500,10 @@ mod tests {
         // Write multiple events to trigger rotation
         for i in 1..=5 {
             let mut data = HashMap::new();
-            data.insert("id".to_string(), serde_json::Value::Number(serde_json::Number::from(i)));
+            data.insert(
+                "id".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(i)),
+            );
 
             let event = ChangeEvent {
                 event_type: EventType::Insert {
@@ -590,6 +528,9 @@ mod tests {
             file_count += 1;
         }
 
-        assert!(file_count > 1, "Expected multiple relay log files due to rotation");
+        assert!(
+            file_count > 1,
+            "Expected multiple relay log files due to rotation"
+        );
     }
 }

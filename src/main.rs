@@ -70,12 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn start_monitoring_task() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
-        
+
         loop {
             interval.tick().await;
-            
+
             tracing::info!("CDC monitoring heartbeat - system is running");
-            
+
             // Simple monitoring without accessing client state
             // More sophisticated monitoring could be added here
         }

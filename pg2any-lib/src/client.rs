@@ -6,8 +6,8 @@
 use crate::config::Config;
 use crate::error::{CdcError, Result};
 use crate::io_thread::{IoThread, IoThreadConfig, IoThreadStats};
-use crate::sql_thread::{SqlThread, SqlThreadConfig, SqlThreadStats};
 use crate::relay_log::RelayLogConfig;
+use crate::sql_thread::{SqlThread, SqlThreadConfig, SqlThreadStats};
 use crate::types::Lsn;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,22 +37,31 @@ impl CdcClient {
     /// Create a new CDC client with I/O and SQL thread architecture
     pub async fn new(config: Config) -> Result<Self> {
         // Get relay log directory from config, environment variable, or use default
-        let relay_log_dir = config.relay_log_directory.clone()
+        let relay_log_dir = config
+            .relay_log_directory
+            .clone()
             .or_else(|| std::env::var("PG2ANY_RELAY_LOG_DIR").ok())
             .unwrap_or_else(|| "relay_logs".to_string());
-        
+
         Self::new_with_relay_log_dir(config, PathBuf::from(relay_log_dir)).await
     }
 
     /// Create a new CDC client with custom relay log directory
-    pub async fn new_with_relay_log_dir(config: Config, relay_log_directory: PathBuf) -> Result<Self> {
+    pub async fn new_with_relay_log_dir(
+        config: Config,
+        relay_log_directory: PathBuf,
+    ) -> Result<Self> {
         info!("Creating enhanced CDC client with I/O/SQL thread architecture");
 
         // Ensure relay log directory exists
-        tokio::fs::create_dir_all(&relay_log_directory).await
+        tokio::fs::create_dir_all(&relay_log_directory)
+            .await
             .map_err(|e| CdcError::io(format!("Failed to create relay log directory: {}", e)))?;
 
-        info!("Using relay log directory: {}", relay_log_directory.display());
+        info!(
+            "Using relay log directory: {}",
+            relay_log_directory.display()
+        );
 
         Ok(Self {
             config,
@@ -73,7 +82,7 @@ impl CdcClient {
             max_file_size: 100 * 1024 * 1024, // 100MB per file
             max_files: 100,
             write_buffer_size: 64 * 1024, // 64KB write buffer
-            read_buffer_size: 64 * 1024  // 64KB read buffer
+            read_buffer_size: 64 * 1024,  // 64KB read buffer
         };
 
         // Create I/O thread configuration
@@ -219,7 +228,10 @@ impl CdcClient {
         let stats = self.get_stats().await;
 
         info!("=== CDC Client Status ===");
-        info!("Relay Log Directory: {}", stats.relay_log_directory.display());
+        info!(
+            "Relay Log Directory: {}",
+            stats.relay_log_directory.display()
+        );
         info!("Running: {}", self.is_running());
 
         if let Some(ref io_stats) = stats.io_stats {
@@ -314,7 +326,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         let config = Config::builder()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -322,7 +336,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
+        let client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         // Check initial state
         assert!(!client.is_running());
@@ -335,7 +351,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         let config = Config::builder()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -343,7 +361,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
+        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         // Initialize the client
         client.init().await.unwrap();
@@ -358,7 +378,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         let config = Config::builder()
-            .source_connection_string("postgresql://test:test@localhost:5432/test?replication=database".to_string())
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
             .destination_type(DestinationType::MySQL)
             .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
             .replication_slot_name("test_slot".to_string())
@@ -366,7 +388,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf()).await.unwrap();
+        let mut client = CdcClient::new_with_relay_log_dir(config, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
         client.init().await.unwrap();
 
         let stats = client.get_stats().await;

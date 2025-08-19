@@ -250,7 +250,7 @@ mod tests {
         let stats = manager.get_stats();
 
         assert_eq!(stats.log_directory, temp_dir.path());
-        assert_eq!(stats.current_file_index, 0);
+        assert_eq!(stats.current_file_index, 1); // Single file approach uses index 1
         assert_eq!(stats.current_sequence, 0);
     }
 

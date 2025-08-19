@@ -37,7 +37,7 @@ pub struct RelayLogPosition {
 impl Default for RelayLogPosition {
     fn default() -> Self {
         Self {
-            file_name: "relay-000001.log".to_string(),
+            file_name: "relay-main.log".to_string(),
             sequence_number: 0,
             source_lsn: None,
             last_updated: chrono::Utc::now(),
@@ -48,22 +48,19 @@ impl Default for RelayLogPosition {
 //todo fix
 impl RelayLogPosition {
     /// Create a new position from file index and other parameters
-    pub fn new(file_index: u64, sequence_number: u64, source_lsn: Option<String>) -> Self {
+    pub fn new(_file_index: u64, sequence_number: u64, source_lsn: Option<String>) -> Self {
         Self {
-            file_name: format!("relay-{:06}.log", file_index),
+            file_name: "relay-main.log".to_string(),
             sequence_number,
             source_lsn,
             last_updated: chrono::Utc::now(),
         }
     }
 
-    /// Extract file index from file name
+    /// Extract file index from file name (always returns 1 for single file approach)
     pub fn get_file_index(&self) -> Result<u64> {
-        if self.file_name.starts_with("relay-") && self.file_name.ends_with(".log") {
-            let index_str = &self.file_name[6..self.file_name.len() - 4];
-            index_str.parse::<u64>().map_err(|e| {
-                CdcError::generic(format!("Invalid relay log file name format: {}", e))
-            })
+        if self.file_name == "relay-main.log" {
+            Ok(1) // Single file approach always uses index 1
         } else {
             Err(CdcError::generic(format!(
                 "Invalid relay log file name: {}",
@@ -85,21 +82,23 @@ impl RelayLogPositionManager {
         Self { position_file_path }
     }
 
-    /// Save current position to disk
+    /// Save current position to disk using direct file overwrite with mutex protection
     pub async fn save_position(&self, position: &RelayLogPosition) -> Result<()> {
         info!("Saving relay log position: {:?}", position);
 
         let json_data = serde_json::to_string_pretty(position)
             .map_err(|e| CdcError::generic(format!("Failed to serialize position: {}", e)))?;
 
-        // Write to a temporary file first, then atomically rename
-        let temp_file_path = self.position_file_path.with_extension("tmp");
+        // Use a static mutex to protect concurrent writes to the position file
+        static POSITION_FILE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = POSITION_FILE_MUTEX.lock().await;
 
+        // Write directly to the position file
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&temp_file_path)
+            .open(&self.position_file_path)
             .await
             .map_err(|e| CdcError::io(format!("Failed to create position file: {}", e)))?;
 
@@ -110,13 +109,6 @@ impl RelayLogPositionManager {
         file.sync_all()
             .await
             .map_err(|e| CdcError::io(format!("Failed to sync position file: {}", e)))?;
-
-        drop(file);
-
-        // todo fix
-        tokio::fs::rename(&temp_file_path, &self.position_file_path)
-            .await
-            .map_err(|e| CdcError::io(format!("Failed to rename position file: {}", e)))?;
 
         debug!(
             "Successfully saved relay log position to {}",
@@ -409,7 +401,7 @@ impl SqlThread {
         // } else {
         //     config.start_sequence
         // };
-        // Create relay log reader
+        // Create relay log reader using latest sequence number and proper file name
         let relay_reader = {
             let current_position = current_position.read().await;
             relay_log_manager
@@ -492,14 +484,14 @@ impl SqlThread {
         Ok(())
     }
 
-    /// Reader loop that reads events from relay logs using async I/O
+    /// Reader loop that reads events from relay logs using async I/O with position tracking
     async fn run_reader_loop(
         relay_reader: RelayLogReader,
         event_tx: mpsc::Sender<RelayLogEntry>,
         stats: Arc<tokio::sync::RwLock<SqlThreadStats>>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        info!("Starting relay log reader loop");
+        info!("Starting relay log reader loop with enhanced position tracking");
 
         loop {
             tokio::select! {
@@ -513,6 +505,11 @@ impl SqlThread {
                 result = relay_reader.wait_for_events() => {
                     match result {
                         Ok(events) => {
+                            if events.is_empty() {
+                                debug!("No events received from relay log reader");
+                                continue;
+                            }
+
                             debug!("Read {} events from relay log", events.len());
 
                             for event in events {
@@ -533,7 +530,7 @@ impl SqlThread {
                             error!("Error reading from relay log: {}", e);
 
                             // Wait before retrying
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
                 }
@@ -711,16 +708,15 @@ impl SqlThread {
                             stats_guard.current_sequence = entry.sequence_id;
                         }
 
-                        // Update current position
+                        // Update current position with better file tracking
                         {
                             let mut position_guard = current_position.write().await;
                             position_guard.sequence_number = entry.sequence_id;
                             position_guard.source_lsn = entry.source_lsn.clone();
                             position_guard.last_updated = chrono::Utc::now();
-
-                            // Note: file_name and file_position would need to be calculated from the relay log entry
-                            // For now, we'll just update sequence_number and source_lsn
-                            // In a future improvement, the RelayLogEntry could include file position info
+                            
+                            // Always use the single relay log file name
+                            position_guard.file_name = "relay-main.log".to_string();
                         }
 
                         break;
@@ -960,7 +956,7 @@ mod tests {
         // Load position
         let loaded_position = position_manager.load_position().await.unwrap().unwrap();
 
-        assert_eq!(loaded_position.file_name, "relay-000005.log");
+        assert_eq!(loaded_position.file_name, "relay-main.log");
         assert_eq!(loaded_position.sequence_number, 12345);
         assert_eq!(loaded_position.source_lsn, Some("0/ABCDEF01".to_string()));
     }
@@ -968,8 +964,8 @@ mod tests {
     #[tokio::test]
     async fn test_relay_log_position_file_index() {
         let position = RelayLogPosition::new(42, 0, None);
-        assert_eq!(position.get_file_index().unwrap(), 42);
-        assert_eq!(position.file_name, "relay-000042.log");
+        assert_eq!(position.get_file_index().unwrap(), 1); // Single file always returns 1
+        assert_eq!(position.file_name, "relay-main.log");
     }
 
     #[tokio::test]
@@ -1004,7 +1000,7 @@ mod tests {
 
         let loaded_position = sql_thread.get_current_position().await;
         assert_eq!(loaded_position.sequence_number, 9999);
-        assert_eq!(loaded_position.file_name, "relay-000003.log");
+        assert_eq!(loaded_position.file_name, "relay-main.log");
         assert_eq!(loaded_position.source_lsn, Some("0/1234ABCD".to_string()));
     }
 }

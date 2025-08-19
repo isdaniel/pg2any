@@ -389,7 +389,7 @@ impl IoThread {
 
                         for event in event_buffer.drain(..) {
                             match relay_writer.write_event(event.clone(), event.lsn.clone()).await {
-                                Ok(_sequence_id) => {
+                                Ok(_sequence_number) => {
                                     // Update statistics
                                     let mut stats_guard = stats.write().await;
                                     stats_guard.events_written += 1;
@@ -420,7 +420,7 @@ impl IoThread {
 
                                 for event in event_buffer.drain(..) {
                                     match relay_writer.write_event(event.clone(), event.lsn.clone()).await {
-                                        Ok(_sequence_id) => {
+                                        Ok(_sequence_number) => {
                                             // Update statistics
                                             let mut stats_guard = stats.write().await;
                                             stats_guard.events_written += 1;

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{Mutex, Notify, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Relay log entry with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,37 +83,28 @@ impl RelayLogManager {
         // Ensure log directory exists
         tokio::fs::create_dir_all(&config.log_directory).await?;
 
-        // Find latest sequence from the single relay log file
-        let relay_log_sequence = Self::find_latest_sequence(&config.log_directory).await?;
-
-        // // Read SQL thread position if it exists
-        // let sql_thread_sequence = Self::read_sql_thread_position(&config.log_directory).await?;
-
-        // // Use the maximum of both sequences to ensure continuity
-        // let current_sequence = match sql_thread_sequence {
-        //     Some(sql_seq) => std::cmp::max(relay_log_sequence, sql_seq),
-        //     None => relay_log_sequence,
-        // };
+        // Read SQL thread position if it exists
+        let current_sequence = Self::read_sql_thread_position(&config.log_directory).await?;
 
         info!(
-            "Initialized relay log manager at {} relay_log_seq={}",
+            "Initialized relay log manager at {}  current_seq={}",
             config.log_directory.display(),
-            relay_log_sequence
+            current_sequence
         );
 
         Ok(Self {
             log_directory: config.log_directory.clone(),
             config,
-            current_file_index: AtomicU64::new(1), // Always 1 for single file approach
-            current_sequence: AtomicU64::new(relay_log_sequence),
+            current_file_index: AtomicU64::new(1),
+            current_sequence: AtomicU64::new(current_sequence),
             writer_state: Arc::new(Mutex::new(WriterState {
                 current_file: None,
                 current_file_size: 0,
             })),
             reader_state: Arc::new(RwLock::new(ReaderState {
                 current_file: None,
-                current_file_index: 1, // Always 1 for single file
-                current_sequence: relay_log_sequence,
+                current_file_index: 1,
+                current_sequence: current_sequence,
             })),
             new_data_notify: Arc::new(Notify::new()),
         })
@@ -148,36 +139,37 @@ impl RelayLogManager {
     }
 
     /// Read the SQL thread position from sql_thread_position.json if it exists
-    // async fn read_sql_thread_position(log_dir: &Path) -> Result<Option<u64>> {
-    //     let position_file_path = log_dir.join("sql_thread_position.json");
-        
-    //     if !position_file_path.exists() {
-    //         return Ok(None);
-    //     }
+    async fn read_sql_thread_position(log_dir: &Path) -> Result<u64> {
+        let position_file_path = log_dir.join("sql_thread_position.json");
 
-    //     let content = tokio::fs::read_to_string(&position_file_path).await?;
-        
-    //     match serde_json::from_str::<serde_json::Value>(&content) {
-    //         Ok(json) => {
-    //             if let Some(seq) = json.get("sequence_number").and_then(|v| v.as_u64()) {
-    //                 Ok(Some(seq))
-    //             } else {
-    //                 Ok(None)
-    //             }
-    //         }
-    //         Err(_) => Ok(None),
-    //     }
-    // }
+        if !position_file_path.exists() {
+            return Ok(0);
+        }
+
+        let content = tokio::fs::read_to_string(&position_file_path).await?;
+
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(json) => {
+                if let Some(seq) = json.get("sequence_number").and_then(|v| v.as_u64()) {
+                    Ok(seq)
+                } else {
+                    Ok(0)
+                }
+            }
+            Err(_) => Ok(0),
+        }
+    }
 
     /// Create a new relay log writer  
     pub async fn create_writer(&self) -> Result<RelayLogWriter> {
         let current_sequence = self.current_sequence.load(Ordering::Relaxed);
         RelayLogWriter::new(
-            self.config.clone(), 
+            self.config.clone(),
             self.writer_state.clone(),
             self.new_data_notify.clone(),
             current_sequence,
-        ).await
+        )
+        .await
     }
 
     /// Create a new relay log reader for single file approach
@@ -232,7 +224,7 @@ pub struct RelayLogWriter {
 impl RelayLogWriter {
     /// Create a new relay log writer
     async fn new(
-        config: RelayLogConfig, 
+        config: RelayLogConfig,
         writer_state: Arc<Mutex<WriterState>>,
         new_data_notify: Arc<Notify>,
         starting_sequence: u64,
@@ -382,8 +374,7 @@ impl RelayLogReader {
                         if line.trim().is_empty() {
                             continue; // Continue the loop instead of recursive call
                         }
-                        
-          
+
                         // Try to parse as a single JSON object first
                         match serde_json::from_str::<RelayLogEntry>(&line) {
                             Ok(entry) => {
@@ -399,7 +390,7 @@ impl RelayLogReader {
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to parse relay log entry: {},{:?}",e,line);
+                                error!("Failed to parse relay log entry: {},{:?}", e, line);
                                 continue; // Continue the loop instead of recursive call
                             }
                         }
@@ -420,15 +411,16 @@ impl RelayLogReader {
             match self.read_event().await? {
                 Some(event) => {
                     events.push(event);
-                    
+
                     // Try to read more events that might be immediately available
-                    while events.len() < 100 { // Reasonable batch size
+                    while events.len() < 100 {
+                        // Reasonable batch size
                         match self.read_event().await? {
                             Some(event) => events.push(event),
                             None => break,
                         }
                     }
-                    
+
                     if !events.is_empty() {
                         break;
                     }
@@ -475,7 +467,10 @@ mod tests {
 
         let manager = RelayLogManager::new(config).await.unwrap();
         let writer = manager.create_writer().await.unwrap();
-        let reader = manager.create_reader("relay-main.log".to_string(), 0).await.unwrap();
+        let reader = manager
+            .create_reader("relay-main.log".to_string(), 0)
+            .await
+            .unwrap();
 
         // Create test event
         let mut data = HashMap::new();
@@ -550,7 +545,7 @@ mod tests {
         let config = RelayLogConfig {
             log_directory: temp_dir.path().to_path_buf(),
             max_file_size: 100 * 1024 * 1024, // Large size since we don't rotate
-            max_files: 1, // Single file approach
+            max_files: 1,                     // Single file approach
             write_buffer_size: 1024,
             read_buffer_size: 1024,
         };
@@ -614,17 +609,19 @@ mod tests {
             "source_lsn": "0/12345",
             "last_updated": "2025-08-19T12:00:00Z"
         }"#;
-        tokio::fs::write(&position_file, position_data).await.unwrap();
+        tokio::fs::write(&position_file, position_data)
+            .await
+            .unwrap();
 
         // Create a relay log manager - it should read the position
         let manager = RelayLogManager::new(config).await.unwrap();
-        
+
         // Verify the manager loaded the correct sequence
         assert_eq!(manager.current_sequence.load(Ordering::Relaxed), 100);
 
         // Create a writer - it should start from sequence 100
         let writer = manager.create_writer().await.unwrap();
-        
+
         // Verify the writer starts from the correct sequence
         assert_eq!(writer.sequence_number.load(Ordering::Relaxed), 100);
     }
@@ -636,9 +633,11 @@ mod tests {
 
         // Create a relay log file with sequence 150
         let relay_log_file = temp_dir.path().join("relay-main.log");
-        let relay_log_data = r#"{"sequence_id":149,"source_lsn":"0/AAA","timestamp":"2025-08-19T12:00:00Z","event":{"event_type":"Test"}}
-{"sequence_id":150,"source_lsn":"0/BBB","timestamp":"2025-08-19T12:00:01Z","event":{"event_type":"Test"}}"#;
-        tokio::fs::write(&relay_log_file, relay_log_data).await.unwrap();
+        let relay_log_data = r#"{"sequence_id":149,"source_lsn":"0/AAA","timestamp":"2025-08-19T12:00:00Z","event":{"event_type":{"Begin":{"transaction_id":1,"commit_timestamp":"2025-08-19T12:00:00Z"}},"lsn":"0/AAA","metadata":null}}
+{"sequence_id":150,"source_lsn":"0/BBB","timestamp":"2025-08-19T12:00:01Z","event":{"event_type":{"Begin":{"transaction_id":2,"commit_timestamp":"2025-08-19T12:00:01Z"}},"lsn":"0/BBB","metadata":null}}"#;
+        tokio::fs::write(&relay_log_file, relay_log_data)
+            .await
+            .unwrap();
 
         // Create a sql_thread_position.json file with sequence 120 (lower than relay log)
         let position_file = temp_dir.path().join("sql_thread_position.json");
@@ -648,13 +647,14 @@ mod tests {
             "source_lsn": "0/12345",
             "last_updated": "2025-08-19T12:00:00Z"
         }"#;
-        tokio::fs::write(&position_file, position_data).await.unwrap();
+        tokio::fs::write(&position_file, position_data)
+            .await
+            .unwrap();
 
         // Create a relay log manager - it should use the higher sequence from relay log
         let manager = RelayLogManager::new(config).await.unwrap();
-        
-        // Verify the manager uses the max sequence (150 from relay log)
-        assert_eq!(manager.current_sequence.load(Ordering::Relaxed), 150);
+
+        assert_eq!(manager.current_sequence.load(Ordering::Relaxed), 120);
     }
 
     #[tokio::test]
@@ -664,8 +664,10 @@ mod tests {
 
         // Create a relay log file with sequence 120
         let relay_log_file = temp_dir.path().join("relay-main.log");
-        let relay_log_data = r#"{"sequence_id":120,"source_lsn":"0/AAA","timestamp":"2025-08-19T12:00:00Z","event":{"event_type":"Test"}}"#;
-        tokio::fs::write(&relay_log_file, relay_log_data).await.unwrap();
+        let relay_log_data = r#"{"sequence_id":120,"source_lsn":"0/AAA","timestamp":"2025-08-19T12:00:00Z","event":{"event_type":{"Begin":{"transaction_id":1,"commit_timestamp":"2025-08-19T12:00:00Z"}},"lsn":"0/AAA","metadata":null}}"#;
+        tokio::fs::write(&relay_log_file, relay_log_data)
+            .await
+            .unwrap();
 
         // Create a sql_thread_position.json file with sequence 150 (higher than relay log)
         let position_file = temp_dir.path().join("sql_thread_position.json");
@@ -675,11 +677,13 @@ mod tests {
             "source_lsn": "0/12345",
             "last_updated": "2025-08-19T12:00:00Z"
         }"#;
-        tokio::fs::write(&position_file, position_data).await.unwrap();
+        tokio::fs::write(&position_file, position_data)
+            .await
+            .unwrap();
 
         // Create a relay log manager - it should use the higher sequence from sql thread position
         let manager = RelayLogManager::new(config).await.unwrap();
-        
+
         // Verify the manager uses the max sequence (150 from sql thread position)
         assert_eq!(manager.current_sequence.load(Ordering::Relaxed), 150);
     }

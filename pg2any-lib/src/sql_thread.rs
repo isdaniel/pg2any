@@ -714,7 +714,7 @@ impl SqlThread {
                             position_guard.sequence_number = entry.sequence_id;
                             position_guard.source_lsn = entry.source_lsn.clone();
                             position_guard.last_updated = chrono::Utc::now();
-                            
+
                             // Always use the single relay log file name
                             position_guard.file_name = "relay-main.log".to_string();
                         }

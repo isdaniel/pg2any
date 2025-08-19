@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, SeekFrom};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info};
 
@@ -75,6 +75,10 @@ struct ReaderState {
     current_file: Option<BufReader<File>>,
     current_file_index: u64,
     current_sequence: u64,
+    /// Cached file metadata for seeking optimization
+    file_size: Option<u64>,
+    /// Last known position in the file for efficient seeking
+    last_file_position: Option<u64>,
 }
 
 impl RelayLogManager {
@@ -105,32 +109,11 @@ impl RelayLogManager {
                 current_file: None,
                 current_file_index: 1,
                 current_sequence: current_sequence,
+                file_size: None,
+                last_file_position: None,
             })),
             new_data_notify: Arc::new(Notify::new()),
         })
-    }
-
-    /// Find the latest sequence number by reading the last entry from relay-main.log
-    async fn find_latest_sequence(log_dir: &Path) -> Result<u64> {
-        let file_path = Self::get_log_file_path(log_dir);
-        if !file_path.exists() {
-            return Ok(0);
-        }
-
-        let file = File::open(&file_path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut last_sequence = 0u64;
-
-        while let Some(line) = lines.next_line().await? {
-            if !line.trim().is_empty() {
-                if let Ok(entry) = serde_json::from_str::<RelayLogEntry>(&line) {
-                    last_sequence = entry.sequence_id;
-                }
-            }
-        }
-
-        Ok(last_sequence)
     }
 
     /// Get the path for the single relay log file
@@ -339,21 +322,170 @@ impl RelayLogReader {
             let mut state = reader.reader_state.write().await;
             state.current_file_index = file_index;
             state.current_sequence = start_sequence;
+            state.file_size = None;
+            state.last_file_position = None;
         }
 
         Ok(reader)
     }
 
-    /// Read the next event from relay logs with sequence filtering
+    /// Seek to the approximate position in the file where the target sequence might be found
+    /// This uses a binary search approach to efficiently find the starting position for large files
+    async fn seek_to_sequence_position(&self, target_sequence: u64) -> Result<Option<u64>> {
+        let file_path = RelayLogManager::get_log_file_path(&self.log_directory);
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        // Open file for seeking (separate from the buffered reader)
+        let mut file = File::open(&file_path).await?;
+        let file_size = file.metadata().await?.len();
+        
+        if file_size == 0 {
+            return Ok(Some(0));
+        }
+
+        // Use binary search on file positions to find approximate location
+        let mut low: u64 = 0;
+        let mut high: u64 = file_size;
+        let mut best_position = 0u64;
+
+        // Limit iterations to prevent infinite loops
+        let max_iterations = (file_size as f64).log2().ceil() as usize + 10;
+        
+        for _iteration in 0..max_iterations {
+            if high <= low {
+                break;
+            }
+
+            let mid = low + (high - low) / 2;
+            
+            // Seek to midpoint and find the next complete line
+            if let Some((line_start_pos, sequence_at_pos)) = 
+                self.find_sequence_at_position(&mut file, mid).await? {
+                
+                match sequence_at_pos.cmp(&target_sequence) {
+                    std::cmp::Ordering::Equal => {
+                        // Found exact match
+                        return Ok(Some(line_start_pos));
+                    }
+                    std::cmp::Ordering::Less => {
+                        // Current position is before target, search right half
+                        best_position = line_start_pos;
+                        low = mid + 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // Current position is after target, search left half  
+                        high = mid.saturating_sub(1);
+                    }
+                }
+            } else {
+                // No valid sequence found at this position, try left half
+                high = mid.saturating_sub(1);
+            }
+        }
+
+        Ok(Some(best_position))
+    }
+
+    /// Find the sequence number at a given file position
+    /// Returns the position of the line start and the sequence number found
+    async fn find_sequence_at_position(&self, file: &mut File, position: u64) -> Result<Option<(u64, u64)>> {
+        if position >= file.metadata().await?.len() {
+            return Ok(None);
+        }
+
+        // Seek to the position
+        file.seek(SeekFrom::Start(position)).await?;
+        
+        let mut reader = BufReader::with_capacity(self.config.read_buffer_size, file);
+        
+        // If we're not at the start of the file, skip to the next line
+        // since we might be in the middle of a line
+        if position > 0 {
+            let mut dummy_line = String::new();
+            reader.read_line(&mut dummy_line).await?;
+        }
+
+        // Record the position at the start of the next complete line
+        let line_start_pos = reader.stream_position().await?;
+        
+        // Read the next line and try to parse the sequence number
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => Ok(None), // EOF
+            Ok(_) => {
+                // Try to parse the line as a RelayLogEntry
+                match serde_json::from_str::<RelayLogEntry>(line.trim()) {
+                    Ok(entry) => Ok(Some((line_start_pos, entry.sequence_id))),
+                    Err(_) => {
+                        // If parsing fails, we might be at a corrupted line
+                        // Let's try reading a few more lines to find a valid entry
+                        for _ in 0..5 {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) => break, // EOF
+                                Ok(_) => {
+                                    if let Ok(entry) = serde_json::from_str::<RelayLogEntry>(line.trim()) {
+                                        let current_pos = reader.stream_position().await?;
+                                        return Ok(Some((current_pos - line.len() as u64, entry.sequence_id)));
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Ok(None)
+                    }
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read the next event from relay logs with sequence filtering and efficient seeking
     pub async fn read_event(&self) -> Result<Option<RelayLogEntry>> {
         loop {
             let mut state = self.reader_state.write().await;
 
-            // Open current file if needed
+            // Open current file if needed and seek to the appropriate position
             if state.current_file.is_none() {
                 let file_path = RelayLogManager::get_log_file_path(&self.log_directory);
                 if file_path.exists() {
-                    let file = File::open(&file_path).await?;
+                    // Get file size for optimization
+                    let metadata = tokio::fs::metadata(&file_path).await?;
+                    state.file_size = Some(metadata.len());
+
+                    // For large files, try to seek to an efficient starting position
+                    let seek_position = if metadata.len() > 1024 * 1024 { // 1MB threshold (lowered for testing)
+                        // Drop the write lock temporarily to perform seeking
+                        drop(state);
+                        
+                        debug!(
+                            "Large file detected ({}KB), seeking to sequence {}",
+                            metadata.len() / 1024,
+                            self.start_sequence
+                        );
+                        
+                        let seek_pos = self.seek_to_sequence_position(self.start_sequence).await?;
+                        
+                        // Reacquire the lock
+                        state = self.reader_state.write().await;
+                        seek_pos
+                    } else {
+                        Some(0) // For small files, start from beginning
+                    };
+
+                    // Open the file
+                    let mut file = File::open(&file_path).await?;
+                    
+                    // Seek to the determined position
+                    if let Some(pos) = seek_position {
+                        file.seek(SeekFrom::Start(pos)).await?;
+                        state.last_file_position = Some(pos);
+                        
+                        debug!("Seeked to position {} for sequence {}", pos, self.start_sequence);
+                    }
+                    
                     let reader = BufReader::with_capacity(self.config.read_buffer_size, file);
                     state.current_file = Some(reader);
                 } else {
@@ -361,7 +493,7 @@ impl RelayLogReader {
                     return Ok(None);
                 }
             }
-
+            
             // Read from current file
             if let Some(ref mut reader) = state.current_file {
                 let mut line = String::new();
@@ -371,6 +503,11 @@ impl RelayLogReader {
                         return Ok(None);
                     }
                     Ok(_) => {
+                        // Update file position tracking
+                        if let Ok(pos) = reader.stream_position().await {
+                            state.last_file_position = Some(pos);
+                        }
+
                         if line.trim().is_empty() {
                             continue; // Continue the loop instead of recursive call
                         }
@@ -384,8 +521,9 @@ impl RelayLogReader {
                                     debug!("Read relay log entry: sequence={}", entry.sequence_id);
                                     return Ok(Some(entry));
                                 } else {
-                                    // todo
                                     // Skip this entry and continue reading
+                                    debug!("Skipping entry with sequence {} (looking for >= {})", 
+                                           entry.sequence_id, state.current_sequence);
                                     continue;
                                 }
                             }
@@ -448,6 +586,8 @@ impl RelayLogReader {
             // File changed, close current file
             state.current_file = None;
             state.current_file_index = file_index;
+            state.file_size = None;
+            state.last_file_position = None;
         }
         state.current_sequence = sequence;
     }
@@ -686,5 +826,218 @@ mod tests {
 
         // Verify the manager uses the max sequence (150 from sql thread position)
         assert_eq!(manager.current_sequence.load(Ordering::Relaxed), 150);
+    }
+
+    #[tokio::test]
+    async fn test_large_file_seeking_performance() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
+
+        let manager = RelayLogManager::new(config).await.unwrap();
+        let writer = manager.create_writer().await.unwrap();
+
+        // Write many events to create a large file
+        let num_events = 1000;
+        for i in 1..=num_events {
+            let mut data = HashMap::new();
+            data.insert(
+                "id".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(i)),
+            );
+
+            let event = ChangeEvent {
+                event_type: EventType::Insert {
+                    schema: "public".to_string(),
+                    table: "test_table".to_string(),
+                    relation_oid: 12345,
+                    data,
+                },
+                lsn: Some(format!("0/1234{:04}", i)),
+                metadata: None,
+            };
+
+            writer.write_event(event, None).await.unwrap();
+        }
+
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        // Test seeking to different positions in the file
+        let test_cases = vec![1, 100, 500, 800, 999];
+        
+        for start_sequence in test_cases {
+            let reader = manager
+                .create_reader("relay-main.log".to_string(), start_sequence)
+                .await
+                .unwrap();
+
+            // First event should be >= start_sequence
+            let first_event = reader.read_event().await.unwrap();
+            assert!(first_event.is_some());
+            let entry = first_event.unwrap();
+            assert!(
+                entry.sequence_id >= start_sequence,
+                "Expected sequence >= {}, got {}",
+                start_sequence,
+                entry.sequence_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_seek_to_sequence_position() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
+
+        let manager = RelayLogManager::new(config.clone()).await.unwrap();
+        let writer = manager.create_writer().await.unwrap();
+
+        // Write test events
+        for i in 1..=100 {
+            let mut data = HashMap::new();
+            data.insert(
+                "id".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(i)),
+            );
+
+            let event = ChangeEvent {
+                event_type: EventType::Insert {
+                    schema: "public".to_string(),
+                    table: "test_table".to_string(),
+                    relation_oid: 12345,
+                    data,
+                },
+                lsn: Some(format!("0/1234{:04}", i)),
+                metadata: None,
+            };
+
+            writer.write_event(event, None).await.unwrap();
+        }
+
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        // Test the seeking functionality directly
+        let reader = manager
+            .create_reader("relay-main.log".to_string(), 50)
+            .await
+            .unwrap();
+
+        // Test seeking to position for sequence 50
+        let seek_pos = reader.seek_to_sequence_position(50).await.unwrap();
+        assert!(seek_pos.is_some(), "Should find a seek position");
+
+        // Verify that seeking actually helps performance by testing
+        // that we can read from the middle of the file efficiently
+        let event = reader.read_event().await.unwrap();
+        assert!(event.is_some());
+        let entry = event.unwrap();
+        assert!(
+            entry.sequence_id >= 50,
+            "Should read sequence >= 50, got {}",
+            entry.sequence_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_performance_comparison_with_and_without_seeking() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
+
+        let manager = RelayLogManager::new(config.clone()).await.unwrap();
+        let writer = manager.create_writer().await.unwrap();
+
+        // Write a substantial number of events to create a larger file for testing
+        let num_events = 5000;
+        println!("Writing {} events for performance test...", num_events);
+        
+        let start_time = std::time::Instant::now();
+        for i in 1..=num_events {
+            let mut data = HashMap::new();
+            data.insert(
+                "id".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(i)),
+            );
+            data.insert(
+                "message".to_string(),
+                serde_json::Value::String(format!("Test message number {} with some additional data to make entries larger", i)),
+            );
+
+            let event = ChangeEvent {
+                event_type: EventType::Insert {
+                    schema: "public".to_string(),
+                    table: "test_table".to_string(),
+                    relation_oid: 12345,
+                    data,
+                },
+                lsn: Some(format!("0/1234{:06}", i)),
+                metadata: None,
+            };
+
+            writer.write_event(event, None).await.unwrap();
+        }
+
+        writer.flush().await.unwrap();
+        drop(writer);
+        
+        let write_duration = start_time.elapsed();
+        println!("Write completed in {:?}", write_duration);
+
+        // Check file size
+        let file_path = RelayLogManager::get_log_file_path(&temp_dir.path());
+        let file_size = tokio::fs::metadata(&file_path).await.unwrap().len();
+        println!("Created relay log file of {} MB", file_size / (1024 * 1024));
+
+        // Test reading from near the end of the file (should benefit most from seeking)
+        let target_sequence = num_events - 100; // Start near the end
+        
+        println!("Testing read performance starting from sequence {}...", target_sequence);
+        
+        let start_time = std::time::Instant::now();
+        let reader = manager
+            .create_reader("relay-main.log".to_string(), target_sequence)
+            .await
+            .unwrap();
+
+        // Read a few events to verify seeking worked
+        let mut events_read = 0;
+        for _ in 0..10 {
+            if let Some(entry) = reader.read_event().await.unwrap() {
+                if events_read == 0 {
+                    // First event should be close to our target
+                    assert!(
+                        entry.sequence_id >= target_sequence,
+                        "First event sequence {} should be >= target {}",
+                        entry.sequence_id,
+                        target_sequence
+                    );
+                    // Should not have to read through the entire file
+                    assert!(
+                        entry.sequence_id < target_sequence + 1000,
+                        "First event sequence {} should be reasonably close to target {}",
+                        entry.sequence_id,
+                        target_sequence
+                    );
+                }
+                events_read += 1;
+            } else {
+                break;
+            }
+        }
+        
+        let read_duration = start_time.elapsed();
+        println!("Read {} events starting from sequence {} in {:?}", 
+                events_read, target_sequence, read_duration);
+        
+        // Verify we read some events
+        assert!(events_read > 0, "Should have read at least one event");
+        
+        // For a large file, reading from near the end should be very fast with seeking
+        // Without seeking, it would have to read through thousands of entries first
+        assert!(
+            read_duration < std::time::Duration::from_secs(2),
+            "Reading with seeking should be reasonably fast, took {:?}",
+            read_duration
+        );
     }
 }

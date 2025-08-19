@@ -494,7 +494,7 @@ impl RelayLogReader {
                         state.last_file_position = Some(pos);
 
                         debug!(
-                            "Seeked to position {} for sequence {}",
+                            "Sought to position {} for sequence {}",
                             pos, self.start_sequence
                         );
                     }

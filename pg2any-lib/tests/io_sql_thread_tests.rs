@@ -23,7 +23,6 @@ mod tests {
             .publication_name("test_pub".to_string())
             .protocol_version(1)
             .streaming(false)
-            .auto_create_tables(true)
             .connection_timeout(Duration::from_secs(5))
             .query_timeout(Duration::from_secs(5))
             .heartbeat_interval(Duration::from_secs(1))
@@ -99,7 +98,6 @@ mod tests {
             .publication_name("my_pub".to_string())
             .protocol_version(2)
             .streaming(true)
-            .auto_create_tables(false)
             .connection_timeout(Duration::from_secs(15))
             .query_timeout(Duration::from_secs(8))
             .heartbeat_interval(Duration::from_secs(20))
@@ -125,7 +123,6 @@ mod tests {
             sql_config.destination_connection_string,
             config.destination_connection_string
         );
-        assert!(!sql_config.auto_create_tables);
         assert_eq!(sql_config.heartbeat_interval, Duration::from_secs(20));
         assert_eq!(sql_config.batch_size, 100); // Default batch size
     }

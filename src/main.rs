@@ -169,10 +169,6 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     let replication_slot =
         std::env::var("CDC_REPLICATION_SLOT").unwrap_or_else(|_| "cdc_slot".to_string());
     let publication = std::env::var("CDC_PUBLICATION").unwrap_or_else(|_| "cdc_pub".to_string());
-    let auto_create_tables = std::env::var("CDC_AUTO_CREATE_TABLES")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse::<bool>()
-        .unwrap_or(true);
 
     let protocol_version = std::env::var("CDC_PROTOCOL_VERSION")
         .unwrap_or_else(|_| "1".to_string())
@@ -238,7 +234,6 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         .protocol_version(protocol_version)
         .binary_format(binary_format)
         .streaming(streaming)
-        .auto_create_tables(auto_create_tables)
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))

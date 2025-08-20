@@ -185,8 +185,6 @@ pub struct SqlThreadConfig {
     pub start_sequence: Option<u64>,
     /// Starting relay log position (for resumption)
     pub start_position: Option<RelayLogPosition>,
-    /// Whether to auto-create tables
-    pub auto_create_tables: bool,
     /// Batch size for processing events
     pub batch_size: usize,
     /// Maximum time to wait for a batch
@@ -247,7 +245,6 @@ impl From<&Config> for SqlThreadConfig {
             relay_log_config,
             start_sequence: None,
             start_position: None,
-            auto_create_tables: config.auto_create_tables,
             batch_size: 100, // Reasonable batch size for performance
             batch_timeout: Duration::from_millis(500),
             heartbeat_interval: config.heartbeat_interval,
@@ -435,7 +432,6 @@ impl SqlThread {
             let cancellation_token = cancellation_token.clone();
             let batch_size = config.batch_size;
             let batch_timeout = config.batch_timeout;
-            let auto_create_tables = config.auto_create_tables;
             let retry_config = config.retry_config;
             let heartbeat_interval = config.heartbeat_interval;
             let position_save_interval = config.position_save_interval;
@@ -450,7 +446,6 @@ impl SqlThread {
                     cancellation_token,
                     batch_size,
                     batch_timeout,
-                    auto_create_tables,
                     retry_config,
                     heartbeat_interval,
                     position_save_interval,
@@ -551,7 +546,6 @@ impl SqlThread {
         cancellation_token: CancellationToken,
         batch_size: usize,
         batch_timeout: Duration,
-        auto_create_tables: bool,
         retry_config: RetryConfig,
         heartbeat_interval: Duration,
         position_save_interval: Duration,
@@ -559,7 +553,7 @@ impl SqlThread {
         info!("Starting event processor loop");
 
         let mut batch_buffer = Vec::with_capacity(batch_size);
-        let mut batch_timer = tokio::time::interval(batch_timeout);
+        let _batch_timer = tokio::time::interval(batch_timeout);
         let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
         let mut position_save_timer = tokio::time::interval(position_save_interval);
 
@@ -578,7 +572,6 @@ impl SqlThread {
                             &mut destination_handler,
                             &stats,
                             &current_position,
-                            auto_create_tables,
                             &retry_config,
                         ).await {
                             error!("Failed to process final batch: {}", e);
@@ -632,7 +625,6 @@ impl SqlThread {
                                     &mut destination_handler,
                                     &stats,
                                     &current_position,
-                                    auto_create_tables,
                                     &retry_config,
                                 ).await {
                                     error!("Failed to process batch: {}", e);
@@ -657,7 +649,6 @@ impl SqlThread {
         destination_handler: &mut Box<dyn DestinationHandler>,
         stats: &Arc<tokio::sync::RwLock<SqlThreadStats>>,
         current_position: &Arc<tokio::sync::RwLock<RelayLogPosition>>,
-        auto_create_tables: bool,
         retry_config: &RetryConfig,
     ) -> Result<()> {
         if batch.is_empty() {
@@ -677,7 +668,6 @@ impl SqlThread {
                 match Self::process_single_event(
                     &entry.event,
                     destination_handler,
-                    auto_create_tables,
                 )
                 .await
                 {
@@ -762,17 +752,8 @@ impl SqlThread {
     async fn process_single_event(
         event: &ChangeEvent,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        auto_create_tables: bool,
     ) -> Result<()> {
         debug!("Processing event: {:?}", event.event_type);
-
-        // Auto-create table if needed and enabled
-        if auto_create_tables && crate::destinations::destination_factory::is_dml_event(event) {
-            if let Err(e) = destination_handler.create_table_if_not_exists(event).await {
-                error!("Failed to auto-create table for event: {}", e);
-                // Continue processing even if table creation fails
-            }
-        }
 
         // Process the event
         destination_handler.process_event(event).await?;
@@ -893,7 +874,6 @@ mod tests {
             .destination_connection_string("mssql://test:test@localhost:1433/test".to_string())
             .replication_slot_name("test_slot".to_string())
             .publication_name("test_pub".to_string())
-            .auto_create_tables(false)
             .heartbeat_interval(Duration::from_secs(15))
             .relay_log_directory(Some(temp_dir.path().to_string_lossy().to_string()))
             .build()
@@ -906,7 +886,6 @@ mod tests {
             sql_config.destination_connection_string,
             config.destination_connection_string
         );
-        assert!(!sql_config.auto_create_tables);
         assert_eq!(sql_config.heartbeat_interval, Duration::from_secs(15));
         assert_eq!(sql_config.batch_size, 100);
     }

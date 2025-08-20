@@ -64,41 +64,6 @@ impl MySQLDestination {
         }
     }
 
-    /// Generate CREATE TABLE statement for MySQL
-    async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
-        match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => {
-                let mut sql = format!("CREATE TABLE IF NOT EXISTS `{}`.`{}` (\n", schema, table);
-
-                // For now, we'll create columns based on the data we receive
-                // In a production system, you'd want to query the PostgreSQL schema
-                let mut columns = Vec::new();
-                for (column_name, value) in data {
-                    let column_type = match value {
-                        serde_json::Value::Number(n) if n.is_i64() => "BIGINT",
-                        serde_json::Value::Number(n) if n.is_f64() => "DOUBLE",
-                        serde_json::Value::Bool(_) => "BOOLEAN",
-                        serde_json::Value::String(s) if s.len() <= 255 => "VARCHAR(255)",
-                        serde_json::Value::String(_) => "TEXT",
-                        _ => "JSON",
-                    };
-                    columns.push(format!("  `{}` {}", column_name, column_type));
-                }
-                sql.push_str(&columns.join(",\n"));
-                sql.push_str("\n)");
-                Ok(sql)
-            }
-            _ => Err(CdcError::generic(
-                "Cannot generate CREATE TABLE for non-INSERT event",
-            )),
-        }
-    }
-
     fn bind_value<'a>(
         &self,
         query: sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments>,
@@ -431,18 +396,6 @@ impl DestinationHandler for MySQLDestination {
         Ok(())
     }
 
-    async fn create_table_if_not_exists(&mut self, event: &ChangeEvent) -> Result<()> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
-
-        let sql = self.generate_create_table(event).await?;
-        sqlx::query(&sql).execute(pool).await?;
-
-        Ok(())
-    }
-
     async fn health_check(&mut self) -> Result<bool> {
         let pool = self
             .pool
@@ -467,7 +420,6 @@ impl DestinationHandler for MySQLDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_mysql_destination_creation() {
@@ -485,39 +437,5 @@ mod tests {
         assert_eq!(destination.convert_type("boolean"), "BOOLEAN");
         assert_eq!(destination.convert_type("uuid"), "VARCHAR(36)");
         assert_eq!(destination.convert_type("unknown_type"), "TEXT");
-    }
-
-    #[tokio::test]
-    async fn test_generate_create_table() {
-        let destination = MySQLDestination::new();
-
-        let mut data = HashMap::new();
-        data.insert(
-            "id".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(1)),
-        );
-        data.insert(
-            "name".to_string(),
-            serde_json::Value::String("test".to_string()),
-        );
-        data.insert("active".to_string(), serde_json::Value::Bool(true));
-
-        let event = ChangeEvent {
-            event_type: EventType::Insert {
-                schema: "test_schema".to_string(),
-                table: "test_table".to_string(),
-                relation_oid: 456,
-                data,
-            },
-            lsn: None,
-            metadata: None,
-        };
-
-        let sql = destination.generate_create_table(&event).await.unwrap();
-
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS `test_schema`.`test_table`"));
-        assert!(sql.contains("`id` BIGINT"));
-        assert!(sql.contains("`name` VARCHAR(255)"));
-        assert!(sql.contains("`active` BOOLEAN"));
     }
 }

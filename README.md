@@ -279,7 +279,6 @@ The following environment variables can be used to configure pg2any:
 ### Replication Configuration
 - `CDC_REPLICATION_SLOT` - PostgreSQL replication slot name (default: `cdc_slot`)
 - `CDC_PUBLICATION` - PostgreSQL publication name (default: `cdc_pub`)
-- `CDC_AUTO_CREATE_TABLES` - Auto-create destination tables: `true`/`false` (default: `true`)
 - `CDC_PROTOCOL_VERSION` - Protocol version 1-4 (default: `1`)
 - `CDC_BINARY_FORMAT` - Use binary format: `true`/`false` (default: `false`)
 - `CDC_STREAMING` - Enable streaming: `true`/`false` (default: `false`)
@@ -317,7 +316,6 @@ PG2ANY_RELAY_LOG_DIR=/var/lib/pg2any/relay_logs
 # Replication Settings
 CDC_REPLICATION_SLOT=cdc_slot
 CDC_PUBLICATION=cdc_pub
-CDC_AUTO_CREATE_TABLES=true
 ```
 
 ## Development Status

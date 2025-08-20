@@ -1,6 +1,6 @@
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, DestinationType, EventType},
+    types::{ChangeEvent, DestinationType},
 };
 use async_trait::async_trait;
 
@@ -19,9 +19,6 @@ pub trait DestinationHandler: Send + Sync {
 
     /// Process a single change event
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()>;
-
-    /// Create a table if it doesn't exist
-    async fn create_table_if_not_exists(&mut self, event: &ChangeEvent) -> Result<()>;
 
     /// Check if the destination is healthy
     async fn health_check(&mut self) -> Result<bool>;
@@ -51,14 +48,9 @@ impl DestinationFactory {
     }
 }
 
-pub fn is_dml_event(event: &ChangeEvent) -> bool {
-    matches!(event.event_type, EventType::Insert { .. })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_destination_factory_create() {
@@ -78,17 +70,6 @@ mod tests {
         // Test unsupported destination type
         let result = DestinationFactory::create(DestinationType::PostgreSQL);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_is_dml_event() {
-        let insert_event = ChangeEvent::insert(
-            "public".to_string(),
-            "test_table".to_string(),
-            1234,
-            HashMap::new(),
-        );
-        assert!(is_dml_event(&insert_event));
     }
 
     #[test]

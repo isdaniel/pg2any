@@ -593,21 +593,21 @@ impl RelayLogReader {
     ) -> Result<Option<RelayLogEntry>> {
         match serde_json::from_str::<RelayLogEntry>(&line) {
             Ok(entry) => {
-                // Only return entries with sequence >= our start sequence
-                if entry.sequence_id >= current_sequence {
-                    debug!("Read relay log entry: sequence={}", entry.sequence_id);
+                // Only return entries with sequence > our start sequence
+                if entry.sequence_id > current_sequence {
+                    debug!("Reading relay log entry: sequence={}", entry.sequence_id);
                     Ok(Some(entry))
                 } else {
-                    // Skip this entry
+                    // Skip this entry - it has already been processed
                     debug!(
-                        "Skipping entry with sequence {} (looking for >= {})",
+                        "Skipping already processed entry: sequence={} (resume point: {})",
                         entry.sequence_id, current_sequence
                     );
                     Ok(None)
                 }
             }
             Err(e) => {
-                error!("Failed to parse relay log entry: {},{:?}", e, line);
+                error!("Failed to parse relay log entry: {}, line: {:?}", e, line);
                 Ok(None) // Skip invalid entries
             }
         }
@@ -638,7 +638,6 @@ impl RelayLogReader {
                         }
                         return Ok(Some(entry));
                     }
-                    // Continue loop if entry was filtered out
                 }
                 None => {
                     // EOF - for single file, just return None and wait for more data

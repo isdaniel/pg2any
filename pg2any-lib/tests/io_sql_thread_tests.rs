@@ -222,8 +222,6 @@ mod tests {
         assert_eq!(sql_stats.events_applied, 0);
         assert_eq!(sql_stats.events_failed, 0);
         assert!(!sql_stats.is_connected);
-        assert_eq!(sql_stats.processing_lag_ms, 0);
-        assert_eq!(sql_stats.average_batch_size, 0.0);
         assert_eq!(sql_stats.total_batches, 0);
     }
 

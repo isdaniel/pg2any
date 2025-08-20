@@ -247,7 +247,6 @@ impl CdcClient {
             info!("Events Applied: {}", sql_stats.events_applied);
             info!("Events Failed: {}", sql_stats.events_failed);
             info!("Current Sequence: {}", sql_stats.current_sequence);
-            info!("Processing Lag: {}ms", sql_stats.processing_lag_ms);
             info!("Average Batch Size: {:.1}", sql_stats.average_batch_size);
             info!("Total Batches: {}", sql_stats.total_batches);
             //info!("Last Heartbeat: {}", sql_stats.last_heartbeat);

@@ -431,10 +431,10 @@ impl SqlThread {
                 RelayLogPositionManager::new(&config.relay_log_config.log_directory);
             let cancellation_token = cancellation_token.clone();
             let batch_size = config.batch_size;
-            let batch_timeout = config.batch_timeout;
+            let _batch_timeout = config.batch_timeout;
             let retry_config = config.retry_config;
-            let heartbeat_interval = config.heartbeat_interval;
-            let position_save_interval = config.position_save_interval;
+            let _heartbeat_interval = config.heartbeat_interval;
+            let _position_save_interval = config.position_save_interval;
 
             tokio::spawn(async move {
                 Self::run_processor_loop(
@@ -445,25 +445,24 @@ impl SqlThread {
                     position_manager,
                     cancellation_token,
                     batch_size,
-                    batch_timeout,
                     retry_config,
-                    heartbeat_interval,
-                    position_save_interval,
                 )
                 .await
             })
         };
+        let mut reader_task = Some(reader_task);
+        let mut processor_task = Some(processor_task);
 
         // Wait for either task to complete or cancellation
         tokio::select! {
-            result = reader_task => {
+            result = reader_task.as_mut().unwrap() => {
                 match result {
                     Ok(Ok(())) => info!("Reader task completed successfully"),
                     Ok(Err(e)) => error!("Reader task failed: {}", e),
                     Err(e) => error!("Reader task panicked: {}", e),
                 }
             }
-            result = processor_task => {
+            result = processor_task.as_mut().unwrap() => {
                 match result {
                     Ok(Ok(())) => info!("Processor task completed successfully"),
                     Ok(Err(e)) => error!("Processor task failed: {}", e),
@@ -472,6 +471,22 @@ impl SqlThread {
             }
             _ = cancellation_token.cancelled() => {
                 info!("SQL thread received cancellation signal");
+
+                if let Some(handle) = reader_task.take() {
+                    match handle.await {
+                        Ok(Ok(())) => info!("Reader task completed successfully on shutdown"),
+                        Ok(Err(e)) => error!("Reader task failed on shutdown: {}", e),
+                        Err(e) => error!("Reader task panicked on shutdown: {}", e),
+                    }
+                }
+
+                if let Some(handle) = processor_task.take() {
+                    match handle.await {
+                        Ok(Ok(())) => info!("Processor task completed successfully on shutdown"),
+                        Ok(Err(e)) => error!("Processor task failed on shutdown: {}", e),
+                        Err(e) => error!("Processor task panicked on shutdown: {}", e),
+                    }
+                }
             }
         }
 
@@ -545,17 +560,11 @@ impl SqlThread {
         position_manager: RelayLogPositionManager,
         cancellation_token: CancellationToken,
         batch_size: usize,
-        batch_timeout: Duration,
-        retry_config: RetryConfig,
-        heartbeat_interval: Duration,
-        position_save_interval: Duration,
+        retry_config: RetryConfig
     ) -> Result<()> {
         info!("Starting event processor loop");
 
         let mut batch_buffer = Vec::with_capacity(batch_size);
-        let _batch_timer = tokio::time::interval(batch_timeout);
-        let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-        let mut position_save_timer = tokio::time::interval(position_save_interval);
 
         loop {
             tokio::select! {
@@ -589,27 +598,6 @@ impl SqlThread {
                     break;
                 }
 
-                _ = position_save_timer.tick() => {
-                    // Periodically save position to disk
-                    let position = current_position.read().await.clone();
-                    if let Err(e) = position_manager.save_position(&position).await {
-                        warn!("Failed to save position: {}", e);
-                    } else {
-                        debug!("Saved position: file={}, seq={}", position.file_name, position.sequence_number);
-                    }
-                }
-
-                _ = heartbeat_timer.tick() => {
-                    // Update heartbeat timestamp
-                    let mut stats_guard = stats.write().await;
-                    // stats_guard.last_heartbeat = chrono::Utc::now();
-
-                    // Calculate processing lag (simplified)
-                    stats_guard.processing_lag_ms = 0; // Would calculate based on relay log timestamps
-
-                    debug!("SQL thread heartbeat: sequence={}, processed={}",
-                           stats_guard.current_sequence, stats_guard.events_processed);
-                }
 
                 event = event_rx.recv() => {
                     match event {

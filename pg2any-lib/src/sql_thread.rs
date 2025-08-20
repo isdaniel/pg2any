@@ -560,7 +560,7 @@ impl SqlThread {
         position_manager: RelayLogPositionManager,
         cancellation_token: CancellationToken,
         batch_size: usize,
-        retry_config: RetryConfig
+        retry_config: RetryConfig,
     ) -> Result<()> {
         info!("Starting event processor loop");
 
@@ -653,12 +653,7 @@ impl SqlThread {
             let mut delay = retry_config.initial_delay;
 
             loop {
-                match Self::process_single_event(
-                    &entry.event,
-                    destination_handler,
-                )
-                .await
-                {
+                match Self::process_single_event(&entry.event, destination_handler).await {
                     Ok(()) => {
                         // Update success statistics
                         {

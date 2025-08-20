@@ -618,23 +618,6 @@ impl SqlThread {
                            stats_guard.current_sequence, stats_guard.events_processed);
                 }
 
-                _ = batch_timer.tick() => {
-                    // Process batch on timeout
-                    if !batch_buffer.is_empty() {
-                        debug!("Processing batch of {} events due to timeout", batch_buffer.len());
-                        if let Err(e) = Self::process_event_batch(
-                            &mut batch_buffer,
-                            &mut destination_handler,
-                            &stats,
-                            &current_position,
-                            auto_create_tables,
-                            &retry_config,
-                        ).await {
-                            error!("Failed to process batch: {}", e);
-                        }
-                    }
-                }
-
                 event = event_rx.recv() => {
                     match event {
                         Some(relay_entry) => {
@@ -669,7 +652,6 @@ impl SqlThread {
         Ok(())
     }
 
-    /// Process a batch of events
     async fn process_event_batch(
         batch: &mut Vec<RelayLogEntry>,
         destination_handler: &mut Box<dyn DestinationHandler>,

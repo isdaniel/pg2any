@@ -1357,7 +1357,6 @@ version = "0.1.0"
 dependencies = [
  "pg2any_lib",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

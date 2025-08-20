@@ -14,6 +14,179 @@ use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWrit
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info};
 
+/// File path management for relay logs
+#[derive(Debug, Clone)]
+pub struct RelayLogFileManager {
+    log_directory: PathBuf,
+}
+
+impl RelayLogFileManager {
+    pub fn new(log_directory: PathBuf) -> Self {
+        Self { log_directory }
+    }
+
+    /// Get the path for the single relay log file
+    pub fn get_main_log_path(&self) -> PathBuf {
+        self.log_directory.join("relay-main.log")
+    }
+
+    /// Get the path for the SQL thread position file
+    pub fn get_position_file_path(&self) -> PathBuf {
+        self.log_directory.join("sql_thread_position.json")
+    }
+
+    pub fn log_directory(&self) -> &Path {
+        &self.log_directory
+    }
+}
+
+/// Position tracking for relay log reading
+#[derive(Debug, Clone, Copy)]
+pub struct RelayLogPosition {
+    pub file_index: u64,
+    pub sequence: u64,
+    pub file_position: Option<u64>,
+}
+
+impl RelayLogPosition {
+    pub fn new(file_index: u64, sequence: u64) -> Self {
+        Self {
+            file_index,
+            sequence,
+            file_position: None,
+        }
+    }
+
+    pub fn with_file_position(mut self, position: u64) -> Self {
+        self.file_position = Some(position);
+        self
+    }
+
+    pub fn update_file_position(&mut self, position: u64) {
+        self.file_position = Some(position);
+    }
+
+    pub fn update_sequence(&mut self, sequence: u64) {
+        self.sequence = sequence;
+    }
+}
+
+/// File seeking operations for relay logs
+pub struct RelayLogSeeker {
+    config: RelayLogConfig,
+}
+
+impl RelayLogSeeker {
+    pub fn new(config: RelayLogConfig) -> Self {
+        Self { config }
+    }
+
+    /// Seek to the approximate position in the file where the target sequence might be found
+    /// This uses a binary search approach to efficiently find the starting position for large files
+    pub async fn seek_to_sequence_position(
+        &self,
+        file_path: &Path,
+        target_sequence: u64,
+    ) -> Result<Option<u64>> {
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        // Open file for seeking (separate from the buffered reader)
+        let mut file = File::open(file_path).await?;
+        let file_size = file.metadata().await?.len();
+
+        if file_size == 0 {
+            return Ok(Some(0));
+        }
+
+        // Use binary search on file positions to find approximate location
+        let mut low: u64 = 0;
+        let mut high: u64 = file_size;
+        let mut best_position = 0u64;
+
+        // Limit iterations to prevent infinite loops
+        let max_iterations = (file_size as f64).log2().ceil() as usize + 10;
+
+        for _iteration in 0..max_iterations {
+            if high <= low {
+                break;
+            }
+
+            let mid = low + (high - low) / 2;
+
+            // Seek to midpoint and find the next complete line
+            if let Some((line_start_pos, sequence_at_pos)) =
+                self.find_sequence_at_position(&mut file, mid).await?
+            {
+                match sequence_at_pos.cmp(&target_sequence) {
+                    std::cmp::Ordering::Equal => {
+                        // Found exact match
+                        return Ok(Some(line_start_pos));
+                    }
+                    std::cmp::Ordering::Less => {
+                        // Current position is before target, search right half
+                        best_position = line_start_pos;
+                        low = mid + 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // Current position is after target, search left half
+                        high = mid.saturating_sub(1);
+                    }
+                }
+            } else {
+                // No valid sequence found at this position, try left half
+                high = mid.saturating_sub(1);
+            }
+        }
+
+        Ok(Some(best_position))
+    }
+
+    /// Find the sequence number at a given file position
+    /// Returns the position of the line start and the sequence number found
+    async fn find_sequence_at_position(
+        &self,
+        file: &mut File,
+        position: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        if position >= file.metadata().await?.len() {
+            return Ok(None);
+        }
+
+        // Seek to the position
+        file.seek(SeekFrom::Start(position)).await?;
+
+        let mut reader = BufReader::with_capacity(self.config.read_buffer_size, file);
+
+        // If we're not at the start of the file, skip to the next line
+        // since we might be in the middle of a line
+        if position > 0 {
+            reader.read_line(&mut String::new()).await?;
+        }
+
+        // Record the position at the start of the next complete line
+        let line_start_pos = reader.stream_position().await?;
+
+        // Read the next line and try to parse the sequence number
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => Ok(None), // EOF
+            Ok(_) => {
+                // Try to parse the line as a RelayLogEntry
+                match serde_json::from_str::<RelayLogEntry>(line.trim()) {
+                    Ok(entry) => Ok(Some((line_start_pos, entry.sequence_id))),
+                    Err(e) => {
+                        error!("Error parsing line from relay log: {}", e);
+                        Ok(None)
+                    }
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 /// Relay log entry with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayLogEntry {
@@ -40,17 +213,27 @@ pub struct RelayLogConfig {
     pub write_buffer_size: usize,
     /// Buffer size for reading
     pub read_buffer_size: usize,
+    /// File manager for path operations
+    file_manager: RelayLogFileManager,
 }
 
 impl RelayLogConfig {
     pub fn new(relay_log_dir: String) -> RelayLogConfig {
+        let log_directory = PathBuf::from(relay_log_dir);
+        let file_manager = RelayLogFileManager::new(log_directory.clone());
+
         Self {
-            log_directory: PathBuf::from(relay_log_dir),
+            log_directory,
             max_file_size: 500 * 1024 * 1024, // 500MB
             max_files: 100,
             write_buffer_size: 64 * 1024, // 64KB
             read_buffer_size: 64 * 1024,  // 64KB
+            file_manager,
         }
+    }
+
+    pub fn file_manager(&self) -> &RelayLogFileManager {
+        &self.file_manager
     }
 }
 
@@ -59,7 +242,6 @@ pub struct RelayLogManager {
     config: RelayLogConfig,
     current_file_index: AtomicU64,
     current_sequence: AtomicU64,
-    log_directory: PathBuf,
     writer_state: Arc<Mutex<WriterState>>,
     reader_state: Arc<RwLock<ReaderState>>,
     /// Notify mechanism to wake up SQL thread when new data is available
@@ -73,12 +255,9 @@ struct WriterState {
 
 struct ReaderState {
     current_file: Option<BufReader<File>>,
-    current_file_index: u64,
-    current_sequence: u64,
+    position: RelayLogPosition,
     /// Cached file metadata for seeking optimization
     file_size: Option<u64>,
-    /// Last known position in the file for efficient seeking
-    last_file_position: Option<u64>,
 }
 
 impl RelayLogManager {
@@ -88,7 +267,7 @@ impl RelayLogManager {
         tokio::fs::create_dir_all(&config.log_directory).await?;
 
         // Read SQL thread position if it exists
-        let current_sequence = Self::read_sql_thread_position(&config.log_directory).await?;
+        let current_sequence = Self::read_sql_thread_position(&config).await?;
 
         info!(
             "Initialized relay log manager at {}  current_seq={}",
@@ -97,7 +276,6 @@ impl RelayLogManager {
         );
 
         Ok(Self {
-            log_directory: config.log_directory.clone(),
             config,
             current_file_index: AtomicU64::new(1),
             current_sequence: AtomicU64::new(current_sequence),
@@ -107,23 +285,16 @@ impl RelayLogManager {
             })),
             reader_state: Arc::new(RwLock::new(ReaderState {
                 current_file: None,
-                current_file_index: 1,
-                current_sequence: current_sequence,
+                position: RelayLogPosition::new(1, current_sequence),
                 file_size: None,
-                last_file_position: None,
             })),
             new_data_notify: Arc::new(Notify::new()),
         })
     }
 
-    /// Get the path for the single relay log file
-    fn get_log_file_path(log_dir: &Path) -> PathBuf {
-        log_dir.join("relay-main.log")
-    }
-
     /// Read the SQL thread position from sql_thread_position.json if it exists
-    async fn read_sql_thread_position(log_dir: &Path) -> Result<u64> {
-        let position_file_path = log_dir.join("sql_thread_position.json");
+    async fn read_sql_thread_position(config: &RelayLogConfig) -> Result<u64> {
+        let position_file_path = config.file_manager().get_position_file_path();
 
         if !position_file_path.exists() {
             return Ok(0);
@@ -183,7 +354,7 @@ impl RelayLogManager {
         RelayLogStats {
             current_file_index: self.current_file_index.load(Ordering::Relaxed),
             current_sequence: self.current_sequence.load(Ordering::Relaxed),
-            log_directory: self.log_directory.clone(),
+            log_directory: self.config.log_directory.clone(),
         }
     }
 }
@@ -262,7 +433,7 @@ impl RelayLogWriter {
     async fn ensure_file_open(&self, state: &mut WriterState) -> Result<()> {
         // Close current file if exists and reopen to ensure it's valid
         if state.current_file.is_none() {
-            let file_path = RelayLogManager::get_log_file_path(&self.config.log_directory);
+            let file_path = self.config.file_manager().get_main_log_path();
 
             let file = OpenOptions::new()
                 .create(true)
@@ -293,10 +464,9 @@ impl RelayLogWriter {
 pub struct RelayLogReader {
     config: RelayLogConfig,
     reader_state: Arc<RwLock<ReaderState>>,
-    log_directory: PathBuf,
-    current_file_index: u64,
     start_sequence: u64,
     new_data_notify: Arc<Notify>,
+    seeker: RelayLogSeeker,
 }
 
 impl RelayLogReader {
@@ -308,250 +478,172 @@ impl RelayLogReader {
         file_index: u64,
         new_data_notify: Arc<Notify>,
     ) -> Result<Self> {
+        let seeker = RelayLogSeeker::new(config.clone());
+
         let reader = Self {
-            log_directory: config.log_directory.clone(),
-            config,
+            config: config.clone(),
             reader_state,
-            current_file_index: file_index,
             start_sequence,
             new_data_notify,
+            seeker,
         };
 
         // Initialize reader state
         {
             let mut state = reader.reader_state.write().await;
-            state.current_file_index = file_index;
-            state.current_sequence = start_sequence;
+            state.position = RelayLogPosition::new(file_index, start_sequence);
             state.file_size = None;
-            state.last_file_position = None;
         }
 
         Ok(reader)
     }
 
-    /// Seek to the approximate position in the file where the target sequence might be found
-    /// This uses a binary search approach to efficiently find the starting position for large files
-    async fn seek_to_sequence_position(&self, target_sequence: u64) -> Result<Option<u64>> {
-        let file_path = RelayLogManager::get_log_file_path(&self.log_directory);
+    /// Initialize the file for reading with optimal seeking
+    async fn initialize_file(&self) -> Result<bool> {
+        let mut state = self.reader_state.write().await;
+
+        if state.current_file.is_some() {
+            return Ok(true);
+        }
+
+        let file_path = self.config.file_manager().get_main_log_path();
         if !file_path.exists() {
-            return Ok(None);
+            return Ok(false);
         }
 
-        // Open file for seeking (separate from the buffered reader)
+        // Get file size for optimization
+        let metadata = tokio::fs::metadata(&file_path).await?;
+        state.file_size = Some(metadata.len());
+
+        // For large files, try to seek to an efficient starting position
+        let seek_position = if metadata.len() > 1024 * 1024 {
+            // 1MB threshold
+            debug!(
+                "Large file detected ({}KB), seeking to sequence {}",
+                metadata.len() / 1024,
+                self.start_sequence
+            );
+
+            // Drop the write lock temporarily to perform seeking
+            drop(state);
+            let seek_pos = self
+                .seeker
+                .seek_to_sequence_position(&file_path, self.start_sequence)
+                .await?;
+            // Reacquire the lock
+            state = self.reader_state.write().await;
+            seek_pos
+        } else {
+            Some(0) // For small files, start from beginning
+        };
+
+        // Open the file
         let mut file = File::open(&file_path).await?;
-        let file_size = file.metadata().await?.len();
 
-        if file_size == 0 {
-            return Ok(Some(0));
+        // Seek to the determined position
+        if let Some(pos) = seek_position {
+            file.seek(SeekFrom::Start(pos)).await?;
+            state.position.update_file_position(pos);
+            debug!(
+                "Sought to position {} for sequence {}",
+                pos, self.start_sequence
+            );
         }
 
-        // Use binary search on file positions to find approximate location
-        let mut low: u64 = 0;
-        let mut high: u64 = file_size;
-        let mut best_position = 0u64;
+        let reader = BufReader::with_capacity(self.config.read_buffer_size, file);
+        state.current_file = Some(reader);
 
-        // Limit iterations to prevent infinite loops
-        let max_iterations = (file_size as f64).log2().ceil() as usize + 10;
-
-        for _iteration in 0..max_iterations {
-            if high <= low {
-                break;
-            }
-
-            let mid = low + (high - low) / 2;
-
-            // Seek to midpoint and find the next complete line
-            if let Some((line_start_pos, sequence_at_pos)) =
-                self.find_sequence_at_position(&mut file, mid).await?
-            {
-                match sequence_at_pos.cmp(&target_sequence) {
-                    std::cmp::Ordering::Equal => {
-                        // Found exact match
-                        return Ok(Some(line_start_pos));
-                    }
-                    std::cmp::Ordering::Less => {
-                        // Current position is before target, search right half
-                        best_position = line_start_pos;
-                        low = mid + 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        // Current position is after target, search left half
-                        high = mid.saturating_sub(1);
-                    }
-                }
-            } else {
-                // No valid sequence found at this position, try left half
-                high = mid.saturating_sub(1);
-            }
-        }
-
-        Ok(Some(best_position))
+        Ok(true)
     }
 
-    /// Find the sequence number at a given file position
-    /// Returns the position of the line start and the sequence number found
-    async fn find_sequence_at_position(
-        &self,
-        file: &mut File,
-        position: u64,
-    ) -> Result<Option<(u64, u64)>> {
-        if position >= file.metadata().await?.len() {
-            return Ok(None);
-        }
-
-        // Seek to the position
-        file.seek(SeekFrom::Start(position)).await?;
-
-        let mut reader = BufReader::with_capacity(self.config.read_buffer_size, file);
-
-        // If we're not at the start of the file, skip to the next line
-        // since we might be in the middle of a line
-        if position > 0 {
-            let mut dummy_line = String::new();
-            reader.read_line(&mut dummy_line).await?;
-        }
-
-        // Record the position at the start of the next complete line
-        let line_start_pos = reader.stream_position().await?;
-
-        // Read the next line and try to parse the sequence number
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => Ok(None), // EOF
-            Ok(_) => {
-                // Try to parse the line as a RelayLogEntry
-                match serde_json::from_str::<RelayLogEntry>(line.trim()) {
-                    Ok(entry) => Ok(Some((line_start_pos, entry.sequence_id))),
-                    Err(_) => {
-                        // If parsing fails, we might be at a corrupted line
-                        // Let's try reading a few more lines to find a valid entry
-                        for _ in 0..5 {
-                            line.clear();
-                            match reader.read_line(&mut line).await {
-                                Ok(0) => break, // EOF
-                                Ok(_) => {
-                                    if let Ok(entry) =
-                                        serde_json::from_str::<RelayLogEntry>(line.trim())
-                                    {
-                                        let current_pos = reader.stream_position().await?;
-                                        return Ok(Some((
-                                            current_pos - line.len() as u64,
-                                            entry.sequence_id,
-                                        )));
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        Ok(None)
-                    }
-                }
-            }
-            Err(_) => Ok(None),
-        }
-    }
-
-    /// Read the next event from relay logs with sequence filtering and efficient seeking
-    pub async fn read_event(&self) -> Result<Option<RelayLogEntry>> {
+    /// Read and parse a single line from the current file
+    async fn read_line_from_file(&self) -> Result<Option<String>> {
         loop {
             let mut state = self.reader_state.write().await;
 
-            // Open current file if needed and seek to the appropriate position
-            if state.current_file.is_none() {
-                let file_path = RelayLogManager::get_log_file_path(&self.log_directory);
-                if file_path.exists() {
-                    // Get file size for optimization
-                    let metadata = tokio::fs::metadata(&file_path).await?;
-                    state.file_size = Some(metadata.len());
-
-                    // For large files, try to seek to an efficient starting position
-                    let seek_position = if metadata.len() > 1024 * 1024 {
-                        // 1MB threshold (lowered for testing)
-                        // Drop the write lock temporarily to perform seeking
-                        drop(state);
-
-                        debug!(
-                            "Large file detected ({}KB), seeking to sequence {}",
-                            metadata.len() / 1024,
-                            self.start_sequence
-                        );
-
-                        let seek_pos = self.seek_to_sequence_position(self.start_sequence).await?;
-
-                        // Reacquire the lock
-                        state = self.reader_state.write().await;
-                        seek_pos
-                    } else {
-                        Some(0) // For small files, start from beginning
-                    };
-
-                    // Open the file
-                    let mut file = File::open(&file_path).await?;
-
-                    // Seek to the determined position
-                    if let Some(pos) = seek_position {
-                        file.seek(SeekFrom::Start(pos)).await?;
-                        state.last_file_position = Some(pos);
-
-                        debug!(
-                            "Sought to position {} for sequence {}",
-                            pos, self.start_sequence
-                        );
-                    }
-
-                    let reader = BufReader::with_capacity(self.config.read_buffer_size, file);
-                    state.current_file = Some(reader);
-                } else {
-                    // No file exists yet for single file approach
-                    return Ok(None);
-                }
-            }
-
-            // Read from current file
             if let Some(ref mut reader) = state.current_file {
                 let mut line = String::new();
                 match reader.read_line(&mut line).await {
-                    Ok(0) => {
-                        // EOF - for single file, just return None and wait for more data
-                        return Ok(None);
-                    }
+                    Ok(0) => return Ok(None), // EOF
                     Ok(_) => {
                         // Update file position tracking
                         if let Ok(pos) = reader.stream_position().await {
-                            state.last_file_position = Some(pos);
+                            state.position.update_file_position(pos);
                         }
 
                         if line.trim().is_empty() {
-                            continue; // Continue the loop instead of recursive call
+                            continue; // Skip empty lines
                         }
 
-                        // Try to parse as a single JSON object first
-                        match serde_json::from_str::<RelayLogEntry>(&line) {
-                            Ok(entry) => {
-                                // Only return entries with sequence >= our start sequence
-                                if entry.sequence_id >= state.current_sequence {
-                                    state.current_sequence = entry.sequence_id;
-                                    debug!("Read relay log entry: sequence={}", entry.sequence_id);
-                                    return Ok(Some(entry));
-                                } else {
-                                    // Skip this entry and continue reading
-                                    debug!(
-                                        "Skipping entry with sequence {} (looking for >= {})",
-                                        entry.sequence_id, state.current_sequence
-                                    );
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse relay log entry: {},{:?}", e, line);
-                                continue; // Continue the loop instead of recursive call
-                            }
-                        }
+                        return Ok(Some(line));
                     }
                     Err(e) => return Err(CdcError::io(format!("Failed to read relay log: {}", e))),
                 }
             } else {
                 return Ok(None);
+            }
+        }
+    }
+
+    /// Parse a line into a RelayLogEntry and check sequence filtering
+    fn parse_and_filter_entry(
+        &self,
+        line: String,
+        current_sequence: u64,
+    ) -> Result<Option<RelayLogEntry>> {
+        match serde_json::from_str::<RelayLogEntry>(&line) {
+            Ok(entry) => {
+                // Only return entries with sequence >= our start sequence
+                if entry.sequence_id >= current_sequence {
+                    debug!("Read relay log entry: sequence={}", entry.sequence_id);
+                    Ok(Some(entry))
+                } else {
+                    // Skip this entry
+                    debug!(
+                        "Skipping entry with sequence {} (looking for >= {})",
+                        entry.sequence_id, current_sequence
+                    );
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse relay log entry: {},{:?}", e, line);
+                Ok(None) // Skip invalid entries
+            }
+        }
+    }
+
+    /// Read the next event from relay logs with sequence filtering and efficient seeking
+    pub async fn read_event(&self) -> Result<Option<RelayLogEntry>> {
+        // Initialize file if needed
+        if !self.initialize_file().await? {
+            return Ok(None); // No file exists yet
+        }
+
+        loop {
+            let current_sequence = {
+                let state = self.reader_state.read().await;
+                state.position.sequence
+            };
+
+            // Try to read a line from the file
+            match self.read_line_from_file().await? {
+                Some(line) => {
+                    // Parse and filter the entry
+                    if let Some(entry) = self.parse_and_filter_entry(line, current_sequence)? {
+                        // Update the sequence position
+                        {
+                            let mut state = self.reader_state.write().await;
+                            state.position.update_sequence(entry.sequence_id);
+                        }
+                        return Ok(Some(entry));
+                    }
+                    // Continue loop if entry was filtered out
+                }
+                None => {
+                    // EOF - for single file, just return None and wait for more data
+                    return Ok(None);
+                }
             }
         }
     }
@@ -591,20 +683,20 @@ impl RelayLogReader {
     /// Get current reading position information for position tracking
     pub async fn get_current_position(&self) -> (u64, u64) {
         let state = self.reader_state.read().await;
-        (state.current_file_index, state.current_sequence)
+        (state.position.file_index, state.position.sequence)
     }
 
     /// Update the current reading position
     pub async fn update_position(&self, file_index: u64, sequence: u64) {
         let mut state = self.reader_state.write().await;
-        if file_index != state.current_file_index {
+        if file_index != state.position.file_index {
             // File changed, close current file
             state.current_file = None;
-            state.current_file_index = file_index;
+            state.position.file_index = file_index;
             state.file_size = None;
-            state.last_file_position = None;
+            state.position.file_position = None;
         }
-        state.current_sequence = sequence;
+        state.position.update_sequence(sequence);
     }
 }
 
@@ -697,13 +789,7 @@ mod tests {
     #[tokio::test]
     async fn test_relay_log_single_file_approach() {
         let temp_dir = TempDir::new().unwrap();
-        let config = RelayLogConfig {
-            log_directory: temp_dir.path().to_path_buf(),
-            max_file_size: 100 * 1024 * 1024, // Large size since we don't rotate
-            max_files: 1,                     // Single file approach
-            write_buffer_size: 1024,
-            read_buffer_size: 1024,
-        };
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
 
         let manager = RelayLogManager::new(config).await.unwrap();
         let writer = manager.create_writer().await.unwrap();
@@ -939,7 +1025,12 @@ mod tests {
             .unwrap();
 
         // Test seeking to position for sequence 50
-        let seek_pos = reader.seek_to_sequence_position(50).await.unwrap();
+        let file_path = config.file_manager().get_main_log_path();
+        let seeker = RelayLogSeeker::new(config);
+        let seek_pos = seeker
+            .seek_to_sequence_position(&file_path, 50)
+            .await
+            .unwrap();
         assert!(seek_pos.is_some(), "Should find a seek position");
 
         // Verify that seeking actually helps performance by testing
@@ -1002,7 +1093,7 @@ mod tests {
         println!("Write completed in {:?}", write_duration);
 
         // Check file size
-        let file_path = RelayLogManager::get_log_file_path(&temp_dir.path());
+        let file_path = temp_dir.path().join("relay-main.log");
         let file_size = tokio::fs::metadata(&file_path).await.unwrap().len();
         println!("Created relay log file of {} MB", file_size / (1024 * 1024));
 

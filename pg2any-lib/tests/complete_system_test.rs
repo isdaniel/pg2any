@@ -31,19 +31,11 @@ async fn test_complete_system_creation() {
 #[tokio::test]
 async fn test_relay_log_end_to_end() {
     use pg2any_lib::relay_log::{RelayLogConfig, RelayLogManager};
-    use std::path::PathBuf;
 
     // Create temporary directory
     let temp_dir = TempDir::new().unwrap();
-    let relay_log_path = PathBuf::from(temp_dir.path());
 
-    let config = RelayLogConfig {
-        log_directory: relay_log_path,
-        max_file_size: 1024 * 1024, // 1MB
-        max_files: 10,
-        write_buffer_size: 1024,
-        read_buffer_size: 1024,
-    };
+    let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
 
     let manager = RelayLogManager::new(config).await.unwrap();
     let writer = manager.create_writer().await.unwrap();

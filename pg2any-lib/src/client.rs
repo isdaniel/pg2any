@@ -77,13 +77,8 @@ impl CdcClient {
         info!("Initializing CDC client with I/O and SQL threads");
 
         // Create relay log configuration
-        let relay_log_config = RelayLogConfig {
-            log_directory: self.relay_log_directory.clone(),
-            max_file_size: 500 * 1024 * 1024, // 500MB per file
-            max_files: 100,
-            write_buffer_size: 64 * 1024, // 64KB write buffer
-            read_buffer_size: 64 * 1024,  // 64KB read buffer
-        };
+        let relay_log_config =
+            RelayLogConfig::new(self.relay_log_directory.to_string_lossy().to_string());
 
         // Create I/O thread configuration
         let mut io_config = IoThreadConfig::from(&self.config);

@@ -236,13 +236,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
 
-        let config = RelayLogConfig {
-            log_directory: temp_dir.path().to_path_buf(),
-            max_file_size: 1024 * 1024, // 1MB
-            max_files: 50,
-            write_buffer_size: 32 * 1024, // 32KB
-            read_buffer_size: 32 * 1024,  // 32KB
-        };
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
 
         let manager = pg2any_lib::RelayLogManager::new(config.clone())
             .await
@@ -329,13 +323,7 @@ mod performance_tests {
     #[tokio::test]
     async fn test_relay_log_high_throughput() {
         let temp_dir = TempDir::new().unwrap();
-        let config = RelayLogConfig {
-            log_directory: temp_dir.path().to_path_buf(),
-            max_file_size: 10 * 1024 * 1024, // 10MB for more realistic file sizes
-            max_files: 10,
-            write_buffer_size: 256 * 1024, // 256KB for better performance
-            read_buffer_size: 256 * 1024,
-        };
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
 
         let manager = RelayLogManager::new(config).await.unwrap();
         let writer = manager.create_writer().await.unwrap();
@@ -427,13 +415,7 @@ mod performance_tests {
     #[tokio::test]
     async fn test_concurrent_writers_readers() {
         let temp_dir = TempDir::new().unwrap();
-        let config = RelayLogConfig {
-            log_directory: temp_dir.path().to_path_buf(),
-            max_file_size: 5 * 1024 * 1024, // 5MB
-            max_files: 20,
-            write_buffer_size: 128 * 1024, // 128KB
-            read_buffer_size: 128 * 1024,
-        };
+        let config = RelayLogConfig::new(temp_dir.path().to_string_lossy().to_string());
 
         let manager = Arc::new(RelayLogManager::new(config).await.unwrap());
         let num_writers = 3;

@@ -36,7 +36,6 @@ pub enum EventType {
         commit_timestamp: DateTime<Utc>,
     },
     Commit {
-        transaction_id: u32,
         commit_timestamp: DateTime<Utc>,
     },
     Relation,
@@ -61,7 +60,7 @@ pub struct ChangeEvent {
     pub event_type: EventType,
 
     /// LSN (Log Sequence Number) position
-    pub lsn: Option<String>,
+    pub lsn: Option<Lsn>,
 
     /// Additional metadata
     pub metadata: Option<HashMap<String, serde_json::Value>>,
@@ -151,7 +150,6 @@ impl ChangeEvent {
     pub fn commit(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
         Self {
             event_type: EventType::Commit {
-                transaction_id,
                 commit_timestamp,
             },
             lsn: None,
@@ -202,12 +200,6 @@ impl ChangeEvent {
             lsn: None,
             metadata: None,
         }
-    }
-
-    /// Set the LSN for this event
-    pub fn with_lsn(mut self, lsn: String) -> Self {
-        self.lsn = Some(lsn);
-        self
     }
 
     /// Set metadata for this event
@@ -314,7 +306,7 @@ pub struct TransactionInfo {
 }
 
 /// LSN (Log Sequence Number) representation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Lsn(pub u64);
 
 impl Lsn {

@@ -123,10 +123,8 @@ fn test_new_event_type_begin_commit() {
     let commit_event = ChangeEvent::commit(12345, timestamp);
     match commit_event.event_type {
         EventType::Commit {
-            transaction_id,
             commit_timestamp,
         } => {
-            assert_eq!(transaction_id, 12345);
             assert_eq!(commit_timestamp, timestamp);
         }
         _ => panic!("Expected Commit variant"),
@@ -182,20 +180,4 @@ fn test_event_serialization() {
         }
         _ => panic!("Serialization/deserialization failed"),
     }
-}
-
-#[test]
-fn test_event_with_lsn_and_metadata() {
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-
-    let mut metadata = HashMap::new();
-    metadata.insert("source".to_string(), json!("postgresql"));
-
-    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data)
-        .with_lsn("0/12345678".to_string())
-        .with_metadata(metadata.clone());
-
-    assert_eq!(event.lsn, Some("0/12345678".to_string()));
-    assert_eq!(event.metadata, Some(metadata));
 }

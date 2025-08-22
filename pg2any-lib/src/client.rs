@@ -90,7 +90,8 @@ impl CdcClient {
         let producer_token = self.cancellation_token.clone();
 
         let producer_handle = tokio::spawn(async move {
-            Self::run_producer(replication_stream, event_sender, producer_token).await
+            Self::run_producer(replication_stream, event_sender, producer_token,
+                start_lsn.unwrap_or(Lsn::new(0))).await
         });
 
         // Start the consumer task (writes to destination)
@@ -112,7 +113,7 @@ impl CdcClient {
                 event_receiver,
                 destination_handler,
                 consumer_token,
-                auto_create_tables,
+                auto_create_tables
             )
             .await
         });
@@ -131,6 +132,7 @@ impl CdcClient {
         mut replication_stream: ReplicationStream,
         event_sender: mpsc::Sender<ChangeEvent>,
         cancellation_token: CancellationToken,
+        start_lsn : Lsn,
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
 
@@ -144,6 +146,13 @@ impl CdcClient {
                 result = replication_stream.next_event(&cancellation_token) => {
                     match result {
                         Ok(Some(event)) => {
+                            if let Some(current_lsn) = event.lsn {
+                                if current_lsn <= start_lsn {
+                                    info!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
+                                    continue;
+                                }
+                            }
+
                             debug!("Producer received single event: {:?}", event.event_type);
                             if let Err(e) = event_sender.send(event).await {
                                 error!("Failed to send event to consumer: {}", e);
@@ -165,9 +174,7 @@ impl CdcClient {
         }
 
         // Gracefully stop the replication stream
-        if let Err(e) = replication_stream.stop().await {
-            warn!("Error stopping replication stream: {}", e);
-        }
+        replication_stream.stop().await?;
 
         info!("Replication producer stopped gracefully");
         Ok(())
@@ -178,7 +185,7 @@ impl CdcClient {
         mut event_receiver: mpsc::Receiver<ChangeEvent>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
-        auto_create_tables: bool,
+        auto_create_tables: bool
     ) -> Result<()> {
         info!("Starting replication consumer (single event mode)");
 
@@ -187,10 +194,8 @@ impl CdcClient {
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer received cancellation signal");
                     // Process any remaining events in the channel
-                    let mut remaining_events = 0;
                     while let Ok(event) = event_receiver.try_recv() {
-                        remaining_events += 1;
-                        debug!("Processing remaining event during shutdown: {:?}", event.event_type);
+                        debug!("Processing remaining event during shutdown: {:?}", event);
 
                         // Auto-create table if needed and enabled
                         if auto_create_tables && is_dml_event(&event) {
@@ -203,11 +208,8 @@ impl CdcClient {
                         if let Err(e) = destination_handler.process_event(&event).await {
                             error!("Failed to process single event during shutdown: {}", e);
                         }
-                        remaining_events -= 1;
                     }
-                    if remaining_events > 0 {
-                        info!("Processed {} remaining events during graceful shutdown", remaining_events);
-                    }
+                    info!("Processed {} remaining events during graceful shutdown", event_receiver.len());
                     break;
                 }
                 event = event_receiver.recv() => {
@@ -250,7 +252,7 @@ impl CdcClient {
 
         // Wait for both tasks to complete gracefully
         self.wait_for_tasks_completion().await?;
-
+        
         // Close destination connection
         if let Some(ref mut handler) = self.destination_handler {
             handler.close().await?;
@@ -299,12 +301,6 @@ impl CdcClient {
                 return Ok(false);
             }
         }
-
-        // In a full implementation, you'd also check:
-        // - PostgreSQL connection health
-        // - Replication slot status
-        // - Event processing lag
-        // - Memory usage, etc.
 
         Ok(true)
     }
@@ -402,7 +398,7 @@ mod tests {
             .connection_timeout(Duration::from_secs(10))
             .query_timeout(Duration::from_secs(5))
             .heartbeat_interval(Duration::from_secs(10))
-            .buffer_size(1000)
+            .buffer_size(500)
             .build()
             .expect("Failed to build test config")
     }

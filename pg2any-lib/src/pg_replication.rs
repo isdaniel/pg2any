@@ -16,7 +16,7 @@ use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // PostgreSQL constants
 const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800; // Seconds from 1970-01-01 to 2000-01-01
@@ -529,9 +529,7 @@ impl Drop for PgResult {
 
 pub struct ReplicationStream {
     logical_stream: LogicalReplicationStream,
-    config: Config,
-    last_received_lsn: Option<Lsn>,
-    last_feedback_time: SystemTime,
+    _config: Config,
 }
 
 impl ReplicationStream {
@@ -542,9 +540,7 @@ impl ReplicationStream {
 
         Ok(Self {
             logical_stream,
-            config,
-            last_received_lsn: None,
-            last_feedback_time: SystemTime::now(),
+            _config: config
         })
     }
 
@@ -572,34 +568,38 @@ impl ReplicationStream {
 
         if let Some(ref event) = event {
             debug!("Received single change event: {:?}", event.event_type);
-
             // Update last received LSN
-            self.last_received_lsn = event
-                .lsn
-                .as_ref()
-                .and_then(|lsn_str| crate::pg_replication::parse_lsn(lsn_str).ok())
-                .map(Lsn);
+            if let Some(lsn) = event.lsn {
+                self.logical_stream.state.update_lsn(lsn.0);
+            }
         }
 
         Ok(event)
     }
 
-    pub fn send_feedback(&mut self) {
+    pub fn maybe_send_feedback(&mut self) {
         self.logical_stream.maybe_send_feedback();
     }
 
     pub async fn stop(&mut self) -> Result<()> {
-        if let Some(last_lsn) = self.last_received_lsn {
-            info!("Sending final LSN feedback: {last_lsn}");
-            self.send_feedback();
+        self.logical_stream.send_feedback()?;
+        let lsn_file = std::env::var("CDC_LAST_LSN_FILE")
+            .unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
+
+        match std::fs::write(&lsn_file, self.current_lsn().to_string()) {
+            Ok(_) => info!("Saved last LSN to file: {}, lsn_str {}", lsn_file, self.current_lsn().to_string()),
+            Err(e) => warn!("Failed to save last LSN to {}: {}", lsn_file, e),
         }
+
+
         info!("Stopping logical replication stream");
         self.logical_stream.stop().await?;
         Ok(())
     }
 
-    pub fn current_lsn(&self) -> Option<Lsn> {
-        self.last_received_lsn
+    #[inline]
+    pub fn current_lsn(&self) -> Lsn {
+        Lsn::from(self.logical_stream.state.last_received_lsn)
     }
 }
 

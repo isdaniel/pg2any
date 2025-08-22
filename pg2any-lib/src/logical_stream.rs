@@ -14,7 +14,7 @@ use crate::replication_protocol::{parse_keepalive_message, LogicalReplicationPar
 use crate::replication_protocol::{
     LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage,
 };
-use crate::types::{ChangeEvent, EventType, ReplicaIdentity};
+use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 pub struct LogicalReplicationStream {
     connection: PgReplicationConnection,
     parser: LogicalReplicationParser,
-    state: ReplicationState,
+    pub state: ReplicationState,
     config: ReplicationStreamConfig,
     slot_created: bool,
     //last_feedback_time: std::time::Instant,
@@ -198,7 +198,6 @@ impl LogicalReplicationStream {
         let start_lsn = reader.read_u64()?;
         let _end_lsn = reader.read_u64()?;
         let _send_time = reader.read_i64()?;
-
         // Update LSN tracking
         if start_lsn > 0 {
             self.state.update_lsn(start_lsn);
@@ -280,7 +279,7 @@ impl LogicalReplicationStream {
                             relation_oid: relation_id,
                             data,
                         },
-                        lsn: Some(format_lsn(lsn)),
+                        lsn: Some(Lsn::new(lsn)),
                         metadata: None,
                     }
                 } else {
@@ -315,7 +314,7 @@ impl LogicalReplicationStream {
                             replica_identity,
                             key_columns,
                         },
-                        lsn: Some(format_lsn(lsn)),
+                        lsn: Some(Lsn::new(lsn)),
                         metadata: None,
                     }
                 } else {
@@ -343,7 +342,7 @@ impl LogicalReplicationStream {
                             replica_identity,
                             key_columns,
                         },
-                        lsn: Some(format_lsn(lsn)),
+                        lsn: Some(Lsn::new(lsn)),
                         metadata: None,
                     }
                 } else {
@@ -359,19 +358,18 @@ impl LogicalReplicationStream {
                         transaction_id: xid,
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
-                    lsn: Some(format_lsn(lsn)),
+                    lsn: Some(Lsn::new(lsn)),
                     metadata: None,
                 }
             }
 
-            LogicalReplicationMessage::Commit { timestamp, .. } => {
-                debug!("Transaction commit");
+            LogicalReplicationMessage::Commit { timestamp, commit_lsn, end_lsn, .. } => {
+                debug!("Transaction commit, commit_lsn:{}, end_lsn:{}", format_lsn(commit_lsn), format_lsn(end_lsn));
                 ChangeEvent {
                     event_type: EventType::Commit {
-                        transaction_id: 0, // We don't have transaction ID in commit message, will be managed by destination
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
                     },
-                    lsn: Some(format_lsn(lsn)),
+                    lsn: Some(Lsn::new(lsn)),
                     metadata: None,
                 }
             }
@@ -390,7 +388,7 @@ impl LogicalReplicationStream {
 
                 ChangeEvent {
                     event_type: EventType::Truncate(truncate_tables),
-                    lsn: Some(format_lsn(lsn)),
+                    lsn: Some(Lsn::new(lsn)),
                     metadata: None,
                 }
             }
@@ -445,7 +443,7 @@ impl LogicalReplicationStream {
     }
 
     /// Send feedback to the server
-    fn send_feedback(&mut self) -> Result<()> {
+    pub fn send_feedback(&mut self) -> Result<()> {
         if self.state.last_received_lsn == 0 {
             return Ok(());
         }
@@ -551,11 +549,11 @@ impl LogicalReplicationStream {
 
     /// Stop the replication stream
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Stopping logical replication stream");
+        //info!("Stopping logical replication stream");
         // The connection will be closed when dropped
         Ok(())
     }
-
+    
     /// Get the current LSN position
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.state.last_received_lsn

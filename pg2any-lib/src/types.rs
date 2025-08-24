@@ -149,9 +149,7 @@ impl ChangeEvent {
     /// Create a COMMIT transaction event
     pub fn commit(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
         Self {
-            event_type: EventType::Commit {
-                commit_timestamp,
-            },
+            event_type: EventType::Commit { commit_timestamp },
             lsn: None,
             metadata: None,
         }

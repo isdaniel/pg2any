@@ -122,9 +122,7 @@ fn test_new_event_type_begin_commit() {
 
     let commit_event = ChangeEvent::commit(12345, timestamp);
     match commit_event.event_type {
-        EventType::Commit {
-            commit_timestamp,
-        } => {
+        EventType::Commit { commit_timestamp } => {
             assert_eq!(commit_timestamp, timestamp);
         }
         _ => panic!("Expected Commit variant"),

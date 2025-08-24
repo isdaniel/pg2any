@@ -363,8 +363,17 @@ impl LogicalReplicationStream {
                 }
             }
 
-            LogicalReplicationMessage::Commit { timestamp, commit_lsn, end_lsn, .. } => {
-                debug!("Transaction commit, commit_lsn:{}, end_lsn:{}", format_lsn(commit_lsn), format_lsn(end_lsn));
+            LogicalReplicationMessage::Commit {
+                timestamp,
+                commit_lsn,
+                end_lsn,
+                ..
+            } => {
+                debug!(
+                    "Transaction commit, commit_lsn:{}, end_lsn:{}",
+                    format_lsn(commit_lsn),
+                    format_lsn(end_lsn)
+                );
                 ChangeEvent {
                     event_type: EventType::Commit {
                         commit_timestamp: postgres_timestamp_to_chrono(timestamp),
@@ -553,7 +562,7 @@ impl LogicalReplicationStream {
         // The connection will be closed when dropped
         Ok(())
     }
-    
+
     /// Get the current LSN position
     pub fn current_lsn(&self) -> XLogRecPtr {
         self.state.last_received_lsn

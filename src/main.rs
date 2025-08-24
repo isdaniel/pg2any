@@ -35,7 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("This will continuously monitor PostgreSQL changes");
 
     // Try to load persisted last LSN from file so we can continue where we left off
-    let last_lsn_file = std::env::var("CDC_LAST_LSN_FILE").unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
+    let last_lsn_file =
+        std::env::var("CDC_LAST_LSN_FILE").unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
     let start_lsn = match std::fs::read_to_string(&last_lsn_file) {
         Ok(contents) => {
             let s = contents.trim();
@@ -45,14 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match pg2any_lib::pg_replication::parse_lsn(s) {
                     Ok(v) => Some(pg2any_lib::types::Lsn(v)),
                     Err(e) => {
-                        tracing::warn!("Failed to parse persisted LSN from {}: {}", last_lsn_file, e);
+                        tracing::warn!(
+                            "Failed to parse persisted LSN from {}: {}",
+                            last_lsn_file,
+                            e
+                        );
                         None
                     }
                 }
             }
         }
         Err(_) => {
-            tracing::info!("No persisted LSN file found at {}, starting from latest", last_lsn_file);
+            tracing::info!(
+                "No persisted LSN file found at {}, starting from latest",
+                last_lsn_file
+            );
             None
         }
     };
@@ -225,7 +233,7 @@ fn load_config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
-        .buffer_size(500) 
+        .buffer_size(500)
         .build()?;
 
     Ok(config)

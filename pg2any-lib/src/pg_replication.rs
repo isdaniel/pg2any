@@ -540,7 +540,7 @@ impl ReplicationStream {
 
         Ok(Self {
             logical_stream,
-            _config: config
+            _config: config,
         })
     }
 
@@ -583,14 +583,17 @@ impl ReplicationStream {
 
     pub async fn stop(&mut self) -> Result<()> {
         self.logical_stream.send_feedback()?;
-        let lsn_file = std::env::var("CDC_LAST_LSN_FILE")
-            .unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
+        let lsn_file =
+            std::env::var("CDC_LAST_LSN_FILE").unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
 
         match std::fs::write(&lsn_file, self.current_lsn().to_string()) {
-            Ok(_) => info!("Saved last LSN to file: {}, lsn_str {}", lsn_file, self.current_lsn().to_string()),
+            Ok(_) => info!(
+                "Saved last LSN to file: {}, lsn_str {}",
+                lsn_file,
+                self.current_lsn().to_string()
+            ),
             Err(e) => warn!("Failed to save last LSN to {}: {}", lsn_file, e),
         }
-
 
         info!("Stopping logical replication stream");
         self.logical_stream.stop().await?;

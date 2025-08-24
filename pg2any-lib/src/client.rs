@@ -90,8 +90,13 @@ impl CdcClient {
         let producer_token = self.cancellation_token.clone();
 
         let producer_handle = tokio::spawn(async move {
-            Self::run_producer(replication_stream, event_sender, producer_token,
-                start_lsn.unwrap_or(Lsn::new(0))).await
+            Self::run_producer(
+                replication_stream,
+                event_sender,
+                producer_token,
+                start_lsn.unwrap_or(Lsn::new(0)),
+            )
+            .await
         });
 
         // Start the consumer task (writes to destination)
@@ -113,7 +118,7 @@ impl CdcClient {
                 event_receiver,
                 destination_handler,
                 consumer_token,
-                auto_create_tables
+                auto_create_tables,
             )
             .await
         });
@@ -132,7 +137,7 @@ impl CdcClient {
         mut replication_stream: ReplicationStream,
         event_sender: mpsc::Sender<ChangeEvent>,
         cancellation_token: CancellationToken,
-        start_lsn : Lsn,
+        start_lsn: Lsn,
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
 
@@ -185,7 +190,7 @@ impl CdcClient {
         mut event_receiver: mpsc::Receiver<ChangeEvent>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
-        auto_create_tables: bool
+        auto_create_tables: bool,
     ) -> Result<()> {
         info!("Starting replication consumer (single event mode)");
 
@@ -252,7 +257,7 @@ impl CdcClient {
 
         // Wait for both tasks to complete gracefully
         self.wait_for_tasks_completion().await?;
-        
+
         // Close destination connection
         if let Some(ref mut handler) = self.destination_handler {
             handler.close().await?;

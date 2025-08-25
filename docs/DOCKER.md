@@ -154,7 +154,6 @@ CDC_DEST_PASSWORD=test.123      # Password (from docker-compose)
 CDC_REPLICATION_SLOT=cdc_slot           # PostgreSQL replication slot name
 CDC_PUBLICATION=cdc_pub                 # PostgreSQL publication name  
 CDC_PROTOCOL_VERSION=1                  # Logical replication protocol version
-CDC_AUTO_CREATE_TABLES=true            # Auto-create destination tables
 CDC_CONNECTION_TIMEOUT=30               # Connection timeout in seconds
 CDC_QUERY_TIMEOUT=10                   # Query timeout in seconds  
 CDC_HEARTBEAT_INTERVAL=10              # Heartbeat interval in seconds
@@ -549,7 +548,6 @@ docker run -d \
 | `CDC_REPLICATION_SLOT` | `cdc_slot` | PostgreSQL replication slot name |
 | `CDC_PUBLICATION` | `cdc_pub` | PostgreSQL publication name |
 | `CDC_PROTOCOL_VERSION` | `1` | Logical replication protocol version |
-| `CDC_AUTO_CREATE_TABLES` | `true` | Automatically create destination tables |
 | `CDC_CONNECTION_TIMEOUT` | `30` | Database connection timeout (seconds) |
 | `CDC_QUERY_TIMEOUT` | `10` | Database query timeout (seconds) |
 | `CDC_HEARTBEAT_INTERVAL` | `10` | Replication heartbeat interval (seconds) |

@@ -31,7 +31,6 @@ use std::time::Duration;
 /// ## CDC Configuration
 /// - `CDC_REPLICATION_SLOT`: Replication slot name (default: "cdc_slot")
 /// - `CDC_PUBLICATION`: Publication name (default: "cdc_pub")
-/// - `CDC_AUTO_CREATE_TABLES`: Auto-create tables (default: "true")
 /// - `CDC_PROTOCOL_VERSION`: Protocol version (default: "1")
 /// - `CDC_BINARY_FORMAT`: Use binary format (default: "false")
 /// - `CDC_STREAMING`: Enable streaming (default: "true")
@@ -132,7 +131,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         std::env::var("CDC_REPLICATION_SLOT").unwrap_or_else(|_| "cdc_slot".to_string());
     let publication = std::env::var("CDC_PUBLICATION").unwrap_or_else(|_| "cdc_pub".to_string());
 
-    let auto_create_tables = parse_bool_env("CDC_AUTO_CREATE_TABLES", true)?;
     let protocol_version = parse_u32_env("CDC_PROTOCOL_VERSION", 1)?;
     let binary_format = parse_bool_env("CDC_BINARY_FORMAT", false)?;
     let streaming = parse_bool_env("CDC_STREAMING", true)?;
@@ -168,7 +166,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .protocol_version(protocol_version)
         .binary_format(binary_format)
         .streaming(streaming)
-        .auto_create_tables(auto_create_tables)
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))

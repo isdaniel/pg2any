@@ -602,7 +602,7 @@ impl ReplicationStream {
 
     #[inline]
     pub fn current_lsn(&self) -> Lsn {
-        Lsn::from(self.logical_stream.state.last_received_lsn)
+        Lsn::from(self.logical_stream.state.last_applied_lsn)
     }
 }
 

@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::destinations::destination_factory::is_dml_event;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
@@ -111,14 +110,12 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
 
         let consumer_token = self.cancellation_token.clone();
-        let auto_create_tables = self.config.auto_create_tables;
 
         let consumer_handle = tokio::spawn(async move {
             Self::run_consumer(
                 event_receiver,
                 destination_handler,
                 consumer_token,
-                auto_create_tables,
             )
             .await
         });
@@ -190,7 +187,6 @@ impl CdcClient {
         mut event_receiver: mpsc::Receiver<ChangeEvent>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
-        auto_create_tables: bool,
     ) -> Result<()> {
         info!("Starting replication consumer (single event mode)");
 
@@ -201,13 +197,6 @@ impl CdcClient {
                     // Process any remaining events in the channel
                     while let Ok(event) = event_receiver.try_recv() {
                         debug!("Processing remaining event during shutdown: {:?}", event);
-
-                        // Auto-create table if needed and enabled
-                        if auto_create_tables && is_dml_event(&event) {
-                            if let Err(e) = destination_handler.create_table_if_not_exists(&event).await {
-                                error!("Failed to auto-create table for event: {}", e);
-                            }
-                        }
 
                         // Process the single event immediately
                         if let Err(e) = destination_handler.process_event(&event).await {
@@ -221,13 +210,6 @@ impl CdcClient {
                     match event {
                         Some(event) => {
                             debug!("Consumer processing event: {:?}", event.event_type);
-
-                            // Auto-create table if needed and enabled
-                            if auto_create_tables && is_dml_event(&event) {
-                                if let Err(e) = destination_handler.create_table_if_not_exists(&event).await {
-                                    error!("Failed to auto-create table for event: {}", e);
-                                }
-                            }
 
                             // Process the single event immediately
                             if let Err(e) = destination_handler.process_event(&event).await {
@@ -374,10 +356,6 @@ mod tests {
             Ok(())
         }
 
-        async fn create_table_if_not_exists(&mut self, _event: &ChangeEvent) -> Result<()> {
-            Ok(())
-        }
-
         async fn close(&mut self) -> Result<()> {
             Ok(())
         }
@@ -399,7 +377,6 @@ mod tests {
             .protocol_version(2)
             .binary_format(false)
             .streaming(true)
-            .auto_create_tables(true)
             .connection_timeout(Duration::from_secs(10))
             .query_timeout(Duration::from_secs(5))
             .heartbeat_interval(Duration::from_secs(10))
@@ -528,7 +505,7 @@ mod tests {
         let token_clone = cancellation_token.clone();
 
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
+            CdcClient::run_consumer(event_receiver, mock_handler, token_clone).await
         });
 
         // Let the consumer run for a bit
@@ -576,7 +553,7 @@ mod tests {
         let events_clone = events_processed.clone();
 
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone, true).await
+            CdcClient::run_consumer(event_receiver, mock_handler, token_clone).await
         });
 
         // Give the consumer time to start processing

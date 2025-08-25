@@ -51,9 +51,6 @@ pub struct Config {
     /// Buffer size for the event channel (kept for channel capacity)
     pub buffer_size: usize,
 
-    /// Whether to create missing destination tables automatically
-    pub auto_create_tables: bool,
-
     /// Table mapping for transformation between source and destination
     pub table_mappings: HashMap<String, TableMapping>,
 
@@ -147,7 +144,6 @@ impl Default for Config {
             query_timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10), // Send feedback every 10 seconds to prevent 60s timeout
             buffer_size: 1000,
-            auto_create_tables: true,
             table_mappings: HashMap::new(),
             extra_options: HashMap::new(),
         }
@@ -255,12 +251,6 @@ impl ConfigBuilder {
     /// Set buffer size
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.config.buffer_size = size;
-        self
-    }
-
-    /// Enable/disable automatic table creation
-    pub fn auto_create_tables(mut self, enabled: bool) -> Self {
-        self.config.auto_create_tables = enabled;
         self
     }
 

@@ -18,89 +18,6 @@ impl SqlServerDestination {
     pub fn new() -> Self {
         Self { client: None }
     }
-
-    /// Convert PostgreSQL type to SQL Server type
-    #[allow(dead_code)]
-    fn convert_type(&self, pg_type: &str) -> &str {
-        match pg_type.to_lowercase().as_str() {
-            "integer" | "int4" => "INT",
-            "bigint" | "int8" => "BIGINT",
-            "smallint" | "int2" => "SMALLINT",
-            "real" | "float4" => "REAL",
-            "double precision" | "float8" => "FLOAT",
-            "numeric" | "decimal" => "DECIMAL",
-            "boolean" | "bool" => "BIT",
-            "character varying" | "varchar" => "NVARCHAR(255)",
-            "character" | "char" => "NCHAR",
-            "text" => "NVARCHAR(MAX)",
-            "date" => "DATE",
-            "time" | "time without time zone" => "TIME",
-            "timestamp" | "timestamp without time zone" => "DATETIME2",
-            "timestamp with time zone" | "timestamptz" => "DATETIMEOFFSET",
-            "uuid" => "UNIQUEIDENTIFIER",
-            "json" | "jsonb" => "NVARCHAR(MAX)",
-            _ => "NVARCHAR(MAX)", // fallback
-        }
-    }
-
-    /// Generate CREATE TABLE statement for SQL Server
-    async fn generate_create_table(&self, event: &ChangeEvent) -> Result<String> {
-        let (schema_name, table_name, data) = match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => (schema, table, Some(data)),
-            EventType::Update {
-                schema,
-                table,
-                new_data,
-                ..
-            } => (schema, table, Some(new_data)),
-            EventType::Delete {
-                schema,
-                table,
-                old_data,
-                ..
-            } => (schema, table, Some(old_data)),
-            _ => {
-                return Err(CdcError::generic(
-                    "Cannot create table for non-DML event".to_string(),
-                ))
-            }
-        };
-
-        let default_schema = "dbo";
-        let schema_name = if schema_name.is_empty() {
-            default_schema
-        } else {
-            schema_name
-        };
-
-        let mut sql = format!("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{}' AND xtype='U') CREATE TABLE [{}].[{}] (\n", table_name, schema_name, table_name);
-
-        // For now, we'll create columns based on the data we receive
-        // In a production system, you'd want to query the PostgreSQL schema
-        if let Some(data) = data {
-            let mut columns = Vec::new();
-            for (column_name, value) in data {
-                let column_type = match value {
-                    serde_json::Value::Number(n) if n.is_i64() => "BIGINT",
-                    serde_json::Value::Number(n) if n.is_f64() => "FLOAT",
-                    serde_json::Value::Bool(_) => "BIT",
-                    serde_json::Value::String(s) if s.len() <= 255 => "NVARCHAR(255)",
-                    serde_json::Value::String(_) => "NVARCHAR(MAX)",
-                    _ => "NVARCHAR(MAX)",
-                };
-                columns.push(format!("  [{}] {}", column_name, column_type));
-            }
-            sql.push_str(&columns.join(",\n"));
-        }
-
-        sql.push_str("\n)");
-        Ok(sql)
-    }
 }
 
 #[async_trait]
@@ -249,22 +166,6 @@ impl DestinationHandler for SqlServerDestination {
         Ok(())
     }
 
-    async fn create_table_if_not_exists(&mut self, event: &ChangeEvent) -> Result<()> {
-        let sql = self.generate_create_table(event).await?;
-
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| CdcError::generic(format!("SQL Server CREATE TABLE failed: {}", e)))?;
-
-        Ok(())
-    }
-
     async fn health_check(&mut self) -> Result<bool> {
         let client = self
             .client
@@ -288,53 +189,10 @@ impl DestinationHandler for SqlServerDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_sqlserver_destination_creation() {
         let destination = SqlServerDestination::new();
         assert!(destination.client.is_none());
-    }
-
-    #[test]
-    fn test_type_conversion() {
-        let destination = SqlServerDestination::new();
-
-        assert_eq!(destination.convert_type("integer"), "INT");
-        assert_eq!(destination.convert_type("bigint"), "BIGINT");
-        assert_eq!(destination.convert_type("varchar"), "NVARCHAR(255)");
-        assert_eq!(destination.convert_type("boolean"), "BIT");
-        assert_eq!(destination.convert_type("uuid"), "UNIQUEIDENTIFIER");
-        assert_eq!(destination.convert_type("unknown_type"), "NVARCHAR(MAX)");
-    }
-
-    #[tokio::test]
-    async fn test_generate_create_table() {
-        let destination = SqlServerDestination::new();
-
-        let mut data = HashMap::new();
-        data.insert(
-            "id".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(1)),
-        );
-        data.insert(
-            "name".to_string(),
-            serde_json::Value::String("test".to_string()),
-        );
-        data.insert("active".to_string(), serde_json::Value::Bool(true));
-
-        let event = ChangeEvent::insert(
-            "test_schema".to_string(),
-            "test_table".to_string(),
-            456,
-            data,
-        );
-
-        let sql = destination.generate_create_table(&event).await.unwrap();
-
-        assert!(sql.contains("CREATE TABLE [test_schema].[test_table]"));
-        assert!(sql.contains("[id] BIGINT"));
-        assert!(sql.contains("[name] NVARCHAR(255)"));
-        assert!(sql.contains("[active] BIT"));
     }
 }

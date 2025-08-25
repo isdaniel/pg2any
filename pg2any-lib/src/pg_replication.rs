@@ -341,10 +341,7 @@ impl PgReplicationConnection {
     }
 
     /// Get copy data from replication stream (async non-blocking version)
-    pub async fn get_copy_data_async(
-        &mut self,
-        cancellation_token: &CancellationToken,
-    ) -> Result<Option<Vec<u8>>> {
+    pub async fn get_copy_data_async(&mut self) -> Result<Option<Vec<u8>>> {
         if !self.is_replication_conn {
             return Err(CdcError::protocol(
                 "Connection is not in replication mode".to_string(),
@@ -356,23 +353,16 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
 
-        loop {
-            if cancellation_token.is_cancelled() {
-                info!("get_copy_data_async received cancellation_token is_cancelled request.");
-                break;
-            }
+        let mut guard = async_fd.readable().await.map_err(|e| {
+            CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
+        })?;
 
-            // Wait for socket to be readable
-            let mut guard = async_fd.readable().await.map_err(|e| {
-                CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
-            })?;
-
-            if let Some(data) = self.try_read_copy_data()? {
-                return Ok(Some(data));
-            }
-
-            guard.clear_ready();
+        if let Some(data) = self.try_read_copy_data()? {
+            return Ok(Some(data));
         }
+
+        guard.clear_ready();
+
         Ok(None)
     }
 
@@ -558,16 +548,13 @@ impl ReplicationStream {
         Ok(())
     }
 
-    pub async fn next_event(
-        &mut self,
-        cancellation_token: &CancellationToken,
-    ) -> Result<Option<ChangeEvent>> {
+    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
         debug!("Fetching next single change event");
 
-        let event = self.logical_stream.next_event(&cancellation_token).await?;
+        let event = self.logical_stream.next_event().await?;
 
         if let Some(ref event) = event {
-            debug!("Received single change event: {:?}", event.event_type);
+            debug!("Received single change event: {:?}", event);
             // Update last received LSN
             if let Some(lsn) = event.lsn {
                 self.logical_stream.state.update_lsn(lsn.0);

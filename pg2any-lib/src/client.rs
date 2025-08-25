@@ -3,10 +3,8 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, Lsn};
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -112,20 +110,14 @@ impl CdcClient {
         let consumer_token = self.cancellation_token.clone();
 
         let consumer_handle = tokio::spawn(async move {
-            Self::run_consumer(
-                event_receiver,
-                destination_handler,
-                consumer_token,
-            )
-            .await
+            Self::run_consumer(event_receiver, destination_handler, consumer_token).await
         });
 
-        // Store the task handles for graceful shutdown
         self.producer_handle = Some(producer_handle);
         self.consumer_handle = Some(consumer_handle);
-        let tasks = self.wait_for_tasks_completion();
+
         info!("CDC replication started successfully");
-        tasks.await?;
+        self.cancellation_token.cancelled().await;
         Ok(())
     }
 
@@ -145,7 +137,7 @@ impl CdcClient {
                     info!("Producer received cancellation signal");
                     break;
                 }
-                result = replication_stream.next_event(&cancellation_token) => {
+                result = replication_stream.next_event() => {
                     match result {
                         Ok(Some(event)) => {
                             if let Some(current_lsn) = event.lsn {
@@ -163,8 +155,10 @@ impl CdcClient {
                         }
                         Ok(None) => {
                             // No event available, wait a bit before trying again
-                            debug!("No event available, retrying...");
-                            sleep(Duration::from_millis(100)).await; // Reduced sleep time for more responsive feedback
+                            if cancellation_token.is_cancelled(){
+                                info!("Producer received cancellation signal");
+                                break;
+                            }
                         }
                         Err(e) => {
                             error!("Error reading from replication stream: {}", e);
@@ -192,6 +186,7 @@ impl CdcClient {
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer received cancellation signal");
                     // Process any remaining events in the channel
@@ -259,13 +254,22 @@ impl CdcClient {
 
     /// Wait for producer and consumer tasks to complete gracefully
     pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
-        Self::wait_handle(self.producer_handle.take(), "Producer").await?;
-        Self::wait_handle(self.consumer_handle.take(), "Consumer").await?;
-        info!("All CDC tasks completed successfully");
+        let producer_task = Self::wait_handle(self.producer_handle.take(), "Producer");
+        let consumer_task = Self::wait_handle(self.consumer_handle.take(), "Consumer");
+        match tokio::join!(producer_task, consumer_task) {
+            (Ok(_), Ok(_)) => {
+                info!("All CDC tasks completed successfully!!");
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                error!("Task failed: {}", e);
+            }
+        }
+
         Ok(())
     }
 
     /// Check if the CDC client is currently running
+    #[inline]
     pub fn is_running(&self) -> bool {
         !self.cancellation_token.is_cancelled()
     }

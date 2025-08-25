@@ -135,18 +135,11 @@ impl LogicalReplicationStream {
     }
 
     /// Process the next single replication event
-    pub async fn next_event(
-        &mut self,
-        cancellation_token: &CancellationToken,
-    ) -> Result<Option<ChangeEvent>> {
+    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
         // Send proactive feedback if enough time has passed
         self.maybe_send_feedback();
 
-        match self
-            .connection
-            .get_copy_data_async(cancellation_token)
-            .await?
-        {
+        match self.connection.get_copy_data_async().await? {
             Some(data) => {
                 if data.is_empty() {
                     return Ok(None);

@@ -41,8 +41,6 @@ impl MySQLDestination {
         Self { pool: None }
     }
 
-
-
     fn bind_value<'a>(
         &self,
         query: sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments>,

@@ -147,7 +147,7 @@ impl ChangeEvent {
     }
 
     /// Create a COMMIT transaction event
-    pub fn commit(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
+    pub fn commit(_transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
         Self {
             event_type: EventType::Commit { commit_timestamp },
             lsn: None,
@@ -317,9 +317,13 @@ impl Lsn {
     pub fn value(&self) -> u64 {
         self.0
     }
+}
 
-    /// Parse LSN from PostgreSQL string format (e.g., "16/B374D848")
-    pub fn from_str(s: &str) -> Result<Self, crate::error::CdcError> {
+/// Parse LSN from PostgreSQL string format (e.g., "16/B374D848")
+impl std::str::FromStr for Lsn {
+    type Err = crate::error::CdcError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split('/').collect();
         if parts.len() != 2 {
             return Err(crate::error::CdcError::protocol("Invalid LSN format"));

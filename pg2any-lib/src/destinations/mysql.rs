@@ -42,6 +42,7 @@ impl MySQLDestination {
     }
 
     /// Convert PostgreSQL type to MySQL type
+    #[allow(dead_code)]
     fn convert_type(&self, pg_type: &str) -> &str {
         match pg_type.to_lowercase().as_str() {
             "integer" | "int4" => "INT",

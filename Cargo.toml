@@ -11,7 +11,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
 description = "PostgreSQL to Any database replication tool with Change Data Capture (CDC)"
+keywords = ["postgresql", "cdc", "replication", "database", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 # Main library dependency
@@ -24,11 +29,16 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-authors = ["dog830228@gmail.com"]
+authors = ["your-name <dog830228@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/isdaniel/pg2any"
+homepage = "https://github.com/isdaniel/pg2any"
+documentation = "https://docs.rs/pg2any"
+readme = "README.md"
+categories = ["database", "asynchronous", "development-tools"]
+keywords = ["postgresql", "cdc", "replication", "database", "streaming"]
 
 [workspace.dependencies]
 tokio = { version = "1.47.1", features = ["full"] }

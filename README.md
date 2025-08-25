@@ -1,8 +1,7 @@
-# PostgreSQL to Any Database Replication (pg2any)
+# PostgreSQL to Any Database Replication (pg2any) v0.1.0
 
 A comprehensive PostgreSQL to Any database replication tool using Change Data Capture (CDC) with logical replication. This tool allows you to stream database changes in real-time from PostgreSQL to other databases such as SQL Server, MySQL, and more.
-
-## ⚠️ Project Status
+## Project Status
 
 This is a **working CDC implementation** that provides comprehensive PostgreSQL to Any database replication using logical replication. 
 
@@ -17,21 +16,22 @@ This is a **working CDC implementation** that provides comprehensive PostgreSQL 
 - ✅ **PostgreSQL logical replication protocol implementation** with full message parsing
 - ✅ **WAL (Write-Ahead Log) record interpretation and processing** 
 - ✅ **Binary protocol message handling** with efficient buffer operations
-- ✅ **LSN (Log Sequence Number) tracking and feedback mechanisms**
+- ✅ **LSN (Log Sequence Number) tracking and feedback mechanisms** with persistence
 - ✅ **Transaction boundary handling** (BEGIN, COMMIT) with consistency guarantees
+- ✅ **Graceful shutdown with proper resource cleanup** and synchronization
 - ✅ Complete destination handlers for MySQL and SQL Server
-- ✅ Real-time change streaming (INSERT, UPDATE, DELETE, TRUNCATE)
-- ✅ Graceful shutdown with CancellationToken and proper resource cleanup
+- ✅ **Real-time change streaming** (INSERT, UPDATE, DELETE, TRUNCATE) with bug fixes
+- ✅ **WHERE clause generation** with replica identity support for accurate updates
 - ✅ Docker containerization with multi-database development environment
 - ✅ Development tooling (Makefile, formatting, testing, linting)
-- ✅ Production-ready logging and structured error handling
+- ✅ **Production-ready logging** and structured error handling with enhanced visibility
 
 ### What Needs Enhancement 🚧
-- 🚧 **Production-ready error recovery** and automatic reconnection strategies
-- 🚧 **Performance optimizations** for high-throughput scenarios and benchmarking
 - 🚧 **Advanced monitoring** with metrics collection and observability dashboards
 - 🚧 **Additional destination databases** (Oracle, SQLite, ClickHouse, etc.)
 - 🚧 **Multi-table replication** with table filtering and routing
+- 🚧 **Schema evolution support** for DDL changes and migrations
+- 🚧 **Performance benchmarking** and optimization for high-throughput scenarios
 
 ## Features
 
@@ -257,27 +257,35 @@ let config = Config::builder()
 
 This project provides **working PostgreSQL to Any database replication** with comprehensive functionality:
 
-### ✅ Completed Implementation
+### ✅ Completed Implementation (v0.1.0)
 - **Core CDC Pipeline**: Complete end-to-end replication from PostgreSQL to destination databases
 - **PostgreSQL Protocol**: Full logical replication protocol implementation with message parsing
 - **WAL Processing**: Complete Write-Ahead Log record parsing and interpretation
 - **Transaction Processing**: BEGIN/COMMIT transaction boundary handling with consistency
 - **Change Event Processing**: Real-time INSERT, UPDATE, DELETE, TRUNCATE operations
 - **Binary Protocol**: Efficient binary message format support with buffer operations
-- **LSN Management**: Log Sequence Number tracking and feedback mechanisms implemented
+- **LSN Management**: Log Sequence Number tracking and feedback mechanisms with persistence
 - **Error Handling**: Production-ready error handling with proper error propagation
 - **Destination Adapters**: Working MySQL and SQL Server destination implementations
 - **Configuration**: Environment-based configuration with validation and defaults
 - **Docker Environment**: Working multi-database development environment
 - **Async Architecture**: Full async/await support with graceful shutdown via CancellationToken
+- **Recent Bug Fixes**: Resolved UPDATE/DELETE operations and LSN synchronization issues
+- **Enhanced Reliability**: Improved graceful shutdown and resource management
 
 ### 🚧 Enhancement Opportunities
-- **Production Hardening**: Enhanced error recovery and automatic reconnection strategies
-- **Performance Optimization**: High-throughput optimizations and comprehensive benchmarking
 - **Advanced Monitoring**: Production metrics collection, dashboards, and alerting
 - **Schema Evolution**: DDL change handling and schema migration support  
 - **Multi-Database Support**: Additional destination databases (Oracle, SQLite, ClickHouse)
 - **Advanced Features**: Table filtering, data transformations, and custom routing
+- **Performance Benchmarking**: High-throughput testing and optimization analysis
+
+### 📊 Current Repository Status
+- **Version**: 0.1.0 (Tagged as `Simple-implementation`)
+- **Branch**: `main` (up to date with origin)
+- **Last Updates**: Enhanced LSN persistence, graceful shutdown improvements, and WHERE clause fixes
+- **Test Coverage**: Comprehensive test suite covering core functionality and edge cases
+- **Code Quality**: Clean, formatted codebase with proper linting and type safety
 
 ## Quick Start with Docker
 
@@ -365,6 +373,23 @@ When you run the application, you'll see structured logging output like this:
 - `bytes`: Byte buffer manipulation
 - `libpq-sys`: Low-level PostgreSQL C library bindings for replication
 
+## 📝 Changelog
+
+### Latest Updates (August 2025)
+- **LSN Persistence Enhancement**: Implemented LSN state persistence before shutdown to prevent data loss and ensure consistent restart points
+- **Graceful Shutdown Improvements**: Enhanced shutdown flow with proper resource cleanup, synchronization, and connection management
+- **WHERE Clause Bug Fixes**: Fixed critical UPDATE and DELETE operations with proper replica identity support for accurate row targeting
+- **Enhanced Transaction Logging**: Added comprehensive logging for BEGIN/COMMIT events with better visibility into transaction boundaries
+- **Bug Resolution**: Resolved `last_received_lsn` synchronization issues and various edge cases in change event processing
+- **Test Suite Expansion**: Added comprehensive unit tests covering new functionality and edge case scenarios
+- **Code Quality**: Applied consistent formatting and improved error handling patterns
+
+### v0.1.0 - Simple Implementation (Tagged Release)
+- Complete PostgreSQL logical replication CDC implementation
+- Support for MySQL and SQL Server destinations
+- Comprehensive test coverage and Docker development environment
+- Production-ready async architecture with proper error handling
+
 ## Test Coverage
 
 Key areas covered by tests:
@@ -379,23 +404,30 @@ Key areas covered by tests:
 
 ## Contributing
 
-This project provides **working PostgreSQL to Any database replication** with a solid foundation for contributions. The core CDC functionality is implemented and tested, making it easy for contributors to focus on specific enhancements:
+This project provides **production-ready PostgreSQL to Any database replication** with a solid foundation for contributions. The core CDC functionality is implemented, tested, and continuously improved, making it easy for contributors to focus on specific enhancements:
 
 ### 🎯 High Impact Areas
-1. **Production Hardening**: Enhance error recovery, reconnection strategies, and resilience patterns
-2. **Performance Optimization**: Implement high-throughput optimizations and comprehensive benchmarking
-3. **Advanced Monitoring**: Add production metrics, dashboards, and observability features
-4. **Additional Destinations**: Extend support to more databases (Oracle, SQLite, ClickHouse, etc.)
-5. **Schema Evolution**: Implement DDL change handling and schema migration capabilities
-6. **Advanced Features**: Add table filtering, data transformations, and routing capabilities
+1. **Advanced Monitoring**: Add production metrics, dashboards, and observability features
+2. **Additional Destinations**: Extend support to more databases (Oracle, SQLite, ClickHouse, etc.)
+3. **Schema Evolution**: Implement DDL change handling and schema migration capabilities
+4. **Performance Benchmarking**: Implement comprehensive performance testing and optimization analysis
+5. **Advanced Features**: Add table filtering, data transformations, and routing capabilities
+6. **Documentation**: Expand usage examples, troubleshooting guides, and best practices
 
 ### 🏗️ Architecture Benefits for Contributors
-- **Working Foundation**: Core CDC pipeline is functional with comprehensive test coverage
+- **Stable Foundation**: Core CDC pipeline is production-ready with recent stability improvements
 - **Modular Design**: Clear separation of concerns makes extending functionality straightforward
 - **Type Safety**: Rust's type system prevents common replication errors and ensures reliability
 - **Async Architecture**: Built for high-performance concurrent processing with Tokio
-- **Documentation**: Well-documented APIs and architecture make contribution easier
+- **Comprehensive Documentation**: Well-documented APIs and architecture with recent updates
 - **Development Environment**: Complete Docker setup for immediate local development and testing
+- **Quality Assurance**: Automated testing, formatting, and linting ensure code quality
+
+### 🔄 Recent Development Activity
+- **Active Maintenance**: Regular bug fixes and improvements (latest commits in August 2025)
+- **Stability Focus**: Recent emphasis on graceful shutdown, LSN persistence, and error handling
+- **Test-Driven**: Expanding test coverage for new features and edge cases
+- **Production Readiness**: Focus on reliability, proper resource management, and operational concerns
 
 ### 🚀 Getting Started Contributing
 

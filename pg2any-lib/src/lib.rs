@@ -37,7 +37,9 @@
 //! ```
 
 // Core modules
+pub mod app;
 pub mod config;
+pub mod env;
 pub mod error;
 
 // Destination handlers
@@ -56,8 +58,10 @@ pub mod client;
 pub mod connection;
 
 // Public API exports
+pub use app::{run_cdc_app, CdcApp};
 pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
+pub use env::load_config_from_env;
 pub use error::CdcError;
 
 /// Result type for CDC operations

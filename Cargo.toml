@@ -24,10 +24,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-license = "MIT OR Apache-2.0"
+authors = ["dog830228@gmail.com"]
+license = "Apache-2.0"
 repository = "https://github.com/isdaniel/pg2any"
 
 [workspace.dependencies]

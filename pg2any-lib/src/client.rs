@@ -130,45 +130,37 @@ impl CdcClient {
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    info!("Producer received cancellation signal");
-                    break;
-                }
-                result = replication_stream.next_event() => {
-                    match result {
-                        Ok(Some(event)) => {
-                            if let Some(current_lsn) = event.lsn {
-                                if current_lsn <= start_lsn {
-                                    info!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
-                                    continue;
-                                }
-                            }
-
-                            debug!("Producer received single event: {:?}", event.event_type);
-                            if let Err(e) = event_sender.send(event).await {
-                                error!("Failed to send event to consumer: {}", e);
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // No event available, wait a bit before trying again
-                            if cancellation_token.is_cancelled(){
-                                info!("Producer received cancellation signal");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error reading from replication stream: {}", e);
-                            break;
+        while !cancellation_token.is_cancelled() {
+            match replication_stream.next_event().await {
+                Ok(Some(event)) => {
+                    if let Some(current_lsn) = event.lsn {
+                        if current_lsn <= start_lsn {
+                            info!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
+                            continue;
                         }
                     }
+
+                    debug!("Producer received single event: {:?}", event.event_type);
+                    if let Err(e) = event_sender.send(event).await {
+                        error!("Failed to send event to consumer: {}", e);
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    // No event available
+                    if cancellation_token.is_cancelled() {
+                        info!("Ok(None) Producer received cancellation signal");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading from replication stream: {}", e);
+                    break;
                 }
             }
         }
 
+        info!("Producer received cancellation signal");
         // Gracefully stop the replication stream
         replication_stream.stop().await?;
 

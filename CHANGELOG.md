@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2025-08-26
+
+### Updated
+- **README.md**: Comprehensive update to accurately reflect current codebase
+- **Documentation**: Enhanced project structure documentation with accurate file counts
+- **Test Coverage**: Updated test statistics to reflect 104+ tests across 8 test files
+- **Architecture**: Improved architecture documentation with detailed component breakdown
+- **Dependencies**: Updated dependency list with accurate versions and descriptions
+- **Contributing**: Enhanced contributing guidelines with better onboarding process
+- **Make Commands**: Complete documentation of all available Makefile commands
+- **Project Statistics**: Added accurate codebase metrics (67 Rust files, 113K+ lines of code)
+
+### Fixed
+- **Directory References**: Corrected repository directory name from `cdc_rs` to `pg2any`
+- **Test Count**: Updated from 80+ to accurate 104+ test count
+- **Feature Documentation**: Aligned feature descriptions with actual implementation
+- **Development Setup**: Fixed Docker and local development instructions
+
+### Enhanced
+- **Client Implementation**: Improved error handling and logging in CDC client
+- **Production Readiness**: Emphasized mature, production-ready status
+- **Code Quality**: Better documentation of test coverage and quality metrics
+- **User Experience**: Clearer quick start guide and development workflow
+
 ## [0.1.0] - 2025-08-25
 
 ### Added

@@ -21,12 +21,12 @@ use std::time::Duration;
 /// - `CDC_SOURCE_PASSWORD`: PostgreSQL password (default: "postgres")
 ///
 /// ## Destination Configuration
-/// - `CDC_DEST_TYPE`: Destination type ("MySQL" or "SqlServer", default: "MySQL")
-/// - `CDC_DEST_HOST`: Destination host (default: "localhost")
-/// - `CDC_DEST_PORT`: Destination port (default: "3306" for MySQL)
-/// - `CDC_DEST_DB`: Destination database name (default: "cdc_target")
-/// - `CDC_DEST_USER`: Destination username (default: "cdc_user")
-/// - `CDC_DEST_PASSWORD`: Destination password (default: "cdc_password")
+/// - `CDC_DEST_TYPE`: Destination type ("MySQL", "SqlServer", or "SQLite", default: "MySQL")
+/// - `CDC_DEST_URI`: Destination URI/host/file path (default: "localhost" for databases, "./cdc_target.db" for SQLite)
+/// - `CDC_DEST_PORT`: Destination port (default: "3306" for MySQL, "1433" for SqlServer) - Not used for SQLite
+/// - `CDC_DEST_DB`: Destination database name (default: "cdc_target") - For SQLite, this is the database file path
+/// - `CDC_DEST_USER`: Destination username (default: "cdc_user") - Not used for SQLite
+/// - `CDC_DEST_PASSWORD`: Destination password (default: "cdc_password") - Not used for SQLite
 ///
 /// ## CDC Configuration
 /// - `CDC_REPLICATION_SLOT`: Replication slot name (default: "cdc_slot")
@@ -72,6 +72,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let dest_type = match dest_type_str.as_str() {
         "MySQL" | "mysql" => DestinationType::MySQL,
         "SqlServer" | "sqlserver" => DestinationType::SqlServer,
+        "SQLite" | "sqlite" => DestinationType::SQLite,
         _ => {
             tracing::warn!(
                 "Unknown destination type '{}', defaulting to MySQL",
@@ -81,7 +82,9 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         }
     };
 
-    let dest_host = std::env::var("CDC_DEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let dest_host = std::env::var("CDC_DEST_URI")
+        .or_else(|_| std::env::var("CDC_DEST_HOST")) // Fallback for backward compatibility
+        .unwrap_or_else(|_| "localhost".to_string());
     let dest_port = match dest_type {
         DestinationType::MySQL => {
             std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "3306".to_string())
@@ -89,12 +92,22 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         DestinationType::SqlServer => {
             std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "1433".to_string())
         }
+        DestinationType::SQLite => {
+            // SQLite doesn't use port, but we'll keep the variable for consistency
+            std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "".to_string())
+        }
         _ => std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "3306".to_string()),
     };
     let dest_db = std::env::var("CDC_DEST_DB").unwrap_or_else(|_| "cdc_target".to_string());
     let dest_user = std::env::var("CDC_DEST_USER").unwrap_or_else(|_| "cdc_user".to_string());
     let dest_password =
         std::env::var("CDC_DEST_PASSWORD").unwrap_or_else(|_| "cdc_password".to_string());
+
+    // For SQLite, handle the file path configuration using CDC_DEST_URI
+    let sqlite_file_path = std::env::var("CDC_DEST_URI")
+        .or_else(|_| std::env::var("CDC_DEST_FILE")) // Fallback for backward compatibility
+        .or_else(|_| std::env::var("CDC_DEST_DB"))
+        .unwrap_or_else(|_| "./cdc_target.db".to_string());
 
     let destination_connection_string = match dest_type {
         DestinationType::MySQL => {
@@ -109,6 +122,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
                 dest_user, dest_password, dest_host, dest_port, dest_db
             )
         }
+        DestinationType::SQLite => sqlite_file_path.clone(),
         _ => {
             return Err(CdcError::config(format!(
                 "Unsupported destination type: {:?}",
@@ -117,13 +131,15 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         }
     };
 
+    let logging_destination = match dest_type {
+        DestinationType::SQLite => sqlite_file_path.clone(),
+        _ => format!("{}@{}:{}/{}", dest_user, dest_host, dest_port, dest_db),
+    };
+
     tracing::info!(
-        "Destination: {:?} at {}@{}:{}/{}",
+        "Destination: {:?} at {}",
         dest_type,
-        dest_user,
-        dest_host,
-        dest_port,
-        dest_db
+        logging_destination
     );
 
     // CDC-specific configuration

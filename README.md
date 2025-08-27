@@ -50,7 +50,7 @@ use pg2any_lib::{load_config_from_env, run_cdc_app};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Main entry point for the CDC application
-/// This function sets up a complete CDC pipeline from PostgreSQL to MySQL/SqlServer
+/// This function sets up a complete CDC pipeline from PostgreSQL to MySQL/SqlServer/SQLite
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize comprehensive logging
@@ -148,7 +148,7 @@ pg2any/                          # Workspace root
 │   │       ├── mysql.rs         # MySQL destination with SQLx
 │   │       ├── sqlserver.rs     # SQL Server destination with Tiberius
 │   │       └── sqlite.rs        # SQLite destination with SQLx
-│   └── tests/                   # Comprehensive test suite (8 test files, 104+ tests)
+│   └── tests/                   # Comprehensive test suite (10 test files, 100+ tests)
 │       ├── integration_tests.rs       # End-to-end CDC testing
 │       ├── destination_integration_tests.rs # Database destination testing
 │       ├── event_type_refactor_tests.rs    # Event type handling tests
@@ -156,6 +156,8 @@ pg2any/                          # Workspace root
 │       ├── mysql_error_handling_simple_tests.rs # Error handling tests
 │       ├── mysql_where_clause_fix_tests.rs # WHERE clause generation tests
 │       ├── replica_identity_tests.rs       # Replica identity handling
+│       ├── sqlite_comprehensive_tests.rs   # SQLite comprehensive testing
+│       ├── sqlite_destination_tests.rs     # SQLite destination tests
 │       └── where_clause_fix_tests.rs       # WHERE clause bug fixes
 ├── docker-compose.yml           # Multi-database development environment
 ├── Dockerfile                   # Application containerization
@@ -171,6 +173,7 @@ pg2any/                          # Workspace root
 ### Currently Implemented
 - **MySQL**: Full implementation using SQLx with connection pooling, type mapping, and DML operations
 - **SQL Server**: Native implementation using Tiberius TDS protocol with comprehensive type support
+- **SQLite**: Complete implementation using SQLx with file-based storage and embedded scenarios
 
 ### Destination Features
 - ✅ **Automatic Schema Management**: Table creation with proper type mapping from PostgreSQL
@@ -178,8 +181,9 @@ pg2any/                          # Workspace root
 - ✅ **Type Conversion**: Comprehensive PostgreSQL to destination type mapping
 - ✅ **WHERE Clause Generation**: Accurate UPDATE/DELETE targeting with replica identity support
 - ✅ **Null Handling**: Proper null value processing and validation
-- ✅ **Connection Management**: Pooling, reconnection, and error recovery
-- ✅ **Feature Flags**: Optional compilation with `mysql` and `sqlserver` features
+- ✅ **Connection Management**: Pooling, reconnection, and error recovery for network databases
+- ✅ **File-based Storage**: SQLite support for embedded and local development scenarios
+- ✅ **Feature Flags**: Optional compilation with `mysql`, `sqlserver`, and `sqlite` features
 
 ## Change Event Types
 
@@ -227,28 +231,118 @@ pub enum CdcError {
 
 ## Configuration
 
-All configuration uses environment variables or the `ConfigBuilder` pattern:
+pg2any supports comprehensive configuration through environment variables or the `ConfigBuilder` pattern. All configuration can be managed through environment variables for containerized deployments or programmatically using the builder pattern.
+
+### Environment Variables Mapping Table
+
+| Category | Variable | Description | Default Value | Example | Notes |
+|----------|----------|-------------|---------------|---------|-------|
+| **Source PostgreSQL** | | | | | |
+| | `CDC_SOURCE_HOST` | PostgreSQL hostname | `localhost` | `postgres` | |
+| | `CDC_SOURCE_PORT` | PostgreSQL port | `5432` | `5432` | |
+| | `CDC_SOURCE_DB` | PostgreSQL database name | `postgres` | `myapp_db` | |
+| | `CDC_SOURCE_USER` | PostgreSQL username | `postgres` | `replication_user` | |
+| | `CDC_SOURCE_PASSWORD` | PostgreSQL password | `postgres` | `securepassword` | |
+| **Destination** | | | | | |
+| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `SQLite`, `SqlServer` | Case-insensitive |
+| | `CDC_DEST_URI` | Destination URI/host/file path | `localhost` for databases, `./cdc_target.db` for SQLite | `mysql-server`, `/data/replica.db` | Host for databases, file path for SQLite |
+| | `CDC_DEST_PORT` | Destination port | `3306` (MySQL), `1433` (SqlServer) | `3306` | Not used for SQLite |
+| | `CDC_DEST_DB` | Destination database name | `cdc_target` | `replicated_db` | For SQLite: file path |
+| | `CDC_DEST_USER` | Destination username | `cdc_user` | `replica_user` | Not used for SQLite |
+| | `CDC_DEST_PASSWORD` | Destination password | `cdc_password` | `secure123` | Not used for SQLite |
+| **CDC Settings** | | | | | |
+| | `CDC_REPLICATION_SLOT` | PostgreSQL replication slot | `cdc_slot` | `my_app_slot` | |
+| | `CDC_PUBLICATION` | PostgreSQL publication name | `cdc_pub` | `my_app_publication` | |
+| | `CDC_PROTOCOL_VERSION` | Replication protocol version | `1` | `1` | Integer value |
+| | `CDC_BINARY_FORMAT` | Use binary message format | `false` | `true` | Boolean |
+| | `CDC_STREAMING` | Enable streaming mode | `true` | `false` | Boolean |
+| **Timeouts** | | | | | |
+| | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
+| | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
+| | `CDC_HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | `10` | `15` | Integer |
+| **System** | | | | | |
+| | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
+| | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
+
+### Configuration Examples
+
+#### MySQL Destination (Docker Environment)
+```bash
+# Source PostgreSQL
+CDC_SOURCE_HOST=postgres
+CDC_SOURCE_PORT=5432
+CDC_SOURCE_DB=postgres
+CDC_SOURCE_USER=postgres
+CDC_SOURCE_PASSWORD=test.123
+
+# MySQL Destination
+CDC_DEST_TYPE=MySQL
+CDC_DEST_URI=mysql
+CDC_DEST_PORT=3306
+CDC_DEST_DB=cdc_db
+CDC_DEST_USER=cdc_user
+CDC_DEST_PASSWORD=test.123
+
+# CDC Configuration
+CDC_REPLICATION_SLOT=cdc_slot
+CDC_PUBLICATION=cdc_pub
+```
+
+#### SQLite Destination (Local Development)
+```bash
+# Source PostgreSQL
+CDC_SOURCE_HOST=localhost
+CDC_SOURCE_PORT=7777
+CDC_SOURCE_DB=postgres
+CDC_SOURCE_USER=postgres
+CDC_SOURCE_PASSWORD=test.123
+
+# SQLite Destination
+CDC_DEST_TYPE=SQLite
+CDC_DEST_URI=./my_replica.db
+
+# CDC Configuration
+CDC_REPLICATION_SLOT=cdc_slot
+CDC_PUBLICATION=cdc_pub
+CDC_STREAMING=true
+```
+
+#### SQL Server Destination (Production)
+```bash
+# Source PostgreSQL
+CDC_SOURCE_HOST=prod-postgres.example.com
+CDC_SOURCE_PORT=5432
+CDC_SOURCE_DB=application_db
+CDC_SOURCE_USER=replication_user
+CDC_SOURCE_PASSWORD=${POSTGRES_PASSWORD}
+
+# SQL Server Destination
+CDC_DEST_TYPE=SqlServer
+CDC_DEST_URI=prod-sqlserver.example.com
+CDC_DEST_PORT=1433
+CDC_DEST_DB=replica_db
+CDC_DEST_USER=sa
+CDC_DEST_PASSWORD=${SQLSERVER_PASSWORD}
+
+# Production Settings
+CDC_CONNECTION_TIMEOUT=60
+CDC_QUERY_TIMEOUT=30
+CDC_HEARTBEAT_INTERVAL=30
+```
+
+### Programmatic Configuration
+
+You can also configure pg2any programmatically using the builder pattern:
 
 ```rust
-// Environment variables (used in Docker setup)
-std::env::set_var("CDC_SOURCE_HOST", "postgres");
-std::env::set_var("CDC_SOURCE_PORT", "5432");
-std::env::set_var("CDC_SOURCE_DB", "postgres");
-std::env::set_var("CDC_SOURCE_USER", "postgres");
-std::env::set_var("CDC_SOURCE_PASSWORD", "test.123");
+```rust
+use pg2any_lib::{Config, DestinationType};
+use std::time::Duration;
 
-std::env::set_var("CDC_DEST_TYPE", "MySQL");
-std::env::set_var("CDC_DEST_HOST", "mysql");
-std::env::set_var("CDC_DEST_PORT", "3306");
-std::env::set_var("CDC_DEST_DB", "cdc_db");
-std::env::set_var("CDC_DEST_USER", "cdc_user");
-std::env::set_var("CDC_DEST_PASSWORD", "test.123");
-
-// Or using the builder pattern
 let config = Config::builder()
     .source_connection_string("postgresql://postgres:test.123@localhost:7777/postgres")
-    .destination_type(DestinationType::MySQL)
-    .destination_connection_string("mysql://cdc_user:test.123@localhost:3306/cdc_db")
+    .destination_type(DestinationType::SQLite)
+    .destination_connection_string("./my_replica.db")
     .replication_slot_name("cdc_slot")
     .publication_name("cdc_pub")
     .protocol_version(1)
@@ -261,15 +355,23 @@ let config = Config::builder()
     .build()?;
 ```
 
+### Configuration Validation
+
+The configuration system provides comprehensive validation:
+- **Connection Strings**: Automatically formatted and validated
+- **Type Safety**: Proper enum handling for destination types
+- **Default Values**: Sensible defaults for all optional parameters
+- **Error Handling**: Clear error messages for invalid configurations
+
 ## Development Status
 
-### ✅ Production-Ready Implementation (v0.1.0)
+### ✅ Production-Ready Implementation 
 This project provides **enterprise-grade PostgreSQL to Any database replication** with battle-tested reliability:
 
 - **🏗️ Core CDC Pipeline**: Complete end-to-end replication with transaction consistency
 - **🔄 PostgreSQL Protocol**: Full logical replication implementation with binary message parsing
 - **📊 Change Processing**: Real-time streaming of all DML operations with proper error handling
-- **🎯 Destination Support**: Production-ready MySQL and SQL Server implementations
+- **🎯 Destination Support**: Production-ready MySQL, SQL Server, and SQLite implementations
 - **⚙️ Configuration**: Flexible environment-based configuration with validation
 - **🐳 Docker Environment**: Complete development setup with multi-database support
 - **📈 Monitoring**: Structured logging with configurable levels and filtering

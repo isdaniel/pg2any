@@ -17,7 +17,6 @@ use crate::replication_protocol::{
 use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// PostgreSQL logical replication stream

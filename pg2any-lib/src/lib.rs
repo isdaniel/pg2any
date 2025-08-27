@@ -4,6 +4,7 @@
 //! This library allows you to stream database changes in real-time from PostgreSQL to other databases
 //! such as SQL Server, MySQL, and more.
 //!
+
 //! ## Features
 //!
 //! - PostgreSQL logical replication support
@@ -17,22 +18,40 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use pg2any_lib::{CdcClient, Config, DestinationType};
-//!
+//! use pg2any_lib::{load_config_from_env, run_cdc_app};
+//! use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+//! 
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = Config::builder()
-//!         .source_connection_string("postgresql://user:password@localhost/source_db")
-//!         .destination_type(DestinationType::MySQL)
-//!         .destination_connection_string("mysql://user:password@localhost/target_db")
-//!         .replication_slot_name("my_cdc_slot")
-//!         .publication_name("my_publication")
-//!         .build()?;
-//!     
-//!     let mut client = CdcClient::new(config).await?;
-//!     client.start_replication_from_lsn(None).await?;
-//!     
+//!     async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Initialize comprehensive logging
+//!     init_logging();
+//!     tracing::info!("Starting PostgreSQL CDC Application");
+//!     // Load configuration from environment variables
+//!     let config = load_config_from_env()?;
+//!     // Run the CDC application with graceful shutdown handling
+//!     run_cdc_app(config, None).await?;
+//!     tracing::info!("CDC application stopped");
 //!     Ok(())
+//! }
+//! 
+//! pub fn init_logging() {
+//!     // Create a sophisticated logging setup
+//!     let env_filter = EnvFilter::try_from_default_env()
+//!         .unwrap_or_else(|_| EnvFilter::new("pg2any=debug,tokio_postgres=info,sqlx=info"));
+//! 
+//!     let fmt_layer = fmt::layer()
+//!         .with_target(true)
+//!         .with_thread_ids(true)
+//!         .with_level(true)
+//!         .with_ansi(true)
+//!         .compact();
+//! 
+//!     tracing_subscriber::registry()
+//!         .with(env_filter)
+//!         .with(fmt_layer)
+//!         .init();
+//! 
+//!     tracing::info!("Logging initialized with level filtering");
 //! }
 //! ```
 

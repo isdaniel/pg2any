@@ -15,7 +15,6 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 // PostgreSQL constants

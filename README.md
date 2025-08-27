@@ -1,12 +1,15 @@
-# PostgreSQL to Any Database Replication (pg2any) v0.1.1
+[![Crates.io Version](https://img.shields.io/crates/v/pg2any_lib)](https://crates.io/crates/pg2any_lib)
+[![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/pg2any_lib)](https://crates.io/crates/pg2any_lib)
+
+# PostgreSQL to Any Database Replication (pg2any) 
 
 A high-performance, production-ready PostgreSQL to Any database replication tool using Change Data Capture (CDC) with logical replication. This tool streams database changes in real-time from PostgreSQL to target databases such as MySQL and SQL Server with comprehensive error handling and monitoring.
 
 ## Project Status
 
-This is a **fully functional CDC implementation** providing enterprise-grade PostgreSQL to Any database replication using logical replication with 100+ tests and production-ready features.
+This is a **fully functional CDC implementation** providing enterprise-grade PostgreSQL to Any database replication using logical replication production-ready features.
 
-**Current Status**: Production-ready CDC tool with complete PostgreSQL logical replication protocol implementation, extensive test coverage (104 tests), and real-time change streaming capabilities with graceful shutdown and LSN persistence.
+**Current Status**: Production-ready CDC tool with complete PostgreSQL logical replication protocol implementation, and real-time change streaming capabilities with graceful shutdown and LSN persistence.
 
 ### What's Implemented ✅
 - ✅ **Complete Rust Workspace**: Multi-crate project with `pg2any` binary and `pg2any-lib` library
@@ -16,7 +19,6 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - ✅ **Transaction Consistency**: BEGIN/COMMIT boundary handling with LSN persistence
 - ✅ **Database Destinations**: Complete MySQL and SQL Server implementations with type mapping
 - ✅ **Configuration Management**: Environment variables and builder pattern with validation
-- ✅ **Comprehensive Testing**: 104+ tests covering integration, edge cases, and error scenarios
 - ✅ **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - ✅ **Development Tooling**: Makefile automation, formatting, linting, and quality checks
 - ✅ **Production Logging**: Structured tracing with configurable levels and filtering
@@ -30,7 +32,6 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 ## Features
 
-- ✅ **Modular Architecture**: Rust workspace with `pg2any` CLI and `pg2any-lib` core library
 - ✅ **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - ✅ **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
 - ✅ **Multiple Destinations**: MySQL (via SQLx) and SQL Server (via Tiberius) support
@@ -164,11 +165,6 @@ pg2any/                          # Workspace root
     └── init_mysql.sql           # MySQL destination database setup
 ```
 
-**Codebase Statistics:**
-- **67 Rust files** with **113,696 total lines of code**
-- **104+ tests** covering integration, unit, and edge case scenarios
-- **Production-ready** with comprehensive error handling and logging
-
 ## Supported Destination Databases
 
 ### Currently Implemented
@@ -274,7 +270,6 @@ This project provides **enterprise-grade PostgreSQL to Any database replication*
 - **📊 Change Processing**: Real-time streaming of all DML operations with proper error handling
 - **🎯 Destination Support**: Production-ready MySQL and SQL Server implementations
 - **⚙️ Configuration**: Flexible environment-based configuration with validation
-- **🧪 Test Coverage**: 104+ tests covering integration, edge cases, and error scenarios
 - **🐳 Docker Environment**: Complete development setup with multi-database support
 - **📈 Monitoring**: Structured logging with configurable levels and filtering
 - **🛡️ Error Handling**: Comprehensive error types with proper propagation and recovery
@@ -286,13 +281,6 @@ This project provides **enterprise-grade PostgreSQL to Any database replication*
 - **🔄 Schema Evolution**: DDL change handling and migration automation
 - **🎯 Advanced Features**: Table filtering, transformations, and routing
 - **⚡ Performance**: High-throughput optimization and benchmarking
-
-### 📊 Current Repository Metrics
-- **Version**: 0.1.0 (Latest stable release)
-- **Codebase**: 67 Rust files, 113,696 lines of code
-- **Test Suite**: 104+ comprehensive tests with edge case coverage
-- **Build Status**: ✅ All tests passing, warnings resolved
-- **Documentation**: Complete API documentation and usage examples
 
 ## Quick Start with Docker
 
@@ -408,20 +396,6 @@ When you run the application, you'll see structured logging output like this:
 - **tracing-subscriber** (0.3): Log filtering and formatting
 - **libc** (0.2.174): C library bindings for system operations
 
-## Test Coverage
-
-The project includes comprehensive testing with **104+ tests** covering all critical functionality:
-
-### Test Categories
-- **Integration Tests**: End-to-end CDC pipeline validation
-- **Destination Tests**: Database-specific functionality and edge cases  
-- **Protocol Tests**: PostgreSQL replication message parsing
-- **Error Handling**: Recovery scenarios and error propagation
-- **Edge Cases**: MySQL-specific behavior and WHERE clause generation
-- **Replica Identity**: Primary key and unique constraint handling
-- **Buffer Operations**: Binary protocol parsing and manipulation
-- **Configuration**: Environment loading and validation
-
 ### Test Files Structure
 ```
 pg2any-lib/tests/
@@ -471,15 +445,6 @@ This project provides **production-ready PostgreSQL CDC replication** with a sol
    - Benchmark suite development
    - Connection pooling enhancements
 
-### 🏗️ Architecture Benefits for Contributors
-
-- **📚 Well-Documented**: Complete API documentation and inline comments
-- **🧪 Test-Driven**: 104+ tests provide safety net for changes
-- **🏭 Modular Design**: Clear separation of concerns, easy to extend
-- **🔒 Type-Safe**: Rust's type system prevents common replication errors
-- **🚀 Async-First**: Built for high-performance concurrent processing
-- **🐳 Dev Environment**: Complete Docker setup for immediate productivity
-
 ### � Getting Started Contributing
 
 ```bash
@@ -516,6 +481,8 @@ make docker-start        # Start PostgreSQL and MySQL
 cargo run               # Test end-to-end replication
 make test-data          # Insert test data
 make show-data          # Verify replication worked
+
+set -a; source .env; set +a
 ```
 
 ### 📋 Contribution Guidelines
@@ -526,10 +493,6 @@ make show-data          # Verify replication worked
 - **Error Handling**: Use the established `CdcError` pattern
 - **Performance**: Consider async patterns and resource usage
 
-## License
-
-MIT OR Apache-2.0
-
 ---
 
 ## References
@@ -539,8 +502,3 @@ MIT OR Apache-2.0
 - [Logical Decoding Output Plugin](https://www.postgresql.org/docs/current/logicaldecoding-output-plugin.html)
 - [Rust Async Book](https://rust-lang.github.io/async-book/)
 - [Tokio Runtime Documentation](https://docs.rs/tokio/latest/tokio/)
-
----
-
-**pg2any** - High-performance PostgreSQL CDC replication tool  
-🚀 **Production Ready** | 🧪 **104+ Tests** | 🐳 **Docker Ready** | 📚 **Well Documented**

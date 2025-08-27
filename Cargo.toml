@@ -29,7 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["your-name <dog830228@gmail.com>"]
 license = "Apache-2.0"

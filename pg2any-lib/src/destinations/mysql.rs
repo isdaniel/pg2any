@@ -1,5 +1,6 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
+    destinations::operation::Operation,
     error::{CdcError, Result},
     types::{ChangeEvent, EventType},
 };
@@ -13,26 +14,11 @@ pub struct MySQLDestination {
     pool: Option<MySqlPool>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Operation {
-    Update,
-    Delete,
-}
-
 /// Helper struct for building WHERE clauses with proper parameter binding
 #[derive(Debug)]
 struct WhereClause {
     sql: String,
     bind_values: Vec<serde_json::Value>,
-}
-
-impl Operation {
-    fn name(&self) -> String {
-        match self {
-            Operation::Update => "UPDATE".to_string(),
-            Operation::Delete => "DELETE".to_string(),
-        }
-    }
 }
 
 impl MySQLDestination {

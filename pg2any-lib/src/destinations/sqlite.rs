@@ -1,5 +1,6 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
+    destinations::operation::Operation,
     error::{CdcError, Result},
     types::{ChangeEvent, EventType, ReplicaIdentity},
 };
@@ -53,7 +54,7 @@ impl SQLiteDestination {
         key_columns: &[String],
         schema: &str,
         table: &str,
-        operation: &str,
+        operation: Operation,
     ) -> Result<(String, Vec<serde_json::Value>)> {
         match replica_identity {
             ReplicaIdentity::Full => {
@@ -114,7 +115,7 @@ impl SQLiteDestination {
             }
 
             ReplicaIdentity::Nothing => {
-                if operation == "DELETE" {
+                if operation == Operation::Delete {
                     return Err(CdcError::generic(format!(
                         "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
                         DELETE requires a replica identity.",
@@ -170,10 +171,16 @@ impl SQLiteDestination {
         let columns: Vec<String> = data.keys().map(|k| format!("\"{}\"", k)).collect();
         let placeholders: Vec<String> = (0..data.len()).map(|_| "?".to_string()).collect();
 
+        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
+        let table_ref = if schema.is_empty() || schema == "main" {
+            format!("\"{}\"", table)
+        } else {
+            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
+        };
+
         let sql = format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({})",
-            schema,
-            table,
+            "INSERT INTO {} ({}) VALUES ({})",
+            table_ref,
             columns.join(", "),
             placeholders.join(", ")
         );
@@ -213,13 +220,19 @@ impl SQLiteDestination {
             key_columns,
             schema,
             table,
-            "UPDATE",
+            Operation::Update,
         )?;
 
+        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
+        let table_ref = if schema.is_empty() || schema == "main" {
+            format!("\"{}\"", table)
+        } else {
+            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
+        };
+
         let sql = format!(
-            "UPDATE \"{}\".\"{}\" SET {} WHERE {}",
-            schema,
-            table,
+            "UPDATE {} SET {} WHERE {}",
+            table_ref,
             set_clauses.join(", "),
             where_clause
         );
@@ -272,12 +285,19 @@ impl SQLiteDestination {
             key_columns,
             schema,
             table,
-            "DELETE",
+            Operation::Delete,
         )?;
 
+        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
+        let table_ref = if schema.is_empty() || schema == "main" {
+            format!("\"{}\"", table)
+        } else {
+            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
+        };
+
         let sql = format!(
-            "DELETE FROM \"{}\".\"{}\" WHERE {}",
-            schema, table, where_clause
+            "DELETE FROM {} WHERE {}",
+            table_ref, where_clause
         );
 
         debug!("Executing SQLite DELETE: {}", sql);
@@ -430,7 +450,14 @@ impl DestinationHandler for SQLiteDestination {
                         ("main", parts[0]) // Default schema in SQLite is "main"
                     };
 
-                    let sql = format!("DELETE FROM \"{}\".\"{}\"", schema, table);
+                    // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
+                    let table_ref = if schema.is_empty() || schema == "main" {
+                        format!("\"{}\"", table)
+                    } else {
+                        format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
+                    };
+
+                    let sql = format!("DELETE FROM {}", table_ref);
 
                     sqlx::query(&sql).execute(pool).await.map_err(|e| {
                         CdcError::generic(format!(

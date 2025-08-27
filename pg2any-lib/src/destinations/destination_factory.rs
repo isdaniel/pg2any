@@ -11,6 +11,9 @@ use super::mysql::MySQLDestination;
 #[cfg(feature = "sqlserver")]
 use super::sqlserver::SqlServerDestination;
 
+#[cfg(feature = "sqlite")]
+use super::sqlite::SQLiteDestination;
+
 /// Trait for database destination handlers
 #[async_trait]
 pub trait DestinationHandler: Send + Sync {
@@ -40,6 +43,9 @@ impl DestinationFactory {
             #[cfg(feature = "sqlserver")]
             DestinationType::SqlServer => Ok(Box::new(SqlServerDestination::new())),
 
+            #[cfg(feature = "sqlite")]
+            DestinationType::SQLite => Ok(Box::new(SQLiteDestination::new())),
+
             _ => Err(CdcError::unsupported(format!(
                 "Destination type {:?} is not supported or not enabled",
                 destination_type
@@ -67,6 +73,12 @@ mod tests {
             assert!(result.is_ok());
         }
 
+        #[cfg(feature = "sqlite")]
+        {
+            let result = DestinationFactory::create(DestinationType::SQLite);
+            assert!(result.is_ok());
+        }
+
         // Test unsupported destination type
         let result = DestinationFactory::create(DestinationType::PostgreSQL);
         assert!(result.is_err());
@@ -82,5 +94,12 @@ mod tests {
 
         let deserialized: DestinationType = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, mysql_type);
+
+        let sqlite_type = DestinationType::SQLite;
+        let sqlite_json = serde_json::to_string(&sqlite_type).unwrap();
+        assert_eq!(sqlite_json, "\"SQLite\"");
+
+        let sqlite_deserialized: DestinationType = serde_json::from_str(&sqlite_json).unwrap();
+        assert_eq!(sqlite_deserialized, sqlite_type);
     }
 }

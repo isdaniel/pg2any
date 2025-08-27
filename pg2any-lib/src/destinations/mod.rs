@@ -6,6 +6,10 @@ pub mod mysql;
 #[cfg(feature = "sqlserver")]
 pub mod sqlserver;
 
+/// SQLite destination implementation
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 /// Destination factory and trait definitions
 pub mod destination_factory;
 
@@ -15,6 +19,9 @@ pub use mysql::MySQLDestination;
 
 #[cfg(feature = "sqlserver")]
 pub use sqlserver::SqlServerDestination;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SQLiteDestination;
 
 // Re-export factory and trait
 pub use destination_factory::{DestinationFactory, DestinationHandler};

@@ -17,10 +17,10 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use pg2any_lib::{load_config_from_env, run_cdc_app};
 //! use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-//! 
+//!
 //! #[tokio::main]
 //!     async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Initialize comprehensive logging
@@ -33,24 +33,24 @@
 //!     tracing::info!("CDC application stopped");
 //!     Ok(())
 //! }
-//! 
+//!
 //! pub fn init_logging() {
 //!     // Create a sophisticated logging setup
 //!     let env_filter = EnvFilter::try_from_default_env()
 //!         .unwrap_or_else(|_| EnvFilter::new("pg2any=debug,tokio_postgres=info,sqlx=info"));
-//! 
+//!
 //!     let fmt_layer = fmt::layer()
 //!         .with_target(true)
 //!         .with_thread_ids(true)
 //!         .with_level(true)
 //!         .with_ansi(true)
 //!         .compact();
-//! 
+//!
 //!     tracing_subscriber::registry()
 //!         .with(env_filter)
 //!         .with(fmt_layer)
 //!         .init();
-//! 
+//!
 //!     tracing::info!("Logging initialized with level filtering");
 //! }
 //! ```

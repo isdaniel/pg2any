@@ -110,8 +110,19 @@ fn test_unsupported_destination_types() {
     let postgres_result = DestinationFactory::create(DestinationType::PostgreSQL);
     assert!(postgres_result.is_err());
 
-    let sqlite_result = DestinationFactory::create(DestinationType::SQLite);
-    assert!(sqlite_result.is_err());
+    // SQLite is now supported, so it should succeed
+    #[cfg(feature = "sqlite")]
+    {
+        let sqlite_result = DestinationFactory::create(DestinationType::SQLite);
+        assert!(sqlite_result.is_ok());
+    }
+
+    // If SQLite feature is not enabled, it should fail
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let sqlite_result = DestinationFactory::create(DestinationType::SQLite);
+        assert!(sqlite_result.is_err());
+    }
 
     // Verify error messages contain helpful information
     if let Err(error) = postgres_result {

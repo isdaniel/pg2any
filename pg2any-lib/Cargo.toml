@@ -29,6 +29,7 @@ tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [features]
-default = ["mysql", "sqlserver"]
-mysql = ["sqlx"]
+default = ["mysql", "sqlserver", "sqlite"]
+mysql = ["sqlx/mysql"]
 sqlserver = ["tiberius"]
+sqlite = ["sqlx/sqlite"]

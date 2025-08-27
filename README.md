@@ -17,7 +17,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - ✅ **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
 - ✅ **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
 - ✅ **Transaction Consistency**: BEGIN/COMMIT boundary handling with LSN persistence
-- ✅ **Database Destinations**: Complete MySQL and SQL Server implementations with type mapping
+- ✅ **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with type mapping
 - ✅ **Configuration Management**: Environment variables and builder pattern with validation
 - ✅ **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - ✅ **Development Tooling**: Makefile automation, formatting, linting, and quality checks
@@ -25,7 +25,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 ### What Needs Enhancement 🚧
 - 🚧 **Monitoring & Observability**: Production metrics, dashboards, and alerting systems
-- 🚧 **Additional Destinations**: Oracle, SQLite, ClickHouse, Elasticsearch support
+- 🚧 **Additional Destinations**: Oracle, ClickHouse, Elasticsearch support
 - 🚧 **Schema Evolution**: DDL change handling and automatic schema migration
 - 🚧 **Multi-table Replication**: Table filtering, routing, and transformation pipelines
 - 🚧 **Performance Optimization**: High-throughput benchmarking and memory optimization
@@ -34,7 +34,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 - ✅ **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - ✅ **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
-- ✅ **Multiple Destinations**: MySQL (via SQLx) and SQL Server (via Tiberius) support
+- ✅ **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
 - ✅ **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
 - ✅ **Configuration**: Environment variables, builder pattern, and validation
 - ✅ **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
@@ -108,7 +108,7 @@ pub fn init_logging() {
 2. **Config/ConfigBuilder**: Comprehensive configuration management with environment variable support
 3. **LogicalReplicationStream**: PostgreSQL logical replication lifecycle and protocol implementation
 4. **LogicalReplicationParser**: Complete PostgreSQL replication protocol message parsing
-5. **DestinationHandler**: Production-ready database destination handling (MySQL, SQL Server)
+5. **DestinationHandler**: Production-ready database destination handling (MySQL, SQL Server, SQLite)
 6. **Error Types**: Comprehensive error handling with `CdcError` and proper error propagation
 7. **Buffer Operations**: Efficient binary protocol handling with zero-copy optimizations
 
@@ -146,7 +146,8 @@ pg2any/                          # Workspace root
 │   │   └── destinations/        # Database destination implementations
 │   │       ├── mod.rs           # Destination trait and factory pattern
 │   │       ├── mysql.rs         # MySQL destination with SQLx
-│   │       └── sqlserver.rs     # SQL Server destination with Tiberius
+│   │       ├── sqlserver.rs     # SQL Server destination with Tiberius
+│   │       └── sqlite.rs        # SQLite destination with SQLx
 │   └── tests/                   # Comprehensive test suite (8 test files, 104+ tests)
 │       ├── integration_tests.rs       # End-to-end CDC testing
 │       ├── destination_integration_tests.rs # Database destination testing

@@ -295,10 +295,7 @@ impl SQLiteDestination {
             format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
         };
 
-        let sql = format!(
-            "DELETE FROM {} WHERE {}",
-            table_ref, where_clause
-        );
+        let sql = format!("DELETE FROM {} WHERE {}", table_ref, where_clause);
 
         debug!("Executing SQLite DELETE: {}", sql);
 

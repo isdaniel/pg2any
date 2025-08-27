@@ -136,11 +136,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         _ => format!("{}@{}:{}/{}", dest_user, dest_host, dest_port, dest_db),
     };
 
-    tracing::info!(
-        "Destination: {:?} at {}",
-        dest_type,
-        logging_destination
-    );
+    tracing::info!("Destination: {:?} at {}", dest_type, logging_destination);
 
     // CDC-specific configuration
     let replication_slot =

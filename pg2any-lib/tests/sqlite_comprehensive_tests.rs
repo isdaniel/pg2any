@@ -1,3 +1,4 @@
+use chrono::Utc;
 use pg2any_lib::{
     destinations::{DestinationFactory, DestinationHandler},
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
@@ -5,9 +6,8 @@ use pg2any_lib::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use chrono::Utc;
 
 #[cfg(feature = "sqlite")]
 use pg2any_lib::destinations::sqlite::SQLiteDestination;
@@ -43,7 +43,7 @@ impl Drop for TempDatabase {
     fn drop(&mut self) {
         // Clean up the temporary database file
         let _ = fs::remove_file(&self.path);
-        
+
         // Also clean up WAL and SHM files
         let wal_path = self.path.with_extension("db-wal");
         let shm_path = self.path.with_extension("db-shm");
@@ -122,7 +122,12 @@ async fn test_sqlite_empty_string_handling() {
     data.insert("text_field".to_string(), json!(""));
     data.insert("nullable_field".to_string(), json!(""));
 
-    let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data,
+    );
     let result = destination.process_event(&event).await;
     assert!(result.is_ok());
 
@@ -131,7 +136,7 @@ async fn test_sqlite_empty_string_handling() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    
+
     let text_field: String = row.get("text_field");
     let nullable_field: String = row.get("nullable_field");
     assert_eq!(text_field, "");
@@ -163,20 +168,27 @@ async fn test_sqlite_null_value_handling() {
     data.insert("int_field".to_string(), json!(null));
     data.insert("real_field".to_string(), json!(null));
 
-    let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data,
+    );
     let result = destination.process_event(&event).await;
     assert!(result.is_ok());
 
     // Verify null values are handled correctly
-    let row = sqlx::query("SELECT nullable_field, int_field, real_field FROM comprehensive_test WHERE id = 1")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    
+    let row = sqlx::query(
+        "SELECT nullable_field, int_field, real_field FROM comprehensive_test WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
     let nullable_field: Option<String> = row.get("nullable_field");
     let int_field: Option<i32> = row.get("int_field");
     let real_field: Option<f64> = row.get("real_field");
-    
+
     assert!(nullable_field.is_none());
     assert!(int_field.is_none());
     assert!(real_field.is_none());
@@ -202,10 +214,21 @@ async fn test_sqlite_unicode_and_special_characters() {
     // Test unicode and special character insertion
     let mut data = HashMap::new();
     data.insert("id".to_string(), json!(1));
-    data.insert("text_field".to_string(), json!("🚀 Hello 世界! Special chars: áéíóú ñüç"));
-    data.insert("json_field".to_string(), json!("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"));
+    data.insert(
+        "text_field".to_string(),
+        json!("🚀 Hello 世界! Special chars: áéíóú ñüç"),
+    );
+    data.insert(
+        "json_field".to_string(),
+        json!("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"),
+    );
 
-    let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data,
+    );
     let result = destination.process_event(&event).await;
     assert!(result.is_ok());
 
@@ -214,10 +237,10 @@ async fn test_sqlite_unicode_and_special_characters() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    
+
     let text_field: String = row.get("text_field");
     let json_field: String = row.get("json_field");
-    
+
     assert!(text_field.contains("🚀"));
     assert!(text_field.contains("世界"));
     assert!(text_field.contains("áéíóú"));
@@ -256,7 +279,12 @@ async fn test_sqlite_large_data_handling() {
     data.insert("text_field".to_string(), json!(large_text));
     data.insert("json_field".to_string(), large_json);
 
-    let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data,
+    );
     let result = destination.process_event(&event).await;
     assert!(result.is_ok());
 
@@ -265,10 +293,10 @@ async fn test_sqlite_large_data_handling() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    
+
     let text_len: i32 = row.get("text_len");
     let json_len: i32 = row.get("json_len");
-    
+
     assert_eq!(text_len, 1024 * 1024);
     assert!(json_len > 1000000); // Should be large due to JSON structure
 
@@ -292,10 +320,10 @@ async fn test_sqlite_numeric_precision() {
 
     // Test various numeric types and precision
     let test_cases = vec![
-        (1, json!(9223372036854775807i64)), // i64 max
+        (1, json!(9223372036854775807i64)),  // i64 max
         (2, json!(-9223372036854775808i64)), // i64 min
-        (3, json!(3.141592653589793)), // High precision float
-        (4, json!(1.7976931348623157e308)), // Large float
+        (3, json!(3.141592653589793)),       // High precision float
+        (4, json!(1.7976931348623157e308)),  // Large float
         (5, json!(2.2250738585072014e-308)), // Small float
     ];
 
@@ -304,7 +332,12 @@ async fn test_sqlite_numeric_precision() {
         data.insert("id".to_string(), json!(id));
         data.insert("real_field".to_string(), value.clone());
 
-        let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data);
+        let event = ChangeEvent::insert(
+            "main".to_string(),
+            "comprehensive_test".to_string(),
+            123,
+            data,
+        );
         let result = destination.process_event(&event).await;
         assert!(result.is_ok(), "Failed to insert value: {:?}", value);
     }
@@ -314,9 +347,9 @@ async fn test_sqlite_numeric_precision() {
         .fetch_all(&pool)
         .await
         .unwrap();
-    
+
     assert_eq!(rows.len(), 5);
-    
+
     // Check specific values
     let pi_value: f64 = rows[2].get("real_field");
     assert!((pi_value - 3.141592653589793).abs() < 1e-10);
@@ -333,12 +366,9 @@ async fn test_sqlite_numeric_precision() {
 #[tokio::test]
 async fn test_sqlite_invalid_connection_string() {
     let mut destination = SQLiteDestination::new();
-    
+
     // Test various invalid connection strings
-    let invalid_connections = vec![
-        "/nonexistent/directory/that/cannot/be/created/test.db",
-        "",
-    ];
+    let invalid_connections = vec!["/nonexistent/directory/that/cannot/be/created/test.db", ""];
 
     for conn_str in invalid_connections {
         let result = destination.connect(conn_str).await;
@@ -367,7 +397,12 @@ async fn test_sqlite_constraint_violations() {
     data1.insert("id".to_string(), json!(1));
     data1.insert("unique_field".to_string(), json!("unique_value"));
 
-    let event1 = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data1);
+    let event1 = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data1,
+    );
     let result1 = destination.process_event(&event1).await;
     assert!(result1.is_ok());
 
@@ -376,9 +411,17 @@ async fn test_sqlite_constraint_violations() {
     data2.insert("id".to_string(), json!(2));
     data2.insert("unique_field".to_string(), json!("unique_value"));
 
-    let event2 = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 124, data2);
+    let event2 = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        124,
+        data2,
+    );
     let result2 = destination.process_event(&event2).await;
-    assert!(result2.is_err(), "Should fail due to unique constraint violation");
+    assert!(
+        result2.is_err(),
+        "Should fail due to unique constraint violation"
+    );
 
     pool.close().await;
     let _ = destination.close().await;
@@ -403,7 +446,12 @@ async fn test_sqlite_missing_key_columns_error() {
     data.insert("id".to_string(), json!(1));
     data.insert("text_field".to_string(), json!("test"));
 
-    let event = ChangeEvent::insert("main".to_string(), "comprehensive_test".to_string(), 123, data.clone());
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "comprehensive_test".to_string(),
+        123,
+        data.clone(),
+    );
     let result = destination.process_event(&event).await;
     assert!(result.is_ok());
 
@@ -456,13 +504,21 @@ async fn test_sqlite_bulk_operations_performance() {
         data.insert("active".to_string(), json!(true));
         data.insert("salary".to_string(), json!(50000.0 + (i as f64 * 10.0)));
 
-        let event = ChangeEvent::insert("main".to_string(), "users".to_string(), 123 + i as u32, data);
+        let event = ChangeEvent::insert(
+            "main".to_string(),
+            "users".to_string(),
+            123 + i as u32,
+            data,
+        );
         let result = destination.process_event(&event).await;
         assert!(result.is_ok(), "Failed to insert record {}", i);
     }
 
     let insert_duration = start_time.elapsed();
-    println!("Bulk INSERT of {} records took: {:?}", batch_size, insert_duration);
+    println!(
+        "Bulk INSERT of {} records took: {:?}",
+        batch_size, insert_duration
+    );
 
     // Verify all records were inserted
     let count_row = sqlx::query("SELECT COUNT(*) as count FROM users")
@@ -477,12 +533,15 @@ async fn test_sqlite_bulk_operations_performance() {
     for i in 0..batch_size / 2 {
         let mut old_data = HashMap::new();
         old_data.insert("id".to_string(), json!(i));
-        
+
         let mut new_data = HashMap::new();
         new_data.insert("id".to_string(), json!(i));
         new_data.insert("name".to_string(), json!(format!("Updated User {}", i)));
         new_data.insert("age".to_string(), json!(25 + (i % 50)));
-        new_data.insert("email".to_string(), json!(format!("updated_user{}@example.com", i)));
+        new_data.insert(
+            "email".to_string(),
+            json!(format!("updated_user{}@example.com", i)),
+        );
         new_data.insert("active".to_string(), json!(true));
         new_data.insert("salary".to_string(), json!(60000.0 + (i as f64 * 15.0)));
 
@@ -501,11 +560,23 @@ async fn test_sqlite_bulk_operations_performance() {
     }
 
     let update_duration = update_start.elapsed();
-    println!("Bulk UPDATE of {} records took: {:?}", batch_size / 2, update_duration);
+    println!(
+        "Bulk UPDATE of {} records took: {:?}",
+        batch_size / 2,
+        update_duration
+    );
 
     // Performance assertions - these are generous to account for CI environment
-    assert!(insert_duration < Duration::from_secs(30), "INSERT operations too slow: {:?}", insert_duration);
-    assert!(update_duration < Duration::from_secs(30), "UPDATE operations too slow: {:?}", update_duration);
+    assert!(
+        insert_duration < Duration::from_secs(30),
+        "INSERT operations too slow: {:?}",
+        insert_duration
+    );
+    assert!(
+        update_duration < Duration::from_secs(30),
+        "UPDATE operations too slow: {:?}",
+        update_duration
+    );
 
     pool.close().await;
     let _ = destination.close().await;
@@ -529,7 +600,7 @@ async fn test_sqlite_concurrent_operations() {
     pool.close().await;
 
     let mut total_records = 0;
-    
+
     // Simulate multiple "sessions" operating sequentially
     // This tests that SQLite can handle repeated operations robustly
     for session_id in 0..3 {
@@ -538,13 +609,30 @@ async fn test_sqlite_concurrent_operations() {
             let record_id = session_id * 1000 + i;
             let mut data = HashMap::new();
             data.insert("id".to_string(), json!(record_id));
-            data.insert("name".to_string(), json!(format!("Session {} Record {}", session_id, i)));
+            data.insert(
+                "name".to_string(),
+                json!(format!("Session {} Record {}", session_id, i)),
+            );
             data.insert("age".to_string(), json!(25 + i % 30));
-            data.insert("email".to_string(), json!(format!("session{}record{}@example.com", session_id, i)));
+            data.insert(
+                "email".to_string(),
+                json!(format!("session{}record{}@example.com", session_id, i)),
+            );
 
-            let event = ChangeEvent::insert("main".to_string(), "users".to_string(), record_id as u32, data);
+            let event = ChangeEvent::insert(
+                "main".to_string(),
+                "users".to_string(),
+                record_id as u32,
+                data,
+            );
             let result = destination.process_event(&event).await;
-            assert!(result.is_ok(), "Session {} failed to insert record {}: {:?}", session_id, i, result);
+            assert!(
+                result.is_ok(),
+                "Session {} failed to insert record {}: {:?}",
+                session_id,
+                i,
+                result
+            );
             total_records += 1;
         }
     }
@@ -553,15 +641,19 @@ async fn test_sqlite_concurrent_operations() {
     let pool = SqlitePool::connect(&format!("sqlite://{}", &connection_string))
         .await
         .unwrap();
-    
+
     let count_row = sqlx::query("SELECT COUNT(*) as count FROM users")
         .fetch_one(&pool)
         .await
         .unwrap();
     let count: i32 = count_row.get("count");
-    
-    assert_eq!(count, total_records, "Expected {} records, got {}", total_records, count);
-    
+
+    assert_eq!(
+        count, total_records,
+        "Expected {} records, got {}",
+        total_records, count
+    );
+
     pool.close().await;
     let _ = destination.close().await;
 }
@@ -636,7 +728,11 @@ async fn test_sqlite_metadata_events() {
 
     for event in metadata_events {
         let result = destination.process_event(&event).await;
-        assert!(result.is_ok(), "Metadata event should not fail: {:?}", event.event_type);
+        assert!(
+            result.is_ok(),
+            "Metadata event should not fail: {:?}",
+            event.event_type
+        );
     }
 
     let _ = destination.close().await;
@@ -692,16 +788,27 @@ async fn test_sqlite_file_permissions_and_paths() {
 
     for (path_format, should_succeed) in test_cases {
         println!("Testing path format: {}", path_format);
-        
+
         let mut temp_path = std::env::temp_dir();
         temp_path.push(format!("pg2any_path_test_{}", std::process::id()));
-        
-        let full_path = if path_format.contains("/") && !path_format.starts_with("file://") && !path_format.starts_with("sqlite://") {
+
+        let full_path = if path_format.contains("/")
+            && !path_format.starts_with("file://")
+            && !path_format.starts_with("sqlite://")
+        {
             temp_path.join(path_format).to_string_lossy().to_string()
         } else if path_format.starts_with("file://") {
-            format!("file://{}/{}", temp_path.to_string_lossy(), path_format.strip_prefix("file://").unwrap())
+            format!(
+                "file://{}/{}",
+                temp_path.to_string_lossy(),
+                path_format.strip_prefix("file://").unwrap()
+            )
         } else if path_format.starts_with("sqlite://") {
-            format!("sqlite://{}/{}", temp_path.to_string_lossy(), path_format.strip_prefix("sqlite://").unwrap())
+            format!(
+                "sqlite://{}/{}",
+                temp_path.to_string_lossy(),
+                path_format.strip_prefix("sqlite://").unwrap()
+            )
         } else {
             temp_path.join(path_format).to_string_lossy().to_string()
         };
@@ -710,7 +817,11 @@ async fn test_sqlite_file_permissions_and_paths() {
         let result = destination.connect(&full_path).await;
 
         if should_succeed {
-            assert!(result.is_ok(), "Path format '{}' should succeed", path_format);
+            assert!(
+                result.is_ok(),
+                "Path format '{}' should succeed",
+                path_format
+            );
             let _ = destination.close().await;
         } else {
             assert!(result.is_err(), "Path format '{}' should fail", path_format);
@@ -748,7 +859,12 @@ async fn test_sqlite_complete_crud_cycle() {
     create_data.insert("active".to_string(), json!(true));
     create_data.insert("salary".to_string(), json!(50000.0));
 
-    let create_event = ChangeEvent::insert("main".to_string(), "users".to_string(), 1, create_data.clone());
+    let create_event = ChangeEvent::insert(
+        "main".to_string(),
+        "users".to_string(),
+        1,
+        create_data.clone(),
+    );
     let create_result = destination.process_event(&create_event).await;
     assert!(create_result.is_ok());
 
@@ -765,7 +881,7 @@ async fn test_sqlite_complete_crud_cycle() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    
+
     assert_eq!(row.get::<String, _>("name"), "John Doe");
     assert_eq!(row.get::<i32, _>("age"), 30);
     assert_eq!(row.get::<String, _>("email"), "john@example.com");
@@ -797,10 +913,13 @@ async fn test_sqlite_complete_crud_cycle() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    
+
     assert_eq!(updated_row.get::<String, _>("name"), "John Smith");
     assert_eq!(updated_row.get::<i32, _>("age"), 31);
-    assert_eq!(updated_row.get::<String, _>("email"), "john.smith@example.com");
+    assert_eq!(
+        updated_row.get::<String, _>("email"),
+        "john.smith@example.com"
+    );
     assert_eq!(updated_row.get::<f64, _>("salary"), 55000.0);
 
     // 4. DELETE

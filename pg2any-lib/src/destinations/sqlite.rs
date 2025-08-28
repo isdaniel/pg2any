@@ -71,8 +71,8 @@ impl SQLiteDestination {
                     Ok((conditions.join(" AND "), bind_values))
                 } else {
                     Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during {}",
-                        schema, table, operation
+                        "REPLICA IDENTITY FULL requires old_data but none provided for {} during {}",
+                        table, operation
                     )))
                 }
             }
@@ -164,19 +164,14 @@ impl SQLiteDestination {
     async fn execute_insert(
         &self,
         pool: &SqlitePool,
-        schema: &str,
         table: &str,
         data: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         let columns: Vec<String> = data.keys().map(|k| format!("\"{}\"", k)).collect();
         let placeholders: Vec<String> = (0..data.len()).map(|_| "?".to_string()).collect();
 
-        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
-        let table_ref = if schema.is_empty() || schema == "main" {
-            format!("\"{}\"", table)
-        } else {
-            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
-        };
+        // Use only table name without schema
+        let table_ref = format!("\"{}\"", table);
 
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
@@ -223,12 +218,8 @@ impl SQLiteDestination {
             Operation::Update,
         )?;
 
-        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
-        let table_ref = if schema.is_empty() || schema == "main" {
-            format!("\"{}\"", table)
-        } else {
-            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
-        };
+        // Use only table name without schema
+        let table_ref = format!("\"{}\"", table);
 
         let sql = format!(
             "UPDATE {} SET {} WHERE {}",
@@ -288,12 +279,8 @@ impl SQLiteDestination {
             Operation::Delete,
         )?;
 
-        // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
-        let table_ref = if schema.is_empty() || schema == "main" {
-            format!("\"{}\"", table)
-        } else {
-            format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
-        };
+        // Use only table name without schema
+        let table_ref = format!("\"{}\"", table);
 
         let sql = format!("DELETE FROM {} WHERE {}", table_ref, where_clause);
 
@@ -316,6 +303,43 @@ impl SQLiteDestination {
             );
         } else {
             debug!("DELETE operation affected {} rows", result.rows_affected());
+        }
+
+        Ok(())
+    }
+
+    /// Execute TRUNCATE operation (implemented as DELETE FROM table)
+    /// SQLite doesn't have a native TRUNCATE command, so we use DELETE FROM table
+    /// with optimizations for better performance
+    async fn execute_truncate(&self, pool: &SqlitePool, tables: &[String]) -> Result<()> {
+        for table_ref in tables {
+            // Parse table reference: "schema.table" or just "table"
+            let parts: Vec<&str> = table_ref.split('.').collect();
+            let (_schema, table) = if parts.len() >= 2 {
+                (parts[0], parts[1])
+            } else {
+                ("main", parts[0]) // Default schema in SQLite is "main"
+            };
+
+            // Use only table name without schema
+            let table_name = format!("\"{}\"", table);
+
+            // SQLite doesn't have TRUNCATE, but DELETE without WHERE clause is equivalent
+            // We could also use: DELETE FROM table; DELETE FROM sqlite_sequence WHERE name='table';
+            // to reset auto-increment counters, but we'll keep it simple for now
+            let sql = format!("DELETE FROM {}", table_name);
+
+            debug!("Executing SQLite TRUNCATE (DELETE): {}", sql);
+
+            let result = sqlx::query(&sql).execute(pool).await.map_err(|e| {
+                CdcError::generic(format!("SQLite TRUNCATE failed for {}: {}", table_name, e))
+            })?;
+
+            info!(
+                "Successfully truncated table {} (deleted {} rows)",
+                table_name,
+                result.rows_affected()
+            );
         }
 
         Ok(())
@@ -398,8 +422,8 @@ impl DestinationHandler for SQLiteDestination {
                 data,
                 ..
             } => {
-                self.execute_insert(pool, schema, table, data).await?;
-                debug!("Successfully inserted record into {}.{}", schema, table);
+                self.execute_insert(pool, table, data).await?;
+                debug!("Successfully inserted record into {}", table);
             }
 
             EventType::Update {
@@ -413,7 +437,7 @@ impl DestinationHandler for SQLiteDestination {
             } => {
                 self.execute_update(
                     pool,
-                    schema,
+                    "main",
                     table,
                     old_data,
                     new_data,
@@ -421,7 +445,7 @@ impl DestinationHandler for SQLiteDestination {
                     key_columns,
                 )
                 .await?;
-                debug!("Successfully updated record in {}.{}", schema, table);
+                debug!("Successfully updated record in main.{}", table);
             }
 
             EventType::Delete {
@@ -432,39 +456,14 @@ impl DestinationHandler for SQLiteDestination {
                 key_columns,
                 ..
             } => {
-                self.execute_delete(pool, schema, table, old_data, replica_identity, key_columns)
+                self.execute_delete(pool, "main", table, old_data, replica_identity, key_columns)
                     .await?;
-                debug!("Successfully deleted record from {}.{}", schema, table);
+                debug!("Successfully deleted record from main.{}", table);
             }
 
             EventType::Truncate(tables) => {
-                for table_ref in tables {
-                    // table_ref format is typically "schema.table"
-                    let parts: Vec<&str> = table_ref.split('.').collect();
-                    let (schema, table) = if parts.len() >= 2 {
-                        (parts[0], parts[1])
-                    } else {
-                        ("main", parts[0]) // Default schema in SQLite is "main"
-                    };
-
-                    // SQLite schema handling: if schema is "main" or empty, don't use schema prefix
-                    let table_ref = if schema.is_empty() || schema == "main" {
-                        format!("\"{}\"", table)
-                    } else {
-                        format!("[{}].[{}]", schema, table) // Use bracket notation for attached databases
-                    };
-
-                    let sql = format!("DELETE FROM {}", table_ref);
-
-                    sqlx::query(&sql).execute(pool).await.map_err(|e| {
-                        CdcError::generic(format!(
-                            "SQLite TRUNCATE failed for {}.{}: {}",
-                            schema, table, e
-                        ))
-                    })?;
-
-                    info!("Successfully truncated table {}.{}", schema, table);
-                }
+                self.execute_truncate(pool, tables).await?;
+                debug!("Successfully truncated {} table(s)", tables.len());
             }
 
             EventType::Begin { .. } => {

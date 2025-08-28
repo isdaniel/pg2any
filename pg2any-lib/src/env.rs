@@ -104,10 +104,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         std::env::var("CDC_DEST_PASSWORD").unwrap_or_else(|_| "cdc_password".to_string());
 
     // For SQLite, handle the file path configuration using CDC_DEST_URI
-    let sqlite_file_path = std::env::var("CDC_DEST_URI")
-        .or_else(|_| std::env::var("CDC_DEST_FILE")) // Fallback for backward compatibility
-        .or_else(|_| std::env::var("CDC_DEST_DB"))
-        .unwrap_or_else(|_| "./cdc_target.db".to_string());
+    let sqlite_file_path =
+        std::env::var("CDC_DEST_URI").unwrap_or_else(|_| "./cdc_target.db".to_string());
 
     let destination_connection_string = match dest_type {
         DestinationType::MySQL => {

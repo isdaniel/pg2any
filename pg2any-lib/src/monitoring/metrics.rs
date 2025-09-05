@@ -3,16 +3,15 @@
 //! This module provides comprehensive metrics collection for monitoring CDC replication
 //! performance, lag, errors, and resource usage.
 
+use crate::types::ChangeEvent;
+use crate::types::EventType;
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
-    register_histogram_vec, Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec,
-    Registry,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec,
+    register_histogram_vec, Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, Registry,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
-
-use crate::types::ChangeEvent;
 
 lazy_static! {
     /// Global metrics registry for all CDC metrics
@@ -33,12 +32,6 @@ lazy_static! {
         "pg2any_events_by_type_total",
         "Number of events processed by type",
         &["event_type", "table_name"]
-    ).expect("metric can be created");
-
-    /// Current replication lag in seconds
-    pub static ref REPLICATION_LAG_SECONDS: Gauge = register_gauge!(
-        "pg2any_replication_lag_seconds",
-        "Current replication lag between source and target in seconds"
     ).expect("metric can be created");
 
     /// Events processing rate (events per second)
@@ -100,34 +93,9 @@ lazy_static! {
         "Number of events waiting to be processed"
     ).expect("metric can be created");
 
-    /// Batch size for event processing
-    pub static ref BATCH_SIZE: Histogram = register_histogram!(
-        "pg2any_batch_size",
-        "Size of event batches being processed"
-    ).expect("metric can be created");
-
-    /// Network I/O metrics
-    pub static ref NETWORK_BYTES_RECEIVED: Counter = register_counter!(
-        "pg2any_network_bytes_received_total",
-        "Total bytes received from PostgreSQL replication stream"
-    ).expect("metric can be created");
-
-    /// Network I/O - bytes sent to destination
-    pub static ref NETWORK_BYTES_SENT: CounterVec = register_counter_vec!(
-        "pg2any_network_bytes_sent_total",
-        "Total bytes sent to destination databases",
-        &["destination_type"]
-    ).expect("metric can be created");
-
     // =============================================================================
     // Resource Usage Metrics
     // =============================================================================
-
-    /// Memory usage for event buffers
-    pub static ref BUFFER_MEMORY_USAGE_BYTES: Gauge = register_gauge!(
-        "pg2any_buffer_memory_usage_bytes",
-        "Memory usage for event buffering in bytes"
-    ).expect("metric can be created");
 
     /// Active connections count
     pub static ref ACTIVE_CONNECTIONS: GaugeVec = register_gauge_vec!(
@@ -165,10 +133,6 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to register EVENTS_BY_TYPE: {}", e))?;
 
     REGISTRY
-        .register(Box::new(REPLICATION_LAG_SECONDS.clone()))
-        .map_err(|e| format!("Failed to register REPLICATION_LAG_SECONDS: {}", e))?;
-
-    REGISTRY
         .register(Box::new(EVENTS_RATE.clone()))
         .map_err(|e| format!("Failed to register EVENTS_RATE: {}", e))?;
 
@@ -199,22 +163,6 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
     REGISTRY
         .register(Box::new(QUEUE_DEPTH.clone()))
         .map_err(|e| format!("Failed to register QUEUE_DEPTH: {}", e))?;
-
-    REGISTRY
-        .register(Box::new(BATCH_SIZE.clone()))
-        .map_err(|e| format!("Failed to register BATCH_SIZE: {}", e))?;
-
-    REGISTRY
-        .register(Box::new(NETWORK_BYTES_RECEIVED.clone()))
-        .map_err(|e| format!("Failed to register NETWORK_BYTES_RECEIVED: {}", e))?;
-
-    REGISTRY
-        .register(Box::new(NETWORK_BYTES_SENT.clone()))
-        .map_err(|e| format!("Failed to register NETWORK_BYTES_SENT: {}", e))?;
-
-    REGISTRY
-        .register(Box::new(BUFFER_MEMORY_USAGE_BYTES.clone()))
-        .map_err(|e| format!("Failed to register BUFFER_MEMORY_USAGE_BYTES: {}", e))?;
 
     REGISTRY
         .register(Box::new(ACTIVE_CONNECTIONS.clone()))
@@ -289,21 +237,15 @@ impl MetricsCollector {
         EVENTS_PROCESSED_TOTAL.inc();
 
         // Track by event type and table
-        let event_type = match &event.event_type {
-            crate::types::EventType::Insert { .. } => "insert",
-            crate::types::EventType::Update { .. } => "update",
-            crate::types::EventType::Delete { .. } => "delete",
-            crate::types::EventType::Truncate(_) => "truncate",
-            _ => "other",
-        };
-
+        let event_type = event.event_type_str();
         // Extract table name from event type
         let table_name = match &event.event_type {
-            crate::types::EventType::Insert { table, .. } => table.as_str(),
-            crate::types::EventType::Update { table, .. } => table.as_str(),
-            crate::types::EventType::Delete { table, .. } => table.as_str(),
+            EventType::Insert { table, .. }
+            | EventType::Update { table, .. }
+            | EventType::Delete { table, .. } => table.as_str(),
             _ => "unknown",
         };
+
         EVENTS_BY_TYPE
             .with_label_values(&[event_type, table_name])
             .inc();
@@ -343,12 +285,6 @@ impl MetricsCollector {
             .observe(duration.as_secs_f64());
     }
 
-    /// Record replication lag in seconds
-    pub fn record_replication_lag(&self, lag_seconds: f64) {
-        REPLICATION_LAG_SECONDS.set(lag_seconds);
-        debug!("Replication lag recorded: {} seconds", lag_seconds);
-    }
-
     /// Record current received LSN
     pub fn record_received_lsn(&self, lsn: u64) {
         CURRENT_RECEIVED_LSN.set(lsn as f64);
@@ -382,28 +318,6 @@ impl MetricsCollector {
         QUEUE_DEPTH.set(depth as f64);
     }
 
-    /// Record batch size
-    pub fn record_batch_size(&self, size: usize) {
-        BATCH_SIZE.observe(size as f64);
-    }
-
-    /// Record network bytes received
-    pub fn record_bytes_received(&self, bytes: u64) {
-        NETWORK_BYTES_RECEIVED.inc_by(bytes as f64);
-    }
-
-    /// Record network bytes sent to destination
-    pub fn record_bytes_sent(&self, bytes: u64, destination_type: &str) {
-        NETWORK_BYTES_SENT
-            .with_label_values(&[destination_type])
-            .inc_by(bytes as f64);
-    }
-
-    /// Update buffer memory usage
-    pub fn update_buffer_memory_usage(&self, bytes: u64) {
-        BUFFER_MEMORY_USAGE_BYTES.set(bytes as f64);
-    }
-
     /// Update active connections count
     pub fn update_active_connections(&self, count: usize, connection_type: &str) {
         ACTIVE_CONNECTIONS
@@ -419,27 +333,6 @@ impl MetricsCollector {
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer)?;
         Ok(String::from_utf8(buffer)?)
-    }
-
-    /// Calculate replication lag from timestamps
-    pub fn calculate_lag_from_timestamp(&self, event_timestamp: SystemTime) -> Option<f64> {
-        match event_timestamp.duration_since(UNIX_EPOCH) {
-            Ok(event_duration) => {
-                match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(now_duration) => {
-                        if now_duration > event_duration {
-                            let lag = now_duration - event_duration;
-                            Some(lag.as_secs_f64())
-                        } else {
-                            // Event is from the future, return 0 lag
-                            Some(0.0)
-                        }
-                    }
-                    Err(_) => None,
-                }
-            }
-            Err(_) => None,
-        }
     }
 }
 
@@ -470,7 +363,6 @@ impl ProcessingTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EventType, Lsn};
 
     #[test]
     fn test_metrics_collector_creation() {
@@ -490,23 +382,6 @@ mod tests {
         // Check that build info is set
         let metrics = collector.get_metrics().unwrap();
         assert!(metrics.contains("pg2any_build_info"));
-    }
-
-    #[test]
-    fn test_lag_calculation() {
-        let collector = MetricsCollector::new();
-
-        // Test with past timestamp
-        let past_time = SystemTime::now() - Duration::from_secs(30);
-        let lag = collector.calculate_lag_from_timestamp(past_time);
-        assert!(lag.is_some());
-        assert!(lag.unwrap() >= 29.0 && lag.unwrap() <= 31.0); // Allow some tolerance
-
-        // Test with future timestamp
-        let future_time = SystemTime::now() + Duration::from_secs(30);
-        let lag = collector.calculate_lag_from_timestamp(future_time);
-        assert!(lag.is_some());
-        assert_eq!(lag.unwrap(), 0.0);
     }
 
     #[test]

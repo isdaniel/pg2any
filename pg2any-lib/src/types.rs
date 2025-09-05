@@ -238,6 +238,16 @@ impl ChangeEvent {
             _ => None,
         }
     }
+
+    pub fn event_type_str(&self) -> &str {
+        match self.event_type {
+            EventType::Insert { .. } => "insert",
+            EventType::Update { .. } => "update",
+            EventType::Delete { .. } => "delete",
+            EventType::Truncate(_) => "truncate",
+            _ => "other",
+        }
+    }
 }
 
 /// Represents a PostgreSQL logical replication message

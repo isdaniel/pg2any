@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
-use crate::metrics_abstraction::{MetricsCollector, MetricsCollectorTrait, ProcessingTimer, ProcessingTimerTrait};
+use crate::monitoring::{
+    MetricsCollector, MetricsCollectorTrait, ProcessingTimer, ProcessingTimerTrait,
+};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, Lsn};
 use std::sync::{Arc, Mutex};
@@ -245,92 +247,38 @@ impl CdcClient {
         info!("Starting replication consumer (single event mode)");
 
         // Initialize destination connection status
-        {
-            let collector = metrics_collector.lock().unwrap();
-            collector.update_destination_connection_status(&destination_type, true);
-        }
+        Self::update_connection_status(&metrics_collector, &destination_type, true);
 
         loop {
             tokio::select! {
                 biased;
+
+                // Handle graceful shutdown
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer received cancellation signal");
-                    // Process any remaining events in the channel
-                    while let Ok(event) = event_receiver.try_recv() {
-                        debug!("Processing remaining event during shutdown: {:?}", event);
-
-                        // Start timer for processing duration
-                        let event_type = match &event.event_type {
-                            crate::types::EventType::Insert { .. } => "insert",
-                            crate::types::EventType::Update { .. } => "update",
-                            crate::types::EventType::Delete { .. } => "delete",
-                            crate::types::EventType::Truncate(_) => "truncate",
-                            _ => "other",
-                        };
-                        let timer = ProcessingTimer::start(event_type, &destination_type);
-
-                        // Process the single event immediately
-                        match destination_handler.process_event(&event).await {
-                            Ok(_) => {
-                                // Record successful event processing
-                                let collector = metrics_collector.lock().unwrap();
-                                collector.record_event(&event, &destination_type);
-                                timer.finish(&*collector);
-                            }
-                            Err(e) => {
-                                error!("Failed to process single event during shutdown: {}", e);
-                                let collector = metrics_collector.lock().unwrap();
-                                collector.record_error("event_processing_failed", "consumer");
-                            }
-                        }
-                    }
-                    info!("Processed {} remaining events during graceful shutdown", event_receiver.len());
+                    Self::drain_remaining_events(
+                        &mut event_receiver,
+                        &mut destination_handler,
+                        &metrics_collector,
+                        &destination_type
+                    ).await;
                     break;
                 }
+
+                // Handle incoming event
                 event = event_receiver.recv() => {
                     match event {
                         Some(event) => {
                             debug!("Consumer processing event: {:?}", event.event_type);
-
-                            // Start timer for processing duration
-                            let event_type = match &event.event_type {
-                                crate::types::EventType::Insert { .. } => "insert",
-                                crate::types::EventType::Update { .. } => "update",
-                                crate::types::EventType::Delete { .. } => "delete",
-                                crate::types::EventType::Truncate(_) => "truncate",
-                                _ => "other",
-                            };
-                            let timer = ProcessingTimer::start(event_type, &destination_type);
-
-                            // Process the single event immediately
-                            match destination_handler.process_event(&event).await {
-                            Ok(_) => {
-                                // Record successful event processing
-                                let collector = metrics_collector.lock().unwrap();
-                                collector.record_event(&event, &destination_type);
-                                timer.finish(&*collector);                                    // Calculate and record replication lag if timestamp is available in metadata
-                                    if let Some(metadata) = &event.metadata {
-                                        if let Some(timestamp_val) = metadata.get("timestamp") {
-                                            if let Ok(timestamp_str) = timestamp_val.as_str().ok_or("not a string") {
-                                                if let Ok(timestamp) = timestamp_str.parse::<chrono::DateTime<chrono::Utc>>() {
-                                                    if let Some(lag) = collector.calculate_lag_from_timestamp(timestamp.into()) {
-                                                        collector.record_replication_lag(lag);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to process single event: {}", e);
-                                    let collector = metrics_collector.lock().unwrap();
-                                    collector.record_error("event_processing_failed", "consumer");
-                                    // Continue processing other events even if one fails
-                                }
-                            }
+                            Self::process_single_event(
+                                event,
+                                &mut destination_handler,
+                                &metrics_collector,
+                                &destination_type
+                            ).await;
                         }
                         None => {
-                            // Channel closed, exit the loop
+                            // Channel closed, exit loop
                             break;
                         }
                     }
@@ -339,13 +287,67 @@ impl CdcClient {
         }
 
         // Update destination connection status on shutdown
-        {
-            let collector = metrics_collector.lock().unwrap();
-            collector.update_destination_connection_status(&destination_type, false);
-        }
+        Self::update_connection_status(&metrics_collector, &destination_type, false);
 
         info!("Replication consumer stopped gracefully");
         Ok(())
+    }
+
+    /// Drain any remaining events from the channel during shutdown.
+    async fn drain_remaining_events(
+        event_receiver: &mut mpsc::Receiver<ChangeEvent>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        destination_type: &str,
+    ) {
+        while let Ok(event) = event_receiver.try_recv() {
+            debug!("Processing remaining event during shutdown: {:?}", event);
+            Self::process_single_event(
+                event,
+                destination_handler,
+                metrics_collector,
+                destination_type,
+            )
+            .await;
+        }
+        info!(
+            "Processed {} remaining events during graceful shutdown",
+            event_receiver.len()
+        );
+    }
+
+    /// Process one event (normal or shutdown).
+    async fn process_single_event(
+        event: ChangeEvent,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        destination_type: &str,
+    ) {
+        let event_type = event.event_type_str();
+        let timer = ProcessingTimer::start(event_type, destination_type);
+
+        match destination_handler.process_event(&event).await {
+            Ok(_) => {
+                let collector = metrics_collector.lock().unwrap();
+                collector.record_event(&event, destination_type);
+                timer.finish(&*collector);
+            }
+            Err(e) => {
+                error!("Failed to process event: {}", e);
+                let collector = metrics_collector.lock().unwrap();
+                collector.record_error("event_processing_failed", "consumer");
+            }
+        }
+    }
+
+    /// Update connection status in metrics.
+    fn update_connection_status(
+        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        destination_type: &str,
+        status: bool,
+    ) {
+        let collector = metrics_collector.lock().unwrap();
+        collector.update_destination_connection_status(destination_type, status);
     }
 
     /// Stop the CDC replication process gracefully

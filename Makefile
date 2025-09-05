@@ -41,14 +41,16 @@ check:
 test:
 	cd ./pg2any-lib && cargo test
 
+audit:
+	cargo audit
+
 format:
 	cargo fmt
 
 run:
 	cargo run
 
-build:
-before-git-push: check build format test
+before-git-push: check build format test audit
 
 # Docker commands
 docker-build:
@@ -98,7 +100,7 @@ show-data:
 	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db -e "SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema='cdc_db';"
 	
 # Development workflow
-dev-setup: check format test docker-build
+dev-setup: check format test docker-build 
 	@echo "Development setup completed!"
 
 # Full cleanup and fresh start

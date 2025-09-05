@@ -33,7 +33,7 @@ metrics = ["pg2any_lib/metrics"]
 mysql = ["pg2any_lib/mysql"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["your-name <dog830228@gmail.com>"]
 license = "Apache-2.0"

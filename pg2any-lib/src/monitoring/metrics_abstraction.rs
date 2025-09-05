@@ -3,9 +3,6 @@
 //! This module provides an abstraction layer for metrics that allows the application
 //! to work with or without the metrics feature enabled. When metrics are disabled,
 //! no-op implementations are provided to maintain the same API surface.
-
-use std::time::SystemTime;
-
 use crate::CdcResult;
 
 /// Abstract metrics collector trait
@@ -23,10 +20,12 @@ pub trait MetricsCollectorTrait: Send + Sync {
     fn record_event(&self, event: &crate::types::ChangeEvent, destination_type: &str);
 
     /// Record event processing duration
-    fn record_processing_duration(&self, duration: std::time::Duration, event_type: &str, destination_type: &str);
-
-    /// Record replication lag
-    fn record_replication_lag(&self, lag_seconds: f64);
+    fn record_processing_duration(
+        &self,
+        duration: std::time::Duration,
+        event_type: &str,
+        destination_type: &str,
+    );
 
     /// Record an error
     fn record_error(&self, error_type: &str, component: &str);
@@ -40,18 +39,6 @@ pub trait MetricsCollectorTrait: Send + Sync {
     /// Update queue depth
     fn update_queue_depth(&self, depth: usize);
 
-    /// Record batch size
-    fn record_batch_size(&self, size: usize);
-
-    /// Record network bytes received
-    fn record_bytes_received(&self, bytes: u64);
-
-    /// Record network bytes sent
-    fn record_bytes_sent(&self, bytes: u64, destination_type: &str);
-
-    /// Update buffer memory usage
-    fn update_buffer_memory_usage(&self, bytes: u64);
-
     /// Update active connections count
     fn update_active_connections(&self, count: usize, connection_type: &str);
 
@@ -63,9 +50,6 @@ pub trait MetricsCollectorTrait: Send + Sync {
 
     /// Get metrics in Prometheus text format
     fn get_metrics(&self) -> CdcResult<String>;
-
-    /// Calculate replication lag from timestamps
-    fn calculate_lag_from_timestamp(&self, event_timestamp: SystemTime) -> Option<f64>;
 
     /// Initialize build information
     fn init_build_info(&self, version: &str);
@@ -92,7 +76,7 @@ pub use real_metrics::*;
 #[cfg(feature = "metrics")]
 mod real_metrics {
     use super::*;
-    use crate::metrics::{MetricsCollector as RealMetricsCollector};
+    use crate::monitoring::metrics::MetricsCollector as RealMetricsCollector;
     use std::sync::{Arc, Mutex};
 
     /// Real metrics collector that wraps the actual prometheus-based collector
@@ -114,15 +98,14 @@ mod real_metrics {
             }
         }
 
-        fn record_processing_duration(&self, duration: std::time::Duration, event_type: &str, destination_type: &str) {
+        fn record_processing_duration(
+            &self,
+            duration: std::time::Duration,
+            event_type: &str,
+            destination_type: &str,
+        ) {
             if let Ok(collector) = self.inner.lock() {
                 collector.record_processing_duration(duration, event_type, destination_type);
-            }
-        }
-
-        fn record_replication_lag(&self, lag_seconds: f64) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_replication_lag(lag_seconds);
             }
         }
 
@@ -150,30 +133,6 @@ mod real_metrics {
             }
         }
 
-        fn record_batch_size(&self, size: usize) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_batch_size(size);
-            }
-        }
-
-        fn record_bytes_received(&self, bytes: u64) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_bytes_received(bytes);
-            }
-        }
-
-        fn record_bytes_sent(&self, bytes: u64, destination_type: &str) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_bytes_sent(bytes, destination_type);
-            }
-        }
-
-        fn update_buffer_memory_usage(&self, bytes: u64) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_buffer_memory_usage(bytes);
-            }
-        }
-
         fn update_active_connections(&self, count: usize, connection_type: &str) {
             if let Ok(collector) = self.inner.lock() {
                 collector.update_active_connections(count, connection_type);
@@ -194,17 +153,13 @@ mod real_metrics {
 
         fn get_metrics(&self) -> CdcResult<String> {
             if let Ok(collector) = self.inner.lock() {
-                collector.get_metrics().map_err(|e| crate::CdcError::generic(&e.to_string()))
+                collector
+                    .get_metrics()
+                    .map_err(|e| crate::CdcError::generic(&e.to_string()))
             } else {
-                Err(crate::CdcError::generic("Failed to acquire metrics collector lock"))
-            }
-        }
-
-        fn calculate_lag_from_timestamp(&self, event_timestamp: SystemTime) -> Option<f64> {
-            if let Ok(collector) = self.inner.lock() {
-                collector.calculate_lag_from_timestamp(event_timestamp)
-            } else {
-                None
+                Err(crate::CdcError::generic(
+                    "Failed to acquire metrics collector lock",
+                ))
             }
         }
 
@@ -233,7 +188,11 @@ mod real_metrics {
 
         fn finish(self, collector: &dyn MetricsCollectorTrait) {
             let duration = self.start_time.elapsed();
-            collector.record_processing_duration(duration, &self.event_type, &self.destination_type);
+            collector.record_processing_duration(
+                duration,
+                &self.event_type,
+                &self.destination_type,
+            );
         }
     }
 }
@@ -260,9 +219,13 @@ mod noop_metrics {
 
         fn record_event(&self, _event: &crate::types::ChangeEvent, _destination_type: &str) {}
 
-        fn record_processing_duration(&self, _duration: std::time::Duration, _event_type: &str, _destination_type: &str) {}
-
-        fn record_replication_lag(&self, _lag_seconds: f64) {}
+        fn record_processing_duration(
+            &self,
+            _duration: std::time::Duration,
+            _event_type: &str,
+            _destination_type: &str,
+        ) {
+        }
 
         fn record_error(&self, _error_type: &str, _component: &str) {}
 
@@ -272,14 +235,6 @@ mod noop_metrics {
 
         fn update_queue_depth(&self, _depth: usize) {}
 
-        fn record_batch_size(&self, _size: usize) {}
-
-        fn record_bytes_received(&self, _bytes: u64) {}
-
-        fn record_bytes_sent(&self, _bytes: u64, _destination_type: &str) {}
-
-        fn update_buffer_memory_usage(&self, _bytes: u64) {}
-
         fn update_active_connections(&self, _count: usize, _connection_type: &str) {}
 
         fn update_uptime(&self) {}
@@ -288,10 +243,6 @@ mod noop_metrics {
 
         fn get_metrics(&self) -> CdcResult<String> {
             Ok("# Metrics not available - metrics feature disabled\n".to_string())
-        }
-
-        fn calculate_lag_from_timestamp(&self, _event_timestamp: SystemTime) -> Option<f64> {
-            None
         }
 
         fn init_build_info(&self, _version: &str) {}
@@ -304,7 +255,9 @@ mod noop_metrics {
 
     impl ProcessingTimerTrait for ProcessingTimer {
         fn start(_event_type: &str, _destination_type: &str) -> Self {
-            Self { _phantom: std::marker::PhantomData }
+            Self {
+                _phantom: std::marker::PhantomData,
+            }
         }
 
         fn finish(self, _collector: &dyn MetricsCollectorTrait) {}
@@ -318,7 +271,7 @@ mod noop_metrics {
 /// Initialize the global metrics registry (only when metrics feature is enabled)
 #[cfg(feature = "metrics")]
 pub fn init_metrics() -> CdcResult<()> {
-    crate::metrics::init_metrics().map_err(|e| crate::CdcError::generic(&e.to_string()))
+    crate::monitoring::metrics::init_metrics().map_err(|e| crate::CdcError::generic(&e.to_string()))
 }
 
 /// No-op metrics initialization when metrics feature is disabled
@@ -332,7 +285,8 @@ pub fn init_metrics() -> CdcResult<()> {
 /// Gather all metrics from the global registry (only when metrics feature is enabled)
 #[cfg(feature = "metrics")]
 pub fn gather_metrics() -> CdcResult<String> {
-    crate::metrics::gather_metrics().map_err(|e| crate::CdcError::generic(&e.to_string()))
+    crate::monitoring::metrics::gather_metrics()
+        .map_err(|e| crate::CdcError::generic(&e.to_string()))
 }
 
 /// Return a message indicating metrics are disabled

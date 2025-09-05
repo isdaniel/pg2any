@@ -76,16 +76,8 @@ pub mod replication_protocol;
 pub mod client;
 pub mod connection;
 
-// Metrics and monitoring
-#[cfg(feature = "metrics")]
-pub mod metrics;
-
-// HTTP metrics server (optional)
-#[cfg(feature = "metrics")]
-pub mod metrics_server;
-
-// Metrics abstraction layer (always available)
-pub mod metrics_abstraction;
+// Monitoring and metrics
+pub mod monitoring;
 
 // Public API exports
 pub use app::{run_cdc_app, CdcApp, CdcAppConfig};
@@ -118,16 +110,16 @@ pub use crate::types::DestinationType;
 
 // Conditionally export metrics server functionality
 #[cfg(feature = "metrics")]
-pub use crate::metrics_server::{
+pub use crate::monitoring::{
     create_metrics_server, create_metrics_server_with_config, MetricsServer, MetricsServerConfig,
 };
 
 // Always export metrics abstraction layer
-pub use crate::metrics_abstraction::{
+pub use crate::monitoring::{
     gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
     ProcessingTimerTrait,
 };
 
 // Conditionally export real metrics functionality when feature is enabled
 #[cfg(feature = "metrics")]
-pub use crate::metrics_abstraction::init_metrics as init_real_metrics;
+pub use crate::monitoring::init_real_metrics;

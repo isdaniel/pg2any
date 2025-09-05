@@ -90,7 +90,7 @@ impl MetricsServer {
 
 async fn metrics_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     match (req.method(), req.uri().path()) {
-        (&hyper::Method::GET, "/metrics") => match crate::metrics::gather_metrics() {
+        (&hyper::Method::GET, "/metrics") => match crate::monitoring::metrics::gather_metrics() {
             Ok(metrics) => Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain; version=0.0.4; charset=utf-8")

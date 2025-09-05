@@ -27,9 +27,16 @@ libpq-sys = { workspace = true }
 libc = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+lazy_static = { workspace = true }
+# Monitoring dependencies (optional)
+prometheus = { workspace = true, optional = true  }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
 
 [features]
 default = ["mysql", "sqlserver", "sqlite"]
 mysql = ["sqlx/mysql"]
 sqlserver = ["tiberius"]
 sqlite = ["sqlx/sqlite"]
+metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]

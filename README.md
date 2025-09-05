@@ -23,8 +23,13 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - ✅ **Development Tooling**: Makefile automation, formatting, linting, and quality checks
 - ✅ **Production Logging**: Structured tracing with configurable levels and filtering
 
+### Production-Ready Features ✅
+- ✅ **Monitoring & Observability**: Complete Prometheus metrics collection and alerting systems
+- ✅ **Enterprise Monitoring**: 20+ metrics covering performance, errors, resource usage, and health status
+- ✅ **Production Logging**: Structured tracing with configurable levels and HTTP metrics endpoint
+- ✅ **Health Monitoring**: Database connection monitoring, replication lag tracking, and error rate alerts
+
 ### What Needs Enhancement 🚧
-- 🚧 **Monitoring & Observability**: Production metrics, dashboards, and alerting systems
 - 🚧 **Additional Destinations**: Oracle, ClickHouse, Elasticsearch support
 - 🚧 **Schema Evolution**: DDL change handling and automatic schema migration
 - 🚧 **Multi-table Replication**: Table filtering, routing, and transformation pipelines
@@ -40,8 +45,30 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - ✅ **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
 - ✅ **Real-time Streaming**: Live change capture for all DML operations
 - ✅ **Production Ready**: Structured logging, graceful shutdown, and resource management
+- ✅ **Monitoring & Metrics**: Comprehensive Prometheus metrics, Grafana dashboards, and health monitoring
+- ✅ **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
 - ✅ **Development Tools**: Docker environment, Makefile automation, extensive testing
 
+### PostgreSQL Setup
+
+1. Enable logical replication in your PostgreSQL configuration:
+   ```sql
+   ALTER SYSTEM SET wal_level = logical;
+   -- Restart PostgreSQL server after this change
+   ```
+
+2. Create a publication for the tables you want to replicate:
+   ```sql
+   CREATE PUBLICATION my_publication FOR TABLE table1, table2;
+   -- Or for all tables:
+   CREATE PUBLICATION my_publication FOR ALL TABLES;
+   ```
+
+3. Create a user with replication privileges:
+   ```sql
+   CREATE USER replicator WITH REPLICATION LOGIN PASSWORD 'password';
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
+   ```
 
 ### Basic Usage
 
@@ -292,7 +319,7 @@ CDC_PUBLICATION=cdc_pub
 ```bash
 # Source PostgreSQL
 CDC_SOURCE_HOST=localhost
-CDC_SOURCE_PORT=7777
+CDC_SOURCE_PORT=5432
 CDC_SOURCE_DB=postgres
 CDC_SOURCE_USER=postgres
 CDC_SOURCE_PASSWORD=test.123
@@ -366,7 +393,7 @@ The configuration system provides comprehensive validation:
 ## Development Status
 
 ### ✅ Production-Ready Implementation 
-This project provides **enterprise-grade PostgreSQL to Any database replication** with battle-tested reliability:
+This project provides **enterprise-grade PostgreSQL to Any database replication** with comprehensive monitoring:
 
 - **🏗️ Core CDC Pipeline**: Complete end-to-end replication with transaction consistency
 - **🔄 PostgreSQL Protocol**: Full logical replication implementation with binary message parsing
@@ -374,34 +401,88 @@ This project provides **enterprise-grade PostgreSQL to Any database replication*
 - **🎯 Destination Support**: Production-ready MySQL, SQL Server, and SQLite implementations
 - **⚙️ Configuration**: Flexible environment-based configuration with validation
 - **🐳 Docker Environment**: Complete development setup with multi-database support
-- **📈 Monitoring**: Structured logging with configurable levels and filtering
+- **📈 Monitoring**: Prometheus metrics collection and alerting systems
+- **🔍 Observability**: 20+ metrics covering performance, errors, and resource usage
 - **🛡️ Error Handling**: Comprehensive error types with proper propagation and recovery
 - **🔄 Graceful Shutdown**: Proper resource cleanup and LSN persistence
+- **📊 Health Monitoring**: HTTP metrics endpoint, connection status, and replication lag tracking
 
 ### � Enhancement Opportunities
-- **📊 Advanced Monitoring**: Production metrics, dashboards, and alerting systems
-- **🗄️ Additional Databases**: Oracle, SQLite, ClickHouse, Elasticsearch support  
+- **️ Additional Databases**: Oracle, ClickHouse, Elasticsearch support  
 - **🔄 Schema Evolution**: DDL change handling and migration automation
 - **🎯 Advanced Features**: Table filtering, transformations, and routing
 - **⚡ Performance**: High-throughput optimization and benchmarking
 
+## Monitoring & Observability
+
+pg2any includes comprehensive monitoring and observability features for production environments:
+
+### Built-in Metrics System
+- **HTTP Metrics Endpoint**: Prometheus-compatible metrics served on port 8080
+- **20+ Key Metrics**: Performance, errors, resource usage, and health monitoring
+- **Real-time Monitoring**: Replication lag, event processing rates, connection status
+- **Resource Tracking**: Memory usage, network I/O, active connections, queue depth
+
+### Key Metrics Available
+```prometheus
+# Core Replication Metrics
+pg2any_events_processed_total          # Total CDC events processed
+pg2any_events_by_type_total            # Events by type (insert/update/delete)
+pg2any_replication_lag_seconds         # Current replication lag
+pg2any_events_per_second               # Event processing rate
+pg2any_last_processed_lsn              # Last processed LSN from PostgreSQL WAL
+
+# Health & Error Metrics
+pg2any_errors_total                    # Total errors by type and component
+pg2any_source_connection_status        # PostgreSQL connection status
+pg2any_destination_connection_status   # Destination database connection status
+
+# Performance Metrics
+pg2any_event_processing_duration_seconds # Event processing time
+pg2any_queue_depth                     # Events waiting to be processed
+pg2any_network_bytes_received_total    # Network I/O from PostgreSQL
+pg2any_buffer_memory_usage_bytes       # Memory usage for event buffers
+```
+
+### Complete Monitoring Stack
+The Docker environment includes a full observability stack:
+
+- **Prometheus**: Metrics collection and storage (port 9090)
+- **Grafana**: Visualization dashboards (port 3000)
+- **Node Exporter**: System metrics (port 9100)
+- **PostgreSQL Exporter**: Database metrics (port 9187)
+- **MySQL Exporter**: Destination database metrics (port 9104)
+- **Alert Rules**: Predefined alerts for lag, errors, and connection issues
+
+### Grafana Dashboards
+Access comprehensive dashboards at http://localhost:3000:
+- **CDC Overview**: High-level replication status and performance
+- **Database Health**: Source and destination database monitoring
+- **Error Analysis**: Error trends, rates, and troubleshooting
+- **Resource Usage**: Memory, CPU, and network utilization
+- **Alerting Status**: Current alerts and system health
+
 ## Quick Start with Docker
 
-Get up and running in minutes with the complete development environment:
+Get up and running in minutes with the complete development environment including monitoring:
 
 ```bash
 # Clone the repository
 git clone https://github.com/isdaniel/pg2any
 cd pg2any
 
-# Start the multi-database development environment
-make docker-start
+# Start the complete environment (databases + monitoring)
+docker-compose up -d
 
 # Build the application
 make build
 
-# Run the CDC application
+# Run the CDC application with monitoring
 RUST_LOG=info make run
+
+# Access monitoring dashboards
+open http://localhost:9090   # Prometheus metrics
+open http://localhost:8080/metrics  # Application metrics
 
 # In another terminal, test with sample data
 make test-data     # Insert test data into PostgreSQL
@@ -421,15 +502,22 @@ make run           # Run the CDC application locally
 
 **Docker Management:**
 ```bash
-make docker-start  # Start PostgreSQL and MySQL services
+make docker-start  # Start databases and monitoring stack
 make docker-stop   # Stop all services
 make docker-logs   # View application logs
 make docker-status # Check service status
 ```
 
+**Monitoring:**
+```bash
+make metrics       # View Prometheus metrics
+make grafana       # Open Grafana dashboards
+make alerts        # Check active alerts
+```
+
 **Database Access:**
 ```bash
-make psql          # Connect to PostgreSQL (localhost:7777)
+make psql          # Connect to PostgreSQL (localhost:5432)
 make mysql         # Connect to MySQL (localhost:3306)
 ```
 
@@ -452,6 +540,83 @@ make dev-setup         # Complete development setup
 make before-git-push   # Pre-commit validation
 ```
 
+## Feature Configuration
+
+pg2any supports feature flags to enable or disable optional functionality, allowing you to build a lighter binary when certain features aren't needed.
+
+### Metrics Feature
+
+The metrics collection and HTTP metrics server can be enabled/disabled using the `metrics` feature flag:
+
+```bash
+# Build with metrics (default)
+cargo build
+
+# Build with metrics explicitly
+cargo build --features metrics
+
+# Build without metrics (smaller binary, ~17% reduction)
+cargo build --no-default-features --features mysql,sqlserver,sqlite
+
+# Run tests with metrics enabled
+cargo test --features metrics
+```
+
+### Library Usage
+
+When using pg2any as a library, you can selectively enable features:
+
+```toml
+# Cargo.toml - Full featured (default)
+[dependencies]
+pg2any_lib = "0.2.0"
+
+# Minimal build without metrics
+[dependencies]
+pg2any_lib = { version = "0.2.0", default-features = false, features = ["mysql"] }
+
+# With specific database support
+[dependencies]
+pg2any_lib = { version = "0.2.0", features = ["metrics", "mysql", "sqlite"] }
+```
+
+**Simple usage (metrics abstracted away):**
+```rust
+use pg2any_lib::{load_config_from_env, CdcApp, init_metrics};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize metrics (no-op when disabled)
+    init_metrics()?;
+    
+    let config = load_config_from_env()?;
+    let mut app = CdcApp::new(config).await?;
+    app.run(None).await?;
+    Ok(())
+}
+```
+
+**With metrics server (when metrics feature enabled):**
+```rust
+use pg2any_lib::{create_metrics_server, MetricsServerConfig, load_config_from_env, CdcApp};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config_from_env()?;
+    let mut app = CdcApp::new(config).await?;
+    
+    // Conditionally start metrics server
+    #[cfg(feature = "metrics")]
+    let _server = {
+        let server = create_metrics_server(8080);
+        tokio::spawn(async move { server.start().await })
+    };
+    
+    app.run(None).await?;
+    Ok(())
+}
+```
+
 ## Example Application Output
 
 When you run the application, you'll see structured logging output like this:
@@ -472,12 +637,14 @@ When you run the application, you'll see structured logging output like this:
 2025-08-15T10:30:00.135Z INFO  pg2any: ✨ CDC replication running! Real-time change streaming active
 ```
 
-**Note**: This shows the complete working application with real PostgreSQL logical replication message processing, LSN tracking, and transaction handling.
+**Note**: This shows the production-ready application with real PostgreSQL logical replication, integrated metrics collection, LSN tracking, and comprehensive monitoring capabilities.
 
 ## Dependencies
 
 ### Core Runtime
 - **tokio** (1.47.1): Async runtime with full feature set
+- **hyper** (1.x): HTTP server for metrics endpoint
+- **prometheus** (0.13): Metrics collection and Prometheus integration
 - **tokio-postgres** (0.7.13): PostgreSQL async client with logical replication support
 - **tokio-util** (0.7.16): Utilities for async operations and cancellation
 
@@ -497,6 +664,8 @@ When you run the application, you'll see structured logging output like this:
 - **async-trait** (0.1.88): Async trait definitions
 - **tracing** (0.1.41): Structured logging and instrumentation
 - **tracing-subscriber** (0.3): Log filtering and formatting
+- **prometheus** (0.13): Metrics collection library
+- **lazy_static** (1.4): Global metrics registry initialization
 - **libc** (0.2.174): C library bindings for system operations
 
 ### Test Files Structure

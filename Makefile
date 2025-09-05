@@ -80,10 +80,10 @@ docker-mysql:
 	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db
 
 psql:
-	psql -h 127.0.0.1 -U postgres -p 7777 postgres
+	psql -h 127.0.0.1 -U postgres -p 5432 postgres
 
 mysql:
-	mysql -h 127.0.0.1 -P 3306 -u root -ptest.123 public
+	mysql -h 127.0.0.1 -P 3306 -u root -ptest.123 mysql
 
 # Database utilities  
 test-data:

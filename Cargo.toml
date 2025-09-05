@@ -19,14 +19,18 @@ keywords = ["postgresql", "cdc", "replication", "database", "cli"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-# Main library dependency
-pg2any_lib = { path = "pg2any-lib" }
+# Main library dependency with conditional features
+pg2any_lib = { path = "pg2any-lib", default-features = false, features = ["mysql","metrics"] }
 
 # Dependencies for the binary
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+metrics = ["pg2any_lib/metrics"]
+mysql = ["pg2any_lib/mysql"]
 
 [workspace.package]
 version = "0.2.0"
@@ -56,3 +60,9 @@ tiberius = { version = "0.12", features = ["tds73", "sql-browser-tokio", "bigdec
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "sqlite", "chrono", "uuid"] }
 libpq-sys = "0.8"
 libc = "0.2.174"
+# Monitoring and metrics dependencies
+prometheus = { version = "0.13.4", features = ["process"] }
+lazy_static = "1.5"
+hyper = { version = "1.7", features = ["full"] }
+hyper-util = { version = "0.1.16", features = ["full"] }
+http-body-util = "0.1.3"

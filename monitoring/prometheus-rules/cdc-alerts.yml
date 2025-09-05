@@ -1,0 +1,74 @@
+groups:
+  - name: pg2any-cdc-alerts
+    rules:
+      - alert: CDCHighReplicationLag
+        expr: pg2any_replication_lag_seconds > 30
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC replication lag is high"
+          description: "Replication lag is {{ $value }} seconds, which is above the 30 second threshold"
+
+      - alert: CDCReplicationLagCritical
+        expr: pg2any_replication_lag_seconds > 120
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC replication lag is critical"
+          description: "Replication lag is {{ $value }} seconds, which is critically high"
+
+      - alert: CDCHighErrorRate
+        expr: rate(pg2any_errors_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC error rate is high"
+          description: "Error rate is {{ $value }} errors per second"
+
+      - alert: CDCSourceConnectionDown
+        expr: pg2any_connection_status{connection_type="source"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC source connection is down"
+          description: "Connection to PostgreSQL source is lost"
+
+      - alert: CDCDestinationConnectionDown
+        expr: pg2any_connection_status{destination_type!=""} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC destination connection is down"
+          description: "Connection to {{ $labels.destination_type }} destination is lost"
+
+      - alert: CDCLowEventProcessingRate
+        expr: rate(pg2any_events_processed_total[5m]) < 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC event processing rate is low"
+          description: "Event processing rate is {{ $value }} events per second, which may indicate an issue"
+
+      - alert: CDCHighQueueDepth
+        expr: pg2any_queue_depth > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC queue depth is high"
+          description: "Queue depth is {{ $value }}, which may indicate processing bottleneck"
+
+      - alert: CDCApplicationDown
+        expr: up{job="pg2any-cdc"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC application is down"
+          description: "pg2any CDC application is not responding"

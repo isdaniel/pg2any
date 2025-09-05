@@ -45,7 +45,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - ✅ **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
 - ✅ **Real-time Streaming**: Live change capture for all DML operations
 - ✅ **Production Ready**: Structured logging, graceful shutdown, and resource management
-- ✅ **Monitoring & Metrics**: Comprehensive Prometheus metrics, Grafana dashboards, and health monitoring
+- ✅ **Monitoring & Metrics**: Comprehensive Prometheus metrics, and health monitoring
 - ✅ **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
 - ✅ **Development Tools**: Docker environment, Makefile automation, extensive testing
 
@@ -201,16 +201,6 @@ pg2any/                          # Workspace root
 - **MySQL**: Full implementation using SQLx with connection pooling, type mapping, and DML operations
 - **SQL Server**: Native implementation using Tiberius TDS protocol with comprehensive type support
 - **SQLite**: Complete implementation using SQLx with file-based storage and embedded scenarios
-
-### Destination Features
-- ✅ **Automatic Schema Management**: Table creation with proper type mapping from PostgreSQL
-- ✅ **Complete DML Support**: INSERT, UPDATE, DELETE, TRUNCATE operations with transaction safety
-- ✅ **Type Conversion**: Comprehensive PostgreSQL to destination type mapping
-- ✅ **WHERE Clause Generation**: Accurate UPDATE/DELETE targeting with replica identity support
-- ✅ **Null Handling**: Proper null value processing and validation
-- ✅ **Connection Management**: Pooling, reconnection, and error recovery for network databases
-- ✅ **File-based Storage**: SQLite support for embedded and local development scenarios
-- ✅ **Feature Flags**: Optional compilation with `mysql`, `sqlserver`, and `sqlite` features
 
 ## Change Event Types
 
@@ -448,19 +438,10 @@ pg2any_buffer_memory_usage_bytes       # Memory usage for event buffers
 The Docker environment includes a full observability stack:
 
 - **Prometheus**: Metrics collection and storage (port 9090)
-- **Grafana**: Visualization dashboards (port 3000)
 - **Node Exporter**: System metrics (port 9100)
 - **PostgreSQL Exporter**: Database metrics (port 9187)
 - **MySQL Exporter**: Destination database metrics (port 9104)
 - **Alert Rules**: Predefined alerts for lag, errors, and connection issues
-
-### Grafana Dashboards
-Access comprehensive dashboards at http://localhost:3000:
-- **CDC Overview**: High-level replication status and performance
-- **Database Health**: Source and destination database monitoring
-- **Error Analysis**: Error trends, rates, and troubleshooting
-- **Resource Usage**: Memory, CPU, and network utilization
-- **Alerting Status**: Current alerts and system health
 
 ## Quick Start with Docker
 
@@ -506,19 +487,6 @@ make docker-start  # Start databases and monitoring stack
 make docker-stop   # Stop all services
 make docker-logs   # View application logs
 make docker-status # Check service status
-```
-
-**Monitoring:**
-```bash
-make metrics       # View Prometheus metrics
-make grafana       # Open Grafana dashboards
-make alerts        # Check active alerts
-```
-
-**Database Access:**
-```bash
-make psql          # Connect to PostgreSQL (localhost:5432)
-make mysql         # Connect to MySQL (localhost:3306)
 ```
 
 ## Local Development
@@ -668,19 +636,6 @@ When you run the application, you'll see structured logging output like this:
 - **lazy_static** (1.4): Global metrics registry initialization
 - **libc** (0.2.174): C library bindings for system operations
 
-### Test Files Structure
-```
-pg2any-lib/tests/
-├── integration_tests.rs                    # Core CDC functionality
-├── destination_integration_tests.rs        # Database destination testing
-├── event_type_refactor_tests.rs           # Event type handling
-├── mysql_edge_cases_tests.rs              # MySQL-specific scenarios
-├── mysql_error_handling_simple_tests.rs   # Error recovery testing
-├── mysql_where_clause_fix_tests.rs        # WHERE clause generation
-├── replica_identity_tests.rs              # Primary key handling
-└── where_clause_fix_tests.rs             # UPDATE/DELETE targeting
-```
-
 ### Running Tests
 ```bash
 make test                    # Run all tests
@@ -696,7 +651,7 @@ This project provides **production-ready PostgreSQL CDC replication** with a sol
 ### 🎯 High-Impact Contribution Areas
 
 1. **📊 Monitoring & Observability**
-   - Production metrics collection (Prometheus/Grafana)
+   - Production metrics collection Prometheus
    - Performance dashboards and alerting
    - Health checks and status endpoints
 

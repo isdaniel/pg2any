@@ -36,11 +36,11 @@ pub trait MetricsCollectorTrait: Send + Sync {
     /// Update destination connection status
     fn update_destination_connection_status(&self, destination_type: &str, connected: bool);
 
-    /// Update queue depth
-    fn update_queue_depth(&self, depth: usize);
-
     /// Update active connections count
     fn update_active_connections(&self, count: usize, connection_type: &str);
+
+    /// Update consumer queue size (pending events in the consumer thread)
+    fn update_consumer_queue_size(&self, size: usize);
 
     /// Update uptime
     fn update_uptime(&self);
@@ -127,15 +127,15 @@ mod real_metrics {
             }
         }
 
-        fn update_queue_depth(&self, depth: usize) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_queue_depth(depth);
-            }
-        }
-
         fn update_active_connections(&self, count: usize, connection_type: &str) {
             if let Ok(collector) = self.inner.lock() {
                 collector.update_active_connections(count, connection_type);
+            }
+        }
+
+        fn update_consumer_queue_size(&self, size: usize) {
+            if let Ok(collector) = self.inner.lock() {
+                collector.update_consumer_queue_size(size);
             }
         }
 
@@ -233,9 +233,9 @@ mod noop_metrics {
 
         fn update_destination_connection_status(&self, _destination_type: &str, _connected: bool) {}
 
-        fn update_queue_depth(&self, _depth: usize) {}
-
         fn update_active_connections(&self, _count: usize, _connection_type: &str) {}
+
+        fn update_consumer_queue_size(&self, _size: usize) {}
 
         fn update_uptime(&self) {}
 

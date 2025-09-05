@@ -40,6 +40,12 @@ lazy_static! {
         "Current rate of events being processed per second"
     ).expect("metric can be created");
 
+    /// Consumer queue size (pending events in the consumer thread)
+    pub static ref CONSUMER_QUEUE_SIZE: Gauge = register_gauge!(
+        "pg2any_consumer_queue_size",
+        "Number of pending events in the consumer thread queue"
+    ).expect("metric can be created");
+
     /// Last processed LSN from PostgreSQL WAL
     pub static ref LAST_PROCESSED_LSN: Gauge = register_gauge!(
         "pg2any_last_processed_lsn",
@@ -87,12 +93,6 @@ lazy_static! {
         &["event_type", "destination_type"]
     ).expect("metric can be created");
 
-    /// Queue depth - number of events waiting to be processed
-    pub static ref QUEUE_DEPTH: Gauge = register_gauge!(
-        "pg2any_queue_depth",
-        "Number of events waiting to be processed"
-    ).expect("metric can be created");
-
     // =============================================================================
     // Resource Usage Metrics
     // =============================================================================
@@ -137,6 +137,10 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to register EVENTS_RATE: {}", e))?;
 
     REGISTRY
+        .register(Box::new(CONSUMER_QUEUE_SIZE.clone()))
+        .map_err(|e| format!("Failed to register CONSUMER_QUEUE_SIZE: {}", e))?;
+
+    REGISTRY
         .register(Box::new(LAST_PROCESSED_LSN.clone()))
         .map_err(|e| format!("Failed to register LAST_PROCESSED_LSN: {}", e))?;
 
@@ -159,10 +163,6 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
     REGISTRY
         .register(Box::new(EVENT_PROCESSING_DURATION.clone()))
         .map_err(|e| format!("Failed to register EVENT_PROCESSING_DURATION: {}", e))?;
-
-    REGISTRY
-        .register(Box::new(QUEUE_DEPTH.clone()))
-        .map_err(|e| format!("Failed to register QUEUE_DEPTH: {}", e))?;
 
     REGISTRY
         .register(Box::new(ACTIVE_CONNECTIONS.clone()))
@@ -313,16 +313,17 @@ impl MetricsCollector {
             .set(if connected { 1.0 } else { 0.0 });
     }
 
-    /// Update queue depth
-    pub fn update_queue_depth(&self, depth: usize) {
-        QUEUE_DEPTH.set(depth as f64);
-    }
-
     /// Update active connections count
     pub fn update_active_connections(&self, count: usize, connection_type: &str) {
         ACTIVE_CONNECTIONS
             .with_label_values(&[connection_type])
             .set(count as f64);
+    }
+
+    /// Update consumer queue size (pending events in the consumer thread)
+    pub fn update_consumer_queue_size(&self, size: usize) {
+        CONSUMER_QUEUE_SIZE.set(size as f64);
+        debug!("Updated consumer queue size: {}", size);
     }
 
     /// Get metrics in Prometheus text format
@@ -397,5 +398,23 @@ mod tests {
         // Verify metrics were recorded
         let metrics = collector.get_metrics().unwrap();
         assert!(metrics.contains("pg2any_event_processing_duration_seconds"));
+    }
+
+    #[test]
+    fn test_consumer_queue_size_metric() {
+        // Initialize the metrics registry first
+        let _ = init_metrics();
+
+        let collector = MetricsCollector::new();
+
+        // Test updating queue size
+        collector.update_consumer_queue_size(5);
+        collector.update_consumer_queue_size(10);
+        collector.update_consumer_queue_size(0);
+
+        // Verify metrics were recorded
+        let metrics = collector.get_metrics().unwrap();
+        assert!(metrics.contains("pg2any_consumer_queue_size"));
+        assert!(metrics.contains("pg2any_consumer_queue_size 0"));
     }
 }

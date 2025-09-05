@@ -90,19 +90,19 @@ impl CdcClient {
             .take()
             .ok_or_else(|| CdcError::generic("Event sender not available"))?;
 
-        let producer_token = self.cancellation_token.clone();
-        let metrics_collector_clone = self.metrics_collector.clone();
+        let producer_handle = {
+            let token = self.cancellation_token.clone();
+            let metrics = self.metrics_collector.clone();
+            let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
 
-        let producer_handle = tokio::spawn(async move {
-            Self::run_producer(
+            tokio::spawn(Self::run_producer(
                 replication_stream,
                 event_sender,
-                producer_token,
-                start_lsn.unwrap_or(Lsn::new(0)),
-                metrics_collector_clone,
-            )
-            .await
-        });
+                token,
+                start_lsn,
+                metrics,
+            ))
+        };
 
         // Start the consumer task (writes to destination)
         let event_receiver = self
@@ -115,43 +115,51 @@ impl CdcClient {
             .take()
             .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
 
-        let consumer_token = self.cancellation_token.clone();
-        let metrics_collector_clone = self.metrics_collector.clone();
-        let destination_type = self.config.destination_type.to_string();
+        let consumer_handle = {
+            let token = self.cancellation_token.clone();
+            let metrics = self.metrics_collector.clone();
+            let dest_type = self.config.destination_type.to_string();
 
-        let consumer_handle = tokio::spawn(async move {
-            Self::run_consumer(
+            tokio::spawn(Self::run_consumer(
                 event_receiver,
                 destination_handler,
-                consumer_token,
-                metrics_collector_clone,
-                destination_type,
-            )
-            .await
-        });
+                token,
+                metrics,
+                dest_type,
+            ))
+        };
 
         self.producer_handle = Some(producer_handle);
         self.consumer_handle = Some(consumer_handle);
 
-        // Start metrics update task
-        let metrics_collector_clone = self.metrics_collector.clone();
-        let metrics_token = self.cancellation_token.clone();
-        let _metrics_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                tokio::select! {
-                    _ = metrics_token.cancelled() => break,
-                    _ = interval.tick() => {
-                        let collector = metrics_collector_clone.lock().unwrap();
-                        collector.update_uptime();
-                    }
-                }
-            }
-        });
+        self.start_server_uptime();
 
         info!("CDC replication started successfully");
         self.cancellation_token.cancelled().await;
         Ok(())
+    }
+
+    // Start metrics update task
+    fn start_server_uptime(&mut self) {
+        let metrics = self.metrics_collector.clone();
+        let token = self.cancellation_token.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Ok(collector) = metrics.lock() {
+                            collector.update_uptime();
+                        } else {
+                            error!("Failed to lock metrics_collector in uptime task");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Producer task: reads events from PostgreSQL replication stream
@@ -165,10 +173,7 @@ impl CdcClient {
         info!("Starting replication producer (single event mode)");
 
         // Initialize connection status
-        {
-            let collector = metrics_collector.lock().unwrap();
-            collector.update_source_connection_status(true);
-        }
+        Self::update_source_connection_status(&metrics_collector, true);
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event().await {
@@ -187,12 +192,6 @@ impl CdcClient {
                     }
 
                     debug!("Producer received single event: {:?}", event.event_type);
-
-                    // Update queue depth
-                    {
-                        let collector = metrics_collector.lock().unwrap();
-                        collector.update_queue_depth(event_sender.capacity());
-                    }
 
                     if let Err(e) = event_sender.send(event).await {
                         error!("Failed to send event to consumer: {}", e);
@@ -224,10 +223,7 @@ impl CdcClient {
         info!("Producer received cancellation signal");
 
         // Update connection status on shutdown
-        {
-            let collector = metrics_collector.lock().unwrap();
-            collector.update_source_connection_status(false);
-        }
+        Self::update_source_connection_status(&metrics_collector, false);
 
         // Gracefully stop the replication stream
         replication_stream.stop().await?;
@@ -247,7 +243,10 @@ impl CdcClient {
         info!("Starting replication consumer (single event mode)");
 
         // Initialize destination connection status
-        Self::update_connection_status(&metrics_collector, &destination_type, true);
+        Self::update_destination_connection_status(&metrics_collector, &destination_type, true);
+
+        // Create an interval for periodic queue size reporting
+        let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -263,6 +262,16 @@ impl CdcClient {
                         &destination_type
                     ).await;
                     break;
+                }
+
+                // Periodic queue size reporting
+                _ = queue_size_interval.tick() => {
+                    let queue_size = event_receiver.len();
+                    debug!("Consumer queue size: {}", queue_size);
+                    {
+                        let collector = metrics_collector.lock().unwrap();
+                        collector.update_consumer_queue_size(queue_size);
+                    }
                 }
 
                 // Handle incoming event
@@ -287,7 +296,7 @@ impl CdcClient {
         }
 
         // Update destination connection status on shutdown
-        Self::update_connection_status(&metrics_collector, &destination_type, false);
+        Self::update_destination_connection_status(&metrics_collector, &destination_type, false);
 
         info!("Replication consumer stopped gracefully");
         Ok(())
@@ -300,6 +309,13 @@ impl CdcClient {
         metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
         destination_type: &str,
     ) {
+        let initial_count = event_receiver.len();
+        info!(
+            "Draining {} remaining events during shutdown",
+            initial_count
+        );
+
+        let mut processed_count = 0;
         while let Ok(event) = event_receiver.try_recv() {
             debug!("Processing remaining event during shutdown: {:?}", event);
             Self::process_single_event(
@@ -309,10 +325,25 @@ impl CdcClient {
                 destination_type,
             )
             .await;
+            processed_count += 1;
+
+            // Update queue size periodically during drain
+            if processed_count % 10 == 0 {
+                let remaining_size = event_receiver.len();
+                let collector = metrics_collector.lock().unwrap();
+                collector.update_consumer_queue_size(remaining_size);
+            }
         }
+
+        // Final update to set queue size to 0
+        {
+            let collector = metrics_collector.lock().unwrap();
+            collector.update_consumer_queue_size(0);
+        }
+
         info!(
             "Processed {} remaining events during graceful shutdown",
-            event_receiver.len()
+            processed_count
         );
     }
 
@@ -341,13 +372,21 @@ impl CdcClient {
     }
 
     /// Update connection status in metrics.
-    fn update_connection_status(
+    fn update_destination_connection_status(
         metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
         destination_type: &str,
         status: bool,
     ) {
         let collector = metrics_collector.lock().unwrap();
         collector.update_destination_connection_status(destination_type, status);
+    }
+
+    fn update_source_connection_status(
+        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        status: bool,
+    ) {
+        let collector = metrics_collector.lock().unwrap();
+        collector.update_source_connection_status(status);
     }
 
     /// Stop the CDC replication process gracefully

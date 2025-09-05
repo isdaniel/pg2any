@@ -74,38 +74,11 @@ docker-logs:
 docker-status:
 	docker-compose ps
 
-# Database connection shortcuts
-docker-pg:
-	docker-compose exec postgres psql -U postgres -d postgres
-
-docker-mysql:
-	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db
-
 psql:
 	psql -h 127.0.0.1 -U postgres -p 5432 postgres
 
 mysql:
 	mysql -h 127.0.0.1 -P 3306 -u root -ptest.123 mysql
-
-# Database utilities  
-test-data:
-	@echo "Inserting test data into PostgreSQL..."
-	docker-compose exec postgres psql -U postgres -d postgres -c "INSERT INTO users (username, email, full_name) VALUES ('test_user_$(shell date +%s)', 'test@example.com', 'Test User') ON CONFLICT (username) DO NOTHING;"
-
-show-data:
-	@echo "=== PostgreSQL Data ==="
-	docker-compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM users ORDER BY created_at DESC LIMIT 5;"
-	@echo ""
-	@echo "=== MySQL Data ==="
-	docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db -e "SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema='cdc_db';"
-	
-# Development workflow
-dev-setup: check format test docker-build 
-	@echo "Development setup completed!"
-
-# Full cleanup and fresh start
-reset: docker-clean docker-build docker-start
-	@echo "System reset completed!"
 
 clean:
 	cargo clean

@@ -8,6 +8,38 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{client::CdcClient, config::Config, types::Lsn, CdcResult};
 
+/// Configuration for the CDC application
+#[derive(Debug, Clone)]
+pub struct CdcAppConfig {
+    /// CDC configuration
+    pub cdc_config: Config,
+    /// Metrics server port (if metrics feature is enabled)
+    pub metrics_port: Option<u16>,
+    /// Application version for metrics
+    pub version: String,
+}
+
+impl CdcAppConfig {
+    /// Create a new CDC application configuration
+    pub fn new(cdc_config: Config) -> Self {
+        Self {
+            cdc_config,
+            metrics_port: None,
+            version: "unknown".to_string(),
+        }
+    }
+
+    /// Set the metrics server port
+    pub fn with_metrics_port(&mut self, port: u16) {
+        self.metrics_port = Some(port);
+    }
+
+    /// Set the application version
+    pub fn with_version(&mut self, version: &str) {
+        self.version = version.to_string();
+    }
+}
+
 /// High-level CDC application runner
 ///
 /// This struct encapsulates the complete CDC application workflow,
@@ -15,6 +47,7 @@ use crate::{client::CdcClient, config::Config, types::Lsn, CdcResult};
 /// proper initialization, shutdown handling, and error management.
 pub struct CdcApp {
     client: CdcClient,
+    config: CdcAppConfig,
 }
 
 impl CdcApp {
@@ -22,7 +55,7 @@ impl CdcApp {
     ///
     /// # Arguments
     ///
-    /// * `config` - The CDC configuration to use
+    /// * `config` - The CDC application configuration to use
     ///
     /// # Returns
     ///
@@ -31,16 +64,34 @@ impl CdcApp {
     /// # Errors
     ///
     /// Returns `CdcError` if the CDC client cannot be created or initialized.
-    pub async fn new(config: Config) -> CdcResult<Self> {
+    pub async fn new(config: CdcAppConfig) -> CdcResult<Self> {
         tracing::info!("🔧 Initializing CDC client");
-        let mut client = CdcClient::new(config).await?;
+        let mut client = CdcClient::new(config.cdc_config.clone()).await?;
 
         tracing::info!("⚙️  Performing CDC client initialization");
         client.init().await?;
 
         tracing::info!("✅ CDC client initialized successfully");
 
-        Ok(Self { client })
+        Ok(Self { client, config })
+    }
+
+    /// Create a new CDC application instance with just the CDC config (backwards compatible)
+    ///
+    /// # Arguments
+    ///
+    /// * `cdc_config` - The CDC configuration to use
+    ///
+    /// # Returns
+    ///
+    /// Returns a `CdcResult<CdcApp>` with the initialized application instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CdcError` if the CDC client cannot be created or initialized.
+    pub async fn from_config(cdc_config: Config) -> CdcResult<Self> {
+        let app_config = CdcAppConfig::new(cdc_config);
+        Self::new(app_config).await
     }
 
     /// Run the CDC application with graceful shutdown handling
@@ -48,6 +99,10 @@ impl CdcApp {
     /// This method starts the CDC replication process and handles graceful shutdown
     /// when shutdown signals are received. It automatically loads the last LSN
     /// from persistence to resume replication from where it left off.
+    ///
+    /// This method now automatically handles metrics server initialization
+    /// when the metrics feature is enabled, removing the need for feature checking
+    /// in the main application.
     ///
     /// # Arguments
     ///
@@ -65,9 +120,23 @@ impl CdcApp {
     /// - Replication fails to start or encounters an error
     /// - Shutdown handling fails
     /// - Client stop operation fails
+    /// - Metrics server fails to start (when metrics feature is enabled)
     pub async fn run(&mut self, lsn_file_path: Option<&str>) -> CdcResult<()> {
+        // Initialize build info for metrics
+        self.client.init_build_info(&self.config.version);
+
+        // Start metrics server if metrics feature is enabled and port is configured
+        #[cfg(feature = "metrics")]
+        let metrics_server = if let Some(port) = self.config.metrics_port {
+            tracing::info!("Starting metrics server on port {}", port);
+            let server = crate::create_metrics_server(port);
+            Some(tokio::spawn(async move { server.start().await }))
+        } else {
+            None
+        };
+
         // Set up graceful shutdown handling with the client's cancellation token
-        let shutdown_handler = setup_shutdown_handler(self.client.cancellation_token());
+        let shutdown_handler = tokio::spawn(setup_shutdown_handler(self.client.cancellation_token()));
 
         // Start the CDC replication process
         tracing::info!("Starting CDC replication stream");
@@ -77,6 +146,63 @@ impl CdcApp {
         let start_lsn = load_last_lsn(lsn_file_path);
 
         // Run CDC replication with graceful shutdown
+        // Handle metrics server conditionally
+        #[cfg(feature = "metrics")]
+        if let Some(metrics_server) = metrics_server {
+            tokio::select! {
+                result = self.client.start_replication_from_lsn(start_lsn) => {
+                    match result {
+                        Ok(()) => {
+                            tracing::info!("CDC replication completed successfully");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            tracing::error!("CDC replication failed: {}", e);
+                            Err(e)
+                        }
+                    }
+                }
+                result = metrics_server => {
+                    match result {
+                        Ok(server_result) => {
+                            tracing::error!("Metrics server stopped unexpectedly: {:?}", server_result);
+                            // Continue with CDC cleanup
+                            self.client.stop().await?;
+                            Ok(())
+                        }
+                        Err(join_error) => {
+                            tracing::error!("Metrics server task failed: {:?}", join_error);
+                            // Continue with CDC cleanup
+                            self.client.stop().await?;
+                            Ok(())
+                        }
+                    }
+                }
+                _ = shutdown_handler => {
+                    tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
+                    self.client.stop().await?;
+                    tracing::info!("CDC replication stopped successfully");
+                    Ok(())
+                }
+            }
+        } else {
+            // No metrics server, just run CDC with shutdown handling
+            self.run_without_metrics_server(start_lsn, shutdown_handler).await
+        }
+
+        #[cfg(not(feature = "metrics"))]
+        {
+            tracing::info!("Starting CDC replication (metrics disabled)");
+            self.run_without_metrics_server(start_lsn, shutdown_handler).await
+        }
+    }
+
+    /// Run CDC without metrics server (internal helper method)
+    async fn run_without_metrics_server(
+        &mut self, 
+        start_lsn: Option<Lsn>, 
+        shutdown_handler: tokio::task::JoinHandle<()>
+    ) -> CdcResult<()> {
         tokio::select! {
             result = self.client.start_replication_from_lsn(start_lsn) => {
                 match result {
@@ -99,18 +225,22 @@ impl CdcApp {
         }
     }
 
-    /// Get a reference to the underlying CDC client
-    ///
-    /// This method provides access to the underlying `CdcClient` for advanced
-    /// use cases where direct client manipulation is needed.
+    /// Get metrics in Prometheus text format
+    pub fn get_metrics(&self) -> CdcResult<String> {
+        self.client.get_metrics()
+    }
+
+    /// Initialize build information in metrics  
+    pub fn init_build_info(&self, version: &str) {
+        self.client.init_build_info(version);
+    }
+
+    /// Get access to the underlying client (for advanced use cases)
     pub fn client(&self) -> &CdcClient {
         &self.client
     }
 
-    /// Get a mutable reference to the underlying CDC client
-    ///
-    /// This method provides mutable access to the underlying `CdcClient` for
-    /// advanced use cases where direct client manipulation is needed.
+    /// Get mutable access to the underlying client (for advanced use cases)
     pub fn client_mut(&mut self) -> &mut CdcClient {
         &mut self.client
     }
@@ -148,7 +278,12 @@ impl CdcApp {
 /// }
 /// ```
 pub async fn run_cdc_app(config: Config, lsn_file_path: Option<&str>) -> CdcResult<()> {
-    let mut app = CdcApp::new(config).await?;
+    let app_config = CdcAppConfig {
+        cdc_config: config,
+        metrics_port: None,
+        version: "unknown".to_string(),
+    };
+    let mut app = CdcApp::new(app_config).await?;
     app.run(lsn_file_path).await
 }
 

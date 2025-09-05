@@ -53,6 +53,17 @@ pub enum DestinationType {
     SQLite,
 }
 
+impl std::fmt::Display for DestinationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DestinationType::MySQL => write!(f, "mysql"),
+            DestinationType::SqlServer => write!(f, "sqlserver"),
+            DestinationType::PostgreSQL => write!(f, "postgresql"),
+            DestinationType::SQLite => write!(f, "sqlite"),
+        }
+    }
+}
+
 /// Represents a single change event from PostgreSQL logical replication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {

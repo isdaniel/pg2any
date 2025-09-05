@@ -1,8 +1,10 @@
 use crate::config::Config;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
+use crate::metrics_abstraction::{MetricsCollector, MetricsCollectorTrait, ProcessingTimer, ProcessingTimerTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, Lsn};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +20,7 @@ pub struct CdcClient {
     cancellation_token: CancellationToken,
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
 }
 
 impl CdcClient {
@@ -42,6 +45,7 @@ impl CdcClient {
             cancellation_token: CancellationToken::new(),
             producer_handle: None,
             consumer_handle: None,
+            metrics_collector: Arc::new(Mutex::new(MetricsCollector::new())),
         })
     }
 
@@ -85,6 +89,7 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Event sender not available"))?;
 
         let producer_token = self.cancellation_token.clone();
+        let metrics_collector_clone = self.metrics_collector.clone();
 
         let producer_handle = tokio::spawn(async move {
             Self::run_producer(
@@ -92,6 +97,7 @@ impl CdcClient {
                 event_sender,
                 producer_token,
                 start_lsn.unwrap_or(Lsn::new(0)),
+                metrics_collector_clone,
             )
             .await
         });
@@ -108,13 +114,38 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
 
         let consumer_token = self.cancellation_token.clone();
+        let metrics_collector_clone = self.metrics_collector.clone();
+        let destination_type = self.config.destination_type.to_string();
 
         let consumer_handle = tokio::spawn(async move {
-            Self::run_consumer(event_receiver, destination_handler, consumer_token).await
+            Self::run_consumer(
+                event_receiver,
+                destination_handler,
+                consumer_token,
+                metrics_collector_clone,
+                destination_type,
+            )
+            .await
         });
 
         self.producer_handle = Some(producer_handle);
         self.consumer_handle = Some(consumer_handle);
+
+        // Start metrics update task
+        let metrics_collector_clone = self.metrics_collector.clone();
+        let metrics_token = self.cancellation_token.clone();
+        let _metrics_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = metrics_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        let collector = metrics_collector_clone.lock().unwrap();
+                        collector.update_uptime();
+                    }
+                }
+            }
+        });
 
         info!("CDC replication started successfully");
         self.cancellation_token.cancelled().await;
@@ -127,8 +158,15 @@ impl CdcClient {
         event_sender: mpsc::Sender<ChangeEvent>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
+        metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
+
+        // Initialize connection status
+        {
+            let collector = metrics_collector.lock().unwrap();
+            collector.update_source_connection_status(true);
+        }
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event().await {
@@ -138,11 +176,28 @@ impl CdcClient {
                             info!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
                             continue;
                         }
+
+                        // Record current LSN
+                        {
+                            let collector = metrics_collector.lock().unwrap();
+                            collector.record_received_lsn(current_lsn.0);
+                        }
                     }
 
                     debug!("Producer received single event: {:?}", event.event_type);
+
+                    // Update queue depth
+                    {
+                        let collector = metrics_collector.lock().unwrap();
+                        collector.update_queue_depth(event_sender.capacity());
+                    }
+
                     if let Err(e) = event_sender.send(event).await {
                         error!("Failed to send event to consumer: {}", e);
+                        {
+                            let collector = metrics_collector.lock().unwrap();
+                            collector.record_error("event_send_failed", "producer");
+                        }
                         break;
                     }
                 }
@@ -155,12 +210,23 @@ impl CdcClient {
                 }
                 Err(e) => {
                     error!("Error reading from replication stream: {}", e);
+                    {
+                        let collector = metrics_collector.lock().unwrap();
+                        collector.record_error("replication_stream_error", "producer");
+                    }
                     break;
                 }
             }
         }
 
         info!("Producer received cancellation signal");
+
+        // Update connection status on shutdown
+        {
+            let collector = metrics_collector.lock().unwrap();
+            collector.update_source_connection_status(false);
+        }
+
         // Gracefully stop the replication stream
         replication_stream.stop().await?;
 
@@ -173,8 +239,16 @@ impl CdcClient {
         mut event_receiver: mpsc::Receiver<ChangeEvent>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
+        metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
+        destination_type: String,
     ) -> Result<()> {
         info!("Starting replication consumer (single event mode)");
+
+        // Initialize destination connection status
+        {
+            let collector = metrics_collector.lock().unwrap();
+            collector.update_destination_connection_status(&destination_type, true);
+        }
 
         loop {
             tokio::select! {
@@ -185,9 +259,29 @@ impl CdcClient {
                     while let Ok(event) = event_receiver.try_recv() {
                         debug!("Processing remaining event during shutdown: {:?}", event);
 
+                        // Start timer for processing duration
+                        let event_type = match &event.event_type {
+                            crate::types::EventType::Insert { .. } => "insert",
+                            crate::types::EventType::Update { .. } => "update",
+                            crate::types::EventType::Delete { .. } => "delete",
+                            crate::types::EventType::Truncate(_) => "truncate",
+                            _ => "other",
+                        };
+                        let timer = ProcessingTimer::start(event_type, &destination_type);
+
                         // Process the single event immediately
-                        if let Err(e) = destination_handler.process_event(&event).await {
-                            error!("Failed to process single event during shutdown: {}", e);
+                        match destination_handler.process_event(&event).await {
+                            Ok(_) => {
+                                // Record successful event processing
+                                let collector = metrics_collector.lock().unwrap();
+                                collector.record_event(&event, &destination_type);
+                                timer.finish(&*collector);
+                            }
+                            Err(e) => {
+                                error!("Failed to process single event during shutdown: {}", e);
+                                let collector = metrics_collector.lock().unwrap();
+                                collector.record_error("event_processing_failed", "consumer");
+                            }
                         }
                     }
                     info!("Processed {} remaining events during graceful shutdown", event_receiver.len());
@@ -198,10 +292,41 @@ impl CdcClient {
                         Some(event) => {
                             debug!("Consumer processing event: {:?}", event.event_type);
 
+                            // Start timer for processing duration
+                            let event_type = match &event.event_type {
+                                crate::types::EventType::Insert { .. } => "insert",
+                                crate::types::EventType::Update { .. } => "update",
+                                crate::types::EventType::Delete { .. } => "delete",
+                                crate::types::EventType::Truncate(_) => "truncate",
+                                _ => "other",
+                            };
+                            let timer = ProcessingTimer::start(event_type, &destination_type);
+
                             // Process the single event immediately
-                            if let Err(e) = destination_handler.process_event(&event).await {
-                                error!("Failed to process single event: {}", e);
-                                // Continue processing other events even if one fails
+                            match destination_handler.process_event(&event).await {
+                            Ok(_) => {
+                                // Record successful event processing
+                                let collector = metrics_collector.lock().unwrap();
+                                collector.record_event(&event, &destination_type);
+                                timer.finish(&*collector);                                    // Calculate and record replication lag if timestamp is available in metadata
+                                    if let Some(metadata) = &event.metadata {
+                                        if let Some(timestamp_val) = metadata.get("timestamp") {
+                                            if let Ok(timestamp_str) = timestamp_val.as_str().ok_or("not a string") {
+                                                if let Ok(timestamp) = timestamp_str.parse::<chrono::DateTime<chrono::Utc>>() {
+                                                    if let Some(lag) = collector.calculate_lag_from_timestamp(timestamp.into()) {
+                                                        collector.record_replication_lag(lag);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to process single event: {}", e);
+                                    let collector = metrics_collector.lock().unwrap();
+                                    collector.record_error("event_processing_failed", "consumer");
+                                    // Continue processing other events even if one fails
+                                }
                             }
                         }
                         None => {
@@ -211,6 +336,12 @@ impl CdcClient {
                     }
                 }
             }
+        }
+
+        // Update destination connection status on shutdown
+        {
+            let collector = metrics_collector.lock().unwrap();
+            collector.update_destination_connection_status(&destination_type, false);
         }
 
         info!("Replication consumer stopped gracefully");
@@ -276,12 +407,42 @@ impl CdcClient {
         &self.config
     }
 
+    /// Get metrics collector for accessing metrics
+    pub fn metrics_collector(&self) -> Arc<Mutex<dyn MetricsCollectorTrait>> {
+        self.metrics_collector.clone()
+    }
+
+    /// Get metrics in Prometheus text format
+    pub fn get_metrics(&self) -> Result<String> {
+        let collector = self.metrics_collector.lock().unwrap();
+        collector
+            .get_metrics()
+            .map_err(|e| CdcError::generic(&format!("Failed to get metrics: {}", e)))
+    }
+
+    /// Initialize build information in metrics
+    pub fn init_build_info(&self, version: &str) {
+        let collector = self.metrics_collector.lock().unwrap();
+        collector.init_build_info(version);
+    }
+
     /// Health check for all components
     pub async fn health_check(&mut self) -> Result<bool> {
         // Check destination connection
         if let Some(ref mut handler) = self.destination_handler {
             if !handler.health_check().await? {
+                let collector = self.metrics_collector.lock().unwrap();
+                collector.update_destination_connection_status(
+                    &self.config.destination_type.to_string(),
+                    false,
+                );
                 return Ok(false);
+            } else {
+                let collector = self.metrics_collector.lock().unwrap();
+                collector.update_destination_connection_status(
+                    &self.config.destination_type.to_string(),
+                    true,
+                );
             }
         }
 
@@ -499,9 +660,17 @@ mod tests {
         });
 
         let token_clone = cancellation_token.clone();
+        let metrics_collector = Arc::new(Mutex::new(MetricsCollector::new()));
 
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone).await
+            CdcClient::run_consumer(
+                event_receiver,
+                mock_handler,
+                token_clone,
+                metrics_collector,
+                "test".to_string(),
+            )
+            .await
         });
 
         // Let the consumer run for a bit
@@ -547,9 +716,17 @@ mod tests {
 
         let token_clone = cancellation_token.clone();
         let events_clone = events_processed.clone();
+        let metrics_collector = Arc::new(Mutex::new(MetricsCollector::new()));
 
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(event_receiver, mock_handler, token_clone).await
+            CdcClient::run_consumer(
+                event_receiver,
+                mock_handler,
+                token_clone,
+                metrics_collector,
+                "test".to_string(),
+            )
+            .await
         });
 
         // Give the consumer time to start processing

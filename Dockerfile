@@ -1,6 +1,6 @@
 # Use multi-stage build for smaller final image
 # Build stage
-FROM rust:1.82-slim as builder
+FROM rust:1.88-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,23 +8,18 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libpq-dev \
     build-essential \
+    clang \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy Cargo files first to leverage Docker layer caching
+# Copy Cargo files and source code
 COPY Cargo.toml Cargo.lock ./
+COPY pg2any-lib/ ./pg2any-lib/
+COPY src/ ./src/
 
-# Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build dependencies (this layer will be cached unless Cargo.toml changes)
-RUN cargo build --release && rm src/main.rs target/release/deps/pg2any*
-
-# Copy source code
-COPY src ./src
-
-# Build the actual application
+# Build the application
 RUN cargo build --release
 
 # Runtime stage
@@ -32,9 +27,10 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
+    dnsutils \
+    curl \
     ca-certificates \
-    libssl3 \
-    libpq5 \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -53,19 +49,6 @@ USER pg2any_user
 
 # Expose port (if needed for health checks or metrics)
 EXPOSE 8080
-
-# Set up environment variables with defaults
-ENV RUST_LOG=info
-ENV CDC_SOURCE_HOST=postgres
-ENV CDC_SOURCE_PORT=5432
-ENV CDC_SOURCE_DB=postgres
-ENV CDC_SOURCE_USER=postgres
-ENV CDC_SOURCE_PASSWORD=test.123
-ENV CDC_DEST_HOST=mysql
-ENV CDC_DEST_PORT=3306
-ENV CDC_DEST_DB=cdc_db
-ENV CDC_DEST_USER=cdc_user
-ENV CDC_DEST_PASSWORD=test.123
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

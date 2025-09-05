@@ -76,8 +76,19 @@ pub mod replication_protocol;
 pub mod client;
 pub mod connection;
 
+// Metrics and monitoring
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+// HTTP metrics server (optional)
+#[cfg(feature = "metrics")]
+pub mod metrics_server;
+
+// Metrics abstraction layer (always available)
+pub mod metrics_abstraction;
+
 // Public API exports
-pub use app::{run_cdc_app, CdcApp};
+pub use app::{run_cdc_app, CdcApp, CdcAppConfig};
 pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
 pub use env::load_config_from_env;
@@ -95,9 +106,28 @@ pub use crate::destinations::MySQLDestination;
 #[cfg(feature = "sqlserver")]
 pub use crate::destinations::SqlServerDestination;
 
+#[cfg(feature = "sqlite")]
+pub use crate::destinations::SQLiteDestination;
+
 pub use crate::destinations::{DestinationFactory, DestinationHandler};
 pub use crate::replication_protocol::{
     ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
     ReplicationState, TupleData,
 };
 pub use crate::types::DestinationType;
+
+// Conditionally export metrics server functionality
+#[cfg(feature = "metrics")]
+pub use crate::metrics_server::{
+    create_metrics_server, create_metrics_server_with_config, MetricsServer, MetricsServerConfig,
+};
+
+// Always export metrics abstraction layer
+pub use crate::metrics_abstraction::{
+    gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
+    ProcessingTimerTrait,
+};
+
+// Conditionally export real metrics functionality when feature is enabled
+#[cfg(feature = "metrics")]
+pub use crate::metrics_abstraction::init_metrics as init_real_metrics;

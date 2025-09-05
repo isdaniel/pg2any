@@ -663,7 +663,7 @@ When you run the application, you'll see structured logging output like this:
 - **thiserror** (2.0.12): Ergonomic error handling and propagation
 - **async-trait** (0.1.88): Async trait definitions
 - **tracing** (0.1.41): Structured logging and instrumentation
-- **tracing-subscriber** (0.3): Log filtering and formatting
+- **tracing-subscriber** (0.3.20): Log filtering and formatting
 - **prometheus** (0.13): Metrics collection library
 - **lazy_static** (1.4): Global metrics registry initialization
 - **libc** (0.2.174): C library bindings for system operations

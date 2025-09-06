@@ -180,7 +180,7 @@ impl CdcClient {
                 Ok(Some(event)) => {
                     if let Some(current_lsn) = event.lsn {
                         if current_lsn <= start_lsn {
-                            info!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
+                            debug!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
                             continue;
                         }
 

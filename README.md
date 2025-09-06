@@ -636,7 +636,6 @@ When you run the application, you'll see structured logging output like this:
 - **tokio** (1.47.1): Async runtime with full feature set
 - **hyper** (1.x): HTTP server for metrics endpoint
 - **prometheus** (0.13): Metrics collection and Prometheus integration
-- **tokio-postgres** (0.7.13): PostgreSQL async client with logical replication support
 - **tokio-util** (0.7.16): Utilities for async operations and cancellation
 
 ### Database Clients

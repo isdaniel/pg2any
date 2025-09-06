@@ -124,14 +124,9 @@ impl CdcApp {
     /// - Client stop operation fails
     /// - Metrics server fails to start (when metrics feature is enabled)
     pub async fn run(&mut self, lsn_file_path: Option<&str>) -> CdcResult<()> {
-        // Initialize build info for metrics
         self.client.init_build_info(&self.config.version);
 
-        // Prepare shutdown handler
-        let shutdown_handler =
-            tokio::spawn(setup_shutdown_handler(self.client.cancellation_token()));
-
-        // Try to load persisted last LSN from file so we can continue where we left off
+        // Load last known LSN
         let start_lsn = load_last_lsn(lsn_file_path);
 
         tracing::info!("Starting CDC replication stream");
@@ -142,64 +137,38 @@ impl CdcApp {
             if let Some(port) = self.config.metrics_port {
                 tracing::info!("Starting metrics server on port {}", port);
                 let server = crate::create_metrics_server(port);
-
-                return self
-                    .run_with_metrics_server(start_lsn, shutdown_handler, server)
-                    .await;
+                return self.run_with_optional_server(start_lsn, Some(server)).await;
             }
         }
 
         tracing::info!("Starting CDC replication (metrics disabled)");
-        self.run_without_metrics_server(start_lsn, shutdown_handler)
-            .await
+        self.run_with_optional_server(start_lsn, None).await
     }
 
-    #[cfg(feature = "metrics")]
-    async fn run_with_metrics_server(
+    /// Internal method to run the CDC application with optional metrics server
+    /// This method abstracts away the conditional compilation details and provides a unified interface for running the application.
+    /// Metrics will not guarantee always upload successfully, some telemetry lossing is acceptable, for better performance.
+    /// # Arguments
+    /// * `start_lsn` - Optional starting LSN to resume replication from
+    /// * `server` - Optional metrics server instance (if metrics feature is enabled)
+    /// # Returns
+    /// Returns `CdcResult<()>` when the application completes successfully or is gracefully shut down.
+    async fn run_with_optional_server(
         &mut self,
         start_lsn: Option<Lsn>,
-        shutdown_handler: tokio::task::JoinHandle<()>,
-        server: MetricsServer,
+        #[cfg(feature = "metrics")] server: Option<MetricsServer>,
+        #[cfg(not(feature = "metrics"))] _: Option<()>,
     ) -> CdcResult<()> {
-        let metrics_task = tokio::spawn(async move { server.start().await });
-
-        tokio::select! {
-            result = self.client.start_replication_from_lsn(start_lsn) => {
-                self.handle_replication_result(result).await
-            }
-            result = metrics_task => {
-                tracing::error!("Metrics server stopped unexpectedly: {:?}", result);
-                self.client.stop().await?;
-                Ok(())
-            }
-            _ = shutdown_handler => {
-                tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
-                self.client.stop().await?;
-                tracing::info!("CDC replication stopped successfully");
-                Ok(())
-            }
+        
+        #[cfg(feature = "metrics")]
+        if let Some(server) = server {
+            let _ = tokio::spawn(async move { server.start().await });
+        } else {
+            tracing::warn!("Metrics server not started (metrics feature enabled but no port configured)");
         }
-    }
 
-    async fn handle_replication_result(&mut self, result: CdcResult<()>) -> CdcResult<()> {
-        match result {
-            Ok(()) => {
-                tracing::info!("CDC replication completed successfully");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("CDC replication failed: {}", e);
-                Err(e)
-            }
-        }
-    }
+        let shutdown_handler = setup_shutdown_handler(self.client.cancellation_token());
 
-    /// Run CDC without metrics server (internal helper method)
-    async fn run_without_metrics_server(
-        &mut self,
-        start_lsn: Option<Lsn>,
-        shutdown_handler: tokio::task::JoinHandle<()>,
-    ) -> CdcResult<()> {
         tokio::select! {
             result = self.client.start_replication_from_lsn(start_lsn) => {
                 match result {

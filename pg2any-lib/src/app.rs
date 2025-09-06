@@ -147,7 +147,7 @@ impl CdcApp {
 
     /// Internal method to run the CDC application with optional metrics server
     /// This method abstracts away the conditional compilation details and provides a unified interface for running the application.
-    /// Metrics will not guarantee always upload successfully, some telemetry lossing is acceptable, for better performance.
+    /// Metrics will not guarantee always upload successfully, some telemetry losing is acceptable, for better performance.
     /// # Arguments
     /// * `start_lsn` - Optional starting LSN to resume replication from
     /// * `server` - Optional metrics server instance (if metrics feature is enabled)
@@ -159,12 +159,13 @@ impl CdcApp {
         #[cfg(feature = "metrics")] server: Option<MetricsServer>,
         #[cfg(not(feature = "metrics"))] _: Option<()>,
     ) -> CdcResult<()> {
-        
         #[cfg(feature = "metrics")]
         if let Some(server) = server {
             let _ = tokio::spawn(async move { server.start().await });
         } else {
-            tracing::warn!("Metrics server not started (metrics feature enabled but no port configured)");
+            tracing::warn!(
+                "Metrics server not started (metrics feature enabled but no port configured)"
+            );
         }
 
         let shutdown_handler = setup_shutdown_handler(self.client.cancellation_token());

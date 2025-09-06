@@ -200,7 +200,7 @@ impl BufferWriter {
         self.data.freeze()
     }
 
-    /// Get the data as a Vec<u8>
+    /// Get the data as a `Vec<u8>`
     pub fn into_vec(self) -> Vec<u8> {
         self.data.to_vec()
     }

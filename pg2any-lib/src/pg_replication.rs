@@ -634,7 +634,7 @@ pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
     }
 }
 
-/// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into chrono::DateTime<Utc>.
+/// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
 pub fn postgres_timestamp_to_chrono(ts: i64) -> DateTime<Utc> {
     // Convert back to Unix epoch microseconds
     let unix_micros = ts + PG_EPOCH_OFFSET_SECS * 1_000_000;

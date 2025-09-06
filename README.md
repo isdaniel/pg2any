@@ -154,7 +154,36 @@ This Cargo workspace provides a complete CDC implementation with clean separatio
 ```
 pg2any/                          # Workspace root
 ├── Cargo.toml                   # Workspace configuration with shared dependencies
-├── src/main.rs                  # CLI application entry point (47 lines)
+├── Cargo.lock                   # Dependency lock file
+├── README.md                    # This documentation file
+├── CHANGELOG.md                 # Release notes and version history
+├── LICENSE                      # Project license
+├── Makefile                     # Development automation (35+ commands)
+├── Dockerfile                   # Application containerization
+├── docker-compose.yml           # Multi-database development environment
+├── .gitignore                   # Git ignore patterns
+├── .cargo/                      # Cargo configuration
+├── .github/                     # GitHub workflows and templates
+├── .vscode/                     # VS Code workspace settings
+├── docs/                        # Project documentation
+│   └── DOCKER.md                # Docker setup and usage guide
+├── env/                         # Environment configuration
+│   ├── .env                     # Default environment variables
+│   └── .env_local               # Local development overrides
+├── examples/                    # Example applications and scripts
+│   ├── Cargo.toml               # Examples workspace configuration
+│   ├── pg2any_last_lsn          # LSN persistence file (runtime generated)
+│   ├── src/
+│   │   └── main.rs              # Example CLI application entry point
+│   ├── scripts/                 # Database initialization scripts
+│   │   ├── init_postgres.sql    # PostgreSQL setup with logical replication
+│   │   └── init_mysql.sql       # MySQL destination database setup
+│   └── monitoring/              # Monitoring and observability setup
+│       ├── prometheus.yml       # Prometheus configuration
+│       ├── prometheus-rules/    # Alert rules for monitoring
+│       │   └── cdc-alerts.yml   # CDC-specific alerting rules
+│       └── exporter/            # Database exporters
+│           └── mysql/           # MySQL exporter configuration
 ├── pg2any-lib/                  # Core CDC library
 │   ├── Cargo.toml               # Library dependencies with feature flags
 │   ├── src/
@@ -170,11 +199,18 @@ pg2any/                          # Workspace root
 │   │   ├── replication_protocol.rs # Message parsing and protocol handling
 │   │   ├── buffer.rs            # Binary protocol buffer operations
 │   │   ├── types.rs             # Core data types and enums
-│   │   └── destinations/        # Database destination implementations
-│   │       ├── mod.rs           # Destination trait and factory pattern
-│   │       ├── mysql.rs         # MySQL destination with SQLx
-│   │       ├── sqlserver.rs     # SQL Server destination with Tiberius
-│   │       └── sqlite.rs        # SQLite destination with SQLx
+│   │   ├── destinations/        # Database destination implementations
+│   │   │   ├── mod.rs           # Destination trait and factory pattern
+│   │   │   ├── destination_factory.rs # Factory for creating destinations
+│   │   │   ├── operation.rs     # Operation types and handling
+│   │   │   ├── mysql.rs         # MySQL destination with SQLx
+│   │   │   ├── sqlserver.rs     # SQL Server destination with Tiberius
+│   │   │   └── sqlite.rs        # SQLite destination with SQLx
+│   │   └── monitoring/          # Monitoring and metrics system
+│   │       ├── mod.rs           # Monitoring module exports
+│   │       ├── metrics.rs       # Core metrics definitions
+│   │       ├── metrics_abstraction.rs # Metrics abstraction layer
+│   │       └── metrics_server.rs # HTTP metrics server
 │   └── tests/                   # Comprehensive test suite (10 test files, 100+ tests)
 │       ├── integration_tests.rs       # End-to-end CDC testing
 │       ├── destination_integration_tests.rs # Database destination testing
@@ -186,13 +222,6 @@ pg2any/                          # Workspace root
 │       ├── sqlite_comprehensive_tests.rs   # SQLite comprehensive testing
 │       ├── sqlite_destination_tests.rs     # SQLite destination tests
 │       └── where_clause_fix_tests.rs       # WHERE clause bug fixes
-├── docker-compose.yml           # Multi-database development environment
-├── Dockerfile                   # Application containerization
-├── Makefile                     # Development automation (35+ commands)
-├── CHANGELOG.md                 # Release notes and version history
-└── scripts/                     # Database initialization scripts
-    ├── init_postgres.sql        # PostgreSQL setup with logical replication
-    └── init_mysql.sql           # MySQL destination database setup
 ```
 
 ## Supported Destination Databases

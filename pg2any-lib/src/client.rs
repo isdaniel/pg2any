@@ -263,17 +263,6 @@ impl CdcClient {
                     ).await;
                     break;
                 }
-
-                // Periodic queue size reporting
-                _ = queue_size_interval.tick() => {
-                    let queue_size = event_receiver.len();
-                    debug!("Consumer queue size: {}", queue_size);
-                    {
-                        let collector = metrics_collector.lock().unwrap();
-                        collector.update_consumer_queue_size(queue_size);
-                    }
-                }
-
                 // Handle incoming event
                 event = event_receiver.recv() => {
                     match event {
@@ -290,6 +279,15 @@ impl CdcClient {
                             // Channel closed, exit loop
                             break;
                         }
+                    }
+                }
+                // Periodic queue size reporting
+                _ = queue_size_interval.tick() => {
+                    let queue_size = event_receiver.len();
+                    debug!("Consumer queue size: {}", queue_size);
+                    {
+                        let collector = metrics_collector.lock().unwrap();
+                        collector.update_consumer_queue_size(queue_size);
                     }
                 }
             }
@@ -309,13 +307,6 @@ impl CdcClient {
         metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
         destination_type: &str,
     ) {
-        let initial_count = event_receiver.len();
-        info!(
-            "Draining {} remaining events during shutdown",
-            initial_count
-        );
-
-        let mut processed_count = 0;
         while let Ok(event) = event_receiver.try_recv() {
             debug!("Processing remaining event during shutdown: {:?}", event);
             Self::process_single_event(
@@ -325,25 +316,11 @@ impl CdcClient {
                 destination_type,
             )
             .await;
-            processed_count += 1;
-
-            // Update queue size periodically during drain
-            if processed_count % 10 == 0 {
-                let remaining_size = event_receiver.len();
-                let collector = metrics_collector.lock().unwrap();
-                collector.update_consumer_queue_size(remaining_size);
-            }
-        }
-
-        // Final update to set queue size to 0
-        {
-            let collector = metrics_collector.lock().unwrap();
-            collector.update_consumer_queue_size(0);
         }
 
         info!(
             "Processed {} remaining events during graceful shutdown",
-            processed_count
+            event_receiver.len()
         );
     }
 

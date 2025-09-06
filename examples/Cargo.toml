@@ -1,0 +1,23 @@
+[package]
+name = "pg2any"
+description = "PostgreSQL to Any database replication tool with Change Data Capture (CDC)"
+keywords = ["postgresql", "cdc", "replication", "database", "cli"]
+categories = ["command-line-utilities", "database"]
+edition = "2021"
+authors = ["danielshih <dog830228@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/isdaniel/pg2any"
+homepage = "https://github.com/isdaniel/pg2any"
+documentation = "https://docs.rs/pg2any"
+
+[dependencies]
+# Main library dependency with conditional features
+pg2any_lib = { path = "../pg2any-lib", default-features = false, features = ["mysql","metrics"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+
+[features]
+metrics = ["pg2any_lib/metrics"]
+mysql = ["pg2any_lib/mysql"]

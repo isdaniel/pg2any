@@ -56,7 +56,7 @@ services:
       mysql:
         condition: service_healthy
     env_file:
-      - ./.env
+      - ./env/.env
     ports:
       - "8080:8080"  # Metrics endpoint
     restart: unless-stopped

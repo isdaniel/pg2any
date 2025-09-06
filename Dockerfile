@@ -17,8 +17,9 @@ WORKDIR /app
 # Copy Cargo files and source code
 COPY Cargo.toml Cargo.lock ./
 COPY pg2any-lib/ ./pg2any-lib/
-COPY src/ ./src/
+COPY examples/ ./examples/
 
+WORKDIR /app/examples
 # Build the application
 RUN cargo build --release
 
@@ -27,7 +28,6 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    dnsutils \
     curl \
     ca-certificates \
     libpq-dev \

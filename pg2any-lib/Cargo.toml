@@ -1,12 +1,12 @@
 [package]
 name = "pg2any_lib"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation.workspace = true
+version = "0.3.0"
+edition = "2021"
+authors = ["danielshih <dog830228@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/isdaniel/pg2any"
+homepage = "https://github.com/isdaniel/pg2any"
+documentation = "https://docs.rs/pg2any"
 readme = "../README.md"
 description = "PostgreSQL to Any database library with Change Data Capture (CDC) and logical replication support"
 keywords = ["postgresql", "cdc", "replication", "database", "streaming"]
@@ -25,9 +25,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 libpq-sys = { workspace = true }
 libc = { workspace = true }
+lazy_static = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-lazy_static = { workspace = true }
 # Monitoring dependencies (optional)
 prometheus = { workspace = true, optional = true  }
 hyper = { workspace = true, optional = true }

@@ -74,7 +74,6 @@ pub mod replication_protocol;
 
 // High-level client interface
 pub mod client;
-pub mod connection;
 
 // Monitoring and metrics
 pub mod monitoring;

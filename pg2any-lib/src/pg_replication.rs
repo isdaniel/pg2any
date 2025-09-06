@@ -4,7 +4,6 @@
 
 use crate::buffer::BufferWriter;
 use crate::config::Config;
-use crate::connection::PostgresConnection;
 use crate::error::{CdcError, Result};
 use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
 use crate::types::{ChangeEvent, Lsn};
@@ -522,7 +521,7 @@ pub struct ReplicationStream {
 }
 
 impl ReplicationStream {
-    pub async fn new(_connection: PostgresConnection, config: Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let stream_config = ReplicationStreamConfig::from(&config);
         let logical_stream =
             LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
@@ -602,8 +601,7 @@ impl ReplicationManager {
     }
 
     pub async fn create_stream_async(&mut self) -> Result<ReplicationStream> {
-        let connection = PostgresConnection::placeholder();
-        ReplicationStream::new(connection, self.config.clone()).await
+        ReplicationStream::new( self.config.clone()).await
     }
 }
 

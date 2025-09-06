@@ -3,10 +3,6 @@ use thiserror::Error;
 /// Comprehensive error types for CDC operations
 #[derive(Error, Debug)]
 pub enum CdcError {
-    /// Database connection errors
-    #[error("Database connection error: {0}")]
-    Connection(#[from] tokio_postgres::Error),
-
     /// SQL Server connection errors  
     #[cfg(feature = "sqlserver")]
     #[error("SQL Server connection error: {0}")]

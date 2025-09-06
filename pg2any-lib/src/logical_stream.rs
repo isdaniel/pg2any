@@ -55,7 +55,6 @@ impl LogicalReplicationStream {
             state,
             config,
             slot_created: false,
-            //last_feedback_time: std::time::Instant::now(),
         })
     }
 

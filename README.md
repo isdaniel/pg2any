@@ -25,7 +25,6 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 ### Production-Ready Features ✅
 - ✅ **Monitoring & Observability**: Complete Prometheus metrics collection and alerting systems
-- ✅ **Enterprise Monitoring**: 20+ metrics covering performance, errors, resource usage, and health status
 - ✅ **Production Logging**: Structured tracing with configurable levels and HTTP metrics endpoint
 - ✅ **Health Monitoring**: Database connection monitoring, replication lag tracking, and error rate alerts
 
@@ -421,7 +420,6 @@ This project provides **enterprise-grade PostgreSQL to Any database replication*
 - **⚙️ Configuration**: Flexible environment-based configuration with validation
 - **🐳 Docker Environment**: Complete development setup with multi-database support
 - **📈 Monitoring**: Prometheus metrics collection and alerting systems
-- **🔍 Observability**: 20+ metrics covering performance, errors, and resource usage
 - **🛡️ Error Handling**: Comprehensive error types with proper propagation and recovery
 - **🔄 Graceful Shutdown**: Proper resource cleanup and LSN persistence
 - **📊 Health Monitoring**: HTTP metrics endpoint, connection status, and replication lag tracking
@@ -438,7 +436,6 @@ pg2any includes comprehensive monitoring and observability features for producti
 
 ### Built-in Metrics System
 - **HTTP Metrics Endpoint**: Prometheus-compatible metrics served on port 8080
-- **20+ Key Metrics**: Performance, errors, resource usage, and health monitoring
 - **Real-time Monitoring**: Replication lag, event processing rates, connection status
 - **Resource Tracking**: Memory usage, network I/O, active connections, queue depth
 
@@ -564,15 +561,12 @@ cargo test --features metrics
 When using pg2any as a library, you can selectively enable features:
 
 ```toml
-# Cargo.toml - Full featured (default)
 [dependencies]
 pg2any_lib = "0.2.0"
 
-# Minimal build without metrics
 [dependencies]
 pg2any_lib = { version = "0.2.0", default-features = false, features = ["mysql"] }
 
-# With specific database support
 [dependencies]
 pg2any_lib = { version = "0.2.0", features = ["metrics", "mysql", "sqlite"] }
 ```
@@ -677,31 +671,7 @@ cargo test mysql             # MySQL-specific tests
 
 This project provides **production-ready PostgreSQL CDC replication** with a solid, well-tested foundation that makes contributing straightforward and impactful.
 
-### 🎯 High-Impact Contribution Areas
-
-1. **📊 Monitoring & Observability**
-   - Production metrics collection Prometheus
-   - Performance dashboards and alerting
-   - Health checks and status endpoints
-
-2. **🗄️ Additional Database Destinations**
-   - Oracle Database support
-   - SQLite for embedded scenarios
-   - ClickHouse for analytics workloads
-   - Elasticsearch for search functionality
-
-3. **🔄 Schema Evolution**
-   - DDL change detection and handling
-   - Automatic schema migration
-   - Version compatibility management
-
-4. **⚡ Performance & Scalability**
-   - High-throughput optimization
-   - Memory usage profiling
-   - Benchmark suite development
-   - Connection pooling enhancements
-
-### � Getting Started Contributing
+### Getting Started Contributing
 
 ```bash
 # Fork and clone the repository
@@ -723,15 +693,9 @@ make format             # Format code
 make run                # Test CDC pipeline locally
 ```
 
-### 🧪 Testing Your Changes
+### Testing Your Changes
 
 ```bash
-# Comprehensive testing
-cargo test --all         # All 104+ tests should pass
-cargo test integration   # Integration test subset
-cargo test mysql         # MySQL-specific tests
-cargo test buffer        # Protocol parsing tests
-
 # Manual testing with real databases
 make docker-start        # Start PostgreSQL and MySQL
 cargo run               # Test end-to-end replication
@@ -743,7 +707,7 @@ set -a; source .env; set +a
 
 ### 📋 Contribution Guidelines
 
-- **Code Quality**: Follow existing patterns, use `make format`
+- **Code Quality**: Follow existing patterns, use `make before-git-push`
 - **Testing**: Add tests for new functionality
 - **Documentation**: Update README and inline docs
 - **Error Handling**: Use the established `CdcError` pattern

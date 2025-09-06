@@ -244,14 +244,10 @@ impl CdcClient {
 
         // Initialize destination connection status
         Self::update_destination_connection_status(&metrics_collector, &destination_type, true);
-
-        // Create an interval for periodic queue size reporting
         let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-
         loop {
             tokio::select! {
                 biased;
-
                 // Handle graceful shutdown
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer received cancellation signal");
@@ -262,6 +258,14 @@ impl CdcClient {
                         &destination_type
                     ).await;
                     break;
+                }
+                _ = queue_size_interval.tick() => {
+                    let queue_size = event_receiver.len();
+                    debug!("Consumer queue size: {}", queue_size);
+                    {
+                        let collector = metrics_collector.lock().unwrap();
+                        collector.update_consumer_queue_size(queue_size);
+                    }
                 }
                 // Handle incoming event
                 event = event_receiver.recv() => {
@@ -281,15 +285,7 @@ impl CdcClient {
                         }
                     }
                 }
-                // Periodic queue size reporting
-                _ = queue_size_interval.tick() => {
-                    let queue_size = event_receiver.len();
-                    debug!("Consumer queue size: {}", queue_size);
-                    {
-                        let collector = metrics_collector.lock().unwrap();
-                        collector.update_consumer_queue_size(queue_size);
-                    }
-                }
+
             }
         }
 

@@ -50,7 +50,10 @@ format:
 run:
 	cargo run
 
-before-git-push: check build format test audit
+doc-chcek:
+	cargo doc --no-deps --all-features
+
+before-git-push: check build format test audit doc-chcek
 
 # Docker commands
 docker-build:

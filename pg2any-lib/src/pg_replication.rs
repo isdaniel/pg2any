@@ -64,19 +64,21 @@ impl PgReplicationConnection {
                 }
             };
             unsafe { PQfinish(conn) };
-            
+
             // Categorize the connection error
             let error_msg_lower = error_msg.to_lowercase();
-            if error_msg_lower.contains("authentication failed") 
+            if error_msg_lower.contains("authentication failed")
                 || error_msg_lower.contains("password authentication failed")
-                || error_msg_lower.contains("role does not exist") {
+                || error_msg_lower.contains("role does not exist")
+            {
                 return Err(CdcError::authentication(format!(
                     "PostgreSQL authentication failed: {}",
                     error_msg
                 )));
             } else if error_msg_lower.contains("database does not exist")
                 || error_msg_lower.contains("invalid connection string")
-                || error_msg_lower.contains("unsupported") {
+                || error_msg_lower.contains("unsupported")
+            {
                 return Err(CdcError::permanent_connection(format!(
                     "PostgreSQL connection failed (permanent): {}",
                     error_msg
@@ -637,7 +639,7 @@ impl ReplicationManager {
     }
 
     pub async fn create_stream_async(&mut self) -> Result<ReplicationStream> {
-        ReplicationStream::new( self.config.clone()).await
+        ReplicationStream::new(self.config.clone()).await
     }
 }
 

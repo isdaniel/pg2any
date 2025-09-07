@@ -58,15 +58,13 @@ impl LogicalReplicationStream {
             max_duration: Duration::from_secs(300),
             jitter: true,
         };
-        
-        let retry_handler = ReplicationConnectionRetry::new(
-            retry_config,
-            connection_string.to_string(),
-        );
+
+        let retry_handler =
+            ReplicationConnectionRetry::new(retry_config, connection_string.to_string());
 
         // Establish initial connection with retry
         let connection = retry_handler.connect_with_retry().await?;
-        
+
         let parser = LogicalReplicationParser::new();
         let state = ReplicationState::new();
         let last_health_check = Instant::now();
@@ -207,7 +205,7 @@ impl LogicalReplicationStream {
 
         if !self.connection.is_alive() {
             warn!("Connection health check failed, attempting recovery");
-            
+
             match self.recover_connection().await {
                 Ok(_) => {
                     info!("Connection recovered successfully");
@@ -227,16 +225,16 @@ impl LogicalReplicationStream {
     /// Recover connection after a failure
     async fn recover_connection(&mut self) -> Result<()> {
         info!("Attempting to recover replication connection");
-        
+
         // Attempt reconnection with retry logic
         self.connection = self.retry_handler.connect_with_retry().await?;
-        
+
         // Re-initialize the connection
         self.connection.identify_system()?;
-        
+
         // Ensure replication slot still exists (it should, but let's be safe)
         self.ensure_replication_slot().await?;
-        
+
         // Restart replication from last known position
         let last_lsn = self.state.last_received_lsn;
 
@@ -249,7 +247,7 @@ impl LogicalReplicationStream {
 
         self.connection
             .start_replication(&self.config.slot_name, last_lsn, &options)?;
-        
+
         info!("Replication connection recovered and restarted");
         Ok(())
     }
@@ -268,25 +266,27 @@ impl LogicalReplicationStream {
 
         while attempt < max_attempts {
             attempt += 1;
-            
+
             match self.next_event().await {
                 Ok(event) => {
                     return Ok(event);
                 }
                 Err(e) => {
-
                     if e.is_permanent() {
                         error!("Permanent error in event processing: {}", e);
                         return Err(e);
                     }
-                    
+
                     if attempt >= max_attempts {
                         error!("Exhausted retry attempts for event processing: {}", e);
                         return Err(e);
                     }
-                    
-                    warn!("Transient error in event processing (attempt {}): {}", attempt, e);
-                    
+
+                    warn!(
+                        "Transient error in event processing (attempt {}): {}",
+                        attempt, e
+                    );
+
                     // Try to recover the connection if it's a connection issue
                     if !self.connection.is_alive() {
                         if let Err(recovery_err) = self.recover_connection().await {
@@ -294,7 +294,7 @@ impl LogicalReplicationStream {
                             return Err(recovery_err);
                         }
                     }
-                    
+
                     // Wait before retrying (simple exponential backoff)
                     let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
                     tokio::time::sleep(delay).await;

@@ -48,7 +48,7 @@ impl RetryConfig {
             max_elapsed_time: Some(self.max_duration),
             ..Default::default()
         };
-        
+
         backoff.reset();
         backoff
     }
@@ -68,7 +68,7 @@ impl ReplicationConnectionRetry {
             connection_string,
         }
     }
-    
+
     /// Retry connection establishment with exponential backoff
     pub async fn connect_with_retry(&self) -> Result<PgReplicationConnection> {
         let start_time = Instant::now();
@@ -76,7 +76,7 @@ impl ReplicationConnectionRetry {
 
         let operation = || async {
             debug!("Attempting PostgreSQL connection");
-            
+
             match PgReplicationConnection::connect(&self.connection_string) {
                 Ok(conn) => {
                     info!("Successfully connected to PostgreSQL");
@@ -84,7 +84,7 @@ impl ReplicationConnectionRetry {
                 }
                 Err(e) => {
                     let error_msg = e.to_string();
-                    
+
                     error!("Transient connection error: {}", error_msg);
                     Err(BackoffError::Transient {
                         err: CdcError::transient_connection(error_msg),
@@ -99,14 +99,8 @@ impl ReplicationConnectionRetry {
 
         let elapsed = start_time.elapsed();
         match &result {
-            Ok(_) => info!(
-                "Connection established successfully after {:?}",
-                elapsed
-            ),
-            Err(e) => error!(
-                "Connection failed after {:?} with error: {}",
-                elapsed, e
-            ),
+            Ok(_) => info!("Connection established successfully after {:?}", elapsed),
+            Err(e) => error!("Connection failed after {:?} with error: {}", elapsed, e),
         }
 
         result

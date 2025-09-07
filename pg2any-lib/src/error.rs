@@ -153,10 +153,10 @@ impl CdcError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            CdcError::TransientConnection(_) 
-            | CdcError::Timeout(_) 
-            | CdcError::Io(_)
-            | CdcError::ReplicationConnection(_)
+            CdcError::TransientConnection(_)
+                | CdcError::Timeout(_)
+                | CdcError::Io(_)
+                | CdcError::ReplicationConnection(_)
         )
     }
 
@@ -165,9 +165,9 @@ impl CdcError {
         matches!(
             self,
             CdcError::PermanentConnection(_)
-            | CdcError::Authentication(_)
-            | CdcError::Config(_)
-            | CdcError::Unsupported(_)
+                | CdcError::Authentication(_)
+                | CdcError::Config(_)
+                | CdcError::Unsupported(_)
         )
     }
 }

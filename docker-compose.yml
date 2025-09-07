@@ -74,8 +74,8 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./monitoring/prometheus-rules:/etc/prometheus/rules
+      - ./examples/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./examples/monitoring/prometheus-rules:/etc/prometheus/rules
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -125,7 +125,7 @@ services:
     command:
       - --config.my-cnf=/etc/mysql/.my.cnf
     volumes:
-      - ./monitoring/exporter/mysql/:/etc/mysql/:ro
+      - ./examples/monitoring/exporter/mysql/:/etc/mysql/:ro
     restart: unless-stopped
     depends_on:
       mysql:

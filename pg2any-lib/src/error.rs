@@ -64,6 +64,18 @@ pub enum CdcError {
     /// Unsupported operation errors
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
+
+    /// Connection errors that can be retried (transient)
+    #[error("Transient connection error: {0}")]
+    TransientConnection(String),
+
+    /// Connection errors that should not be retried (permanent)
+    #[error("Permanent connection error: {0}")]
+    PermanentConnection(String),
+
+    /// Replication connection errors  
+    #[error("Replication connection error: {0}")]
+    ReplicationConnection(String),
 }
 
 impl CdcError {
@@ -120,6 +132,43 @@ impl CdcError {
     /// Create a new unsupported operation error
     pub fn unsupported<S: Into<String>>(msg: S) -> Self {
         CdcError::Unsupported(msg.into())
+    }
+
+    /// Create a new transient connection error (can be retried)
+    pub fn transient_connection<S: Into<String>>(msg: S) -> Self {
+        CdcError::TransientConnection(msg.into())
+    }
+
+    /// Create a new permanent connection error (should not be retried)
+    pub fn permanent_connection<S: Into<String>>(msg: S) -> Self {
+        CdcError::PermanentConnection(msg.into())
+    }
+
+    /// Create a new replication connection error
+    pub fn replication_connection<S: Into<String>>(msg: S) -> Self {
+        CdcError::ReplicationConnection(msg.into())
+    }
+
+    /// Check if the error is transient (can be retried)
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            CdcError::TransientConnection(_) 
+            | CdcError::Timeout(_) 
+            | CdcError::Io(_)
+            | CdcError::ReplicationConnection(_)
+        )
+    }
+
+    /// Check if the error is permanent (should not be retried)
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            CdcError::PermanentConnection(_)
+            | CdcError::Authentication(_)
+            | CdcError::Config(_)
+            | CdcError::Unsupported(_)
+        )
     }
 }
 

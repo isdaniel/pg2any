@@ -67,6 +67,7 @@ pub mod types;
 // Low-level PostgreSQL replication using libpq-sys
 pub mod buffer;
 pub mod pg_replication;
+pub mod retry;
 
 // Unified replication protocol implementation
 pub mod logical_stream;

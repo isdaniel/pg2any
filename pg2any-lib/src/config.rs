@@ -48,6 +48,24 @@ pub struct Config {
     /// Heartbeat interval for sending feedback to PostgreSQL
     pub heartbeat_interval: Duration,
 
+    /// Maximum number of retry attempts for connection failures
+    pub max_retry_attempts: u32,
+
+    /// Initial retry delay (will be increased exponentially)
+    pub initial_retry_delay: Duration,
+
+    /// Maximum retry delay between attempts
+    pub max_retry_delay: Duration,
+
+    /// Retry multiplier for exponential backoff
+    pub retry_multiplier: f64,
+
+    /// Maximum total time to spend retrying before giving up
+    pub max_retry_duration: Duration,
+
+    /// Whether to add jitter to retry delays to prevent thundering herd
+    pub retry_jitter: bool,
+
     /// Buffer size for the event channel (kept for channel capacity)
     pub buffer_size: usize,
 
@@ -143,6 +161,12 @@ impl Default for Config {
             connection_timeout: Duration::from_secs(30),
             query_timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10), // Send feedback every 10 seconds to prevent 60s timeout
+            max_retry_attempts: 5,
+            initial_retry_delay: Duration::from_secs(1),
+            max_retry_delay: Duration::from_secs(60),
+            retry_multiplier: 2.0,
+            max_retry_duration: Duration::from_secs(300), // 5 minutes total
+            retry_jitter: true,
             buffer_size: 1000,
             table_mappings: HashMap::new(),
             extra_options: HashMap::new(),
@@ -245,6 +269,42 @@ impl ConfigBuilder {
     /// Set heartbeat interval
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.config.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set maximum number of retry attempts
+    pub fn max_retry_attempts(mut self, attempts: u32) -> Self {
+        self.config.max_retry_attempts = attempts;
+        self
+    }
+
+    /// Set initial retry delay
+    pub fn initial_retry_delay(mut self, delay: Duration) -> Self {
+        self.config.initial_retry_delay = delay;
+        self
+    }
+
+    /// Set maximum retry delay
+    pub fn max_retry_delay(mut self, delay: Duration) -> Self {
+        self.config.max_retry_delay = delay;
+        self
+    }
+
+    /// Set retry multiplier for exponential backoff
+    pub fn retry_multiplier(mut self, multiplier: f64) -> Self {
+        self.config.retry_multiplier = multiplier;
+        self
+    }
+
+    /// Set maximum retry duration
+    pub fn max_retry_duration(mut self, duration: Duration) -> Self {
+        self.config.max_retry_duration = duration;
+        self
+    }
+
+    /// Enable/disable retry jitter
+    pub fn retry_jitter(mut self, enabled: bool) -> Self {
+        self.config.retry_jitter = enabled;
         self
     }
 

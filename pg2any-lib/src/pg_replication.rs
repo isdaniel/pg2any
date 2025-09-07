@@ -48,7 +48,7 @@ impl PgReplicationConnection {
         let conn = unsafe { PQconnectdb(c_conninfo.as_ptr()) };
 
         if conn.is_null() {
-            return Err(CdcError::connection(
+            return Err(CdcError::transient_connection(
                 "Failed to allocate PostgreSQL connection object".to_string(),
             ));
         }
@@ -64,17 +64,36 @@ impl PgReplicationConnection {
                 }
             };
             unsafe { PQfinish(conn) };
-            return Err(CdcError::connection(format!(
-                "PostgreSQL connection failed: {}",
-                error_msg
-            )));
+            
+            // Categorize the connection error
+            let error_msg_lower = error_msg.to_lowercase();
+            if error_msg_lower.contains("authentication failed") 
+                || error_msg_lower.contains("password authentication failed")
+                || error_msg_lower.contains("role does not exist") {
+                return Err(CdcError::authentication(format!(
+                    "PostgreSQL authentication failed: {}",
+                    error_msg
+                )));
+            } else if error_msg_lower.contains("database does not exist")
+                || error_msg_lower.contains("invalid connection string")
+                || error_msg_lower.contains("unsupported") {
+                return Err(CdcError::permanent_connection(format!(
+                    "PostgreSQL connection failed (permanent): {}",
+                    error_msg
+                )));
+            } else {
+                return Err(CdcError::transient_connection(format!(
+                    "PostgreSQL connection failed (transient): {}",
+                    error_msg
+                )));
+            }
         }
 
         // Check server version - logical replication requires PostgreSQL 14+
         let server_version = unsafe { PQserverVersion(conn) };
         if server_version < 140000 {
             unsafe { PQfinish(conn) };
-            return Err(CdcError::connection(format!(
+            return Err(CdcError::permanent_connection(format!(
                 "PostgreSQL version {} is not supported. Logical replication requires PostgreSQL 14+",
                 server_version
             )));
@@ -547,7 +566,24 @@ impl ReplicationStream {
     }
 
     pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
-        debug!("Fetching next single change event");
+        debug!("Fetching next single change event with retry support");
+
+        let event = self.logical_stream.next_event_with_retry().await?;
+
+        if let Some(ref event) = event {
+            debug!("Received single change event: {:?}", event);
+            // Update last received LSN
+            if let Some(lsn) = event.lsn {
+                self.logical_stream.state.update_lsn(lsn.0);
+            }
+        }
+
+        Ok(event)
+    }
+
+    /// Get next event without retry logic (for compatibility)
+    pub async fn next_event_no_retry(&mut self) -> Result<Option<ChangeEvent>> {
+        debug!("Fetching next single change event (no retry)");
 
         let event = self.logical_stream.next_event().await?;
 

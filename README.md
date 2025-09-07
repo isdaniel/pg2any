@@ -701,7 +701,7 @@ cargo run               # Test end-to-end replication
 make test-data          # Insert test data
 make show-data          # Verify replication worked
 
-set -a; source .env; set +a
+set -a; source env/.env_local; set +a
 ```
 
 ### 📋 Contribution Guidelines

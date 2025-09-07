@@ -14,10 +14,11 @@ use crate::replication_protocol::{parse_keepalive_message, LogicalReplicationPar
 use crate::replication_protocol::{
     LogicalReplicationMessage, ReplicationState, StreamingReplicationMessage,
 };
+use crate::retry::{ReplicationConnectionRetry, RetryConfig};
 use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
-use std::time::Duration;
-use tracing::{debug, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 /// PostgreSQL logical replication stream
 pub struct LogicalReplicationStream {
@@ -26,6 +27,8 @@ pub struct LogicalReplicationStream {
     pub state: ReplicationState,
     config: ReplicationStreamConfig,
     slot_created: bool,
+    retry_handler: ReplicationConnectionRetry,
+    last_health_check: Instant,
     //last_feedback_time: std::time::Instant,
 }
 
@@ -38,16 +41,35 @@ pub struct ReplicationStreamConfig {
     pub streaming_enabled: bool,
     pub feedback_interval: Duration,
     pub connection_timeout: Duration,
+    pub health_check_interval: Duration,
 }
 
 impl LogicalReplicationStream {
     /// Create a new logical replication stream
     pub async fn new(connection_string: &str, config: ReplicationStreamConfig) -> Result<Self> {
-        info!("Creating logical replication stream");
+        info!("Creating logical replication stream with retry support");
 
-        let connection = PgReplicationConnection::connect(connection_string)?;
+        // Create retry handler
+        let retry_config = RetryConfig {
+            max_attempts: 5,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+            max_duration: Duration::from_secs(300),
+            jitter: true,
+        };
+        
+        let retry_handler = ReplicationConnectionRetry::new(
+            retry_config,
+            connection_string.to_string(),
+        );
+
+        // Establish initial connection with retry
+        let connection = retry_handler.connect_with_retry().await?;
+        
         let parser = LogicalReplicationParser::new();
         let state = ReplicationState::new();
+        let last_health_check = Instant::now();
 
         Ok(Self {
             connection,
@@ -55,6 +77,8 @@ impl LogicalReplicationStream {
             state,
             config,
             slot_created: false,
+            retry_handler,
+            last_health_check,
         })
     }
 
@@ -169,6 +193,116 @@ impl LogicalReplicationStream {
 
         // No event received
         Ok(None)
+    }
+
+    /// Check connection health and attempt recovery if needed
+    pub async fn check_connection_health(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if now.duration_since(self.last_health_check) < self.config.health_check_interval {
+            return Ok(()); // Skip health check if not enough time has passed
+        }
+
+        self.last_health_check = now;
+        debug!("Performing connection health check");
+
+        if !self.connection.is_alive() {
+            warn!("Connection health check failed, attempting recovery");
+            
+            match self.recover_connection().await {
+                Ok(_) => {
+                    info!("Connection recovered successfully");
+                }
+                Err(e) => {
+                    error!("Failed to recover connection: {}", e);
+                    return Err(e);
+                }
+            }
+        } else {
+            debug!("Connection health check passed");
+        }
+
+        Ok(())
+    }
+
+    /// Recover connection after a failure
+    async fn recover_connection(&mut self) -> Result<()> {
+        info!("Attempting to recover replication connection");
+        
+        // Attempt reconnection with retry logic
+        self.connection = self.retry_handler.connect_with_retry().await?;
+        
+        // Re-initialize the connection
+        self.connection.identify_system()?;
+        
+        // Ensure replication slot still exists (it should, but let's be safe)
+        self.ensure_replication_slot().await?;
+        
+        // Restart replication from last known position
+        let last_lsn = self.state.last_received_lsn;
+
+        let proto_version = self.config.protocol_version.to_string();
+        let publication_names = format!("\"{}\"", self.config.publication_name);
+        let options = vec![
+            ("proto_version", proto_version.as_str()),
+            ("publication_names", publication_names.as_str()),
+        ];
+
+        self.connection
+            .start_replication(&self.config.slot_name, last_lsn, &options)?;
+        
+        info!("Replication connection recovered and restarted");
+        Ok(())
+    }
+
+    /// Enhanced next_event with automatic retry and recovery
+    pub async fn next_event_with_retry(&mut self) -> Result<Option<ChangeEvent>> {
+        // Perform periodic health check
+        if let Err(e) = self.check_connection_health().await {
+            warn!("Health check failed: {}", e);
+            // Don't fail immediately, try to continue
+        }
+
+        // Try to get the next event, with manual retry logic for connection issues
+        let max_attempts = 3;
+        let mut attempt = 0;
+
+        while attempt < max_attempts {
+            attempt += 1;
+            
+            match self.next_event().await {
+                Ok(event) => {
+                    return Ok(event);
+                }
+                Err(e) => {
+
+                    if e.is_permanent() {
+                        error!("Permanent error in event processing: {}", e);
+                        return Err(e);
+                    }
+                    
+                    if attempt >= max_attempts {
+                        error!("Exhausted retry attempts for event processing: {}", e);
+                        return Err(e);
+                    }
+                    
+                    warn!("Transient error in event processing (attempt {}): {}", attempt, e);
+                    
+                    // Try to recover the connection if it's a connection issue
+                    if !self.connection.is_alive() {
+                        if let Err(recovery_err) = self.recover_connection().await {
+                            error!("Failed to recover connection: {}", recovery_err);
+                            return Err(recovery_err);
+                        }
+                    }
+                    
+                    // Wait before retrying (simple exponential backoff)
+                    let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        Err(CdcError::generic("Exhausted all retry attempts"))
     }
 
     /// Process a WAL data message
@@ -570,6 +704,7 @@ impl From<&Config> for ReplicationStreamConfig {
             streaming_enabled: config.streaming,
             feedback_interval: config.heartbeat_interval,
             connection_timeout: config.connection_timeout,
+            health_check_interval: Duration::from_secs(30), // Default health check every 30 seconds
         }
     }
 }

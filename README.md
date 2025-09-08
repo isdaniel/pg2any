@@ -283,11 +283,7 @@ pg2any supports comprehensive configuration through environment variables or the
 | Category | Variable | Description | Default Value | Example | Notes |
 |----------|----------|-------------|---------------|---------|-------|
 | **Source PostgreSQL** | | | | | |
-| | `CDC_SOURCE_HOST` | PostgreSQL hostname | `localhost` | `postgres` | |
-| | `CDC_SOURCE_PORT` | PostgreSQL port | `5432` | `5432` | |
-| | `CDC_SOURCE_DB` | PostgreSQL database name | `postgres` | `myapp_db` | |
-| | `CDC_SOURCE_USER` | PostgreSQL username | `postgres` | `replication_user` | |
-| | `CDC_SOURCE_PASSWORD` | PostgreSQL password | `postgres` | `securepassword` | |
+| | `CDC_SOURCE_CONNECTION_STRING` | Complete PostgreSQL connection string | | `postgresql://user:pass@host:port/db?replication=database` | If provided, takes precedence over individual parameters |
 | **Destination** | | | | | |
 | | `CDC_DEST_TYPE` | Target database type | `MySQL` | `SQLite`, `SqlServer` | Case-insensitive |
 | | `CDC_DEST_URI` | Destination URI/host/file path | `localhost` for databases, `./cdc_target.db` for SQLite | `mysql-server`, `/data/replica.db` | Host for databases, file path for SQLite |
@@ -313,12 +309,8 @@ pg2any supports comprehensive configuration through environment variables or the
 
 #### MySQL Destination (Docker Environment)
 ```bash
-# Source PostgreSQL
-CDC_SOURCE_HOST=postgres
-CDC_SOURCE_PORT=5432
-CDC_SOURCE_DB=postgres
-CDC_SOURCE_USER=postgres
-CDC_SOURCE_PASSWORD=test.123
+# Source PostgreSQL - using individual parameters
+CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
 
 # MySQL Destination
 CDC_DEST_TYPE=MySQL
@@ -326,7 +318,7 @@ CDC_DEST_URI=mysql
 CDC_DEST_PORT=3306
 CDC_DEST_DB=cdc_db
 CDC_DEST_USER=cdc_user
-CDC_DEST_PASSWORD=test.123
+CDC_DEST_PASSWORD=pass.123
 
 # CDC Configuration
 CDC_REPLICATION_SLOT=cdc_slot
@@ -335,12 +327,8 @@ CDC_PUBLICATION=cdc_pub
 
 #### SQLite Destination (Local Development)
 ```bash
-# Source PostgreSQL
-CDC_SOURCE_HOST=localhost
-CDC_SOURCE_PORT=5432
-CDC_SOURCE_DB=postgres
-CDC_SOURCE_USER=postgres
-CDC_SOURCE_PASSWORD=test.123
+# Source PostgreSQL - using individual parameters
+CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
 
 # SQLite Destination
 CDC_DEST_TYPE=SQLite
@@ -355,11 +343,7 @@ CDC_STREAMING=true
 #### SQL Server Destination (Production)
 ```bash
 # Source PostgreSQL
-CDC_SOURCE_HOST=prod-postgres.example.com
-CDC_SOURCE_PORT=5432
-CDC_SOURCE_DB=application_db
-CDC_SOURCE_USER=replication_user
-CDC_SOURCE_PASSWORD=${POSTGRES_PASSWORD}
+CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
 
 # SQL Server Destination
 CDC_DEST_TYPE=SqlServer
@@ -380,12 +364,11 @@ CDC_HEARTBEAT_INTERVAL=30
 You can also configure pg2any programmatically using the builder pattern:
 
 ```rust
-```rust
 use pg2any_lib::{Config, DestinationType};
 use std::time::Duration;
 
 let config = Config::builder()
-    .source_connection_string("postgresql://postgres:test.123@localhost:7777/postgres")
+    .source_connection_string("postgresql://postgres:pass.123@localhost:7777/postgres")
     .destination_type(DestinationType::SQLite)
     .destination_connection_string("./my_replica.db")
     .replication_slot_name("cdc_slot")

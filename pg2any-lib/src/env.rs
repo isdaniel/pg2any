@@ -14,11 +14,8 @@ use std::time::Duration;
 /// # Environment Variables
 ///
 /// ## Source PostgreSQL Configuration
-/// - `CDC_SOURCE_HOST`: PostgreSQL host (default: "localhost")
-/// - `CDC_SOURCE_PORT`: PostgreSQL port (default: "5432")
-/// - `CDC_SOURCE_DB`: PostgreSQL database name (default: "postgres")
-/// - `CDC_SOURCE_USER`: PostgreSQL username (default: "postgres")
-/// - `CDC_SOURCE_PASSWORD`: PostgreSQL password (default: "postgres")
+/// - `CDC_SOURCE_CONNECTION_STRING`: Complete PostgreSQL connection string with replication parameter
+///   (default: constructed from individual parameters below)
 ///
 /// ## Destination Configuration
 /// - `CDC_DEST_TYPE`: Destination type ("MySQL", "SqlServer", or "SQLite", default: "MySQL")
@@ -47,24 +44,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     tracing::info!("Loading configuration from environment variables");
 
     // Source PostgreSQL configuration
-    let source_host = std::env::var("CDC_SOURCE_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let source_port = std::env::var("CDC_SOURCE_PORT").unwrap_or_else(|_| "5432".to_string());
-    let source_db = std::env::var("CDC_SOURCE_DB").unwrap_or_else(|_| "postgres".to_string());
-    let source_user = std::env::var("CDC_SOURCE_USER").unwrap_or_else(|_| "postgres".to_string());
-    let source_password =
-        std::env::var("CDC_SOURCE_PASSWORD").unwrap_or_else(|_| "postgres".to_string());
-
-    let source_connection_string = format!(
-        "postgresql://{}:{}@{}:{}/{}?replication=database",
-        source_user, source_password, source_host, source_port, source_db
-    );
-
-    tracing::info!(
-        "Source PostgreSQL connection: {}@{}:{}/{}",
-        source_user,
-        source_host,
-        source_port,
-        source_db
+    let source_connection_string = std::env::var("CDC_SOURCE_CONNECTION_STRING").expect(
+        "CDC_SOURCE_CONNECTION_STRING environment variable is required. Example: postgresql://user:password@host:port/dbname?replication=database",
     );
 
     // Destination configuration

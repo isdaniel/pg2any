@@ -278,19 +278,25 @@ pub enum CdcError {
 
 pg2any supports comprehensive configuration through environment variables or the `ConfigBuilder` pattern. All configuration can be managed through environment variables for containerized deployments or programmatically using the builder pattern.
 
+### Key Configuration Approach
+
+ pg2any uses `CDC_DEST_URI` as the primary method for destination database configuration. This uses standard database connection string formats instead of separate host, port, user, and password variables, making configuration simpler and more portable.
+
+```bash
+# Primary configuration method (recommended)
+CDC_DEST_TYPE=MySQL
+CDC_DEST_URI=mysql://user:password@host:port/database
+```
+
 ### Environment Variables Mapping Table
 
 | Category | Variable | Description | Default Value | Example | Notes |
 |----------|----------|-------------|---------------|---------|-------|
 | **Source PostgreSQL** | | | | | |
-| | `CDC_SOURCE_CONNECTION_STRING` | Complete PostgreSQL connection string | | `postgresql://user:pass@host:port/db?replication=database` | If provided, takes precedence over individual parameters |
+| | `CDC_SOURCE_CONNECTION_STRING` | Complete PostgreSQL connection string | | `postgresql://user:pass@host:port/db?replication=database` | Required for PostgreSQL logical replication |
 | **Destination** | | | | | |
-| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `SQLite`, `SqlServer` | Case-insensitive |
-| | `CDC_DEST_URI` | Destination URI/host/file path | `localhost` for databases, `./cdc_target.db` for SQLite | `mysql-server`, `/data/replica.db` | Host for databases, file path for SQLite |
-| | `CDC_DEST_PORT` | Destination port | `3306` (MySQL), `1433` (SqlServer) | `3306` | Not used for SQLite |
-| | `CDC_DEST_DB` | Destination database name | `cdc_target` | `replicated_db` | For SQLite: file path |
-| | `CDC_DEST_USER` | Destination username | `cdc_user` | `replica_user` | Not used for SQLite |
-| | `CDC_DEST_PASSWORD` | Destination password | `cdc_password` | `secure123` | Not used for SQLite |
+| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `MySQL`, `SqlServer`, `SQLite` | Case-insensitive |
+| | `CDC_DEST_URI` | **Complete destination connection string** | | See destination-specific examples below | **Primary connection method - replaces individual host/port/user/password variables** |
 | **CDC Settings** | | | | | |
 | | `CDC_REPLICATION_SLOT` | PostgreSQL replication slot | `cdc_slot` | `my_app_slot` | |
 | | `CDC_PUBLICATION` | PostgreSQL publication name | `cdc_pub` | `my_app_publication` | |
@@ -305,34 +311,68 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
 
-### Configuration Examples
+### Destination Database Environment Configuration
 
-#### MySQL Destination (Docker Environment)
+pg2any uses the `CDC_DEST_URI` environment variable as the primary connection method for all destination databases. This simplifies configuration by using connection strings instead of separate host, port, user, and password variables.
+
+#### MySQL Destination
 ```bash
-# Source PostgreSQL - using individual parameters
+# Source PostgreSQL
 CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
 
-# MySQL Destination
+# MySQL Destination - Complete connection string
 CDC_DEST_TYPE=MySQL
-CDC_DEST_URI=mysql
-CDC_DEST_PORT=3306
-CDC_DEST_DB=cdc_db
-CDC_DEST_USER=cdc_user
-CDC_DEST_PASSWORD=pass.123
+CDC_DEST_URI=mysql://user:password@host:port/database
+
+# Examples:
+# Docker environment
+CDC_DEST_URI=mysql://root:test.123@127.0.0.1:3306/mysql
+# Production environment  
+CDC_DEST_URI=mysql://cdc_user:secure_pass@mysql-prod.company.com:3306/replica_db
 
 # CDC Configuration
 CDC_REPLICATION_SLOT=cdc_slot
 CDC_PUBLICATION=cdc_pub
 ```
 
-#### SQLite Destination (Local Development)
+#### SQL Server Destination
 ```bash
-# Source PostgreSQL - using individual parameters
+# Source PostgreSQL
 CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
 
-# SQLite Destination
+# SQL Server Destination - Complete connection string
+CDC_DEST_TYPE=SqlServer  
+CDC_DEST_URI=sqlserver://user:password@host:port/database
+
+# Examples:
+# Local SQL Server
+CDC_DEST_URI=sqlserver://sa:MyPass@123@localhost:1433/master
+# Azure SQL Database
+CDC_DEST_URI=sqlserver://user@server:password@server.database.windows.net:1433/mydb
+# Production SQL Server
+CDC_DEST_URI=sqlserver://cdc_user:secure_pass@sqlserver-prod:1433/replica_db
+
+# CDC Configuration
+CDC_REPLICATION_SLOT=cdc_slot
+CDC_PUBLICATION=cdc_pub
+```
+
+#### SQLite Destination
+```bash
+# Source PostgreSQL
+CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
+
+# SQLite Destination - File path (no authentication needed)
 CDC_DEST_TYPE=SQLite
+CDC_DEST_URI=./path/to/database.db
+
+# Examples:
+# Local development
 CDC_DEST_URI=./my_replica.db
+# Absolute path
+CDC_DEST_URI=/data/cdc/replica.db
+# In-memory (for testing)
+CDC_DEST_URI=:memory:
 
 # CDC Configuration
 CDC_REPLICATION_SLOT=cdc_slot
@@ -340,46 +380,54 @@ CDC_PUBLICATION=cdc_pub
 CDC_STREAMING=true
 ```
 
-#### SQL Server Destination (Production)
-```bash
-# Source PostgreSQL
-CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
+### Connection String Format Summary
 
-# SQL Server Destination
-CDC_DEST_TYPE=SqlServer
-CDC_DEST_URI=prod-sqlserver.example.com
-CDC_DEST_PORT=1433
-CDC_DEST_DB=replica_db
-CDC_DEST_USER=sa
-CDC_DEST_PASSWORD=${SQLSERVER_PASSWORD}
+| Database | CDC_DEST_URI Format | Example |
+|----------|---------------------|---------|
+| **MySQL** | `mysql://user:password@host:port/database` | `mysql://root:pass123@localhost:3306/mydb` |
+| **SQL Server** | `sqlserver://user:password@host:port/database` | `sqlserver://sa:pass123@localhost:1433/master` |
+| **SQLite** | `./path/to/file.db` or `/absolute/path/file.db` | `./replica.db` or `/data/replica.db` |
 
-# Production Settings
-CDC_CONNECTION_TIMEOUT=60
-CDC_QUERY_TIMEOUT=30
-CDC_HEARTBEAT_INTERVAL=30
-```
 
 ### Programmatic Configuration
 
-You can also configure pg2any programmatically using the builder pattern:
+You can also configure pg2any programmatically using the builder pattern with connection strings:
 
 ```rust
 use pg2any_lib::{Config, DestinationType};
 use std::time::Duration;
 
-let config = Config::builder()
-    .source_connection_string("postgresql://postgres:pass.123@localhost:7777/postgres")
+// SQLite example
+let sqlite_config = Config::builder()
+    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
     .destination_type(DestinationType::SQLite)
     .destination_connection_string("./my_replica.db")
     .replication_slot_name("cdc_slot")
     .publication_name("cdc_pub")
-    .protocol_version(1)
+    .protocol_version(2)
     .binary_format(false)
     .streaming(true)
-    .auto_create_tables(true)
+    .build()?;
+
+// MySQL example
+let mysql_config = Config::builder()
+    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
+    .destination_type(DestinationType::MySQL)
+    .destination_connection_string("mysql://root:pass123@localhost:3306/replica_db")
+    .replication_slot_name("cdc_slot")
+    .publication_name("cdc_pub")
     .connection_timeout(Duration::from_secs(30))
     .query_timeout(Duration::from_secs(10))
     .heartbeat_interval(Duration::from_secs(10))
+    .build()?;
+
+// SQL Server example
+let sqlserver_config = Config::builder()
+    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
+    .destination_type(DestinationType::SqlServer)
+    .destination_connection_string("sqlserver://sa:MyPass@123@localhost:1433/master")
+    .replication_slot_name("cdc_slot")
+    .publication_name("cdc_pub")
     .build()?;
 ```
 

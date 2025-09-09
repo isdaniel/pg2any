@@ -63,59 +63,9 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         }
     };
 
-    let dest_host = std::env::var("CDC_DEST_URI")
-        .or_else(|_| std::env::var("CDC_DEST_HOST")) // Fallback for backward compatibility
-        .unwrap_or_else(|_| "localhost".to_string());
-    let dest_port = match dest_type {
-        DestinationType::MySQL => {
-            std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "3306".to_string())
-        }
-        DestinationType::SqlServer => {
-            std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "1433".to_string())
-        }
-        DestinationType::SQLite => {
-            // SQLite doesn't use port, but we'll keep the variable for consistency
-            std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "".to_string())
-        }
-        _ => std::env::var("CDC_DEST_PORT").unwrap_or_else(|_| "3306".to_string()),
-    };
-    let dest_db = std::env::var("CDC_DEST_DB").unwrap_or_else(|_| "cdc_target".to_string());
-    let dest_user = std::env::var("CDC_DEST_USER").unwrap_or_else(|_| "cdc_user".to_string());
-    let dest_password =
-        std::env::var("CDC_DEST_PASSWORD").unwrap_or_else(|_| "cdc_password".to_string());
-
-    // For SQLite, handle the file path configuration using CDC_DEST_URI
-    let sqlite_file_path =
-        std::env::var("CDC_DEST_URI").unwrap_or_else(|_| "./cdc_target.db".to_string());
-
-    let destination_connection_string = match dest_type {
-        DestinationType::MySQL => {
-            format!(
-                "mysql://{}:{}@{}:{}/{}",
-                dest_user, dest_password, dest_host, dest_port, dest_db
-            )
-        }
-        DestinationType::SqlServer => {
-            format!(
-                "mssql://{}:{}@{}:{}/{}",
-                dest_user, dest_password, dest_host, dest_port, dest_db
-            )
-        }
-        DestinationType::SQLite => sqlite_file_path.clone(),
-        _ => {
-            return Err(CdcError::config(format!(
-                "Unsupported destination type: {:?}",
-                dest_type
-            )));
-        }
-    };
-
-    let logging_destination = match dest_type {
-        DestinationType::SQLite => sqlite_file_path.clone(),
-        _ => format!("{}@{}:{}/{}", dest_user, dest_host, dest_port, dest_db),
-    };
-
-    tracing::info!("Destination: {:?} at {}", dest_type, logging_destination);
+    let destination_connection_string = std::env::var("CDC_DEST_URI").expect(
+        "CDC_DEST_URI environment variable is required. Example for MySQL mysql://replicator:pass.123@127.0.0.1:3306/publif or ./cdc_target.db for SQLite ..etc",
+    );
 
     // CDC-specific configuration
     let replication_slot =

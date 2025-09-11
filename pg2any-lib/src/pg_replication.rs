@@ -361,18 +361,18 @@ impl PgReplicationConnection {
     }
 
     /// Get copy data from replication stream (async non-blocking version)
-    /// 
+    ///
     /// # Arguments
     /// * `cancellation_token` - Optional cancellation token to abort the operation
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(data))` - Successfully received data
-    /// * `Ok(None)` - No data available currently 
+    /// * `Ok(None)` - No data available currently
     /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Other errors occurred
     pub async fn get_copy_data_async(
-        &mut self, 
-        cancellation_token: &CancellationToken
+        &mut self,
+        cancellation_token: &CancellationToken,
     ) -> Result<Option<Vec<u8>>> {
         if !self.is_replication_conn {
             return Err(CdcError::protocol(
@@ -385,7 +385,31 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
 
-                let mut guard = async_fd.readable().await.map_err(|e| {
+        // First, try to read any buffered data without waiting
+        if let Some(data) = self.try_read_copy_data()? {
+            return Ok(Some(data));
+        }
+
+        // If no buffered data, wait for either socket readability or cancellation
+        tokio::select! {
+            biased;
+
+            // Check for cancellation first (biased select)
+            _ = cancellation_token.cancelled() => {
+                info!("Cancellation detected in get_copy_data_async");
+
+                // Try to read any remaining buffered data before cancelling
+                if let Some(data) = self.try_read_copy_data()? {
+                    info!("Found buffered data during cancellation, returning it");
+                    return Ok(Some(data));
+                }
+
+                return Ok(None);
+            }
+
+            // Wait for socket to become readable
+            guard_result = async_fd.readable() => {
+                let mut guard = guard_result.map_err(|e| {
                     CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
                 })?;
 
@@ -394,8 +418,9 @@ impl PgReplicationConnection {
                 }
 
                 guard.clear_ready();
-
-        Ok(None)
+                Ok(None)
+            }
+        }
     }
 
     fn try_read_copy_data(&self) -> Result<Option<Vec<u8>>> {
@@ -469,10 +494,38 @@ impl PgReplicationConnection {
     fn close_replication_connection(&mut self) {
         if !self.conn.is_null() {
             info!("Closing PostgreSQL replication connection");
+
+            // If we're in replication mode, try to end the copy gracefully
+            if self.is_replication_conn {
+                debug!("Ending COPY mode before closing connection");
+                unsafe {
+                    // Try to end the copy operation gracefully
+                    // This is important to properly close the replication stream
+                    let result = PQputCopyEnd(self.conn, ptr::null());
+                    if result != 1 {
+                        warn!(
+                            "Failed to end COPY mode gracefully: {}",
+                            self.last_error_message()
+                        );
+                    } else {
+                        debug!("COPY mode ended gracefully");
+                    }
+                }
+                self.is_replication_conn = false;
+            }
+
+            // Close the connection
             unsafe {
                 PQfinish(self.conn);
             }
-            //self.conn = std::ptr::null_mut();
+
+            // Clear the connection pointer and reset state
+            self.conn = std::ptr::null_mut();
+            self.async_fd = None;
+
+            info!("PostgreSQL replication connection closed and cleaned up");
+        } else {
+            info!("Connection already closed or was never initialized");
         }
     }
 }
@@ -586,22 +639,25 @@ impl ReplicationStream {
     }
 
     /// Get next event with cancellation support
-    /// 
+    ///
     /// # Arguments  
     /// * `cancellation_token` - Optional cancellation token to abort the operation
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(event))` - Successfully received a change event
     /// * `Ok(None)` - No event available currently  
     /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Other errors occurred
     pub async fn next_event(
-        &mut self, 
-        cancellation_token: &CancellationToken
+        &mut self,
+        cancellation_token: &CancellationToken,
     ) -> Result<Option<ChangeEvent>> {
         debug!("Fetching next single change event with retry support and cancellation");
 
-        let event = self.logical_stream.next_event_with_retry(cancellation_token).await?;
+        let event = self
+            .logical_stream
+            .next_event_with_retry(cancellation_token)
+            .await?;
 
         if let Some(ref event) = event {
             debug!("Received single change event: {:?}", event);

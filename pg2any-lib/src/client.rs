@@ -176,7 +176,7 @@ impl CdcClient {
         Self::update_source_connection_status(&metrics_collector, true);
 
         while !cancellation_token.is_cancelled() {
-            match replication_stream.next_event().await {
+            match replication_stream.next_event(&cancellation_token).await {
                 Ok(Some(event)) => {
                     if let Some(current_lsn) = event.lsn {
                         if current_lsn <= start_lsn {

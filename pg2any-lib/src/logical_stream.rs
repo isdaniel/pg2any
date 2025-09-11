@@ -18,6 +18,7 @@ use crate::retry::{ReplicationConnectionRetry, RetryConfig};
 use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// PostgreSQL logical replication stream
@@ -154,12 +155,26 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-    /// Process the next single replication event
-    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
+
+
+    /// Process the next single replication event with cancellation support
+    /// 
+    /// # Arguments
+    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// 
+    /// # Returns
+    /// * `Ok(Some(event))` - Successfully received a change event
+    /// * `Ok(None)` - No event available currently
+    /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
+    /// * `Err(_)` - Other errors occurred
+    pub async fn next_event(
+        &mut self, 
+        cancellation_token: &CancellationToken
+    ) -> Result<Option<ChangeEvent>> {
         // Send proactive feedback if enough time has passed
         self.maybe_send_feedback();
 
-        match self.connection.get_copy_data_async().await? {
+        match self.connection.get_copy_data_async(cancellation_token).await? {
             Some(data) => {
                 if data.is_empty() {
                     return Ok(None);
@@ -252,8 +267,21 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-    /// Enhanced next_event with automatic retry and recovery
-    pub async fn next_event_with_retry(&mut self) -> Result<Option<ChangeEvent>> {
+    /// Enhanced next_event with automatic retry, recovery and cancellation support
+    /// 
+    /// # Arguments
+    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// 
+    /// # Returns
+    /// * `Ok(Some(event))` - Successfully received a change event
+    /// * `Ok(None)` - No event available currently
+    /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
+    /// * `Err(_)` - Other errors occurred
+    pub async fn next_event_with_retry(
+        &mut self, 
+        cancellation_token: &CancellationToken
+    ) -> Result<Option<ChangeEvent>> {
+
         // Perform periodic health check
         if let Err(e) = self.check_connection_health().await {
             warn!("Health check failed: {}", e);
@@ -267,11 +295,12 @@ impl LogicalReplicationStream {
         while attempt < max_attempts {
             attempt += 1;
 
-            match self.next_event().await {
+            match self.next_event(cancellation_token).await {
                 Ok(event) => {
                     return Ok(event);
                 }
                 Err(e) => {
+
                     if e.is_permanent() {
                         error!("Permanent error in event processing: {}", e);
                         return Err(e);
@@ -295,9 +324,9 @@ impl LogicalReplicationStream {
                         }
                     }
 
-                    // Wait before retrying (simple exponential backoff)
+                    // Wait before retrying with cancellation support
                     let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
-                    tokio::time::sleep(delay).await;
+                        tokio::time::sleep(delay).await;
                 }
             }
         }

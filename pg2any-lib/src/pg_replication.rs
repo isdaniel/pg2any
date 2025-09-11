@@ -14,6 +14,7 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 // PostgreSQL constants
@@ -360,7 +361,19 @@ impl PgReplicationConnection {
     }
 
     /// Get copy data from replication stream (async non-blocking version)
-    pub async fn get_copy_data_async(&mut self) -> Result<Option<Vec<u8>>> {
+    /// 
+    /// # Arguments
+    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// 
+    /// # Returns
+    /// * `Ok(Some(data))` - Successfully received data
+    /// * `Ok(None)` - No data available currently 
+    /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
+    /// * `Err(_)` - Other errors occurred
+    pub async fn get_copy_data_async(
+        &mut self, 
+        cancellation_token: &CancellationToken
+    ) -> Result<Option<Vec<u8>>> {
         if !self.is_replication_conn {
             return Err(CdcError::protocol(
                 "Connection is not in replication mode".to_string(),
@@ -372,15 +385,15 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
 
-        let mut guard = async_fd.readable().await.map_err(|e| {
-            CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
-        })?;
+                let mut guard = async_fd.readable().await.map_err(|e| {
+                    CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
+                })?;
 
-        if let Some(data) = self.try_read_copy_data()? {
-            return Ok(Some(data));
-        }
+                if let Some(data) = self.try_read_copy_data()? {
+                    return Ok(Some(data));
+                }
 
-        guard.clear_ready();
+                guard.clear_ready();
 
         Ok(None)
     }
@@ -452,16 +465,21 @@ impl PgReplicationConnection {
     pub fn server_version(&self) -> i32 {
         unsafe { PQserverVersion(self.conn) }
     }
+
+    fn close_replication_connection(&mut self) {
+        if !self.conn.is_null() {
+            info!("Closing PostgreSQL replication connection");
+            unsafe {
+                PQfinish(self.conn);
+            }
+            //self.conn = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for PgReplicationConnection {
     fn drop(&mut self) {
-        if !self.conn.is_null() {
-            debug!("Closing PostgreSQL replication connection");
-            unsafe {
-                PQfinish(self.conn);
-            }
-        }
+        self.close_replication_connection();
     }
 }
 
@@ -567,27 +585,23 @@ impl ReplicationStream {
         Ok(())
     }
 
-    pub async fn next_event(&mut self) -> Result<Option<ChangeEvent>> {
-        debug!("Fetching next single change event with retry support");
+    /// Get next event with cancellation support
+    /// 
+    /// # Arguments  
+    /// * `cancellation_token` - Optional cancellation token to abort the operation
+    /// 
+    /// # Returns
+    /// * `Ok(Some(event))` - Successfully received a change event
+    /// * `Ok(None)` - No event available currently  
+    /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
+    /// * `Err(_)` - Other errors occurred
+    pub async fn next_event(
+        &mut self, 
+        cancellation_token: &CancellationToken
+    ) -> Result<Option<ChangeEvent>> {
+        debug!("Fetching next single change event with retry support and cancellation");
 
-        let event = self.logical_stream.next_event_with_retry().await?;
-
-        if let Some(ref event) = event {
-            debug!("Received single change event: {:?}", event);
-            // Update last received LSN
-            if let Some(lsn) = event.lsn {
-                self.logical_stream.state.update_lsn(lsn.0);
-            }
-        }
-
-        Ok(event)
-    }
-
-    /// Get next event without retry logic (for compatibility)
-    pub async fn next_event_no_retry(&mut self) -> Result<Option<ChangeEvent>> {
-        debug!("Fetching next single change event (no retry)");
-
-        let event = self.logical_stream.next_event().await?;
+        let event = self.logical_stream.next_event_with_retry(cancellation_token).await?;
 
         if let Some(ref event) = event {
             debug!("Received single change event: {:?}", event);

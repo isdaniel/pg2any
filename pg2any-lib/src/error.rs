@@ -76,6 +76,10 @@ pub enum CdcError {
     /// Replication connection errors  
     #[error("Replication connection error: {0}")]
     ReplicationConnection(String),
+
+    /// Operation cancelled errors
+    #[error("Operation was cancelled: {0}")]
+    Cancelled(String),
 }
 
 impl CdcError {
@@ -149,6 +153,11 @@ impl CdcError {
         CdcError::ReplicationConnection(msg.into())
     }
 
+    /// Create a new cancellation error
+    pub fn cancelled<S: Into<String>>(msg: S) -> Self {
+        CdcError::Cancelled(msg.into())
+    }
+
     /// Check if the error is transient (can be retried)
     pub fn is_transient(&self) -> bool {
         matches!(
@@ -169,6 +178,11 @@ impl CdcError {
                 | CdcError::Config(_)
                 | CdcError::Unsupported(_)
         )
+    }
+
+    /// Check if the error is due to cancellation
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, CdcError::Cancelled(_))
     }
 }
 

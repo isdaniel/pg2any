@@ -155,26 +155,28 @@ impl LogicalReplicationStream {
         Ok(())
     }
 
-
-
     /// Process the next single replication event with cancellation support
-    /// 
+    ///
     /// # Arguments
     /// * `cancellation_token` - Optional cancellation token to abort the operation
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(event))` - Successfully received a change event
     /// * `Ok(None)` - No event available currently
     /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Other errors occurred
     pub async fn next_event(
-        &mut self, 
-        cancellation_token: &CancellationToken
+        &mut self,
+        cancellation_token: &CancellationToken,
     ) -> Result<Option<ChangeEvent>> {
         // Send proactive feedback if enough time has passed
         self.maybe_send_feedback();
 
-        match self.connection.get_copy_data_async(cancellation_token).await? {
+        match self
+            .connection
+            .get_copy_data_async(cancellation_token)
+            .await?
+        {
             Some(data) => {
                 if data.is_empty() {
                     return Ok(None);
@@ -268,20 +270,19 @@ impl LogicalReplicationStream {
     }
 
     /// Enhanced next_event with automatic retry, recovery and cancellation support
-    /// 
+    ///
     /// # Arguments
     /// * `cancellation_token` - Optional cancellation token to abort the operation
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(event))` - Successfully received a change event
     /// * `Ok(None)` - No event available currently
     /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
     /// * `Err(_)` - Other errors occurred
     pub async fn next_event_with_retry(
-        &mut self, 
-        cancellation_token: &CancellationToken
+        &mut self,
+        cancellation_token: &CancellationToken,
     ) -> Result<Option<ChangeEvent>> {
-
         // Perform periodic health check
         if let Err(e) = self.check_connection_health().await {
             warn!("Health check failed: {}", e);
@@ -300,7 +301,6 @@ impl LogicalReplicationStream {
                     return Ok(event);
                 }
                 Err(e) => {
-
                     if e.is_permanent() {
                         error!("Permanent error in event processing: {}", e);
                         return Err(e);
@@ -326,7 +326,7 @@ impl LogicalReplicationStream {
 
                     // Wait before retrying with cancellation support
                     let delay = Duration::from_millis(1000 * (1 << (attempt - 1)));
-                        tokio::time::sleep(delay).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }

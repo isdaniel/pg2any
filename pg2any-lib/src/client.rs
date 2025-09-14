@@ -6,7 +6,7 @@ use crate::monitoring::{
 };
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::types::{ChangeEvent, Lsn};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,7 @@ pub struct CdcClient {
     cancellation_token: CancellationToken,
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 impl CdcClient {
@@ -47,7 +47,7 @@ impl CdcClient {
             cancellation_token: CancellationToken::new(),
             producer_handle: None,
             consumer_handle: None,
-            metrics_collector: Arc::new(Mutex::new(MetricsCollector::new())),
+            metrics_collector: Arc::new(MetricsCollector::new()),
         })
     }
 
@@ -151,11 +151,7 @@ impl CdcClient {
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Ok(collector) = metrics.lock() {
-                            collector.update_uptime();
-                        } else {
-                            error!("Failed to lock metrics_collector in uptime task");
-                        }
+                        metrics.update_uptime();
                     }
                 }
             }
@@ -168,12 +164,12 @@ impl CdcClient {
         event_sender: mpsc::Sender<ChangeEvent>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
-        metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
+        metrics_collector: Arc<MetricsCollector>,
     ) -> Result<()> {
         info!("Starting replication producer (single event mode)");
 
         // Initialize connection status
-        Self::update_source_connection_status(&metrics_collector, true);
+        metrics_collector.update_source_connection_status(true);
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
@@ -185,20 +181,14 @@ impl CdcClient {
                         }
 
                         // Record current LSN
-                        {
-                            let collector = metrics_collector.lock().unwrap();
-                            collector.record_received_lsn(current_lsn.0);
-                        }
+                        metrics_collector.record_received_lsn(current_lsn.0);
                     }
 
                     debug!("Producer received single event: {:?}", event.event_type);
 
                     if let Err(e) = event_sender.send(event).await {
                         error!("Failed to send event to consumer: {}", e);
-                        {
-                            let collector = metrics_collector.lock().unwrap();
-                            collector.record_error("event_send_failed", "producer");
-                        }
+                        metrics_collector.record_error("event_send_failed", "producer");
                         break;
                     }
                 }
@@ -211,10 +201,7 @@ impl CdcClient {
                 }
                 Err(e) => {
                     error!("Error reading from replication stream: {}", e);
-                    {
-                        let collector = metrics_collector.lock().unwrap();
-                        collector.record_error("replication_stream_error", "producer");
-                    }
+                    metrics_collector.record_error("replication_stream_error", "producer");
                     break;
                 }
             }
@@ -223,7 +210,7 @@ impl CdcClient {
         info!("Producer received cancellation signal");
 
         // Update connection status on shutdown
-        Self::update_source_connection_status(&metrics_collector, false);
+        metrics_collector.update_source_connection_status(false);
 
         // Gracefully stop the replication stream
         replication_stream.stop().await?;
@@ -237,13 +224,13 @@ impl CdcClient {
         mut event_receiver: mpsc::Receiver<ChangeEvent>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
-        metrics_collector: Arc<Mutex<dyn MetricsCollectorTrait>>,
+        metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
     ) -> Result<()> {
         info!("Starting replication consumer (single event mode)");
 
         // Initialize destination connection status
-        Self::update_destination_connection_status(&metrics_collector, &destination_type, true);
+        metrics_collector.update_destination_connection_status(&destination_type, true);
         let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tokio::select! {
@@ -262,10 +249,7 @@ impl CdcClient {
                 _ = queue_size_interval.tick() => {
                     let queue_size = event_receiver.len();
                     debug!("Consumer queue size: {}", queue_size);
-                    {
-                        let collector = metrics_collector.lock().unwrap();
-                        collector.update_consumer_queue_size(queue_size);
-                    }
+                    metrics_collector.update_consumer_queue_size(queue_size);
                 }
                 // Handle incoming event
                 event = event_receiver.recv() => {
@@ -290,7 +274,7 @@ impl CdcClient {
         }
 
         // Update destination connection status on shutdown
-        Self::update_destination_connection_status(&metrics_collector, &destination_type, false);
+        metrics_collector.update_destination_connection_status(&destination_type, false);
 
         info!("Replication consumer stopped gracefully");
         Ok(())
@@ -300,7 +284,7 @@ impl CdcClient {
     async fn drain_remaining_events(
         event_receiver: &mut mpsc::Receiver<ChangeEvent>,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
     ) {
         while let Ok(event) = event_receiver.try_recv() {
@@ -324,7 +308,7 @@ impl CdcClient {
     async fn process_single_event(
         event: ChangeEvent,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
+        metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
     ) {
         let event_type = event.event_type_str();
@@ -332,34 +316,14 @@ impl CdcClient {
 
         match destination_handler.process_event(&event).await {
             Ok(_) => {
-                let collector = metrics_collector.lock().unwrap();
-                collector.record_event(&event, destination_type);
-                timer.finish(&*collector);
+                metrics_collector.record_event(&event, destination_type);
+                timer.finish(metrics_collector.as_ref());
             }
             Err(e) => {
                 error!("Failed to process event: {}", e);
-                let collector = metrics_collector.lock().unwrap();
-                collector.record_error("event_processing_failed", "consumer");
+                metrics_collector.record_error("event_processing_failed", "consumer");
             }
         }
-    }
-
-    /// Update connection status in metrics.
-    fn update_destination_connection_status(
-        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
-        destination_type: &str,
-        status: bool,
-    ) {
-        let collector = metrics_collector.lock().unwrap();
-        collector.update_destination_connection_status(destination_type, status);
-    }
-
-    fn update_source_connection_status(
-        metrics_collector: &Arc<Mutex<dyn MetricsCollectorTrait>>,
-        status: bool,
-    ) {
-        let collector = metrics_collector.lock().unwrap();
-        collector.update_source_connection_status(status);
     }
 
     /// Stop the CDC replication process gracefully
@@ -422,22 +386,18 @@ impl CdcClient {
     }
 
     /// Get metrics collector for accessing metrics
-    pub fn metrics_collector(&self) -> Arc<Mutex<dyn MetricsCollectorTrait>> {
+    pub fn metrics_collector(&self) -> Arc<MetricsCollector> {
         self.metrics_collector.clone()
     }
 
     /// Get metrics in Prometheus text format
     pub fn get_metrics(&self) -> Result<String> {
-        let collector = self.metrics_collector.lock().unwrap();
-        collector
-            .get_metrics()
-            .map_err(|e| CdcError::generic(&format!("Failed to get metrics: {}", e)))
+        self.metrics_collector.get_metrics()
     }
 
     /// Initialize build information in metrics
     pub fn init_build_info(&self, version: &str) {
-        let collector = self.metrics_collector.lock().unwrap();
-        collector.init_build_info(version);
+        self.metrics_collector.init_build_info(version);
     }
 
     /// Health check for all components
@@ -445,15 +405,13 @@ impl CdcClient {
         // Check destination connection
         if let Some(ref mut handler) = self.destination_handler {
             if !handler.health_check().await? {
-                let collector = self.metrics_collector.lock().unwrap();
-                collector.update_destination_connection_status(
+                self.metrics_collector.update_destination_connection_status(
                     &self.config.destination_type.to_string(),
                     false,
                 );
                 return Ok(false);
             } else {
-                let collector = self.metrics_collector.lock().unwrap();
-                collector.update_destination_connection_status(
+                self.metrics_collector.update_destination_connection_status(
                     &self.config.destination_type.to_string(),
                     true,
                 );
@@ -674,7 +632,7 @@ mod tests {
         });
 
         let token_clone = cancellation_token.clone();
-        let metrics_collector = Arc::new(Mutex::new(MetricsCollector::new()));
+        let metrics_collector = Arc::new(MetricsCollector::new());
 
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer(
@@ -730,7 +688,7 @@ mod tests {
 
         let token_clone = cancellation_token.clone();
         let events_clone = events_processed.clone();
-        let metrics_collector = Arc::new(Mutex::new(MetricsCollector::new()));
+        let metrics_collector = Arc::new(MetricsCollector::new());
 
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer(

@@ -20,8 +20,8 @@ pub mod metrics_server;
 
 // Re-export key types and functions for convenience
 pub use metrics_abstraction::{
-    gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait,
-    ProcessingTimer, ProcessingTimerTrait,
+    gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
+    ProcessingTimerTrait,
 };
 
 #[cfg(feature = "metrics")]

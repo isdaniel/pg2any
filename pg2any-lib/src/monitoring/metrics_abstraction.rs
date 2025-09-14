@@ -56,15 +56,21 @@ pub trait MetricsCollectorTrait: Send + Sync {
     /// This method is thread-safe and handles any necessary locking internally.
     fn update_active_connections(&self, count: usize, connection_type: &str);
 
-    /// Update consumer queue size (pending events in the consumer thread)
+    /// Update consumer queue length (pending events in the consumer thread)
     ///
     /// This method is thread-safe and handles any necessary locking internally.
-    fn update_consumer_queue_size(&self, size: usize);
+    fn update_consumer_queue_length(&self, length: usize);
 
     /// Update uptime
     ///
     /// This method is thread-safe and handles any necessary locking internally.
     fn update_uptime(&self);
+
+    /// Update events rate - should be called periodically to ensure rate reflects current state
+    ///
+    /// This method is thread-safe and handles any necessary locking internally.
+    /// It checks if the current time window has expired and updates the rate accordingly.
+    fn update_events_rate(&self);
 
     /// Record received LSN
     ///
@@ -93,7 +99,7 @@ pub trait ProcessingTimerTrait {
         Self: Sized;
 
     /// Finish timing and record the metric with the duration
-    /// 
+    ///
     /// This method handles thread-safe access to the collector internally.
     fn finish(self, collector: &dyn MetricsCollectorTrait);
 }
@@ -178,11 +184,11 @@ mod real_metrics {
             }
         }
 
-        fn update_consumer_queue_size(&self, size: usize) {
+        fn update_consumer_queue_length(&self, length: usize) {
             if let Ok(collector) = self.inner.lock() {
-                collector.update_consumer_queue_size(size);
+                collector.update_consumer_queue_length(length);
             } else {
-                self.handle_lock_error("update_consumer_queue_size");
+                self.handle_lock_error("update_consumer_queue_length");
             }
         }
 
@@ -191,6 +197,14 @@ mod real_metrics {
                 collector.update_uptime();
             } else {
                 self.handle_lock_error("update_uptime");
+            }
+        }
+
+        fn update_events_rate(&self) {
+            if let Ok(mut collector) = self.inner.lock() {
+                collector.update_events_rate();
+            } else {
+                self.handle_lock_error("update_events_rate");
             }
         }
 
@@ -298,9 +312,11 @@ mod noop_metrics {
 
         fn update_active_connections(&self, _count: usize, _connection_type: &str) {}
 
-        fn update_consumer_queue_size(&self, _size: usize) {}
+        fn update_consumer_queue_length(&self, _size: usize) {}
 
         fn update_uptime(&self) {}
+
+        fn update_events_rate(&self) {}
 
         fn record_received_lsn(&self, _lsn: u64) {}
 

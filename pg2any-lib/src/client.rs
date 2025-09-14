@@ -152,6 +152,7 @@ impl CdcClient {
                     _ = token.cancelled() => break,
                     _ = interval.tick() => {
                         metrics.update_uptime();
+                        metrics.update_events_rate();
                     }
                 }
             }
@@ -247,9 +248,9 @@ impl CdcClient {
                     break;
                 }
                 _ = queue_size_interval.tick() => {
-                    let queue_size = event_receiver.len();
-                    debug!("Consumer queue size: {}", queue_size);
-                    metrics_collector.update_consumer_queue_size(queue_size);
+                    let queue_length = event_receiver.len();
+                    debug!("Consumer queue length: {}", queue_length);
+                    metrics_collector.update_consumer_queue_length(queue_length);
                 }
                 // Handle incoming event
                 event = event_receiver.recv() => {

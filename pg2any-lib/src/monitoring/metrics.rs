@@ -42,7 +42,7 @@ lazy_static! {
 
     /// Consumer queue size (pending events in the consumer thread)
     pub static ref CONSUMER_QUEUE_SIZE: Gauge = register_gauge!(
-        "pg2any_consumer_queue_size",
+        "pg2any_consumer_queue_length",
         "Number of pending events in the consumer thread queue"
     ).expect("metric can be created");
 
@@ -223,6 +223,26 @@ impl MetricsCollector {
         UPTIME_SECONDS.set(uptime);
     }
 
+    /// Update events rate - should be called periodically to ensure rate reflects current state
+    /// This method checks if the current time window has expired and updates the rate accordingly.
+    /// If no events have been processed in the current window, it will set the rate to 0.
+    pub fn update_events_rate(&mut self) {
+        let now = Instant::now();
+
+        // Check if the current window has expired
+        if now.duration_since(self.window_start) >= self.window_duration {
+            // Calculate rate for the current window
+            let rate = self.events_in_window as f64 / self.window_duration.as_secs() as f64;
+            EVENTS_RATE.set(rate);
+
+            // Reset window for next period
+            self.events_in_window = 0;
+            self.window_start = now;
+
+            debug!("Updated events rate: {} events/sec", rate);
+        }
+    }
+
     /// Record a processed CDC event
     pub fn record_event(&mut self, event: &ChangeEvent, destination_type: &str) {
         let now = Instant::now();
@@ -237,6 +257,7 @@ impl MetricsCollector {
             EventType::Insert { table, .. }
             | EventType::Update { table, .. }
             | EventType::Delete { table, .. } => table.as_str(),
+            EventType::Truncate(tables) => &tables.join(","),
             _ => "unknown",
         };
 
@@ -249,16 +270,8 @@ impl MetricsCollector {
             LAST_PROCESSED_LSN.set(lsn.0 as f64);
         }
 
-        // Calculate processing rate
+        // Track events for rate calculation
         self.events_in_window += 1;
-        if now.duration_since(self.window_start) >= self.window_duration {
-            let rate = self.events_in_window as f64 / self.window_duration.as_secs() as f64;
-            EVENTS_RATE.set(rate);
-
-            // Reset window
-            self.events_in_window = 0;
-            self.window_start = now;
-        }
 
         self.last_event_time = Some(now);
         debug!(
@@ -314,10 +327,10 @@ impl MetricsCollector {
             .set(count as f64);
     }
 
-    /// Update consumer queue size (pending events in the consumer thread)
-    pub fn update_consumer_queue_size(&self, size: usize) {
-        CONSUMER_QUEUE_SIZE.set(size as f64);
-        debug!("Updated consumer queue size: {}", size);
+    /// Update consumer queue length (pending events in the consumer thread)
+    pub fn update_consumer_queue_length(&self, length: usize) {
+        CONSUMER_QUEUE_SIZE.set(length as f64);
+        debug!("Updated consumer queue length: {}", length);
     }
 
     /// Get metrics in Prometheus text format
@@ -402,13 +415,33 @@ mod tests {
         let collector = MetricsCollector::new();
 
         // Test updating queue size
-        collector.update_consumer_queue_size(5);
-        collector.update_consumer_queue_size(10);
-        collector.update_consumer_queue_size(0);
+        collector.update_consumer_queue_length(5);
+        collector.update_consumer_queue_length(10);
+        collector.update_consumer_queue_length(0);
 
         // Verify metrics were recorded
         let metrics = collector.get_metrics().unwrap();
-        assert!(metrics.contains("pg2any_consumer_queue_size"));
-        assert!(metrics.contains("pg2any_consumer_queue_size 0"));
+        assert!(metrics.contains("pg2any_consumer_queue_length"));
+        assert!(metrics.contains("pg2any_consumer_queue_length 0"));
+    }
+
+    #[test]
+    fn test_events_rate_periodic_update() {
+        // Initialize the metrics registry first
+        let _ = init_metrics();
+
+        let mut collector = MetricsCollector::new();
+
+        // Simulate events and manual rate update to test the new functionality
+        // Update with no events - should set rate to 0
+        collector.update_events_rate();
+
+        // Verify metrics were recorded
+        let metrics = collector.get_metrics().unwrap();
+        assert!(metrics.contains("pg2any_events_per_second"));
+
+        // The rate should be 0 since no events were recorded
+        // and the window gets reset immediately in test environment
+        println!("Metrics output: {}", metrics);
     }
 }

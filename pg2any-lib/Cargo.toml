@@ -32,8 +32,6 @@ prometheus = { workspace = true, optional = true  }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-# Retry logic dependencies
-backoff = { workspace = true }
 
 [features]
 default = ["mysql", "sqlserver", "sqlite"]

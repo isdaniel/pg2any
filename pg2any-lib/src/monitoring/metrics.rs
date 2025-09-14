@@ -199,12 +199,6 @@ pub struct MetricsCollector {
     window_duration: Duration,
 }
 
-impl Default for MetricsCollector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MetricsCollector {
     /// Create a new metrics collector
     pub fn new() -> Self {

@@ -2,6 +2,10 @@
 //!
 //! This module contains all monitoring-related functionality including metrics collection,
 //! metrics server, and the metrics abstraction layer.
+//!
+//! The metrics system has been unified to eliminate duplicate locking logic. All thread
+//! safety is handled within the trait implementations themselves, with configurable
+//! error handling modes.
 
 // Metrics abstraction layer - always available
 pub mod metrics_abstraction;
@@ -16,8 +20,8 @@ pub mod metrics_server;
 
 // Re-export key types and functions for convenience
 pub use metrics_abstraction::{
-    gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
-    ProcessingTimerTrait,
+    gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait,
+    ProcessingTimer, ProcessingTimerTrait,
 };
 
 #[cfg(feature = "metrics")]

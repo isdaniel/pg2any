@@ -114,29 +114,86 @@ pub use real_metrics::*;
 #[cfg(feature = "metrics")]
 mod real_metrics {
     use super::*;
-    use crate::monitoring::metrics::MetricsCollector as RealMetricsCollector;
-    use std::sync::{Arc, Mutex};
+    use crate::monitoring::metrics::*; // Import the static metrics
+    use crate::types::EventType;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use tracing::{debug, warn};
 
-    /// Real metrics collector that wraps the actual prometheus-based collector
-    /// with built-in thread safety
+    /// Real metrics collector using atomic operations for lock-free performance
     #[derive(Debug)]
     pub struct MetricsCollector {
-        inner: Arc<Mutex<RealMetricsCollector>>,
+        start_time: Instant,
+        last_event_time_nanos: AtomicU64, // 0 means None
+        events_in_window: AtomicU64,
+        window_start_nanos: AtomicU64,
+        window_duration: Duration,
+    }
+
+    impl MetricsCollector {
+        /// Helper method to convert Instant to nanoseconds since start_time
+        #[inline]
+        fn instant_to_nanos(&self, instant: Instant) -> u64 {
+            instant.duration_since(self.start_time).as_nanos() as u64
+        }
+
+        /// Get the current time as nanoseconds since start_time
+        #[inline]
+        fn now_nanos(&self) -> u64 {
+            self.instant_to_nanos(Instant::now())
+        }
     }
 
     impl MetricsCollectorTrait for MetricsCollector {
         fn new() -> Self {
+            let now = Instant::now();
             Self {
-                inner: Arc::new(Mutex::new(RealMetricsCollector::new())),
+                start_time: now,
+                last_event_time_nanos: AtomicU64::new(0), // 0 represents None
+                events_in_window: AtomicU64::new(0),
+                window_start_nanos: AtomicU64::new(0), // Will be set relative to start_time
+                window_duration: Duration::from_secs(60), // 1-minute window for rate calculation
             }
         }
 
         fn record_event(&self, event: &crate::types::ChangeEvent, destination_type: &str) {
-            if let Ok(mut collector) = self.inner.lock() {
-                collector.record_event(event, destination_type);
-            } else {
-                self.handle_lock_error("record_event");
+            let now = Instant::now();
+            let now_nanos = self.instant_to_nanos(now);
+
+            // Update counters
+            EVENTS_PROCESSED_TOTAL.inc();
+
+            // Track by event type and table
+            let event_type = event.event_type_str();
+            // Extract table name from event type
+            let table_name = match &event.event_type {
+                EventType::Insert { table, .. }
+                | EventType::Update { table, .. }
+                | EventType::Delete { table, .. } => table.as_str(),
+                EventType::Truncate(tables) => &tables.join(","),
+                _ => "unknown",
+            };
+
+            EVENTS_BY_TYPE
+                .with_label_values(&[event_type, table_name])
+                .inc();
+
+            // Update LSN if available
+            if let Some(lsn) = event.lsn {
+                LAST_PROCESSED_LSN.set(lsn.0 as f64);
             }
+
+            // Track events for rate calculation
+            self.events_in_window.fetch_add(1, Ordering::Relaxed);
+
+            // Update last event time atomically
+            self.last_event_time_nanos
+                .store(now_nanos, Ordering::Relaxed);
+
+            debug!(
+                "Recorded event: type={}, table={}, destination={}",
+                event_type, table_name, destination_type
+            );
         }
 
         fn record_processing_duration(
@@ -145,105 +202,90 @@ mod real_metrics {
             event_type: &str,
             destination_type: &str,
         ) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_processing_duration(duration, event_type, destination_type);
-            } else {
-                self.handle_lock_error("record_processing_duration");
-            }
+            EVENT_PROCESSING_DURATION
+                .with_label_values(&[event_type, destination_type])
+                .observe(duration.as_secs_f64());
         }
 
         fn record_error(&self, error_type: &str, component: &str) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_error(error_type, component);
-            } else {
-                self.handle_lock_error("record_error");
-            }
+            ERRORS_TOTAL
+                .with_label_values(&[error_type, component])
+                .inc();
+            warn!(
+                "Error recorded: type={}, component={}",
+                error_type, component
+            );
         }
 
         fn update_source_connection_status(&self, connected: bool) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_source_connection_status(connected);
-            } else {
-                self.handle_lock_error("update_source_connection_status");
-            }
+            SOURCE_CONNECTION_STATUS.set(if connected { 1.0 } else { 0.0 });
         }
 
         fn update_destination_connection_status(&self, destination_type: &str, connected: bool) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_destination_connection_status(destination_type, connected);
-            } else {
-                self.handle_lock_error("update_destination_connection_status");
-            }
+            DESTINATION_CONNECTION_STATUS
+                .with_label_values(&[destination_type])
+                .set(if connected { 1.0 } else { 0.0 });
         }
 
         fn update_active_connections(&self, count: usize, connection_type: &str) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_active_connections(count, connection_type);
-            } else {
-                self.handle_lock_error("update_active_connections");
-            }
+            ACTIVE_CONNECTIONS
+                .with_label_values(&[connection_type])
+                .set(count as f64);
         }
 
         fn update_consumer_queue_length(&self, length: usize) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_consumer_queue_length(length);
-            } else {
-                self.handle_lock_error("update_consumer_queue_length");
-            }
+            CONSUMER_QUEUE_SIZE.set(length as f64);
+            debug!("Updated consumer queue length: {}", length);
         }
 
         fn update_uptime(&self) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.update_uptime();
-            } else {
-                self.handle_lock_error("update_uptime");
-            }
+            let uptime = self.start_time.elapsed().as_secs() as f64;
+            UPTIME_SECONDS.set(uptime);
         }
 
         fn update_events_rate(&self) {
-            if let Ok(mut collector) = self.inner.lock() {
-                collector.update_events_rate();
-            } else {
-                self.handle_lock_error("update_events_rate");
+            let now_nanos = self.now_nanos();
+            let window_start = self.window_start_nanos.load(Ordering::Relaxed);
+
+            // Initialize window start if it's not set (first call)
+            if window_start == 0 {
+                self.window_start_nanos.store(now_nanos, Ordering::Relaxed);
+                return;
+            }
+
+            let window_duration_nanos = self.window_duration.as_nanos() as u64;
+
+            // Check if the current window has expired
+            if now_nanos.saturating_sub(window_start) >= window_duration_nanos {
+                // Calculate rate for the current window
+                let events = self.events_in_window.swap(0, Ordering::Relaxed);
+                let rate = events as f64 / self.window_duration.as_secs() as f64;
+                EVENTS_RATE.set(rate);
+
+                // Reset window for next period
+                self.window_start_nanos.store(now_nanos, Ordering::Relaxed);
+
+                debug!("Updated events rate: {} events/sec", rate);
             }
         }
 
         fn record_received_lsn(&self, lsn: u64) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.record_received_lsn(lsn);
-            } else {
-                self.handle_lock_error("record_received_lsn");
-            }
+            CURRENT_RECEIVED_LSN.set(lsn as f64);
         }
 
         fn get_metrics(&self) -> CdcResult<String> {
-            match self.inner.lock() {
-                Ok(collector) => collector
-                    .get_metrics()
-                    .map_err(|e| crate::CdcError::generic(&e.to_string())),
-                Err(_) => {
-                    self.handle_lock_error("get_metrics");
-                    Err(crate::CdcError::generic(
-                        "Failed to acquire metrics collector lock",
-                    ))
-                }
-            }
+            use prometheus::Encoder;
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = REGISTRY.gather();
+            let mut buffer = Vec::new();
+            encoder
+                .encode(&metric_families, &mut buffer)
+                .map_err(|e| crate::CdcError::generic(&e.to_string()))?;
+            String::from_utf8(buffer).map_err(|e| crate::CdcError::generic(&e.to_string()))
         }
 
         fn init_build_info(&self, version: &str) {
-            if let Ok(collector) = self.inner.lock() {
-                collector.init_build_info(version);
-            } else {
-                self.handle_lock_error("init_build_info");
-            }
-        }
-    }
-
-    impl MetricsCollector {
-        /// Handle lock acquisition errors with standard logging
-        #[inline]
-        fn handle_lock_error(&self, operation: &str) {
-            tracing::warn!("Failed to lock metrics_collector for {}", operation);
+            BUILD_INFO.with_label_values(&[version]).set(1.0);
         }
     }
 

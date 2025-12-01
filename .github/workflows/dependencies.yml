@@ -1,58 +1,58 @@
-name: Dependency Updates
+# name: Dependency Updates
 
-on:
-  schedule:
-    # Run every Monday at 9 AM UTC
-    - cron: '0 9 * * 1'
-  workflow_dispatch:
+# on:
+#   schedule:
+#     # Run every Monday at 9 AM UTC
+#     - cron: '0 9 * * 1'
+#   workflow_dispatch:
 
-jobs:
-  update-dependencies:
-    name: Update Dependencies
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
+# jobs:
+#   update-dependencies:
+#     name: Update Dependencies
+#     runs-on: ubuntu-latest
+#     steps:
+#     - uses: actions/checkout@v4
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+#     - name: Install Rust
+#       uses: dtolnay/rust-toolchain@stable
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+#     - name: Install dependencies
+#       run: |
+#         sudo apt-get update
+#         sudo apt-get install -y libpq-dev pkg-config libssl-dev
 
-    - name: Install cargo-edit
-      run: cargo install cargo-edit
+#     - name: Install cargo-edit
+#       run: cargo install cargo-edit
 
-    - name: Update dependencies
-      run: cargo update
+#     - name: Update dependencies
+#       run: cargo update
 
-    - name: Check if dependencies changed
-      id: changes
-      run: |
-        if git diff --exit-code Cargo.lock; then
-          echo "changed=false" >> $GITHUB_OUTPUT
-        else
-          echo "changed=true" >> $GITHUB_OUTPUT
-        fi
+#     - name: Check if dependencies changed
+#       id: changes
+#       run: |
+#         if git diff --exit-code Cargo.lock; then
+#           echo "changed=false" >> $GITHUB_OUTPUT
+#         else
+#           echo "changed=true" >> $GITHUB_OUTPUT
+#         fi
 
-    - name: Run tests with updated dependencies
-      if: steps.changes.outputs.changed == 'true'
-      run: cargo test
+#     - name: Run tests with updated dependencies
+#       if: steps.changes.outputs.changed == 'true'
+#       run: cargo test
 
-    - name: Create Pull Request
-      if: steps.changes.outputs.changed == 'true'
-      uses: peter-evans/create-pull-request@v5
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        commit-message: Update dependencies
-        title: 'chore: Update dependencies'
-        body: |
-          This PR updates the project dependencies to their latest versions.
+#     - name: Create Pull Request
+#       if: steps.changes.outputs.changed == 'true'
+#       uses: peter-evans/create-pull-request@v5
+#       with:
+#         token: ${{ secrets.GITHUB_TOKEN }}
+#         commit-message: Update dependencies
+#         title: 'chore: Update dependencies'
+#         body: |
+#           This PR updates the project dependencies to their latest versions.
           
-          Changes were made to:
-          - Cargo.lock
+#           Changes were made to:
+#           - Cargo.lock
           
-          All tests have passed with the updated dependencies.
-        branch: update-dependencies
-        delete-branch: true
+#           All tests have passed with the updated dependencies.
+#         branch: update-dependencies
+#         delete-branch: true

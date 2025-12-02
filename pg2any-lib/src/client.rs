@@ -80,7 +80,7 @@ impl CdcClient {
         self.init().await?;
 
         // Create replication stream using async method
-        let mut replication_manager = self
+        let replication_manager = self
             .replication_manager
             .take()
             .ok_or_else(|| CdcError::generic("Replication manager not available"))?;

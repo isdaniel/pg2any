@@ -571,14 +571,14 @@ impl LogicalReplicationStream {
         tuple: &TupleData,
         relation: &RelationInfo,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-        let mut data = std::collections::HashMap::new();
+        let mut data = std::collections::HashMap::with_capacity(tuple.columns.len());
 
         for (i, column_data) in tuple.columns.iter().enumerate() {
             if let Some(column_info) = relation.get_column_by_index(i) {
                 let value = if column_data.is_null() {
                     serde_json::Value::Null
-                } else if let Some(text) = column_data.as_string() {
-                    serde_json::Value::String(text)
+                } else if let Some(text) = column_data.as_str() {
+                    serde_json::Value::String(text.into_owned())
                 } else {
                     // For binary data, convert to base64 or hex string
                     let hex_string = hex::encode(column_data.as_bytes());

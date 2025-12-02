@@ -1,9 +1,13 @@
+/// Operation type for database modifications
+/// Currently unused after optimizations but kept for potential future use
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operation {
     Update,
     Delete,
 }
 
+#[allow(dead_code)]
 impl Operation {
     pub fn name(&self) -> String {
         match self {

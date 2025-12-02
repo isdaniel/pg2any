@@ -15,6 +15,7 @@ pub struct BufferReader {
 
 impl BufferReader {
     /// Create a new buffer reader from a byte slice
+    #[inline]
     pub fn new(data: &[u8]) -> Self {
         Self {
             data: Bytes::copy_from_slice(data),
@@ -22,21 +23,32 @@ impl BufferReader {
     }
 
     /// Create a new buffer reader from Bytes
+    #[inline]
     pub fn from_bytes(data: Bytes) -> Self {
         Self { data }
     }
 
+    #[inline]
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        Self {
+            data: Bytes::from(data),
+        }
+    }
+
     /// Get current position in the buffer
+    #[inline]
     pub fn position(&self) -> usize {
         self.data.len()
     }
 
     /// Get remaining bytes in the buffer
+    #[inline]
     pub fn remaining(&self) -> usize {
         self.data.remaining()
     }
 
     /// Check if there are enough bytes remaining
+    #[inline]
     fn ensure_bytes(&self, count: usize) -> Result<()> {
         if self.data.remaining() < count {
             return Err(CdcError::protocol(format!(
@@ -49,6 +61,7 @@ impl BufferReader {
     }
 
     /// Skip the message type byte and return current position
+    #[inline]
     pub fn skip_message_type(&mut self) -> Result<usize> {
         self.ensure_bytes(1)?;
         self.data.advance(1);
@@ -56,48 +69,56 @@ impl BufferReader {
     }
 
     /// Read a single byte
+    #[inline]
     pub fn read_u8(&mut self) -> Result<u8> {
         self.ensure_bytes(1)?;
         Ok(self.data.get_u8())
     }
 
     /// Read a 16-bit unsigned integer in network byte order
+    #[inline]
     pub fn read_u16(&mut self) -> Result<u16> {
         self.ensure_bytes(2)?;
         Ok(self.data.get_u16())
     }
 
     /// Read a 32-bit unsigned integer in network byte order
+    #[inline]
     pub fn read_u32(&mut self) -> Result<u32> {
         self.ensure_bytes(4)?;
         Ok(self.data.get_u32())
     }
 
     /// Read a 64-bit unsigned integer in network byte order
+    #[inline]
     pub fn read_u64(&mut self) -> Result<u64> {
         self.ensure_bytes(8)?;
         Ok(self.data.get_u64())
     }
 
     /// Read a 16-bit signed integer in network byte order
+    #[inline]
     pub fn read_i16(&mut self) -> Result<i16> {
         self.ensure_bytes(2)?;
         Ok(self.data.get_i16())
     }
 
     /// Read a 32-bit signed integer in network byte order
+    #[inline]
     pub fn read_i32(&mut self) -> Result<i32> {
         self.ensure_bytes(4)?;
         Ok(self.data.get_i32())
     }
 
     /// Read a 64-bit signed integer in network byte order
+    #[inline]
     pub fn read_i64(&mut self) -> Result<i64> {
         self.ensure_bytes(8)?;
         Ok(self.data.get_i64())
     }
 
     /// Read a null-terminated string
+    #[inline]
     pub fn read_cstring(&mut self) -> Result<String> {
         let mut bytes_to_read = 0;
         let data_slice = self.data.chunk();
@@ -128,6 +149,7 @@ impl BufferReader {
     }
 
     /// Read a fixed-length string without null terminator
+    #[inline]
     pub fn read_string(&mut self, length: usize) -> Result<String> {
         self.ensure_bytes(length)?;
         let string_bytes = self.data.copy_to_bytes(length);
@@ -137,6 +159,7 @@ impl BufferReader {
     }
 
     /// Read raw bytes
+    #[inline]
     pub fn read_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
         self.ensure_bytes(length)?;
         let bytes = self.data.copy_to_bytes(length);
@@ -144,18 +167,21 @@ impl BufferReader {
     }
 
     /// Get raw bytes as Bytes (zero-copy when possible)
+    #[inline]
     pub fn read_bytes_buf(&mut self, length: usize) -> Result<Bytes> {
         self.ensure_bytes(length)?;
         Ok(self.data.copy_to_bytes(length))
     }
 
     /// Peek at the next byte without advancing position
+    #[inline]
     pub fn peek_u8(&self) -> Result<u8> {
         self.ensure_bytes(1)?;
         Ok(self.data.chunk()[0])
     }
 
     /// Skip n bytes
+    #[inline]
     pub fn skip(&mut self, count: usize) -> Result<()> {
         self.ensure_bytes(count)?;
         self.data.advance(count);

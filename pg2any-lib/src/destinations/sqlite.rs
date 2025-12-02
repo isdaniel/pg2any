@@ -1,6 +1,5 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
-    destinations::operation::Operation,
     error::{CdcError, Result},
     types::{ChangeEvent, EventType, ReplicaIdentity},
 };
@@ -33,10 +32,10 @@ impl SQLiteDestination {
     fn bind_value<'a>(
         &self,
         query: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>>,
-        value: &serde_json::Value,
+        value: &'a serde_json::Value,
     ) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
         match value {
-            serde_json::Value::String(s) => query.bind(s.clone()),
+            serde_json::Value::String(s) => query.bind(s.as_str()),
             serde_json::Value::Number(n) if n.is_i64() => query.bind(n.as_i64().unwrap()),
             serde_json::Value::Number(n) if n.is_f64() => query.bind(n.as_f64().unwrap()),
             serde_json::Value::Bool(b) => query.bind(*b),
@@ -45,34 +44,34 @@ impl SQLiteDestination {
         }
     }
 
-    /// Build WHERE clause for UPDATE and DELETE operations
-    fn build_where_clause(
+    /// Build WHERE clause for UPDATE operations
+    /// Returns the SQL WHERE clause string and a vector of references to the bind values
+    fn build_where_clause_for_update<'a>(
         &self,
-        old_data: &Option<HashMap<String, serde_json::Value>>,
-        new_data: &Option<&HashMap<String, serde_json::Value>>,
+        old_data: &'a Option<HashMap<String, serde_json::Value>>,
+        new_data: &'a HashMap<String, serde_json::Value>,
         replica_identity: &ReplicaIdentity,
         key_columns: &[String],
         schema: &str,
         table: &str,
-        operation: Operation,
-    ) -> Result<(String, Vec<serde_json::Value>)> {
+    ) -> Result<(String, Vec<&'a serde_json::Value>)> {
         match replica_identity {
             ReplicaIdentity::Full => {
                 // Use all old data for WHERE clause
                 if let Some(old) = old_data {
-                    let mut conditions = Vec::new();
-                    let mut bind_values = Vec::new();
+                    let mut conditions = Vec::with_capacity(old.len());
+                    let mut bind_values = Vec::with_capacity(old.len());
 
                     for (column, value) in old {
                         conditions.push(format!("\"{}\" = ?", column));
-                        bind_values.push(value.clone());
+                        bind_values.push(value);
                     }
 
                     Ok((conditions.join(" AND "), bind_values))
                 } else {
                     Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {} during {}",
-                        table, operation
+                        "REPLICA IDENTITY FULL requires old_data but none provided for {} during UPDATE",
+                        table
                     )))
                 }
             }
@@ -80,33 +79,28 @@ impl SQLiteDestination {
             ReplicaIdentity::Default | ReplicaIdentity::Index => {
                 if key_columns.is_empty() {
                     return Err(CdcError::generic(format!(
-                        "No key columns available for {} operation on {}.{}. Check table's replica identity setting.",
-                        operation, schema, table
+                        "No key columns available for UPDATE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
                     )));
                 }
 
-                let mut conditions = Vec::new();
-                let mut bind_values = Vec::new();
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
 
                 // Use old_data if available, otherwise fall back to new_data
-                let data_source = match old_data {
+                let data_source: &HashMap<String, serde_json::Value> = match old_data {
                     Some(old) => old,
-                    None => new_data.ok_or_else(|| {
-                        CdcError::generic(format!(
-                            "No data available to build WHERE clause for {} on {}.{}",
-                            operation, schema, table
-                        ))
-                    })?,
+                    None => new_data,
                 };
 
                 for key_column in key_columns {
                     if let Some(value) = data_source.get(key_column) {
                         conditions.push(format!("\"{}\" = ?", key_column));
-                        bind_values.push(value.clone());
+                        bind_values.push(value);
                     } else {
                         return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for {} on {}.{}",
-                            key_column, operation, schema, table
+                            "Key column '{}' not found in data for UPDATE on {}.{}",
+                            key_column, schema, table
                         )));
                     }
                 }
@@ -115,14 +109,6 @@ impl SQLiteDestination {
             }
 
             ReplicaIdentity::Nothing => {
-                if operation == Operation::Delete {
-                    return Err(CdcError::generic(format!(
-                        "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
-                        DELETE requires a replica identity.",
-                        schema, table
-                    )));
-                }
-
                 // For UPDATE with NOTHING, try to use key columns if available
                 if key_columns.is_empty() {
                     return Err(CdcError::generic(format!(
@@ -131,15 +117,13 @@ impl SQLiteDestination {
                     )));
                 }
 
-                let mut conditions = Vec::new();
-                let mut bind_values = Vec::new();
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
 
-                if let Some(new_data) = new_data {
-                    for key_column in key_columns {
-                        if let Some(value) = new_data.get(key_column) {
-                            conditions.push(format!("\"{}\" = ?", key_column));
-                            bind_values.push(value.clone());
-                        }
+                for key_column in key_columns {
+                    if let Some(value) = new_data.get(key_column) {
+                        conditions.push(format!("\"{}\" = ?", key_column));
+                        bind_values.push(value);
                     }
                 }
 
@@ -157,6 +141,62 @@ impl SQLiteDestination {
 
                 Ok((conditions.join(" AND "), bind_values))
             }
+        }
+    }
+
+    /// Build WHERE clause specifically for DELETE operations (where old_data is always provided)
+    fn build_where_clause_for_delete<'a>(
+        &self,
+        old_data: &'a HashMap<String, serde_json::Value>,
+        replica_identity: &ReplicaIdentity,
+        key_columns: &[String],
+        schema: &str,
+        table: &str,
+    ) -> Result<(String, Vec<&'a serde_json::Value>)> {
+        match replica_identity {
+            ReplicaIdentity::Full => {
+                let mut conditions = Vec::with_capacity(old_data.len());
+                let mut bind_values = Vec::with_capacity(old_data.len());
+
+                for (column, value) in old_data {
+                    conditions.push(format!("\"{}\" = ?", column));
+                    bind_values.push(value);
+                }
+
+                Ok((conditions.join(" AND "), bind_values))
+            }
+
+            ReplicaIdentity::Default | ReplicaIdentity::Index => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No key columns available for DELETE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
+                    )));
+                }
+
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
+
+                for key_column in key_columns {
+                    if let Some(value) = old_data.get(key_column) {
+                        conditions.push(format!("\"{}\" = ?", key_column));
+                        bind_values.push(value);
+                    } else {
+                        return Err(CdcError::generic(format!(
+                            "Key column '{}' not found in data for DELETE on {}.{}",
+                            key_column, schema, table
+                        )));
+                    }
+                }
+
+                Ok((conditions.join(" AND "), bind_values))
+            }
+
+            ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
+                "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
+                DELETE requires a replica identity.",
+                schema, table
+            ))),
         }
     }
 
@@ -208,14 +248,13 @@ impl SQLiteDestination {
     ) -> Result<()> {
         let set_clauses: Vec<String> = new_data.keys().map(|k| format!("\"{}\" = ?", k)).collect();
 
-        let (where_clause, where_values) = self.build_where_clause(
+        let (where_clause, where_values) = self.build_where_clause_for_update(
             old_data,
-            &Some(new_data),
+            new_data,
             replica_identity,
             key_columns,
             schema,
             table,
-            Operation::Update,
         )?;
 
         // Use only table name without schema
@@ -238,7 +277,7 @@ impl SQLiteDestination {
         }
 
         // Then bind WHERE values
-        for value in &where_values {
+        for value in where_values {
             query = self.bind_value(query, value);
         }
 
@@ -269,14 +308,13 @@ impl SQLiteDestination {
         replica_identity: &ReplicaIdentity,
         key_columns: &[String],
     ) -> Result<()> {
-        let (where_clause, where_values) = self.build_where_clause(
-            &Some(old_data.clone()),
-            &None,
+        // Build WHERE clause directly from old_data without wrapping in Option
+        let (where_clause, where_values) = self.build_where_clause_for_delete(
+            old_data,
             replica_identity,
             key_columns,
             schema,
             table,
-            Operation::Delete,
         )?;
 
         // Use only table name without schema
@@ -287,7 +325,7 @@ impl SQLiteDestination {
         debug!("Executing SQLite DELETE: {}", sql);
 
         let mut query = sqlx::query(&sql);
-        for value in &where_values {
+        for value in where_values {
             query = self.bind_value(query, value);
         }
 

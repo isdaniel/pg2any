@@ -608,19 +608,17 @@ impl Drop for PgResult {
 }
 
 pub struct ReplicationStream {
-    logical_stream: LogicalReplicationStream,
-    _config: Config,
+    logical_stream: LogicalReplicationStream
 }
 
 impl ReplicationStream {
-    pub async fn new(config: Config) -> Result<Self> {
-        let stream_config = ReplicationStreamConfig::from(&config);
+    pub async fn new(config: &Config) -> Result<Self> {
+        let stream_config = ReplicationStreamConfig::from(config);
         let logical_stream =
             LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
 
         Ok(Self {
             logical_stream,
-            _config: config,
         })
     }
 
@@ -708,8 +706,8 @@ impl ReplicationManager {
         Self { config }
     }
 
-    pub async fn create_stream_async(&mut self) -> Result<ReplicationStream> {
-        ReplicationStream::new(self.config.clone()).await
+    pub async fn create_stream_async(&self) -> Result<ReplicationStream> {
+        ReplicationStream::new(&self.config).await
     }
 }
 

@@ -7,6 +7,7 @@ use crate::buffer::BufferReader;
 use crate::error::{CdcError, Result};
 use crate::pg_replication::{format_lsn, Oid, TimestampTz, XLogRecPtr, Xid};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -218,6 +219,7 @@ pub struct ColumnData {
 }
 
 impl ColumnData {
+    #[inline]
     pub fn null() -> Self {
         Self {
             data_type: 'n',
@@ -225,6 +227,7 @@ impl ColumnData {
         }
     }
 
+    #[inline]
     pub fn text(data: Vec<u8>) -> Self {
         Self {
             data_type: 't',
@@ -232,6 +235,7 @@ impl ColumnData {
         }
     }
 
+    #[inline]
     pub fn unchanged() -> Self {
         Self {
             data_type: 'u',
@@ -239,23 +243,40 @@ impl ColumnData {
         }
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         self.data_type == 'n'
     }
 
+    #[inline]
     pub fn is_unchanged(&self) -> bool {
         self.data_type == 'u'
     }
 
-    pub fn as_string(&self) -> Option<String> {
+    /// Convert to string, returning a Cow to avoid allocation when possible
+    /// If the data is valid UTF-8, returns a borrowed reference
+    #[inline]
+    pub fn as_str(&self) -> Option<Cow<'_, str>> {
         if self.data_type == 't' && !self.data.is_empty() {
-            String::from_utf8(self.data.clone()).ok()
+            // Try to borrow first (zero-copy), fall back to lossy conversion
+            match std::str::from_utf8(&self.data) {
+                Ok(s) => Some(Cow::Borrowed(s)),
+                Err(_) => Some(Cow::Owned(String::from_utf8_lossy(&self.data).into_owned())),
+            }
         } else {
             None
         }
     }
 
-    /// Get raw bytes data
+    /// Legacy method that returns owned String for compatibility
+    /// Prefer `as_str()` for better performance
+    #[inline]
+    pub fn as_string(&self) -> Option<String> {
+        self.as_str().map(|cow| cow.into_owned())
+    }
+
+    /// Get raw bytes data (zero-copy reference)
+    #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }

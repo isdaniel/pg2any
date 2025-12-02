@@ -1,6 +1,5 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
-    destinations::operation::Operation,
     error::{CdcError, Result},
     types::{ChangeEvent, EventType},
 };
@@ -18,10 +17,11 @@ pub struct MySQLDestination {
 }
 
 /// Helper struct for building WHERE clauses with proper parameter binding
+/// Uses references to avoid unnecessary cloning of JSON values
 #[derive(Debug)]
-struct WhereClause {
+struct WhereClause<'a> {
     sql: String,
-    bind_values: Vec<serde_json::Value>,
+    bind_values: Vec<&'a serde_json::Value>,
 }
 
 impl MySQLDestination {
@@ -45,10 +45,10 @@ impl MySQLDestination {
     fn bind_value<'a>(
         &self,
         query: sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments>,
-        value: &serde_json::Value,
+        value: &'a serde_json::Value,
     ) -> sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments> {
         match value {
-            serde_json::Value::String(s) => query.bind(s.clone()),
+            serde_json::Value::String(s) => query.bind(s.as_str()),
             serde_json::Value::Number(n) if n.is_i64() => query.bind(n.as_i64().unwrap()),
             serde_json::Value::Number(n) if n.is_f64() => query.bind(n.as_f64().unwrap()),
             serde_json::Value::Bool(b) => query.bind(*b),
@@ -57,28 +57,27 @@ impl MySQLDestination {
         }
     }
 
-    fn build_where_clause(
+    fn build_where_clause_for_update<'a>(
         &self,
-        old_data: &Option<HashMap<String, serde_json::Value>>,
-        new_data: &Option<&HashMap<String, serde_json::Value>>, // only used for UPDATE
+        old_data: &'a Option<HashMap<String, serde_json::Value>>,
+        new_data: &'a HashMap<String, serde_json::Value>,
         replica_identity: &crate::types::ReplicaIdentity,
         key_columns: &[String],
         schema: &str,
         table: &str,
-        op: Operation,
-    ) -> Result<WhereClause> {
+    ) -> Result<WhereClause<'a>> {
         use crate::types::ReplicaIdentity;
 
         match replica_identity {
             ReplicaIdentity::Full => {
                 // Always require old_data
                 if let Some(old) = old_data {
-                    let mut conditions = Vec::new();
-                    let mut bind_values = Vec::new();
+                    let mut conditions = Vec::with_capacity(old.len());
+                    let mut bind_values = Vec::with_capacity(old.len());
 
                     for (column, value) in old {
                         conditions.push(format!("`{}` = ?", column));
-                        bind_values.push(value.clone());
+                        bind_values.push(value);
                     }
 
                     Ok(WhereClause {
@@ -87,8 +86,8 @@ impl MySQLDestination {
                     })
                 } else {
                     Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during {}",
-                        schema, table, op.name()
+                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during UPDATE",
+                        schema, table
                     )))
                 }
             }
@@ -96,37 +95,28 @@ impl MySQLDestination {
             ReplicaIdentity::Default | ReplicaIdentity::Index => {
                 if key_columns.is_empty() {
                     return Err(CdcError::generic(format!(
-                        "No key columns available for {} operation on {}.{}. Check table's replica identity setting.",
-                        op.name(), schema, table
+                        "No key columns available for UPDATE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
                     )));
                 }
 
-                let mut conditions = Vec::new();
-                let mut bind_values = Vec::new();
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
 
-                let data_source = match old_data {
+                // Use old_data if available, otherwise use new_data
+                let data_source: &HashMap<String, serde_json::Value> = match old_data {
                     Some(old) => old,
-                    None => new_data.ok_or_else(|| {
-                        CdcError::generic(format!(
-                            "No data available to build WHERE clause for {} on {}.{}",
-                            op.name(),
-                            schema,
-                            table
-                        ))
-                    })?,
+                    None => new_data,
                 };
 
                 for key_column in key_columns {
                     if let Some(value) = data_source.get(key_column) {
                         conditions.push(format!("`{}` = ?", key_column));
-                        bind_values.push(value.clone());
+                        bind_values.push(value);
                     } else {
                         return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for {} on {}.{}",
-                            key_column,
-                            op.name(),
-                            schema,
-                            table
+                            "Key column '{}' not found in data for UPDATE on {}.{}",
+                            key_column, schema, table
                         )));
                     }
                 }
@@ -137,90 +127,106 @@ impl MySQLDestination {
                 })
             }
 
-            ReplicaIdentity::Nothing => match op {
-                Operation::Update => {
-                    if key_columns.is_empty() {
-                        return Err(CdcError::generic(format!(
-                            "Cannot perform UPDATE on {}.{} with REPLICA IDENTITY NOTHING and no key columns.",
-                            schema, table
-                        )));
-                    }
-
-                    let mut conditions = Vec::new();
-                    let mut bind_values = Vec::new();
-
-                    if let Some(new_data) = new_data {
-                        for key_column in key_columns {
-                            if let Some(value) = new_data.get(key_column) {
-                                conditions.push(format!("`{}` = ?", key_column));
-                                bind_values.push(value.clone());
-                            }
-                        }
-                    }
-
-                    if conditions.is_empty() {
-                        return Err(CdcError::generic(format!(
-                            "No usable key columns found for UPDATE on {}.{} with REPLICA IDENTITY NOTHING",
-                            schema, table
-                        )));
-                    }
-
-                    debug!(
-                        "WARNING: Using potentially unreliable WHERE clause for UPDATE on {}.{} due to REPLICA IDENTITY NOTHING",
+            ReplicaIdentity::Nothing => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "Cannot perform UPDATE on {}.{} with REPLICA IDENTITY NOTHING and no key columns.",
                         schema, table
-                    );
-
-                    Ok(WhereClause {
-                        sql: conditions.join(" AND "),
-                        bind_values,
-                    })
+                    )));
                 }
-                Operation::Delete => Err(CdcError::generic(format!(
-                    "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
-                    DELETE requires a replica identity.",
+
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
+
+                for key_column in key_columns {
+                    if let Some(value) = new_data.get(key_column) {
+                        conditions.push(format!("`{}` = ?", key_column));
+                        bind_values.push(value);
+                    }
+                }
+
+                if conditions.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No usable key columns found for UPDATE on {}.{} with REPLICA IDENTITY NOTHING",
+                        schema, table
+                    )));
+                }
+
+                debug!(
+                    "WARNING: Using potentially unreliable WHERE clause for UPDATE on {}.{} due to REPLICA IDENTITY NOTHING",
                     schema, table
-                ))),
-            },
+                );
+
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
+            }
         }
     }
 
-    fn build_where_clause_for_update(
+    fn build_where_clause_for_delete<'a>(
         &self,
-        old_data: &Option<HashMap<String, serde_json::Value>>,
-        new_data: &HashMap<String, serde_json::Value>,
+        old_data: &'a HashMap<String, serde_json::Value>,
         replica_identity: &crate::types::ReplicaIdentity,
         key_columns: &[String],
         schema: &str,
         table: &str,
-    ) -> Result<WhereClause> {
-        self.build_where_clause(
-            old_data,
-            &Some(new_data),
-            replica_identity,
-            key_columns,
-            schema,
-            table,
-            Operation::Update,
-        )
-    }
+    ) -> Result<WhereClause<'a>> {
+        use crate::types::ReplicaIdentity;
 
-    fn build_where_clause_for_delete(
-        &self,
-        old_data: &HashMap<String, serde_json::Value>,
-        replica_identity: &crate::types::ReplicaIdentity,
-        key_columns: &[String],
-        schema: &str,
-        table: &str,
-    ) -> Result<WhereClause> {
-        self.build_where_clause(
-            &Some(old_data.clone()),
-            &None,
-            replica_identity,
-            key_columns,
-            schema,
-            table,
-            Operation::Delete,
-        )
+        // For DELETE, old_data is always provided, handle each replica identity case directly
+        match replica_identity {
+            ReplicaIdentity::Full => {
+                let mut conditions = Vec::with_capacity(old_data.len());
+                let mut bind_values = Vec::with_capacity(old_data.len());
+
+                for (column, value) in old_data {
+                    conditions.push(format!("`{}` = ?", column));
+                    bind_values.push(value);
+                }
+
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
+            }
+
+            ReplicaIdentity::Default | ReplicaIdentity::Index => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No key columns available for DELETE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
+                    )));
+                }
+
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                let mut bind_values = Vec::with_capacity(key_columns.len());
+
+                for key_column in key_columns {
+                    if let Some(value) = old_data.get(key_column) {
+                        conditions.push(format!("`{}` = ?", key_column));
+                        bind_values.push(value);
+                    } else {
+                        return Err(CdcError::generic(format!(
+                            "Key column '{}' not found in data for DELETE on {}.{}",
+                            key_column, schema, table
+                        )));
+                    }
+                }
+
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
+            }
+
+            ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
+                "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
+                DELETE requires a replica identity.",
+                schema, table
+            ))),
+        }
     }
 }
 
@@ -325,7 +331,7 @@ impl DestinationHandler for MySQLDestination {
 
                 // Bind WHERE clause values
                 for value in where_clause.bind_values {
-                    query = self.bind_value(query, &value);
+                    query = self.bind_value(query, value);
                 }
 
                 query.execute(pool).await?;
@@ -357,7 +363,7 @@ impl DestinationHandler for MySQLDestination {
 
                 // Bind WHERE clause values
                 for value in where_clause.bind_values {
-                    query = self.bind_value(query, &value);
+                    query = self.bind_value(query, value);
                 }
 
                 query.execute(pool).await?;

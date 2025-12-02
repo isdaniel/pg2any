@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "pg2any_lib"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "bytes",

@@ -608,7 +608,7 @@ impl Drop for PgResult {
 }
 
 pub struct ReplicationStream {
-    logical_stream: LogicalReplicationStream
+    logical_stream: LogicalReplicationStream,
 }
 
 impl ReplicationStream {
@@ -617,9 +617,7 @@ impl ReplicationStream {
         let logical_stream =
             LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
 
-        Ok(Self {
-            logical_stream,
-        })
+        Ok(Self { logical_stream })
     }
 
     pub async fn start(&mut self, start_lsn: Option<Lsn>) -> Result<()> {

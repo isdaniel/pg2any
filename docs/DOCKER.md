@@ -1,8 +1,8 @@
-# 🐳 PostgreSQL to Any Database (pg2any) Docker Setup
+# PostgreSQL to Any Database (pg2any) Docker Setup
 
 This directory contains a comprehensive Docker containerization setup for the PostgreSQL to Any database replication tool (pg2any) with complete monitoring infrastructure. The setup includes PostgreSQL as the source database, MySQL as the destination database, and a full observability stack with Prometheus, and multiple exporters for production monitoring.
 
-## 🏗️ Current Architecture
+## Current Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
@@ -30,7 +30,7 @@ This directory contains a comprehensive Docker containerization setup for the Po
 
 **Status**: Production-ready CDC implementation with enterprise monitoring and observability stack.
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Docker 20.10+
@@ -70,7 +70,7 @@ open http://localhost:8080/metrics  # Application metrics endpoint
 docker-compose up --build -d cdc_app
 ```
 
-## 📊 Services
+## Services
 
 ### PostgreSQL (Source Database)
 - **Port**: 5432
@@ -118,7 +118,7 @@ docker-compose up --build -d cdc_app
 - **phpMyAdmin**: Can be added to docker-compose.yml if needed
 - **Direct Access**: Use `make psql` and `make mysql` commands
 
-## 📊 Monitoring & Observability
+## Monitoring & Observability
 
 ### Metrics Collection
 The application provides comprehensive metrics through multiple channels:
@@ -162,11 +162,11 @@ Predefined alerts in `monitoring/prometheus-rules/cdc-alerts.yml`:
 - Low processing rates (<0.01 events/second)
 - Queue depth issues and memory usage
 
-## 📋 Current Implementation Status
+## Current Implementation Status
 
 This Docker setup provides a **production-ready CDC replication system** with comprehensive monitoring:
 
-### ✅ Production-Ready Components
+### Production-Ready Components
 - **Complete CDC Pipeline**: PostgreSQL logical replication with real change streaming
 - **Multi-Database Environment**: PostgreSQL source + MySQL destination with health checks
 - **Monitoring Infrastructure**: Prometheus and multiple exporters for observability
@@ -178,21 +178,21 @@ This Docker setup provides a **production-ready CDC replication system** with co
 - **Container Orchestration**: Production-ready Docker compose with dependencies
 - **Build System**: Multi-stage Docker builds with optimization
 
-### ✅ Monitoring & Observability
+### Monitoring & Observability
 - **Prometheus Integration**: Complete metrics collection and alerting
 - **Performance Tracking**: Event processing rates, lag monitoring, error analysis
 - **Resource Monitoring**: Memory usage, network I/O, connection pooling
 - **Database Metrics**: PostgreSQL and MySQL performance monitoring
 - **System Metrics**: Host-level resource utilization
 
-### 🎯 Production Features
+### Production Features
 - **High Availability**: Health checks, restart policies, graceful shutdown
 - **Scalability**: Configurable connection pools, queue management
 - **Reliability**: Error handling, retry logic, LSN persistence
 - **Security**: Database isolation, credential management
 - **Performance**: Optimized Docker builds, resource allocation
 
-## 🎛️ Configuration
+## Configuration
 
 Configuration uses environment variables, with defaults for the Docker setup:
 
@@ -232,7 +232,7 @@ RUST_BACKTRACE=1                        # Enable backtraces for debugging
 METRICS_PORT=8080                       # HTTP metrics server port
 ```
 
-## 🔧 Development Commands
+## Development Commands
 
 ### Using Make (Recommended)
 ```bash
@@ -277,7 +277,7 @@ docker-compose exec mysql mysql -u cdc_user -ptest.123 cdc_db
 docker-compose down -v  # Remove containers and volumes
 ```
 
-## 🧪 Testing the Development Environment
+## Testing the Development Environment
 
 ### 1. Start the Environment
 ```bash
@@ -347,7 +347,7 @@ cargo run          # Test changes
 make docker-logs   # Database logs only
 ```
 
-## 🔍 Monitoring and Debugging
+## Monitoring and Debugging
 
 ### View Logs
 ```bash
@@ -465,7 +465,7 @@ docker stats
 docker-compose logs -t pg2any_app
 ```
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -523,7 +523,7 @@ cargo --version
 netstat -ln | grep -E ':(5432|3306|8080|9090|3000)'
 ```
 
-## 📁 File Structure
+## File Structure
 
 ```
 cdc_rs/
@@ -551,7 +551,7 @@ cdc_rs/
 **init_postgres.sql**: Sample tables (users, orders, order_items) with UUID support
 **init_mysql.sql**: Destination database setup with CDC metadata tables
 
-## 🔒 Security Considerations
+## Security Considerations
 
 ### Development Environment
 - **Passwords**: Uses simple passwords (`test.123`) for development convenience
@@ -567,7 +567,7 @@ cdc_rs/
 - **User Permissions**: Follow principle of least privilege for database users
 - **Monitoring**: Implement comprehensive security monitoring and alerting
 
-## 🚀 Production Deployment Considerations
+## Production Deployment Considerations
 
 ### Container Deployment  
 ```bash
@@ -612,7 +612,7 @@ docker run -d \
    - Resource allocation (CPU, memory, storage)
    - Network optimization for high throughput
 
-## 📝 Environment Variables Reference
+## Environment Variables Reference
 
 ### PostgreSQL Source Database
 | Variable | Default | Description |
@@ -658,7 +658,7 @@ docker run -d \
 - **PostgreSQL Exporter**: Host port `9187` → Container port `9187`
 - **MySQL Exporter**: Host port `9104` → Container port `9104`
 
-## 🎯 Next Steps for Development
+## Next Steps for Development
 
 ### 1. Core Implementation
 - **PostgreSQL Protocol**: Implement logical replication message parsing in `pg2any-lib/src/replication.rs`

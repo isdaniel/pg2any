@@ -12,7 +12,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 **Current Status**: Production-ready CDC tool with complete PostgreSQL logical replication protocol implementation, and real-time change streaming capabilities with graceful shutdown and LSN persistence.
 
 ### What's Implemented
-- **Complete Rust Workspace**: Multi-crate project with `pg2any` binary and `pg2any-lib` library
+
 - **Production-Ready Architecture**: Async/await with Tokio, structured error handling, graceful shutdown
 - **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
 - **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
@@ -23,16 +23,6 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - **Development Tooling**: Makefile automation, formatting, linting, and quality checks
 - **Production Logging**: Structured tracing with configurable levels and filtering
-
-### Production-Ready Features
-- **Monitoring & Observability**: Complete Prometheus metrics collection and alerting systems
-- **Production Logging**: Structured tracing with configurable levels and HTTP metrics endpoint
-- **Health Monitoring**: Database connection monitoring, replication lag tracking, and error rate alerts
-
-### What Needs Enhancement
-- **Additional Destinations**: Oracle, ClickHouse, Elasticsearch support
-- **Multi-table Replication**: Table filtering, routing, and transformation pipelines
-- **Performance Optimization**: High-throughput benchmarking and memory optimization
 
 ## Features
 
@@ -128,16 +118,6 @@ pub fn init_logging() {
 ```
 
 ## Architecture
-
-### Core Components
-
-1. **CdcClient**: Main orchestrator managing the entire CDC pipeline
-2. **Config/ConfigBuilder**: Comprehensive configuration management with environment variable support
-3. **LogicalReplicationStream**: PostgreSQL logical replication lifecycle and protocol implementation
-4. **LogicalReplicationParser**: Complete PostgreSQL replication protocol message parsing
-5. **DestinationHandler**: Production-ready database destination handling (MySQL, SQL Server, SQLite)
-6. **Error Types**: Comprehensive error handling with `CdcError` and proper error propagation
-7. **Buffer Operations**: Efficient binary protocol handling with zero-copy optimizations
 
 ### Data Flow Architecture
 
@@ -248,46 +228,9 @@ pub enum EventType {
 }
 ```
 
-## Error Handling
-
-The library provides comprehensive error types using `thiserror`:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum CdcError {
-    #[error("PostgreSQL connection error: {0}")]
-    Connection(#[from] tokio_postgres::Error),
-    
-    #[error("MySQL destination error: {0}")]
-    MySQL(String),
-    
-    #[error("SQL Server destination error: {0}")]
-    SqlServer(String),
-    
-    #[error("Configuration error: {0}")]
-    Configuration(String),
-    
-    #[error("Protocol parsing error: {0}")]
-    Protocol(String),
-    
-    #[error("Generic CDC error: {0}")]
-    Generic(String),
-}
-```
-
 ## Configuration
 
 pg2any supports comprehensive configuration through environment variables or the `ConfigBuilder` pattern. All configuration can be managed through environment variables for containerized deployments or programmatically using the builder pattern.
-
-### Key Configuration Approach
-
- pg2any uses `CDC_DEST_URI` as the primary method for destination database configuration. This uses standard database connection string formats instead of separate host, port, user, and password variables, making configuration simpler and more portable.
-
-```bash
-# Primary configuration method (recommended)
-CDC_DEST_TYPE=MySQL
-CDC_DEST_URI=mysql://user:password@host:port/database
-```
 
 ### Environment Variables Mapping Table
 
@@ -313,6 +256,16 @@ CDC_DEST_URI=mysql://user:password@host:port/database
 | **System** | | | | | |
 | | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
+
+### Key Configuration Approach
+
+ pg2any uses `CDC_DEST_URI` as the primary method for destination database configuration. This uses standard database connection string formats instead of separate host, port, user, and password variables, making configuration simpler and more portable.
+
+```bash
+# Primary configuration method (recommended)
+CDC_DEST_TYPE=MySQL
+CDC_DEST_URI=mysql://user:password@host:port/database
+```
 
 ### Destination Database Environment Configuration
 
@@ -410,7 +363,6 @@ CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
 ```
 
 **Note:** Schema mapping is primarily useful for MySQL and SQL Server destinations. SQLite doesn't use schema namespacing, so mappings are ignored for SQLite destinations.
-
 
 ### Programmatic Configuration
 
@@ -591,58 +543,6 @@ cargo build --no-default-features --features mysql,sqlserver,sqlite
 cargo test --features metrics
 ```
 
-### Library Usage
-
-When using pg2any as a library, you can selectively enable features:
-
-```toml
-[dependencies]
-pg2any_lib = "0.2.0"
-
-[dependencies]
-pg2any_lib = { version = "0.2.0", default-features = false, features = ["mysql"] }
-
-[dependencies]
-pg2any_lib = { version = "0.2.0", features = ["metrics", "mysql", "sqlite"] }
-```
-
-**Simple usage (metrics abstracted away):**
-```rust
-use pg2any_lib::{load_config_from_env, CdcApp, init_metrics};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize metrics (no-op when disabled)
-    init_metrics()?;
-    
-    let config = load_config_from_env()?;
-    let mut app = CdcApp::new(config).await?;
-    app.run(None).await?;
-    Ok(())
-}
-```
-
-**With metrics server (when metrics feature enabled):**
-```rust
-use pg2any_lib::{create_metrics_server, MetricsServerConfig, load_config_from_env, CdcApp};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config_from_env()?;
-    let mut app = CdcApp::new(config).await?;
-    
-    // Conditionally start metrics server
-    #[cfg(feature = "metrics")]
-    let _server = {
-        let server = create_metrics_server(8080);
-        tokio::spawn(async move { server.start().await })
-    };
-    
-    app.run(None).await?;
-    Ok(())
-}
-```
-
 ## Example Application Output
 
 When you run the application, you'll see structured logging output like this:
@@ -738,14 +638,6 @@ make show-data          # Verify replication worked
 
 set -a; source env/.env_local; set +a
 ```
-
-### Contribution Guidelines
-
-- **Code Quality**: Follow existing patterns, use `make before-git-push`
-- **Testing**: Add tests for new functionality
-- **Documentation**: Update README and inline docs
-- **Error Handling**: Use the established `CdcError` pattern
-- **Performance**: Consider async patterns and resource usage
 
 ---
 

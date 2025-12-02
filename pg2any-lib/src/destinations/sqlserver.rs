@@ -4,6 +4,7 @@ use crate::{
     types::{ChangeEvent, EventType},
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -11,12 +12,26 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
     client: Option<Client<Compat<TcpStream>>>,
+    /// Schema mappings: maps source schema to destination schema
+    schema_mappings: HashMap<String, String>,
 }
 
 impl SqlServerDestination {
     /// Create a new SQL Server destination instance
     pub fn new() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            schema_mappings: HashMap::new(),
+        }
+    }
+
+    /// Map a source schema to the destination schema
+    /// If no mapping exists, returns the original schema name
+    fn map_schema(&self, source_schema: &str) -> String {
+        self.schema_mappings
+            .get(source_schema)
+            .cloned()
+            .unwrap_or_else(|| source_schema.to_string())
     }
 }
 
@@ -43,26 +58,33 @@ impl DestinationHandler for SqlServerDestination {
         Ok(())
     }
 
+    fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
+        self.schema_mappings = mappings;
+    }
+
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
+        // Extract schema mappings before borrowing client
+        let dest_schema = match &event.event_type {
+            EventType::Insert { schema, .. }
+            | EventType::Update { schema, .. }
+            | EventType::Delete { schema, .. } => self.map_schema(schema),
+            _ => String::new(),
+        };
+
         let client = self
             .client
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
         match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => {
+            EventType::Insert { table, data, .. } => {
                 let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
                 let placeholders: Vec<String> =
                     (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
 
                 let sql = format!(
                     "INSERT INTO [{}].[{}] ({}) VALUES ({})",
-                    schema,
+                    dest_schema,
                     table,
                     columns.join(", "),
                     placeholders.join(", ")
@@ -80,8 +102,8 @@ impl DestinationHandler for SqlServerDestination {
                 }
 
                 let _sql_with_placeholders = format!(
-                    "INSERT INTO [{schema}].[{table}] ({columns}) VALUES ({values})",
-                    schema = schema,
+                    "INSERT INTO [{dest_schema}].[{table}] ({columns}) VALUES ({values})",
+                    dest_schema = dest_schema,
                     table = table,
                     columns = columns.join(", "),
                     values = value_holders.join(", ")
@@ -95,7 +117,6 @@ impl DestinationHandler for SqlServerDestination {
                     .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
             }
             EventType::Update {
-                schema,
                 table,
                 old_data,
                 new_data,
@@ -123,7 +144,7 @@ impl DestinationHandler for SqlServerDestination {
 
                 let sql = format!(
                     "UPDATE [{}].[{}] SET {} WHERE {}",
-                    schema,
+                    dest_schema,
                     table,
                     set_clauses.join(", "),
                     where_clause
@@ -137,17 +158,14 @@ impl DestinationHandler for SqlServerDestination {
                     .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
             }
             EventType::Delete {
-                schema,
-                table,
-                old_data,
-                ..
+                table, old_data, ..
             } => {
                 let where_clauses: Vec<String> =
                     old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
 
                 let sql = format!(
                     "DELETE FROM [{}].[{}] WHERE {}",
-                    schema,
+                    dest_schema,
                     table,
                     where_clauses.join(" AND ")
                 );

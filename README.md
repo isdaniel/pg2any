@@ -11,41 +11,43 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 **Current Status**: Production-ready CDC tool with complete PostgreSQL logical replication protocol implementation, and real-time change streaming capabilities with graceful shutdown and LSN persistence.
 
-### What's Implemented ✅
-- ✅ **Complete Rust Workspace**: Multi-crate project with `pg2any` binary and `pg2any-lib` library
-- ✅ **Production-Ready Architecture**: Async/await with Tokio, structured error handling, graceful shutdown
-- ✅ **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
-- ✅ **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
-- ✅ **Transaction Consistency**: BEGIN/COMMIT boundary handling with LSN persistence
-- ✅ **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with type mapping
-- ✅ **Configuration Management**: Environment variables and builder pattern with validation
-- ✅ **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
-- ✅ **Development Tooling**: Makefile automation, formatting, linting, and quality checks
-- ✅ **Production Logging**: Structured tracing with configurable levels and filtering
+### What's Implemented
+- **Complete Rust Workspace**: Multi-crate project with `pg2any` binary and `pg2any-lib` library
+- **Production-Ready Architecture**: Async/await with Tokio, structured error handling, graceful shutdown
+- **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
+- **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
+- **Transaction Consistency**: BEGIN/COMMIT boundary handling with LSN persistence
+- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with type mapping
+- **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
+- **Configuration Management**: Environment variables and builder pattern with validation
+- **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
+- **Development Tooling**: Makefile automation, formatting, linting, and quality checks
+- **Production Logging**: Structured tracing with configurable levels and filtering
 
-### Production-Ready Features ✅
-- ✅ **Monitoring & Observability**: Complete Prometheus metrics collection and alerting systems
-- ✅ **Production Logging**: Structured tracing with configurable levels and HTTP metrics endpoint
-- ✅ **Health Monitoring**: Database connection monitoring, replication lag tracking, and error rate alerts
+### Production-Ready Features
+- **Monitoring & Observability**: Complete Prometheus metrics collection and alerting systems
+- **Production Logging**: Structured tracing with configurable levels and HTTP metrics endpoint
+- **Health Monitoring**: Database connection monitoring, replication lag tracking, and error rate alerts
 
-### What Needs Enhancement 🚧
-- 🚧 **Additional Destinations**: Oracle, ClickHouse, Elasticsearch support
-- 🚧 **Multi-table Replication**: Table filtering, routing, and transformation pipelines
-- 🚧 **Performance Optimization**: High-throughput benchmarking and memory optimization
+### What Needs Enhancement
+- **Additional Destinations**: Oracle, ClickHouse, Elasticsearch support
+- **Multi-table Replication**: Table filtering, routing, and transformation pipelines
+- **Performance Optimization**: High-throughput benchmarking and memory optimization
 
 ## Features
 
-- ✅ **Async Runtime**: High-performance async/await with Tokio and proper cancellation
-- ✅ **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
-- ✅ **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
-- ✅ **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
-- ✅ **Configuration**: Environment variables, builder pattern, and validation
-- ✅ **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
-- ✅ **Real-time Streaming**: Live change capture for all DML operations
-- ✅ **Production Ready**: Structured logging, graceful shutdown, and resource management
-- ✅ **Monitoring & Metrics**: Comprehensive Prometheus metrics, and health monitoring
-- ✅ **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
-- ✅ **Development Tools**: Docker environment, Makefile automation, extensive testing
+- **Async Runtime**: High-performance async/await with Tokio and proper cancellation
+- **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
+- **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
+- **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
+- **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
+- **Configuration**: Environment variables, builder pattern, and validation
+- **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
+- **Real-time Streaming**: Live change capture for all DML operations
+- **Production Ready**: Structured logging, graceful shutdown, and resource management
+- **Monitoring & Metrics**: Comprehensive Prometheus metrics, and health monitoring
+- **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
+- **Development Tools**: Docker environment, Makefile automation, extensive testing
 
 ### PostgreSQL Setup
 
@@ -302,6 +304,8 @@ CDC_DEST_URI=mysql://user:password@host:port/database
 | | `CDC_PROTOCOL_VERSION` | Replication protocol version | `1` | `1` | Integer value |
 | | `CDC_BINARY_FORMAT` | Use binary message format | `false` | `true` | Boolean |
 | | `CDC_STREAMING` | Enable streaming mode | `true` | `false` | Boolean |
+| **Schema Mapping** | | | | | |
+| | `CDC_SCHEMA_MAPPING` | Schema name translation for destination | | `public:cdc_db,myschema:mydb` | Maps PostgreSQL schemas to destination database names |
 | **Timeouts** | | | | | |
 | | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
@@ -328,6 +332,10 @@ CDC_DEST_URI=mysql://user:password@host:port/database
 CDC_DEST_URI=mysql://root:test.123@127.0.0.1:3306/mysql
 # Production environment  
 CDC_DEST_URI=mysql://cdc_user:secure_pass@mysql-prod.company.com:3306/replica_db
+
+# Schema Mapping (maps PostgreSQL schema to MySQL database)
+# Required when PostgreSQL uses "public" schema but MySQL uses a different database name
+CDC_SCHEMA_MAPPING=public:cdc_db
 
 # CDC Configuration
 CDC_REPLICATION_SLOT=cdc_slot
@@ -386,6 +394,22 @@ CDC_STREAMING=true
 | **MySQL** | `mysql://user:password@host:port/database` | `mysql://root:pass123@localhost:3306/mydb` |
 | **SQL Server** | `sqlserver://user:password@host:port/database` | `sqlserver://sa:pass123@localhost:1433/master` |
 | **SQLite** | `./path/to/file.db` or `/absolute/path/file.db` | `./replica.db` or `/data/replica.db` |
+
+### Schema Mapping Configuration
+
+PostgreSQL uses schemas (e.g., `public`) to organize tables, while MySQL uses databases. When replicating from PostgreSQL to MySQL, you may need to map PostgreSQL schema names to MySQL database names to avoid errors like `Table 'public.t1' doesn't exist`.
+
+The `CDC_SCHEMA_MAPPING` environment variable allows you to configure these mappings:
+
+```bash
+# Format: source_schema:dest_database,source_schema2:dest_database2
+CDC_SCHEMA_MAPPING=public:cdc_db
+
+# Multiple mappings
+CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
+```
+
+**Note:** Schema mapping is primarily useful for MySQL and SQL Server destinations. SQLite doesn't use schema namespacing, so mappings are ignored for SQLite destinations.
 
 
 ### Programmatic Configuration
@@ -624,19 +648,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 When you run the application, you'll see structured logging output like this:
 
 ```
-2025-08-15T10:30:00.123Z INFO  pg2any: 🚀 Starting PostgreSQL CDC Application
-2025-08-15T10:30:00.124Z INFO  pg2any: 📋 Loading configuration from environment variables
-2025-08-15T10:30:00.125Z INFO  pg2any: 🔗 Configuration loaded successfully
-2025-08-15T10:30:00.126Z INFO  pg2any: ⚙️  Initializing CDC client
-2025-08-15T10:30:00.127Z INFO  pg2any: 🔧 Performing CDC client initialization
-2025-08-15T10:30:00.128Z INFO  pg2any: ✅ CDC client initialized successfully
-2025-08-15T10:30:00.129Z INFO  pg2any: 🔄 Starting CDC replication pipeline
+2025-08-15T10:30:00.123Z INFO  pg2any: Starting PostgreSQL CDC Application
+2025-08-15T10:30:00.124Z INFO  pg2any: Loading configuration from environment variables
+2025-08-15T10:30:00.125Z INFO  pg2any: Configuration loaded successfully
+2025-08-15T10:30:00.126Z INFO  pg2any: Initializing CDC client
+2025-08-15T10:30:00.127Z INFO  pg2any: Performing CDC client initialization
+2025-08-15T10:30:00.128Z INFO  pg2any: CDC client initialized successfully
+2025-08-15T10:30:00.129Z INFO  pg2any: Starting CDC replication pipeline
 2025-08-15T10:30:00.130Z DEBUG pg2any_lib::logical_stream: Creating logical replication stream
 2025-08-15T10:30:00.131Z DEBUG pg2any_lib::pg_replication: Connected to PostgreSQL server version: 150000
 2025-08-15T10:30:00.132Z INFO  pg2any_lib::client: Processing BEGIN transaction (LSN: 0/1A2B3C4D)
 2025-08-15T10:30:00.133Z INFO  pg2any_lib::client: Processing INSERT event on table 'users'
 2025-08-15T10:30:00.134Z INFO  pg2any_lib::client: Processing COMMIT transaction (LSN: 0/1A2B3C5E)
-2025-08-15T10:30:00.135Z INFO  pg2any: ✨ CDC replication running! Real-time change streaming active
+2025-08-15T10:30:00.135Z INFO  pg2any: CDC replication running! Real-time change streaming active
 ```
 
 **Note**: This shows the production-ready application with real PostgreSQL logical replication, integrated metrics collection, LSN tracking, and comprehensive monitoring capabilities.
@@ -715,7 +739,7 @@ make show-data          # Verify replication worked
 set -a; source env/.env_local; set +a
 ```
 
-### 📋 Contribution Guidelines
+### Contribution Guidelines
 
 - **Code Quality**: Follow existing patterns, use `make before-git-push`
 - **Testing**: Add tests for new functionality

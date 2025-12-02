@@ -3,6 +3,7 @@ use crate::{
     types::{ChangeEvent, DestinationType},
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 // Import destination implementations
 #[cfg(feature = "mysql")]
@@ -19,6 +20,10 @@ use super::sqlite::SQLiteDestination;
 pub trait DestinationHandler: Send + Sync {
     /// Initialize the destination connection
     async fn connect(&mut self, connection_string: &str) -> Result<()>;
+
+    /// Set schema mappings for translating source schemas to destination schemas/databases
+    /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
+    fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
     /// Process a single change event
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()>;

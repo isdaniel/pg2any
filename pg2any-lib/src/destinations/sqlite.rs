@@ -409,6 +409,9 @@ impl DestinationHandler for SQLiteDestination {
         Ok(())
     }
 
+    // SQLite does not use schema/database namespacing like MySQL, so schema mappings are not needed - tables are referenced by name only
+    fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
+
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
         let pool = self
             .pool
@@ -416,18 +419,12 @@ impl DestinationHandler for SQLiteDestination {
             .ok_or_else(|| CdcError::generic("SQLite connection not established"))?;
 
         match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => {
+            EventType::Insert { table, data, .. } => {
                 self.execute_insert(pool, table, data).await?;
                 debug!("Successfully inserted record into {}", table);
             }
 
             EventType::Update {
-                schema,
                 table,
                 old_data,
                 new_data,
@@ -449,7 +446,6 @@ impl DestinationHandler for SQLiteDestination {
             }
 
             EventType::Delete {
-                schema,
                 table,
                 old_data,
                 replica_identity,

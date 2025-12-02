@@ -12,6 +12,9 @@ use tracing::debug;
 /// MySQL destination implementation
 pub struct MySQLDestination {
     pool: Option<MySqlPool>,
+    /// Schema mappings: maps source schema to destination database
+    /// e.g., "public" -> "cdc_db"
+    schema_mappings: HashMap<String, String>,
 }
 
 /// Helper struct for building WHERE clauses with proper parameter binding
@@ -24,7 +27,19 @@ struct WhereClause {
 impl MySQLDestination {
     /// Create a new MySQL destination instance
     pub fn new() -> Self {
-        Self { pool: None }
+        Self {
+            pool: None,
+            schema_mappings: HashMap::new(),
+        }
+    }
+
+    /// Map a source schema to the destination schema/database
+    /// If no mapping exists, returns the original schema name
+    fn map_schema(&self, source_schema: &str) -> String {
+        self.schema_mappings
+            .get(source_schema)
+            .cloned()
+            .unwrap_or_else(|| source_schema.to_string())
     }
 
     fn bind_value<'a>(
@@ -217,6 +232,16 @@ impl DestinationHandler for MySQLDestination {
         Ok(())
     }
 
+    fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
+        self.schema_mappings = mappings;
+        if !self.schema_mappings.is_empty() {
+            debug!(
+                "MySQL destination schema mappings set: {:?}",
+                self.schema_mappings
+            );
+        }
+    }
+
     async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
         let pool = self
             .pool
@@ -230,13 +255,14 @@ impl DestinationHandler for MySQLDestination {
                 data,
                 ..
             } => {
+                let dest_schema = self.map_schema(schema);
                 let columns: Vec<String> = data.keys().map(|k| format!("`{}`", k)).collect();
                 let placeholders: Vec<String> =
                     (0..columns.len()).map(|_| "?".to_string()).collect();
 
                 let sql = format!(
                     "INSERT INTO `{}`.`{}` ({}) VALUES ({})",
-                    schema,
+                    dest_schema,
                     table,
                     columns.join(", "),
                     placeholders.join(", ")
@@ -268,6 +294,7 @@ impl DestinationHandler for MySQLDestination {
                 key_columns,
                 ..
             } => {
+                let dest_schema = self.map_schema(schema);
                 let set_clauses: Vec<String> =
                     new_data.keys().map(|k| format!("`{}` = ?", k)).collect();
 
@@ -283,7 +310,7 @@ impl DestinationHandler for MySQLDestination {
 
                 let sql = format!(
                     "UPDATE `{}`.`{}` SET {} WHERE {}",
-                    schema,
+                    dest_schema,
                     table,
                     set_clauses.join(", "),
                     where_clause.sql
@@ -311,6 +338,7 @@ impl DestinationHandler for MySQLDestination {
                 key_columns,
                 ..
             } => {
+                let dest_schema = self.map_schema(schema);
                 // Build WHERE clause using proper key identification strategy
                 let where_clause = self.build_where_clause_for_delete(
                     old_data,
@@ -322,7 +350,7 @@ impl DestinationHandler for MySQLDestination {
 
                 let sql = format!(
                     "DELETE FROM `{}`.`{}` WHERE {}",
-                    schema, table, where_clause.sql
+                    dest_schema, table, where_clause.sql
                 );
 
                 let mut query = sqlx::query(&sql);
@@ -341,7 +369,8 @@ impl DestinationHandler for MySQLDestination {
                         let mut parts = table_full_name.splitn(2, '.');
                         match (parts.next(), parts.next()) {
                             (Some(schema), Some(table)) => {
-                                format!("TRUNCATE TABLE `{}`.`{}`", schema, table)
+                                let dest_schema = self.map_schema(schema);
+                                format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
                             }
                             _ => format!("TRUNCATE TABLE `{}`", table_full_name),
                         }

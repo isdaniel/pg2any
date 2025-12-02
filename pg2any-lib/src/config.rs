@@ -72,6 +72,10 @@ pub struct Config {
     /// Table mapping for transformation between source and destination
     pub table_mappings: HashMap<String, TableMapping>,
 
+    /// Schema mapping from PostgreSQL schema to destination database/schema
+    /// Maps source schema (e.g., "public") to destination schema/database (e.g., "cdc_db")
+    pub schema_mappings: HashMap<String, String>,
+
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
 }
@@ -169,6 +173,7 @@ impl Default for Config {
             retry_jitter: true,
             buffer_size: 1000,
             table_mappings: HashMap::new(),
+            schema_mappings: HashMap::new(),
             extra_options: HashMap::new(),
         }
     }
@@ -319,6 +324,24 @@ impl ConfigBuilder {
         self.config
             .table_mappings
             .insert(table_name.into(), mapping);
+        self
+    }
+
+    /// Add a schema mapping (maps source schema to destination schema/database)
+    pub fn schema_mapping<S1, S2>(mut self, source_schema: S1, destination_schema: S2) -> Self
+    where
+        S1: Into<String>,
+        S2: Into<String>,
+    {
+        self.config
+            .schema_mappings
+            .insert(source_schema.into(), destination_schema.into());
+        self
+    }
+
+    /// Set all schema mappings at once
+    pub fn schema_mappings(mut self, mappings: HashMap<String, String>) -> Self {
+        self.config.schema_mappings = mappings;
         self
     }
 

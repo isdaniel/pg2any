@@ -4,6 +4,7 @@
 //! and setup various aspects of the CDC application.
 
 use crate::{CdcError, Config, DestinationType};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Load configuration from environment variables
@@ -24,6 +25,10 @@ use std::time::Duration;
 /// - `CDC_DEST_DB`: Destination database name (default: "cdc_target") - For SQLite, this is the database file path
 /// - `CDC_DEST_USER`: Destination username (default: "cdc_user") - Not used for SQLite
 /// - `CDC_DEST_PASSWORD`: Destination password (default: "cdc_password") - Not used for SQLite
+///
+/// ## Schema Mapping Configuration
+/// - `CDC_SCHEMA_MAPPING`: Comma-separated list of schema mappings in format "source:dest"
+///   Example: "public:cdc_db,myschema:mydb" maps PostgreSQL "public" schema to MySQL "cdc_db" database
 ///
 /// ## CDC Configuration
 /// - `CDC_REPLICATION_SLOT`: Replication slot name (default: "cdc_slot")
@@ -66,6 +71,12 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let destination_connection_string = std::env::var("CDC_DEST_URI").expect(
         "CDC_DEST_URI environment variable is required. Example for MySQL mysql://replicator:pass.123@127.0.0.1:3306/publif or ./cdc_target.db for SQLite ..etc",
     );
+
+    // Schema mapping configuration
+    let schema_mappings = parse_schema_mapping_env("CDC_SCHEMA_MAPPING")?;
+    if !schema_mappings.is_empty() {
+        tracing::info!("Schema mappings configured: {:?}", schema_mappings);
+    }
 
     // CDC-specific configuration
     let replication_slot =
@@ -110,6 +121,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
+        .schema_mappings(schema_mappings)
         .buffer_size(500)
         .build()?;
 
@@ -118,6 +130,41 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
 }
 
 // Helper functions for parsing environment variables
+
+/// Parse schema mapping environment variable
+/// Format: "source_schema:dest_schema,source_schema2:dest_schema2"
+/// Example: "public:cdc_db,myschema:mydb"
+fn parse_schema_mapping_env(key: &str) -> Result<HashMap<String, String>, CdcError> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => {
+            let mut mappings = HashMap::new();
+            for pair in value.split(',') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = pair.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(CdcError::config(format!(
+                        "Invalid schema mapping format '{}'. Expected 'source:dest' format.",
+                        pair
+                    )));
+                }
+                let source = parts[0].trim();
+                let dest = parts[1].trim();
+                if source.is_empty() || dest.is_empty() {
+                    return Err(CdcError::config(format!(
+                        "Invalid schema mapping '{}'. Both source and destination must be non-empty.",
+                        pair
+                    )));
+                }
+                mappings.insert(source.to_string(), dest.to_string());
+            }
+            Ok(mappings)
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
 
 /// Parse a boolean environment variable with a default value
 fn parse_bool_env(key: &str, default: bool) -> Result<bool, CdcError> {

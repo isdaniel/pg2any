@@ -60,6 +60,12 @@ impl CdcClient {
             handler
                 .connect(&self.config.destination_connection_string)
                 .await?;
+
+            // Set schema mappings if any are configured
+            if !self.config.schema_mappings.is_empty() {
+                handler.set_schema_mappings(self.config.schema_mappings.clone());
+                info!("Schema mappings applied: {:?}", self.config.schema_mappings);
+            }
         }
 
         info!("CDC client initialized successfully");
@@ -470,6 +476,10 @@ mod tests {
     impl DestinationHandler for MockDestinationHandler {
         async fn connect(&mut self, _connection_string: &str) -> Result<()> {
             Ok(())
+        }
+
+        fn set_schema_mappings(&mut self, _mappings: std::collections::HashMap<String, String>) {
+            // Mock implementation - no-op
         }
 
         async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {

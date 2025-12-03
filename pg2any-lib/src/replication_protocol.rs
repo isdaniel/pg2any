@@ -13,6 +13,7 @@ use tracing::debug;
 
 /// Message type constants for logical replication protocol
 pub mod message_types {
+    // Protocol version 1 messages
     pub const BEGIN: u8 = b'B';
     pub const COMMIT: u8 = b'C';
     pub const ORIGIN: u8 = b'O';
@@ -23,16 +24,26 @@ pub mod message_types {
     pub const DELETE: u8 = b'D';
     pub const TRUNCATE: u8 = b'T';
     pub const MESSAGE: u8 = b'M';
+
+    // Protocol version 2 messages (streaming)
     pub const STREAM_START: u8 = b'S';
     pub const STREAM_STOP: u8 = b'E';
     pub const STREAM_COMMIT: u8 = b'c';
     pub const STREAM_ABORT: u8 = b'A';
+
+    // Protocol version 3 messages (two-phase commit)
+    pub const BEGIN_PREPARE: u8 = b'b';
+    pub const PREPARE: u8 = b'P';
+    pub const COMMIT_PREPARED: u8 = b'K';
+    pub const ROLLBACK_PREPARED: u8 = b'r';
+    pub const STREAM_PREPARE: u8 = b'p';
 }
 
 /// PostgreSQL logical replication message types enum
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
+    // Protocol version 1
     Begin = message_types::BEGIN,
     Commit = message_types::COMMIT,
     Origin = message_types::ORIGIN,
@@ -43,10 +54,17 @@ pub enum MessageType {
     Delete = message_types::DELETE,
     Truncate = message_types::TRUNCATE,
     Message = message_types::MESSAGE,
+    // Protocol version 2 (streaming)
     StreamStart = message_types::STREAM_START,
     StreamStop = message_types::STREAM_STOP,
     StreamCommit = message_types::STREAM_COMMIT,
     StreamAbort = message_types::STREAM_ABORT,
+    // Protocol version 3 (two-phase commit)
+    BeginPrepare = message_types::BEGIN_PREPARE,
+    Prepare = message_types::PREPARE,
+    CommitPrepared = message_types::COMMIT_PREPARED,
+    RollbackPrepared = message_types::ROLLBACK_PREPARED,
+    StreamPrepare = message_types::STREAM_PREPARE,
 }
 
 /// Unified logical replication message enum
@@ -134,7 +152,66 @@ pub enum LogicalReplicationMessage {
     },
 
     /// Streaming transaction abort
-    StreamAbort { xid: Xid, subtransaction_xid: Xid },
+    /// In protocol version 4 with parallel streaming, includes abort_lsn and abort_timestamp
+    StreamAbort {
+        xid: Xid,
+        subtransaction_xid: Xid,
+        /// Abort LSN (only present in protocol v4 with parallel streaming)
+        abort_lsn: Option<XLogRecPtr>,
+        /// Abort timestamp (only present in protocol v4 with parallel streaming)
+        abort_timestamp: Option<TimestampTz>,
+    },
+
+    // Protocol version 3 messages (two-phase commit)
+    /// Begin prepare message (protocol v3+)
+    BeginPrepare {
+        prepare_lsn: XLogRecPtr,
+        end_lsn: XLogRecPtr,
+        timestamp: TimestampTz,
+        xid: Xid,
+        gid: String,
+    },
+
+    /// Prepare message (protocol v3+)
+    Prepare {
+        flags: u8,
+        prepare_lsn: XLogRecPtr,
+        end_lsn: XLogRecPtr,
+        timestamp: TimestampTz,
+        xid: Xid,
+        gid: String,
+    },
+
+    /// Commit prepared message (protocol v3+)
+    CommitPrepared {
+        flags: u8,
+        commit_lsn: XLogRecPtr,
+        end_lsn: XLogRecPtr,
+        timestamp: TimestampTz,
+        xid: Xid,
+        gid: String,
+    },
+
+    /// Rollback prepared message (protocol v3+)
+    RollbackPrepared {
+        flags: u8,
+        prepare_end_lsn: XLogRecPtr,
+        rollback_end_lsn: XLogRecPtr,
+        prepare_timestamp: TimestampTz,
+        rollback_timestamp: TimestampTz,
+        xid: Xid,
+        gid: String,
+    },
+
+    /// Stream prepare message (protocol v3+)
+    StreamPrepare {
+        flags: u8,
+        prepare_lsn: XLogRecPtr,
+        end_lsn: XLogRecPtr,
+        timestamp: TimestampTz,
+        xid: Xid,
+        gid: String,
+    },
 }
 
 /// Column information in a relation
@@ -236,6 +313,14 @@ impl ColumnData {
     }
 
     #[inline]
+    pub fn binary(data: Vec<u8>) -> Self {
+        Self {
+            data_type: 'b',
+            data,
+        }
+    }
+
+    #[inline]
     pub fn unchanged() -> Self {
         Self {
             data_type: 'u',
@@ -253,11 +338,22 @@ impl ColumnData {
         self.data_type == 'u'
     }
 
+    #[inline]
+    pub fn is_binary(&self) -> bool {
+        self.data_type == 'b'
+    }
+
+    #[inline]
+    pub fn is_text(&self) -> bool {
+        self.data_type == 't'
+    }
+
     /// Convert to string, returning a Cow to avoid allocation when possible
     /// If the data is valid UTF-8, returns a borrowed reference
+    /// Works for both text ('t') and binary ('b') format columns
     #[inline]
     pub fn as_str(&self) -> Option<Cow<'_, str>> {
-        if self.data_type == 't' && !self.data.is_empty() {
+        if (self.data_type == 't' || self.data_type == 'b') && !self.data.is_empty() {
             // Try to borrow first (zero-copy), fall back to lossy conversion
             match std::str::from_utf8(&self.data) {
                 Ok(s) => Some(Cow::Borrowed(s)),
@@ -482,6 +578,14 @@ impl LogicalReplicationParser {
             }
             message_types::STREAM_COMMIT => self.parse_stream_commit_message(&mut reader)?,
             message_types::STREAM_ABORT => self.parse_stream_abort_message(&mut reader)?,
+            // Protocol version 3 messages (two-phase commit)
+            message_types::BEGIN_PREPARE => self.parse_begin_prepare_message(&mut reader)?,
+            message_types::PREPARE => self.parse_prepare_message(&mut reader)?,
+            message_types::COMMIT_PREPARED => self.parse_commit_prepared_message(&mut reader)?,
+            message_types::ROLLBACK_PREPARED => {
+                self.parse_rollback_prepared_message(&mut reader)?
+            }
+            message_types::STREAM_PREPARE => self.parse_stream_prepare_message(&mut reader)?,
             _ => {
                 return Err(CdcError::protocol(format!(
                     "Unknown message type: {} ('{}')",
@@ -861,6 +965,7 @@ impl LogicalReplicationParser {
     }
 
     /// Parse STREAM ABORT message
+    /// In protocol version 4 with parallel streaming, includes abort_lsn and abort_timestamp
     fn parse_stream_abort_message(
         &mut self,
         reader: &mut BufferReader,
@@ -868,14 +973,186 @@ impl LogicalReplicationParser {
         let xid = reader.read_u32()?;
         let subtransaction_xid = reader.read_u32()?;
 
+        // Protocol version 4 with parallel streaming includes abort LSN and timestamp
+        let (abort_lsn, abort_timestamp) = if self.protocol_version >= 4 && reader.remaining() >= 16
+        {
+            let lsn = reader.read_u64()?;
+            let timestamp = reader.read_i64()?;
+            (Some(lsn), Some(timestamp))
+        } else {
+            (None, None)
+        };
+
         debug!(
-            "STREAM ABORT: xid={}, subtxn_xid={}",
-            xid, subtransaction_xid
+            "STREAM ABORT: xid={}, subtxn_xid={}, abort_lsn={:?}, abort_timestamp={:?}",
+            xid, subtransaction_xid, abort_lsn, abort_timestamp
         );
 
         Ok(LogicalReplicationMessage::StreamAbort {
             xid,
             subtransaction_xid,
+            abort_lsn,
+            abort_timestamp,
+        })
+    }
+
+    // Protocol version 3 parse methods (two-phase commit)
+
+    /// Parse BEGIN PREPARE message (protocol v3+)
+    fn parse_begin_prepare_message(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<LogicalReplicationMessage> {
+        let prepare_lsn = reader.read_u64()?;
+        let end_lsn = reader.read_u64()?;
+        let timestamp = reader.read_i64()?;
+        let xid = reader.read_u32()?;
+        let gid = reader.read_cstring()?;
+
+        debug!(
+            "BEGIN PREPARE: prepare_lsn={}, end_lsn={}, timestamp={}, xid={}, gid={}",
+            format_lsn(prepare_lsn),
+            format_lsn(end_lsn),
+            timestamp,
+            xid,
+            gid
+        );
+
+        Ok(LogicalReplicationMessage::BeginPrepare {
+            prepare_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        })
+    }
+
+    /// Parse PREPARE message (protocol v3+)
+    fn parse_prepare_message(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<LogicalReplicationMessage> {
+        let flags = reader.read_u8()?;
+        let prepare_lsn = reader.read_u64()?;
+        let end_lsn = reader.read_u64()?;
+        let timestamp = reader.read_i64()?;
+        let xid = reader.read_u32()?;
+        let gid = reader.read_cstring()?;
+
+        debug!(
+            "PREPARE: flags={}, prepare_lsn={}, end_lsn={}, timestamp={}, xid={}, gid={}",
+            flags,
+            format_lsn(prepare_lsn),
+            format_lsn(end_lsn),
+            timestamp,
+            xid,
+            gid
+        );
+
+        Ok(LogicalReplicationMessage::Prepare {
+            flags,
+            prepare_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        })
+    }
+
+    /// Parse COMMIT PREPARED message (protocol v3+)
+    fn parse_commit_prepared_message(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<LogicalReplicationMessage> {
+        let flags = reader.read_u8()?;
+        let commit_lsn = reader.read_u64()?;
+        let end_lsn = reader.read_u64()?;
+        let timestamp = reader.read_i64()?;
+        let xid = reader.read_u32()?;
+        let gid = reader.read_cstring()?;
+
+        debug!(
+            "COMMIT PREPARED: flags={}, commit_lsn={}, end_lsn={}, timestamp={}, xid={}, gid={}",
+            flags,
+            format_lsn(commit_lsn),
+            format_lsn(end_lsn),
+            timestamp,
+            xid,
+            gid
+        );
+
+        Ok(LogicalReplicationMessage::CommitPrepared {
+            flags,
+            commit_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
+        })
+    }
+
+    /// Parse ROLLBACK PREPARED message (protocol v3+)
+    fn parse_rollback_prepared_message(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<LogicalReplicationMessage> {
+        let flags = reader.read_u8()?;
+        let prepare_end_lsn = reader.read_u64()?;
+        let rollback_end_lsn = reader.read_u64()?;
+        let prepare_timestamp = reader.read_i64()?;
+        let rollback_timestamp = reader.read_i64()?;
+        let xid = reader.read_u32()?;
+        let gid = reader.read_cstring()?;
+
+        debug!(
+            "ROLLBACK PREPARED: flags={}, prepare_end_lsn={}, rollback_end_lsn={}, xid={}, gid={}",
+            flags,
+            format_lsn(prepare_end_lsn),
+            format_lsn(rollback_end_lsn),
+            xid,
+            gid
+        );
+
+        Ok(LogicalReplicationMessage::RollbackPrepared {
+            flags,
+            prepare_end_lsn,
+            rollback_end_lsn,
+            prepare_timestamp,
+            rollback_timestamp,
+            xid,
+            gid,
+        })
+    }
+
+    /// Parse STREAM PREPARE message (protocol v3+)
+    fn parse_stream_prepare_message(
+        &mut self,
+        reader: &mut BufferReader,
+    ) -> Result<LogicalReplicationMessage> {
+        let flags = reader.read_u8()?;
+        let prepare_lsn = reader.read_u64()?;
+        let end_lsn = reader.read_u64()?;
+        let timestamp = reader.read_i64()?;
+        let xid = reader.read_u32()?;
+        let gid = reader.read_cstring()?;
+
+        debug!(
+            "STREAM PREPARE: flags={}, prepare_lsn={}, end_lsn={}, timestamp={}, xid={}, gid={}",
+            flags,
+            format_lsn(prepare_lsn),
+            format_lsn(end_lsn),
+            timestamp,
+            xid,
+            gid
+        );
+
+        Ok(LogicalReplicationMessage::StreamPrepare {
+            flags,
+            prepare_lsn,
+            end_lsn,
+            timestamp,
+            xid,
+            gid,
         })
     }
 
@@ -894,6 +1171,12 @@ impl LogicalReplicationParser {
                     let length = reader.read_u32()?;
                     let data = reader.read_bytes(length as usize)?;
                     ColumnData::text(data)
+                }
+                'b' => {
+                    // Binary format column data
+                    let length = reader.read_u32()?;
+                    let data = reader.read_bytes(length as usize)?;
+                    ColumnData::binary(data)
                 }
                 _ => {
                     return Err(CdcError::protocol(format!(
@@ -985,5 +1268,317 @@ mod tests {
         // LSN should not go backwards
         state.update_lsn(50);
         assert_eq!(state.last_received_lsn, 100);
+    }
+
+    fn write_u32_be(val: u32) -> [u8; 4] {
+        val.to_be_bytes()
+    }
+
+    fn write_u64_be(val: u64) -> [u8; 8] {
+        val.to_be_bytes()
+    }
+
+    fn write_i64_be(val: i64) -> [u8; 8] {
+        val.to_be_bytes()
+    }
+
+    fn write_cstring(s: &str) -> Vec<u8> {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    }
+
+    #[test]
+    fn test_column_data_binary() {
+        let binary_col = ColumnData::binary(vec![0x00, 0x01, 0x02, 0xFF]);
+        assert!(binary_col.is_binary());
+        assert!(!binary_col.is_text());
+        assert_eq!(binary_col.data_type, 'b');
+        assert_eq!(binary_col.as_bytes(), &[0x00, 0x01, 0x02, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_begin_prepare_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::BEGIN_PREPARE];
+        data.extend_from_slice(&write_u64_be(0x12345678)); // prepare_lsn
+        data.extend_from_slice(&write_u64_be(0x87654321)); // end_lsn
+        data.extend_from_slice(&write_i64_be(1234567890)); // timestamp
+        data.extend_from_slice(&write_u32_be(42)); // xid
+        data.extend_from_slice(&write_cstring("my_transaction")); // gid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::BeginPrepare {
+                prepare_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(prepare_lsn, 0x12345678);
+                assert_eq!(end_lsn, 0x87654321);
+                assert_eq!(timestamp, 1234567890);
+                assert_eq!(xid, 42);
+                assert_eq!(gid, "my_transaction");
+            }
+            _ => panic!("Expected BeginPrepare message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_prepare_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::PREPARE];
+        data.push(0); // flags
+        data.extend_from_slice(&write_u64_be(0x11111111)); // prepare_lsn
+        data.extend_from_slice(&write_u64_be(0x22222222)); // end_lsn
+        data.extend_from_slice(&write_i64_be(9876543210)); // timestamp
+        data.extend_from_slice(&write_u32_be(100)); // xid
+        data.extend_from_slice(&write_cstring("prepared_txn")); // gid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Prepare {
+                flags,
+                prepare_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0);
+                assert_eq!(prepare_lsn, 0x11111111);
+                assert_eq!(end_lsn, 0x22222222);
+                assert_eq!(timestamp, 9876543210);
+                assert_eq!(xid, 100);
+                assert_eq!(gid, "prepared_txn");
+            }
+            _ => panic!("Expected Prepare message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_commit_prepared_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::COMMIT_PREPARED];
+        data.push(0); // flags
+        data.extend_from_slice(&write_u64_be(0x33333333)); // commit_lsn
+        data.extend_from_slice(&write_u64_be(0x44444444)); // end_lsn
+        data.extend_from_slice(&write_i64_be(111222333)); // timestamp
+        data.extend_from_slice(&write_u32_be(200)); // xid
+        data.extend_from_slice(&write_cstring("commit_prepared_txn")); // gid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::CommitPrepared {
+                flags,
+                commit_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0);
+                assert_eq!(commit_lsn, 0x33333333);
+                assert_eq!(end_lsn, 0x44444444);
+                assert_eq!(timestamp, 111222333);
+                assert_eq!(xid, 200);
+                assert_eq!(gid, "commit_prepared_txn");
+            }
+            _ => panic!("Expected CommitPrepared message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rollback_prepared_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::ROLLBACK_PREPARED];
+        data.push(0); // flags
+        data.extend_from_slice(&write_u64_be(0x55555555)); // prepare_end_lsn
+        data.extend_from_slice(&write_u64_be(0x66666666)); // rollback_end_lsn
+        data.extend_from_slice(&write_i64_be(444555666)); // prepare_timestamp
+        data.extend_from_slice(&write_i64_be(777888999)); // rollback_timestamp
+        data.extend_from_slice(&write_u32_be(300)); // xid
+        data.extend_from_slice(&write_cstring("rollback_txn")); // gid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::RollbackPrepared {
+                flags,
+                prepare_end_lsn,
+                rollback_end_lsn,
+                prepare_timestamp,
+                rollback_timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0);
+                assert_eq!(prepare_end_lsn, 0x55555555);
+                assert_eq!(rollback_end_lsn, 0x66666666);
+                assert_eq!(prepare_timestamp, 444555666);
+                assert_eq!(rollback_timestamp, 777888999);
+                assert_eq!(xid, 300);
+                assert_eq!(gid, "rollback_txn");
+            }
+            _ => panic!("Expected RollbackPrepared message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stream_prepare_message() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(3);
+
+        let mut data = vec![message_types::STREAM_PREPARE];
+        data.push(0); // flags
+        data.extend_from_slice(&write_u64_be(0x77777777)); // prepare_lsn
+        data.extend_from_slice(&write_u64_be(0x88888888)); // end_lsn
+        data.extend_from_slice(&write_i64_be(123123123)); // timestamp
+        data.extend_from_slice(&write_u32_be(400)); // xid
+        data.extend_from_slice(&write_cstring("stream_prepared_txn")); // gid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamPrepare {
+                flags,
+                prepare_lsn,
+                end_lsn,
+                timestamp,
+                xid,
+                gid,
+            } => {
+                assert_eq!(flags, 0);
+                assert_eq!(prepare_lsn, 0x77777777);
+                assert_eq!(end_lsn, 0x88888888);
+                assert_eq!(timestamp, 123123123);
+                assert_eq!(xid, 400);
+                assert_eq!(gid, "stream_prepared_txn");
+            }
+            _ => panic!("Expected StreamPrepare message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stream_abort_v2() {
+        // Protocol version 2 - no abort_lsn or abort_timestamp
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+
+        let mut data = vec![message_types::STREAM_ABORT];
+        data.extend_from_slice(&write_u32_be(500)); // xid
+        data.extend_from_slice(&write_u32_be(501)); // subtransaction_xid
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamAbort {
+                xid,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                assert_eq!(xid, 500);
+                assert_eq!(subtransaction_xid, 501);
+                assert!(abort_lsn.is_none());
+                assert!(abort_timestamp.is_none());
+            }
+            _ => panic!("Expected StreamAbort message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stream_abort_v4_parallel() {
+        // Protocol version 4 with parallel streaming - includes abort_lsn and abort_timestamp
+        let mut parser = LogicalReplicationParser::with_protocol_version(4);
+
+        let mut data = vec![message_types::STREAM_ABORT];
+        data.extend_from_slice(&write_u32_be(600)); // xid
+        data.extend_from_slice(&write_u32_be(601)); // subtransaction_xid
+        data.extend_from_slice(&write_u64_be(0x99999999)); // abort_lsn
+        data.extend_from_slice(&write_i64_be(321321321)); // abort_timestamp
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::StreamAbort {
+                xid,
+                subtransaction_xid,
+                abort_lsn,
+                abort_timestamp,
+            } => {
+                assert_eq!(xid, 600);
+                assert_eq!(subtransaction_xid, 601);
+                assert_eq!(abort_lsn, Some(0x99999999));
+                assert_eq!(abort_timestamp, Some(321321321));
+            }
+            _ => panic!("Expected StreamAbort message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tuple_data_with_binary() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(1);
+
+        // Create a simple INSERT message with binary column data
+        let mut data = vec![message_types::INSERT];
+        data.extend_from_slice(&write_u32_be(12345)); // relation_id
+        data.push(b'N'); // tuple type 'N' for new tuple
+        data.extend_from_slice(&2u16.to_be_bytes()); // column_count = 2
+
+        // First column: text
+        data.push(b't');
+        data.extend_from_slice(&write_u32_be(5)); // length
+        data.extend_from_slice(b"hello"); // data
+
+        // Second column: binary
+        data.push(b'b');
+        data.extend_from_slice(&write_u32_be(4)); // length
+        data.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]); // binary data
+
+        let result = parser.parse_wal_message(&data).unwrap();
+        match result.message {
+            LogicalReplicationMessage::Insert { relation_id, tuple } => {
+                assert_eq!(relation_id, 12345);
+                assert_eq!(tuple.column_count(), 2);
+
+                let col0 = tuple.get_column(0).unwrap();
+                assert!(col0.is_text());
+                assert_eq!(col0.as_string(), Some("hello".to_string()));
+
+                let col1 = tuple.get_column(1).unwrap();
+                assert!(col1.is_binary());
+                assert_eq!(col1.as_bytes(), &[0x00, 0x01, 0x02, 0x03]);
+            }
+            _ => panic!("Expected Insert message"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_message_types() {
+        // Verify all message type constants are correctly defined
+        assert_eq!(message_types::BEGIN, b'B');
+        assert_eq!(message_types::COMMIT, b'C');
+        assert_eq!(message_types::ORIGIN, b'O');
+        assert_eq!(message_types::RELATION, b'R');
+        assert_eq!(message_types::TYPE, b'Y');
+        assert_eq!(message_types::INSERT, b'I');
+        assert_eq!(message_types::UPDATE, b'U');
+        assert_eq!(message_types::DELETE, b'D');
+        assert_eq!(message_types::TRUNCATE, b'T');
+        assert_eq!(message_types::MESSAGE, b'M');
+
+        // Protocol v2 streaming
+        assert_eq!(message_types::STREAM_START, b'S');
+        assert_eq!(message_types::STREAM_STOP, b'E');
+        assert_eq!(message_types::STREAM_COMMIT, b'c');
+        assert_eq!(message_types::STREAM_ABORT, b'A');
+
+        // Protocol v3 two-phase commit
+        assert_eq!(message_types::BEGIN_PREPARE, b'b');
+        assert_eq!(message_types::PREPARE, b'P');
+        assert_eq!(message_types::COMMIT_PREPARED, b'K');
+        assert_eq!(message_types::ROLLBACK_PREPARED, b'r');
+        assert_eq!(message_types::STREAM_PREPARE, b'p');
     }
 }

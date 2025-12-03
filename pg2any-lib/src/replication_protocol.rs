@@ -608,7 +608,10 @@ impl LogicalReplicationParser {
 
         debug!(
             "INSERT: relation_id={}, tuple_type={} (0x{:02x}), streaming={}",
-            relation_id, tuple_type as char, tuple_type, self.is_streaming()
+            relation_id,
+            tuple_type as char,
+            tuple_type,
+            self.is_streaming()
         );
 
         if tuple_type != b'N' {
@@ -635,7 +638,11 @@ impl LogicalReplicationParser {
 
         let relation_id = reader.read_u32()?;
 
-        debug!("UPDATE: relation_id={}, streaming={}", relation_id, self.is_streaming());
+        debug!(
+            "UPDATE: relation_id={}, streaming={}",
+            relation_id,
+            self.is_streaming()
+        );
 
         let mut old_tuple = None;
         let mut key_type = None;
@@ -656,7 +663,9 @@ impl LogicalReplicationParser {
         if new_tuple_type != b'N' {
             return Err(CdcError::protocol(format!(
                 "Unexpected new tuple type in UPDATE: '{}' (0x{:02x}) (expected 'N'), streaming={}",
-                new_tuple_type as char, new_tuple_type, self.is_streaming()
+                new_tuple_type as char,
+                new_tuple_type,
+                self.is_streaming()
             )));
         }
 
@@ -683,7 +692,12 @@ impl LogicalReplicationParser {
         let relation_id = reader.read_u32()?;
         let key_type = reader.read_u8()? as char;
 
-        debug!("DELETE: relation_id={}, key_type={}, streaming={}", relation_id, key_type, self.is_streaming());
+        debug!(
+            "DELETE: relation_id={}, key_type={}, streaming={}",
+            relation_id,
+            key_type,
+            self.is_streaming()
+        );
 
         let old_tuple = self.parse_tuple_data(reader)?;
 

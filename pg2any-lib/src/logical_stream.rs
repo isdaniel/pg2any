@@ -66,7 +66,7 @@ impl LogicalReplicationStream {
         // Establish initial connection with retry
         let connection = retry_handler.connect_with_retry().await?;
 
-        let parser = LogicalReplicationParser::new();
+        let parser = LogicalReplicationParser::with_protocol_version(config.protocol_version);
         let state = ReplicationState::new();
         let last_health_check = Instant::now();
 

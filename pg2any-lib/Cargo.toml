@@ -1,12 +1,12 @@
 [package]
 name = "pg2any_lib"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["danielshih <dog830228@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/isdaniel/pg2any"
 homepage = "https://github.com/isdaniel/pg2any"
-documentation = "https://docs.rs/pg2any-lib"
+documentation = "https://docs.rs/pg2any_lib"
 readme = "../README.md"
 description = "PostgreSQL to Any database library with Change Data Capture (CDC) and logical replication support"
 keywords = ["postgresql", "cdc", "replication", "database", "streaming"]

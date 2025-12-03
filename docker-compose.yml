@@ -13,6 +13,8 @@ services:
     restart: always
     ports:
       - "5432:5432"
+    volumes:
+      - ./examples/scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init_postgres.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -37,6 +39,8 @@ services:
       MYSQL_PASSWORD: test.123
     ports:
       - "3306:3306"
+    volumes:
+      - ./examples/scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init_mysql.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
       interval: 10s

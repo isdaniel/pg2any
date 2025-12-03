@@ -421,13 +421,23 @@ impl Default for ReplicationState {
 /// Unified logical replication parser
 pub struct LogicalReplicationParser {
     streaming_context: Option<Xid>,
+    /// Protocol version (1, 2, 3, or 4)
+    protocol_version: u32,
 }
 
 impl LogicalReplicationParser {
-    pub fn new() -> Self {
+    /// Create a new parser with specified protocol version
+    pub fn with_protocol_version(protocol_version: u32) -> Self {
         Self {
             streaming_context: None,
+            protocol_version,
         }
+    }
+
+    /// Check if we're currently inside a streaming transaction context
+    #[inline]
+    fn is_streaming(&self) -> bool {
+        self.streaming_context.is_some()
     }
 
     /// Parse a WAL data message from the replication stream
@@ -543,6 +553,11 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let relation_id = reader.read_u32()?;
         let namespace = reader.read_cstring()?;
         let relation_name = reader.read_cstring()?;
@@ -583,18 +598,23 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let relation_id = reader.read_u32()?;
         let tuple_type = reader.read_u8()?;
 
         debug!(
-            "INSERT: relation_id={}, tuple_type={}",
-            relation_id, tuple_type as char
+            "INSERT: relation_id={}, tuple_type={} (0x{:02x}), streaming={}",
+            relation_id, tuple_type as char, tuple_type, self.is_streaming()
         );
 
         if tuple_type != b'N' {
             return Err(CdcError::protocol(format!(
-                "Unexpected tuple type in INSERT: {} (expected 'N')",
-                tuple_type as char
+                "Unexpected tuple type in INSERT: '{}' (0x{:02x}) (expected 'N'), streaming={}, protocol_version={}",
+                tuple_type as char, tuple_type, self.is_streaming(), self.protocol_version
             )));
         }
 
@@ -608,9 +628,14 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let relation_id = reader.read_u32()?;
 
-        debug!("UPDATE: relation_id={}", relation_id);
+        debug!("UPDATE: relation_id={}, streaming={}", relation_id, self.is_streaming());
 
         let mut old_tuple = None;
         let mut key_type = None;
@@ -630,8 +655,8 @@ impl LogicalReplicationParser {
         let new_tuple_type = reader.read_u8()?;
         if new_tuple_type != b'N' {
             return Err(CdcError::protocol(format!(
-                "Unexpected new tuple type in UPDATE: {} (expected 'N')",
-                new_tuple_type as char
+                "Unexpected new tuple type in UPDATE: '{}' (0x{:02x}) (expected 'N'), streaming={}",
+                new_tuple_type as char, new_tuple_type, self.is_streaming()
             )));
         }
 
@@ -650,10 +675,15 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let relation_id = reader.read_u32()?;
         let key_type = reader.read_u8()? as char;
 
-        debug!("DELETE: relation_id={}, key_type={}", relation_id, key_type);
+        debug!("DELETE: relation_id={}, key_type={}, streaming={}", relation_id, key_type, self.is_streaming());
 
         let old_tuple = self.parse_tuple_data(reader)?;
 
@@ -669,6 +699,11 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let relation_count = reader.read_u32()?;
         let flags = reader.read_u8()?;
 
@@ -694,6 +729,11 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let type_id = reader.read_u32()?;
         let namespace = reader.read_cstring()?;
         let type_name = reader.read_cstring()?;
@@ -727,8 +767,13 @@ impl LogicalReplicationParser {
         })
     }
 
-    /// Parse MESSAGE
+    /// Parse MESSAGE (logical decoding message)
     fn parse_message(&mut self, reader: &mut BufferReader) -> Result<LogicalReplicationMessage> {
+        // In protocol version 2+ with streaming, there's an extra xid field
+        if self.protocol_version >= 2 && self.is_streaming() {
+            let _xid = reader.read_u32()?; // Skip streaming transaction id
+        }
+
         let flags = reader.read_u8()?;
         let lsn = reader.read_u64()?;
         let prefix = reader.read_cstring()?;
@@ -848,12 +893,6 @@ impl LogicalReplicationParser {
         }
 
         Ok(TupleData::new(columns))
-    }
-}
-
-impl Default for LogicalReplicationParser {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

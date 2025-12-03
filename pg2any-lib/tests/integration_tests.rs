@@ -78,7 +78,7 @@ fn test_message_parsing() {
     use pg2any_lib::replication_protocol::message_types;
     use pg2any_lib::LogicalReplicationParser;
 
-    let mut parser = LogicalReplicationParser::new();
+    let mut parser = LogicalReplicationParser::with_protocol_version(1);
 
     // Create a simple BEGIN message for testing
     let mut begin_msg = vec![message_types::BEGIN];

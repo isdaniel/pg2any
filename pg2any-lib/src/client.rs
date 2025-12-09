@@ -13,6 +13,42 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 /// Main CDC client for coordinating replication and destination writes
+///
+/// # Parallel Processing Architecture
+///
+/// This client uses a producer-consumer pattern with configurable parallelism:
+///
+/// ## Single Producer (PostgreSQL Reader)
+/// - Reads from PostgreSQL logical replication stream
+/// - Sends events to a bounded channel (configurable buffer size)
+/// - Handles LSN tracking and heartbeats
+///
+/// ## Multiple Consumers (Destination Writers)
+/// - Configurable number of worker threads (CDC_CONSUMER_WORKERS)
+/// - **Each worker has its own destination database connection**
+/// - Workers use a work-stealing pattern via shared channel
+/// - TRUE parallelism: workers can write to destination simultaneously
+/// - No mutex contention on writes (each worker owns its connection)
+///
+/// ## Performance Characteristics
+///
+/// ### With 1 Worker (default):
+/// - Sequential processing
+/// - Single connection overhead
+/// - Predictable order of operations
+///
+/// ### With Multiple Workers (e.g., 8):
+/// - Parallel writes to destination database
+/// - Linear scaling for write-heavy workloads
+/// - Best for destinations that support concurrent connections (MySQL, PostgreSQL)
+/// - Each worker independently processes events without blocking others
+///
+/// ### Configuration Tips
+/// - `CDC_CONSUMER_WORKERS=1`: Single-threaded, lowest latency for low-volume
+/// - `CDC_CONSUMER_WORKERS=2-4`: Good balance for moderate throughput
+/// - `CDC_CONSUMER_WORKERS=8-16`: High throughput, ensure destination can handle connections
+/// - `CDC_BUFFER_SIZE=1000-5000`: Typical buffer size for event channel
+/// - `CDC_BUFFER_SIZE=10000+`: Large buffer for burst traffic handling
 pub struct CdcClient {
     config: Config,
     replication_manager: Option<ReplicationManager>,
@@ -21,7 +57,7 @@ pub struct CdcClient {
     event_receiver: Option<mpsc::Receiver<ChangeEvent>>,
     cancellation_token: CancellationToken,
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    consumer_handles: Vec<tokio::task::JoinHandle<Result<()>>>,
     metrics_collector: Arc<MetricsCollector>,
 }
 
@@ -46,7 +82,7 @@ impl CdcClient {
             event_receiver: Some(event_receiver),
             cancellation_token: CancellationToken::new(),
             producer_handle: None,
-            consumer_handle: None,
+            consumer_handles: Vec::new(),
             metrics_collector: Arc::new(MetricsCollector::new()),
         })
     }
@@ -110,37 +146,72 @@ impl CdcClient {
             ))
         };
 
-        // Start the consumer task (writes to destination)
+        // Start consumer worker tasks with per-worker destination connections
+        let num_workers = self.config.consumer_workers;
         let event_receiver = self
             .event_receiver
             .take()
             .ok_or_else(|| CdcError::generic("Event receiver not available"))?;
 
-        let destination_handler = self
-            .destination_handler
-            .take()
-            .ok_or_else(|| CdcError::generic("Destination handler not available"))?;
+        // Discard the pre-created destination handler from init() since we'll create per-worker handlers
+        let _ = self.destination_handler.take();
 
-        let consumer_handle = {
+        let dest_type = &self.config.destination_type;
+        let dest_connection_string = self.config.destination_connection_string.clone();
+        let schema_mappings = self.config.schema_mappings.clone();
+
+        info!(
+            "Starting {} consumer worker(s) for TRUE parallel processing (per-worker connections)",
+            num_workers
+        );
+
+        // Share the receiver among all workers for work-stealing pattern
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+
+        for worker_id in 0..num_workers {
+            // Create a new destination handler for each worker
+            let mut worker_destination = DestinationFactory::create(dest_type.clone())?;
+
+            // Connect the worker's destination handler
+            worker_destination.connect(&dest_connection_string).await?;
+
+            // Apply schema mappings to the worker's handler
+            if !schema_mappings.is_empty() {
+                worker_destination.set_schema_mappings(schema_mappings.clone());
+            }
+
+            info!("Worker {} destination connection established", worker_id);
+
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
-            let dest_type = self.config.destination_type.to_string();
+            let dest_type_str = dest_type.to_string();
+            let shared_recv = shared_receiver.clone();
+            let is_primary = worker_id == 0;
 
-            tokio::spawn(Self::run_consumer(
-                event_receiver,
-                destination_handler,
+            let consumer_handle = tokio::spawn(Self::run_consumer_loop(
+                worker_id,
+                shared_recv,
+                worker_destination,
                 token,
                 metrics,
-                dest_type,
-            ))
-        };
+                dest_type_str,
+                is_primary,
+            ));
+            self.consumer_handles.push(consumer_handle);
+        }
+
+        // Update metrics for active connections
+        self.metrics_collector
+            .update_active_connections(num_workers, "consumer");
 
         self.producer_handle = Some(producer_handle);
-        self.consumer_handle = Some(consumer_handle);
 
         self.start_server_uptime();
 
-        info!("CDC replication started successfully");
+        info!(
+            "CDC replication started successfully with {} consumer worker(s)",
+            num_workers
+        );
         self.cancellation_token.cancelled().await;
         Ok(())
     }
@@ -226,108 +297,168 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Consumer task: processes events and writes to destination
-    async fn run_consumer(
-        mut event_receiver: mpsc::Receiver<ChangeEvent>,
+    /// Unified consumer loop for all worker modes (work-stealing pattern with per-worker connections)
+    ///
+    /// # Arguments
+    /// * `worker_id` - Identifier for this worker (0 for single worker mode)
+    /// * `event_receiver` - Shared receiver for change events (work-stealing)
+    /// * `destination_handler` - Per-worker destination handler (no mutex needed!)
+    /// * `cancellation_token` - Token for graceful shutdown
+    /// * `metrics_collector` - Metrics collector
+    /// * `destination_type` - Type of destination for metrics labeling
+    /// * `is_primary` - Whether this worker handles connection status and event draining
+    async fn run_consumer_loop(
+        worker_id: usize,
+        event_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<ChangeEvent>>>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
+        is_primary: bool,
     ) -> Result<()> {
-        info!("Starting replication consumer (single event mode)");
+        info!(
+            "Starting consumer worker {}{}",
+            worker_id,
+            if is_primary { " (primary)" } else { "" }
+        );
 
-        // Initialize destination connection status
-        metrics_collector.update_destination_connection_status(&destination_type, true);
+        // Initialize destination connection status (only primary worker)
+        if is_primary {
+            metrics_collector.update_destination_connection_status(&destination_type, true);
+        }
+
         let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
         loop {
             tokio::select! {
                 biased;
+
                 // Handle graceful shutdown
                 _ = cancellation_token.cancelled() => {
-                    info!("Consumer received cancellation signal");
-                    Self::drain_remaining_events(
-                        &mut event_receiver,
-                        &mut destination_handler,
-                        &metrics_collector,
-                        &destination_type
-                    ).await;
+                    info!("Consumer worker {} received cancellation signal", worker_id);
+                    // Only primary worker drains remaining events
+                    if is_primary {
+                        Self::drain_remaining_events_per_worker(
+                            &event_receiver,
+                            &mut destination_handler,
+                            &metrics_collector,
+                            &destination_type,
+                            worker_id,
+                        ).await;
+                    }
                     break;
                 }
+
+                // Periodic queue size reporting (only primary worker)
                 _ = queue_size_interval.tick() => {
-                    let queue_length = event_receiver.len();
-                    debug!("Consumer queue length: {}", queue_length);
-                    metrics_collector.update_consumer_queue_length(queue_length);
+                    if is_primary {
+                        let receiver = event_receiver.lock().await;
+                        let queue_length = receiver.len();
+                        debug!("Consumer worker {} queue length: {}", worker_id, queue_length);
+                        metrics_collector.update_consumer_queue_length(queue_length);
+                    }
                 }
-                // Handle incoming event
-                event = event_receiver.recv() => {
+
+                // Efficiently receive and process events (blocking recv, not polling!)
+                event = async {
+                    let mut receiver = event_receiver.lock().await;
+                    receiver.recv().await
+                } => {
                     match event {
                         Some(event) => {
-                            debug!("Consumer processing event: {:?}", event.event_type);
-                            Self::process_single_event(
+                            debug!("Consumer worker {} processing event: {:?}", worker_id, event.event_type);
+                            Self::process_event_per_worker(
                                 event,
                                 &mut destination_handler,
                                 &metrics_collector,
-                                &destination_type
+                                &destination_type,
+                                worker_id,
                             ).await;
                         }
                         None => {
-                            // Channel closed, exit loop
+                            // Channel closed, break loop
+                            info!("Consumer worker {} detected channel closure", worker_id);
                             break;
                         }
                     }
                 }
-
             }
         }
 
-        // Update destination connection status on shutdown
-        metrics_collector.update_destination_connection_status(&destination_type, false);
+        // Close the worker's destination connection
+        if let Err(e) = destination_handler.close().await {
+            error!(
+                "Worker {} failed to close destination connection: {}",
+                worker_id, e
+            );
+        }
 
-        info!("Replication consumer stopped gracefully");
+        // Update destination connection status on shutdown (only primary worker)
+        if is_primary {
+            metrics_collector.update_destination_connection_status(&destination_type, false);
+        }
+
+        info!("Consumer worker {} stopped gracefully", worker_id);
         Ok(())
     }
 
-    /// Drain any remaining events from the channel during shutdown.
-    async fn drain_remaining_events(
-        event_receiver: &mut mpsc::Receiver<ChangeEvent>,
+    /// Drain any remaining events from the channel during shutdown (per-worker version)
+    async fn drain_remaining_events_per_worker(
+        event_receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<ChangeEvent>>>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
+        worker_id: usize,
     ) {
-        while let Ok(event) = event_receiver.try_recv() {
-            debug!("Processing remaining event during shutdown: {:?}", event);
-            Self::process_single_event(
-                event,
-                destination_handler,
-                metrics_collector,
-                destination_type,
-            )
-            .await;
+        let mut count = 0;
+        loop {
+            let event = {
+                let mut receiver = event_receiver.lock().await;
+                receiver.try_recv().ok()
+            };
+
+            match event {
+                Some(event) => {
+                    debug!("Processing remaining event during shutdown: {:?}", event);
+                    Self::process_event_per_worker(
+                        event,
+                        destination_handler,
+                        metrics_collector,
+                        destination_type,
+                        worker_id,
+                    )
+                    .await;
+                    count += 1;
+                }
+                None => break,
+            }
         }
 
         info!(
-            "Processed {} remaining events during graceful shutdown",
-            event_receiver.len()
+            "Worker {} processed {} remaining events during graceful shutdown",
+            worker_id, count
         );
     }
 
-    /// Process one event (normal or shutdown).
-    async fn process_single_event(
+    /// Process a single change event with per-worker destination handler (no mutex!)
+    async fn process_event_per_worker(
         event: ChangeEvent,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
+        worker_id: usize,
     ) {
         let event_type = event.event_type_str();
         let timer = ProcessingTimer::start(event_type, destination_type);
 
+        // Process event directly without mutex lock - each worker has its own handler!
         match destination_handler.process_event(&event).await {
             Ok(_) => {
                 metrics_collector.record_event(&event, destination_type);
                 timer.finish(metrics_collector.as_ref());
             }
             Err(e) => {
-                error!("Failed to process event: {}", e);
+                error!("Worker {} failed to process event: {}", worker_id, e);
                 metrics_collector.record_error("event_processing_failed", "consumer");
             }
         }
@@ -363,10 +494,46 @@ impl CdcClient {
     /// Wait for producer and consumer tasks to complete gracefully
     pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
         let producer_task = Self::wait_handle(self.producer_handle.take(), "Producer");
-        let consumer_task = Self::wait_handle(self.consumer_handle.take(), "Consumer");
-        match tokio::join!(producer_task, consumer_task) {
+
+        // Wait for all consumer workers
+        let consumer_handles: Vec<_> = self.consumer_handles.drain(..).collect();
+        let num_workers = consumer_handles.len();
+
+        let consumer_tasks = async {
+            let mut results = Vec::new();
+            for (idx, handle) in consumer_handles.into_iter().enumerate() {
+                let result = handle.await;
+                match result {
+                    Ok(Ok(_)) => {
+                        debug!("Consumer worker {} completed successfully", idx);
+                        results.push(Ok(()));
+                    }
+                    Ok(Err(e)) => {
+                        error!("Consumer worker {} failed: {}", idx, e);
+                        results.push(Err(e));
+                    }
+                    Err(e) => {
+                        error!("Consumer worker {} panicked: {}", idx, e);
+                        results.push(Err(CdcError::generic(format!(
+                            "Consumer worker {} panicked",
+                            idx
+                        ))));
+                    }
+                }
+            }
+            // Return first error if any
+            for result in results {
+                result?;
+            }
+            Ok::<(), CdcError>(())
+        };
+
+        match tokio::join!(producer_task, consumer_tasks) {
             (Ok(_), Ok(_)) => {
-                info!("All CDC tasks completed successfully!!");
+                info!(
+                    "All CDC tasks completed successfully!! ({} consumer workers)",
+                    num_workers.max(1)
+                );
             }
             (Err(e), _) | (_, Err(e)) => {
                 error!("Task failed: {}", e);
@@ -645,13 +812,19 @@ mod tests {
         let token_clone = cancellation_token.clone();
         let metrics_collector = Arc::new(MetricsCollector::new());
 
+        // Use new per-worker API - pass Box directly, not Arc<Mutex>
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
+
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(
-                event_receiver,
-                mock_handler,
+            CdcClient::run_consumer_loop(
+                0,
+                shared_receiver,
+                boxed_handler,
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
+                true, // is_primary
             )
             .await
         });
@@ -701,13 +874,19 @@ mod tests {
         let events_clone = events_processed.clone();
         let metrics_collector = Arc::new(MetricsCollector::new());
 
+        // Use new per-worker API - pass Box directly, not Arc<Mutex>
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
+
         let consumer_task = tokio::spawn(async move {
-            CdcClient::run_consumer(
-                event_receiver,
-                mock_handler,
+            CdcClient::run_consumer_loop(
+                0,
+                shared_receiver,
+                boxed_handler,
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
+                true, // is_primary
             )
             .await
         });
@@ -743,7 +922,7 @@ mod tests {
 
         // Initially no task handles should be set
         assert!(client.producer_handle.is_none());
-        assert!(client.consumer_handle.is_none());
+        assert!(client.consumer_handles.is_empty());
 
         // Test graceful shutdown without starting tasks
         client
@@ -844,5 +1023,321 @@ mod tests {
         // Client token should now be cancelled
         assert!(client_token.is_cancelled());
         assert!(!client.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_per_worker_connection_architecture() {
+        // Test that multiple workers each get their own destination handler
+        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(100);
+        let cancellation_token = CancellationToken::new();
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+
+        // Create multiple workers with their own handlers
+        let num_workers = 3;
+        let mut worker_handles = Vec::new();
+        let mut events_trackers = Vec::new();
+
+        for worker_id in 0..num_workers {
+            let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            events_trackers.push(events_processed.clone());
+
+            let mock_handler = Box::new(MockDestinationHandler {
+                events_processed,
+                should_fail: false,
+                processing_delay: Duration::from_millis(5),
+            });
+
+            let token = cancellation_token.clone();
+            let metrics = Arc::new(MetricsCollector::new());
+            let receiver = shared_receiver.clone();
+
+            let handle = tokio::spawn(async move {
+                CdcClient::run_consumer_loop(
+                    worker_id,
+                    receiver,
+                    mock_handler,
+                    token,
+                    metrics,
+                    "test".to_string(),
+                    worker_id == 0,
+                )
+                .await
+            });
+            worker_handles.push(handle);
+        }
+
+        // Send test events
+        let num_events = 30;
+        for i in 0..num_events {
+            let mut event = create_test_event();
+            event.lsn = Some(Lsn::new(i as u64)); // Use LSN to track event ID
+            event_sender
+                .send(event)
+                .await
+                .expect("Failed to send event");
+        }
+
+        // Let workers process
+        sleep(Duration::from_millis(200)).await;
+
+        // Cancel and wait
+        cancellation_token.cancel();
+        for handle in worker_handles {
+            let result = timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("Worker should complete")
+                .expect("Worker should not panic");
+            assert!(result.is_ok());
+        }
+
+        // Verify all events were processed
+        let mut total_processed = 0;
+        for tracker in &events_trackers {
+            let count = tracker.lock().unwrap().len();
+            total_processed += count;
+            println!("Worker processed {} events", count);
+        }
+
+        assert_eq!(
+            total_processed, num_events,
+            "All events should be processed by workers"
+        );
+
+        // Verify work was distributed (at least 2 workers should have processed events)
+        let workers_with_events = events_trackers
+            .iter()
+            .filter(|tracker| !tracker.lock().unwrap().is_empty())
+            .count();
+        assert!(
+            workers_with_events >= 2,
+            "Work should be distributed across multiple workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_independence_no_mutex_contention() {
+        // Test that workers can process events independently without blocking each other
+        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(100);
+        let cancellation_token = CancellationToken::new();
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+
+        let num_workers = 4;
+        let mut worker_handles = Vec::new();
+        let processing_times = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for worker_id in 0..num_workers {
+            let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let times = processing_times.clone();
+
+            let mock_handler = Box::new(MockDestinationHandler {
+                events_processed,
+                should_fail: false,
+                processing_delay: Duration::from_millis(20), // Simulate slow writes
+            });
+
+            let token = cancellation_token.clone();
+            let metrics = Arc::new(MetricsCollector::new());
+            let receiver = shared_receiver.clone();
+
+            let handle = tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let result = CdcClient::run_consumer_loop(
+                    worker_id,
+                    receiver,
+                    mock_handler,
+                    token,
+                    metrics,
+                    "test".to_string(),
+                    worker_id == 0,
+                )
+                .await;
+                let elapsed = start.elapsed();
+                times.lock().unwrap().push(elapsed);
+                result
+            });
+            worker_handles.push(handle);
+        }
+
+        // Send events
+        let num_events = 20;
+        for _ in 0..num_events {
+            event_sender
+                .send(create_test_event())
+                .await
+                .expect("Failed to send");
+        }
+
+        // Let workers process
+        sleep(Duration::from_millis(150)).await;
+
+        cancellation_token.cancel();
+        for handle in worker_handles {
+            timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("Worker should complete")
+                .expect("Worker should not panic")
+                .expect("Worker should succeed");
+        }
+
+        // With 4 workers processing 20 events (each taking 20ms),
+        // if they were sequential (mutex bottleneck), it would take 400ms+
+        // With parallel processing, it should take much less (around 100-150ms)
+        let times = processing_times.lock().unwrap();
+        let max_time = times.iter().max().unwrap();
+        println!("Max worker time: {:?}", max_time);
+
+        // The key test: parallel processing should complete faster than sequential
+        // Sequential would be: 20 events * 20ms = 400ms minimum
+        // Parallel with 4 workers: ~100-150ms expected
+        assert!(
+            max_time.as_millis() < 300,
+            "Parallel processing should be faster than sequential (got {}ms)",
+            max_time.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_event_per_worker_direct_no_mutex() {
+        // Test that process_event_per_worker doesn't use mutex (direct mutable access)
+        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock_handler: Box<dyn DestinationHandler> = Box::new(MockDestinationHandler {
+            events_processed: events_processed.clone(),
+            should_fail: false,
+            processing_delay: Duration::ZERO,
+        });
+
+        // Need to use a mutable variable for the trait object
+        let mut handler = mock_handler;
+        let metrics = Arc::new(MetricsCollector::new());
+        let mut event = create_test_event();
+        event.lsn = Some(Lsn::new(12345)); // Set identifiable LSN
+
+        // This should work with direct mutable reference (no mutex)
+        CdcClient::process_event_per_worker(event.clone(), &mut handler, &metrics, "test", 0).await;
+
+        // Verify event was processed
+        let processed = events_processed.lock().unwrap();
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].lsn, event.lsn);
+    }
+
+    #[tokio::test]
+    async fn test_drain_remaining_events_per_worker() {
+        // Test that primary worker drains remaining events on shutdown
+        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+
+        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock_handler: Box<dyn DestinationHandler> = Box::new(MockDestinationHandler {
+            events_processed: events_processed.clone(),
+            should_fail: false,
+            processing_delay: Duration::ZERO,
+        });
+
+        // Need mutable variable for trait object
+        let mut handler = mock_handler;
+
+        // Send events before draining
+        let num_events = 5;
+        for _ in 0..num_events {
+            event_sender
+                .send(create_test_event())
+                .await
+                .expect("Send failed");
+        }
+        drop(event_sender); // Close sender
+
+        let metrics = Arc::new(MetricsCollector::new());
+
+        // Drain events
+        CdcClient::drain_remaining_events_per_worker(
+            &shared_receiver,
+            &mut handler,
+            &metrics,
+            "test",
+            0,
+        )
+        .await;
+
+        // Verify all events were drained and processed
+        let processed = events_processed.lock().unwrap();
+        assert_eq!(
+            processed.len(),
+            num_events,
+            "All remaining events should be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_error_handling() {
+        // Test that worker continues processing even if some events fail
+        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
+        let cancellation_token = CancellationToken::new();
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+
+        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock_handler = Box::new(MockDestinationHandler {
+            events_processed: events_processed.clone(),
+            should_fail: true, // Simulate errors
+            processing_delay: Duration::ZERO,
+        });
+
+        let token = cancellation_token.clone();
+        let metrics = Arc::new(MetricsCollector::new());
+
+        let worker_handle = tokio::spawn(async move {
+            CdcClient::run_consumer_loop(
+                0,
+                shared_receiver,
+                mock_handler,
+                token,
+                metrics,
+                "test".to_string(),
+                true,
+            )
+            .await
+        });
+
+        // Send events (they will fail but worker should continue)
+        for _ in 0..5 {
+            event_sender
+                .send(create_test_event())
+                .await
+                .expect("Send failed");
+        }
+
+        sleep(Duration::from_millis(50)).await;
+        cancellation_token.cancel();
+
+        let result = timeout(Duration::from_secs(1), worker_handle)
+            .await
+            .expect("Worker should complete")
+            .expect("Worker should not panic");
+
+        assert!(result.is_ok(), "Worker should handle errors gracefully");
+    }
+
+    #[tokio::test]
+    async fn test_configurable_buffer_size() {
+        // Test that buffer_size configuration is respected
+        let custom_buffer_size = 2000;
+        let config = ConfigBuilder::default()
+            .source_connection_string(
+                "postgresql://test:test@localhost:5432/test?replication=database".to_string(),
+            )
+            .destination_type(crate::DestinationType::MySQL)
+            .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
+            .buffer_size(custom_buffer_size)
+            .build()
+            .expect("Failed to build config");
+
+        assert_eq!(config.buffer_size, custom_buffer_size);
+
+        let client = CdcClient::new(config)
+            .await
+            .expect("Failed to create client");
+
+        // Verify the client was created successfully with custom buffer
+        assert_eq!(client.config().buffer_size, custom_buffer_size);
     }
 }

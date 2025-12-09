@@ -31,6 +31,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
 - **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
+- **Parallel Processing**: Configurable worker threads with per-worker connections for high throughput
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
 - **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
 - **Configuration**: Environment variables, builder pattern, and validation
@@ -124,9 +125,41 @@ pub fn init_logging() {
 ### Data Flow Architecture
 
 ```
-PostgreSQL WAL → Logical Replication → Message Parser → Change Events → Destination Handler → Target DB
-     ↓                    ↓                   ↓              ↓                    ↓              ↓
-   Transactions      Protocol Messages    Parsed Events   Typed Changes    SQL Operations   Replicated Data
+                                          ┌──────────────────────────────────┐
+                                          │  PostgreSQL Logical Replication  │
+                                          │         (WAL Stream)             │
+                                          └────────────┬─────────────────────┘
+                                                       │
+                                                       ▼
+                                          ┌────────────────────────┐
+                                          │   Protocol Parser     │
+                                          │  (Message Decoding)   │
+                                          └──────────┬─────────────┘
+                                                     │
+                                                     ▼
+                                          ┌──────────────────────┐
+                                          │   Event Channel      │
+                                          │ (Bounded Buffer)     │
+                                          └──────────┬───────────┘
+                                                     │
+                    ┌────────────────────────────────┼────────────────────────────────┐
+                    │                                │                                │
+                    ▼                                ▼                                ▼
+          ┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
+          │   Worker 1      │              │   Worker 2      │              │   Worker N      │
+          │ (Own Connection)│              │ (Own Connection)│              │ (Own Connection)│
+          └────────┬────────┘              └────────┬────────┘              └────────┬────────┘
+                   │                                │                                │
+                   └────────────────────────────────┼────────────────────────────────┘
+                                                    │
+                                                    ▼
+                                          ┌──────────────────────┐
+                                          │  Target Database     │
+                                          │ (MySQL/SQLServer/    │
+                                          │      SQLite)         │
+                                          └──────────────────────┘
+
+Key: Each worker has its own destination connection for TRUE parallel writes
 ```
 
 ## Project Structure
@@ -255,6 +288,9 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
 | | `CDC_HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | `10` | `15` | Integer |
+| **Performance** | | | | | |
+| | `CDC_CONSUMER_WORKERS` | Number of parallel consumer workers (each with own connection) | `1` | `4`, `8` | Integer (1-16 recommended). Each worker gets its own destination connection for TRUE parallel processing |
+| | `CDC_BUFFER_SIZE` | Size of the event channel buffer | `1000` | `5000`, `10000` | Integer. Larger buffers handle burst traffic better but use more memory |
 | **System** | | | | | |
 | | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
@@ -365,6 +401,45 @@ CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
 ```
 
 **Note:** Schema mapping is primarily useful for MySQL and SQL Server destinations. SQLite doesn't use schema namespacing, so mappings are ignored for SQLite destinations.
+
+### Performance Tuning
+
+#### Parallel Processing Architecture
+
+pg2any uses a **producer-consumer architecture with per-worker connections** for high-throughput CDC:
+
+- **Single Producer**: Reads from PostgreSQL logical replication stream
+- **Multiple Consumers**: Each worker has its **own destination database connection**
+- **Work Stealing**: Workers share a bounded channel and compete for events
+- **TRUE Parallelism**: No mutex contention - workers write to destination simultaneously
+
+```bash
+# Enable parallel processing with 4 workers
+CDC_CONSUMER_WORKERS=4
+CDC_BUFFER_SIZE=2000
+```
+
+#### Performance Configuration Parameters
+
+**CDC_CONSUMER_WORKERS** (Per-Worker Connections)
+**CDC_BUFFER_SIZE** (Event Channel Buffer)
+
+#### Performance Examples
+
+**Low Volume / Low Latency**
+```bash
+CDC_CONSUMER_WORKERS=1
+CDC_BUFFER_SIZE=100
+# Best for: <100 events/sec, minimal latency
+```
+
+**Burst Traffic Handling**
+```bash
+CDC_CONSUMER_WORKERS=4
+CDC_BUFFER_SIZE=10000
+# Best for: Intermittent high-volume bursts
+# Large buffer absorbs spikes
+```
 
 ### Programmatic Configuration
 

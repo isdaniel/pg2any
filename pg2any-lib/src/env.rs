@@ -42,6 +42,14 @@ use std::time::Duration;
 /// - `CDC_QUERY_TIMEOUT`: Query timeout in seconds (default: "10")
 /// - `CDC_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: "10")
 ///
+/// ## Performance Configuration
+/// - `CDC_CONSUMER_WORKERS`: Number of parallel consumer workers for processing events (default: "1")
+///   Higher values can improve throughput when processing to destinations that support concurrent writes.
+///   Recommended: 2-4 for most workloads, up to 8-16 for high-throughput scenarios.
+/// - `CDC_BUFFER_SIZE`: Size of the event channel buffer (default: "1000")
+///   Larger buffers can smooth out burst traffic but consume more memory.
+///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
+///
 /// # Errors
 ///
 /// Returns `CdcError` if any required configuration is invalid or missing critical values.
@@ -91,6 +99,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
     let heartbeat_interval_secs = parse_u64_env("CDC_HEARTBEAT_INTERVAL", 10)?;
+    let consumer_workers = parse_usize_env("CDC_CONSUMER_WORKERS", 1)?;
+    let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
 
     tracing::info!(
         "CDC Config - Slot: {}, Publication: {}, Protocol: {}, Streaming: {}, Binary: {}",
@@ -108,6 +118,12 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         heartbeat_interval_secs
     );
 
+    tracing::info!(
+        "Performance - Consumer Workers: {}, Buffer Size: {}",
+        consumer_workers,
+        buffer_size
+    );
+
     // Build the configuration
     let config = Config::builder()
         .source_connection_string(source_connection_string)
@@ -122,7 +138,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
         .schema_mappings(schema_mappings)
-        .buffer_size(500)
+        .consumer_workers(consumer_workers)
+        .buffer_size(buffer_size)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");
@@ -194,6 +211,19 @@ fn parse_u64_env(key: &str, default: u64) -> Result<u64, CdcError> {
     match std::env::var(key) {
         Ok(value) => value.parse::<u64>().map_err(|e| {
             CdcError::config(format!("Invalid u64 value for {}: {} ({})", key, value, e))
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Parse a usize environment variable with a default value
+fn parse_usize_env(key: &str, default: usize) -> Result<usize, CdcError> {
+    match std::env::var(key) {
+        Ok(value) => value.parse::<usize>().map_err(|e| {
+            CdcError::config(format!(
+                "Invalid usize value for {}: {} ({})",
+                key, value, e
+            ))
         }),
         Err(_) => Ok(default),
     }

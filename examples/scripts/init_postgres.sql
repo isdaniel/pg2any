@@ -1,11 +1,28 @@
-CREATE PUBLICATION cdc_pub FOR ALL TABLES;
+-- PostgreSQL 13+: Use publish_via_partition_root to send parent table name
+CREATE PUBLICATION cdc_pub FOR ALL TABLES WITH (publish_via_partition_root = true);
 
-CREATE TABLE public.T1 (
+CREATE TABLE public.t1 (
     ID SERIAL PRIMARY KEY,
-	val INT NOT NULL,
-	col1 UUID NOT NULL,
-	col2 UUID NOT NULL
-);
+    val INT NOT NULL,
+    col1 UUID NOT NULL,
+    col2 UUID NOT NULL
+)
+PARTITION BY HASH (ID);
+
+DO $$
+DECLARE 
+    i INT;
+    part_name TEXT;
+BEGIN
+    FOR i IN 0..49 LOOP
+        part_name := format('t1_p%s', i);
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF public.t1
+             FOR VALUES WITH (MODULUS 50, REMAINDER %s);',
+            part_name, i
+        );
+    END LOOP;
+END $$;
 
 -- INSERT INTO T1
 -- SELECT i,

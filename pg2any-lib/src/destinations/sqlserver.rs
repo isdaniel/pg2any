@@ -1,13 +1,14 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType},
+    types::{ChangeEvent, EventType, Transaction},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tracing::{debug, info};
 
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
@@ -27,11 +28,106 @@ impl SqlServerDestination {
 
     /// Map a source schema to the destination schema
     /// If no mapping exists, returns the original schema name
-    fn map_schema(&self, source_schema: &str) -> String {
-        self.schema_mappings
+    fn map_schema(source_schema: &str, schema_mappings: &HashMap<String, String>) -> String {
+        schema_mappings
             .get(source_schema)
             .cloned()
             .unwrap_or_else(|| source_schema.to_string())
+    }
+
+    /// Process a single event (helper for transaction processing)
+    async fn execute_event_with_mappings(
+        client: &mut Client<Compat<TcpStream>>,
+        event: &ChangeEvent,
+        schema_mappings: &HashMap<String, String>,
+    ) -> Result<()> {
+        let dest_schema = match &event.event_type {
+            EventType::Insert { schema, .. }
+            | EventType::Update { schema, .. }
+            | EventType::Delete { schema, .. } => Self::map_schema(schema, schema_mappings),
+            _ => return Ok(()), // Skip non-DML events
+        };
+
+        match &event.event_type {
+            EventType::Insert { table, data, .. } => {
+                let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
+                let placeholders: Vec<String> =
+                    (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
+
+                let sql = format!(
+                    "INSERT INTO [{}].[{}] ({}) VALUES ({})",
+                    dest_schema,
+                    table,
+                    columns.join(", "),
+                    placeholders.join(", ")
+                );
+
+                // Note: This is a simplified implementation
+                // In a real implementation, you'd need to handle parameters properly
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
+            }
+            EventType::Update {
+                table,
+                old_data,
+                new_data,
+                ..
+            } => {
+                let set_clauses: Vec<String> =
+                    new_data.keys().map(|k| format!("[{k}] = ?")).collect();
+
+                let (where_clause, _where_values) = if let Some(old_data) = old_data {
+                    let where_clauses: Vec<String> =
+                        old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
+                    (where_clauses.join(" AND "), old_data)
+                } else {
+                    let where_clauses: Vec<String> = new_data
+                        .keys()
+                        .take(1)
+                        .map(|k| format!("[{}] = ?", k))
+                        .collect();
+                    (where_clauses.join(" AND "), new_data)
+                };
+
+                let sql = format!(
+                    "UPDATE [{}].[{}] SET {} WHERE {}",
+                    dest_schema,
+                    table,
+                    set_clauses.join(", "),
+                    where_clause
+                );
+
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
+            }
+            EventType::Delete {
+                table, old_data, ..
+            } => {
+                let where_clauses: Vec<String> =
+                    old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
+
+                let sql = format!(
+                    "DELETE FROM [{}].[{}] WHERE {}",
+                    dest_schema,
+                    table,
+                    where_clauses.join(" AND ")
+                );
+
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server DELETE failed: {}", e)))?;
+            }
+            _ => {
+                debug!("Skipping non-DML event: {:?}", event.event_type);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -62,124 +158,56 @@ impl DestinationHandler for SqlServerDestination {
         self.schema_mappings = mappings;
     }
 
-    async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
-        // Extract schema mappings before borrowing client
-        let dest_schema = match &event.event_type {
-            EventType::Insert { schema, .. }
-            | EventType::Update { schema, .. }
-            | EventType::Delete { schema, .. } => self.map_schema(schema),
-            _ => String::new(),
-        };
+    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
+        // Skip empty transactions
+        if transaction.is_empty() {
+            debug!(
+                "Skipping empty transaction {}",
+                transaction.transaction_id
+            );
+            return Ok(());
+        }
+
+        debug!(
+            "Processing transaction {} with {} events",
+            transaction.transaction_id,
+            transaction.event_count()
+        );
+
+        // Clone schema_mappings to avoid borrow issues
+        let schema_mappings = self.schema_mappings.clone();
 
         let client = self
             .client
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
-        match &event.event_type {
-            EventType::Insert { table, data, .. } => {
-                let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
-                let placeholders: Vec<String> =
-                    (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
+        // Begin transaction
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to begin SQL Server transaction: {}", e)))?;
 
-                let sql = format!(
-                    "INSERT INTO [{}].[{}] ({}) VALUES ({})",
-                    dest_schema,
-                    table,
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-
-                // Note: This is a simplified implementation
-                // In a real implementation, you'd need to handle parameters properly
-                let _params: Vec<&dyn tiberius::ToSql> = Vec::new();
-                let mut value_holders: Vec<String> = Vec::new();
-
-                for (_, _value) in data {
-                    value_holders.push("?".to_string());
-                    // Note: This is a simplified approach
-                    // In a real implementation, you'd need to handle different types properly
-                }
-
-                let _sql_with_placeholders = format!(
-                    "INSERT INTO [{dest_schema}].[{table}] ({columns}) VALUES ({values})",
-                    dest_schema = dest_schema,
-                    table = table,
-                    columns = columns.join(", "),
-                    values = value_holders.join(", ")
-                );
-
-                // For now, use a simple execute without parameters
-                // This is a limitation of this simplified implementation
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
-            }
-            EventType::Update {
-                table,
-                old_data,
-                new_data,
-                ..
-            } => {
-                let set_clauses: Vec<String> =
-                    new_data.keys().map(|k| format!("[{k}] = ?")).collect();
-
-                // Use old_data to build WHERE clause for proper row identification
-                // This uses the replica identity (primary key, unique index, or full row)
-                let (where_clause, _where_values) = if let Some(old_data) = old_data {
-                    let where_clauses: Vec<String> =
-                        old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
-                    (where_clauses.join(" AND "), old_data)
-                } else {
-                    // Fallback: use primary key/unique columns from new_data if old_data is not available
-                    // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
-                    let where_clauses: Vec<String> = new_data
-                        .keys()
-                        .take(1) // Take first column as a fallback (not ideal)
-                        .map(|k| format!("[{}] = ?", k))
-                        .collect();
-                    (where_clauses.join(" AND "), new_data)
-                };
-
-                let sql = format!(
-                    "UPDATE [{}].[{}] SET {} WHERE {}",
-                    dest_schema,
-                    table,
-                    set_clauses.join(", "),
-                    where_clause
-                );
-
-                // Note: This is still a simplified implementation without proper parameter binding
-                // In a real implementation, you'd need to properly handle parameters with tiberius
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
-            }
-            EventType::Delete {
-                table, old_data, ..
-            } => {
-                let where_clauses: Vec<String> =
-                    old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
-
-                let sql = format!(
-                    "DELETE FROM [{}].[{}] WHERE {}",
-                    dest_schema,
-                    table,
-                    where_clauses.join(" AND ")
-                );
-
-                // Simplified implementation - in production you'd handle parameters properly
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server DELETE failed: {}", e)))?;
-            }
-            _ => {
-                // Skip non-DML events for now
+        // Process each event
+        for event in &transaction.events {
+            if let Err(e) = Self::execute_event_with_mappings(client, event, &schema_mappings).await {
+                // Rollback on error
+                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
+                return Err(e);
             }
         }
+
+        // Commit transaction
+        client
+            .simple_query("COMMIT TRANSACTION")
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to commit SQL Server transaction: {}", e)))?;
+
+        info!(
+            "Transaction {} committed successfully ({} events)",
+            transaction.transaction_id,
+            transaction.event_count()
+        );
 
         Ok(())
     }

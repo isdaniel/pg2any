@@ -1,12 +1,12 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType},
+    types::{ChangeEvent, EventType, Transaction},
 };
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// MySQL destination implementation
 pub struct MySQLDestination {
@@ -228,32 +228,13 @@ impl MySQLDestination {
             ))),
         }
     }
-}
 
-#[async_trait]
-impl DestinationHandler for MySQLDestination {
-    async fn connect(&mut self, connection_string: &str) -> Result<()> {
-        let pool = MySqlPool::connect(connection_string).await?;
-        self.pool = Some(pool);
-        Ok(())
-    }
-
-    fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
-        self.schema_mappings = mappings;
-        if !self.schema_mappings.is_empty() {
-            debug!(
-                "MySQL destination schema mappings set: {:?}",
-                self.schema_mappings
-            );
-        }
-    }
-
-    async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
-
+    /// Process a single event within an existing database transaction
+    async fn process_event_in_transaction<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        event: &'a ChangeEvent,
+    ) -> Result<()> {
         match &event.event_type {
             EventType::Insert {
                 schema,
@@ -289,7 +270,7 @@ impl DestinationHandler for MySQLDestination {
                     };
                 }
 
-                query.execute(pool).await?;
+                query.execute(&mut **tx).await?;
             }
             EventType::Update {
                 schema,
@@ -304,7 +285,6 @@ impl DestinationHandler for MySQLDestination {
                 let set_clauses: Vec<String> =
                     new_data.keys().map(|k| format!("`{}` = ?", k)).collect();
 
-                // Build WHERE clause using proper key identification strategy
                 let where_clause = self.build_where_clause_for_update(
                     old_data,
                     new_data,
@@ -324,17 +304,15 @@ impl DestinationHandler for MySQLDestination {
 
                 let mut query = sqlx::query(&sql);
 
-                // Bind SET clause values (new data)
                 for (_, value) in new_data {
                     query = self.bind_value(query, value);
                 }
 
-                // Bind WHERE clause values
                 for value in where_clause.bind_values {
                     query = self.bind_value(query, value);
                 }
 
-                query.execute(pool).await?;
+                query.execute(&mut **tx).await?;
             }
             EventType::Delete {
                 schema,
@@ -345,7 +323,6 @@ impl DestinationHandler for MySQLDestination {
                 ..
             } => {
                 let dest_schema = self.map_schema(schema);
-                // Build WHERE clause using proper key identification strategy
                 let where_clause = self.build_where_clause_for_delete(
                     old_data,
                     replica_identity,
@@ -361,35 +338,103 @@ impl DestinationHandler for MySQLDestination {
 
                 let mut query = sqlx::query(&sql);
 
-                // Bind WHERE clause values
                 for value in where_clause.bind_values {
                     query = self.bind_value(query, value);
                 }
 
-                query.execute(pool).await?;
+                query.execute(&mut **tx).await?;
             }
             EventType::Truncate(truncate_tables) => {
-                let sql = truncate_tables
-                    .iter()
-                    .map(|table_full_name| {
-                        let mut parts = table_full_name.splitn(2, '.');
-                        match (parts.next(), parts.next()) {
-                            (Some(schema), Some(table)) => {
-                                let dest_schema = self.map_schema(schema);
-                                format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
-                            }
-                            _ => format!("TRUNCATE TABLE `{}`", table_full_name),
+                for table_full_name in truncate_tables {
+                    let mut parts = table_full_name.splitn(2, '.');
+                    let sql = match (parts.next(), parts.next()) {
+                        (Some(schema), Some(table)) => {
+                            let dest_schema = self.map_schema(schema);
+                            format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
                         }
-                    })
-                    .collect::<Vec<String>>()
-                    .join("; ");
-                let query = sqlx::query(&sql);
-                query.execute(pool).await?;
+                        _ => format!("TRUNCATE TABLE `{}`", table_full_name),
+                    };
+                    sqlx::query(&sql).execute(&mut **tx).await?;
+                }
             }
             _ => {
-                // Skip non-DML events for now
+                // Skip non-DML events (BEGIN, COMMIT, RELATION, etc.)
+                debug!("Skipping non-DML event: {:?}", event.event_type);
             }
         }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DestinationHandler for MySQLDestination {
+    async fn connect(&mut self, connection_string: &str) -> Result<()> {
+        let pool = MySqlPool::connect(connection_string).await?;
+        self.pool = Some(pool);
+        Ok(())
+    }
+
+    fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
+        self.schema_mappings = mappings;
+        if !self.schema_mappings.is_empty() {
+            debug!(
+                "MySQL destination schema mappings set: {:?}",
+                self.schema_mappings
+            );
+        }
+    }
+
+    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
+
+        // Skip empty transactions
+        if transaction.is_empty() {
+            debug!(
+                "Skipping empty transaction {}",
+                transaction.transaction_id
+            );
+            return Ok(());
+        }
+
+        debug!(
+            "Processing transaction {} with {} events",
+            transaction.transaction_id,
+            transaction.event_count()
+        );
+
+        // Start a database transaction
+        let mut tx = pool.begin().await.map_err(|e| {
+            CdcError::generic(format!("Failed to begin MySQL transaction: {}", e))
+        })?;
+
+        // Process each event within the transaction
+        for event in &transaction.events {
+            if let Err(e) = self.process_event_in_transaction(&mut tx, event).await {
+                // Rollback on error
+                tx.rollback().await.map_err(|re| {
+                    CdcError::generic(format!(
+                        "Failed to rollback transaction after error '{}': {}",
+                        e, re
+                    ))
+                })?;
+                return Err(e);
+            }
+        }
+
+        // Commit the transaction
+        tx.commit().await.map_err(|e| {
+            CdcError::generic(format!("Failed to commit MySQL transaction: {}", e))
+        })?;
+
+        info!(
+            "Transaction {} committed successfully ({} events)",
+            transaction.transaction_id,
+            transaction.event_count()
+        );
 
         Ok(())
     }

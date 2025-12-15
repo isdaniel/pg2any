@@ -106,7 +106,7 @@ pub use crate::replication_protocol::{
     ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
     ReplicationState, TupleData,
 };
-pub use crate::types::DestinationType;
+pub use crate::types::{DestinationType, Transaction};
 
 // Conditionally export metrics server functionality
 #[cfg(feature = "metrics")]

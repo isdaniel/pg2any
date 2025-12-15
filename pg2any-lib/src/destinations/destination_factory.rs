@@ -1,6 +1,6 @@
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, DestinationType},
+    types::{DestinationType, Transaction},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -16,6 +16,9 @@ use super::sqlserver::SqlServerDestination;
 use super::sqlite::SQLiteDestination;
 
 /// Trait for database destination handlers
+///
+/// Each worker has its own destination handler with its own connection.
+/// Workers process complete transactions atomically to ensure data consistency.
 #[async_trait]
 pub trait DestinationHandler: Send + Sync {
     /// Initialize the destination connection
@@ -25,8 +28,18 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
-    /// Process a single change event
-    async fn process_event(&mut self, event: &ChangeEvent) -> Result<()>;
+    /// Process a complete transaction atomically
+    ///
+    /// This method processes all events within a transaction as a single atomic unit.
+    /// The destination should use database transactions to ensure all-or-nothing semantics.
+    ///
+    /// # Arguments
+    /// * `transaction` - A complete transaction containing all events from BEGIN to COMMIT
+    ///
+    /// # Returns
+    /// * `Ok(())` - Transaction was successfully applied
+    /// * `Err(...)` - Transaction failed and was rolled back
+    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()>;
 
     /// Check if the destination is healthy
     async fn health_check(&mut self) -> Result<bool>;

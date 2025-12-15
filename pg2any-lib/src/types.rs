@@ -376,3 +376,56 @@ impl From<Lsn> for u64 {
         lsn.0
     }
 }
+
+/// Represents a complete PostgreSQL transaction from BEGIN to COMMIT
+///
+/// A Transaction contains all the change events that occurred within a single
+/// database transaction. Workers process entire transactions atomically to
+/// ensure consistency at the destination.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Transaction {
+    /// Transaction ID from PostgreSQL
+    pub transaction_id: u32,
+
+    /// Commit timestamp of the transaction
+    pub commit_timestamp: DateTime<Utc>,
+
+    /// LSN of the commit
+    pub commit_lsn: Option<Lsn>,
+
+    /// All change events in this transaction (INSERT, UPDATE, DELETE, TRUNCATE)
+    /// Events are in the order they occurred within the transaction
+    pub events: Vec<ChangeEvent>,
+}
+
+impl Transaction {
+    /// Create a new transaction with the given ID and timestamp
+    pub fn new(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
+        Self {
+            transaction_id,
+            commit_timestamp,
+            commit_lsn: None,
+            events: Vec::new(),
+        }
+    }
+
+    /// Add an event to this transaction
+    pub fn add_event(&mut self, event: ChangeEvent) {
+        self.events.push(event);
+    }
+
+    /// Set the commit LSN
+    pub fn set_commit_lsn(&mut self, lsn: Lsn) {
+        self.commit_lsn = Some(lsn);
+    }
+
+    /// Get the number of events in this transaction
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if this transaction is empty (no events)
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}

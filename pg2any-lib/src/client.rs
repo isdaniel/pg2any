@@ -1,60 +1,54 @@
 use crate::config::Config;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
-use crate::monitoring::{
-    MetricsCollector, MetricsCollectorTrait, ProcessingTimer, ProcessingTimerTrait,
-};
+use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::types::{ChangeEvent, Lsn};
+use crate::types::{EventType, Lsn, Transaction};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Main CDC client for coordinating replication and destination writes
 ///
-/// # Parallel Processing Architecture
+/// # Transaction-Based Processing Architecture
 ///
-/// This client uses a producer-consumer pattern with configurable parallelism:
+/// This client uses a producer-consumer pattern where workers process complete
+/// PostgreSQL transactions atomically:
 ///
 /// ## Single Producer (PostgreSQL Reader)
 /// - Reads from PostgreSQL logical replication stream
-/// - Sends events to a bounded channel (configurable buffer size)
+/// - Collects events from BEGIN to COMMIT into Transaction objects
+/// - Sends complete transactions to a bounded channel
 /// - Handles LSN tracking and heartbeats
 ///
 /// ## Multiple Consumers (Destination Writers)
 /// - Configurable number of worker threads (CDC_CONSUMER_WORKERS)
 /// - **Each worker has its own destination database connection**
+/// - **Each worker processes complete transactions atomically**
 /// - Workers use a work-stealing pattern via shared channel
 /// - TRUE parallelism: workers can write to destination simultaneously
-/// - No mutex contention on writes (each worker owns its connection)
+/// - Transaction consistency: all events in a transaction succeed or fail together
 ///
 /// ## Performance Characteristics
 ///
 /// ### With 1 Worker (default):
-/// - Sequential processing
+/// - Sequential transaction processing
 /// - Single connection overhead
-/// - Predictable order of operations
+/// - Predictable order of transactions
 ///
 /// ### With Multiple Workers (e.g., 8):
-/// - Parallel writes to destination database
-/// - Linear scaling for write-heavy workloads
+/// - Parallel transaction writes to destination database
+/// - Different transactions can be processed concurrently
+/// - Transaction order within a single transaction is preserved
 /// - Best for destinations that support concurrent connections (MySQL, PostgreSQL)
-/// - Each worker independently processes events without blocking others
-///
-/// ### Configuration Tips
-/// - `CDC_CONSUMER_WORKERS=1`: Single-threaded, lowest latency for low-volume
-/// - `CDC_CONSUMER_WORKERS=2-4`: Good balance for moderate throughput
-/// - `CDC_CONSUMER_WORKERS=8-16`: High throughput, ensure destination can handle connections
-/// - `CDC_BUFFER_SIZE=1000-5000`: Typical buffer size for event channel
-/// - `CDC_BUFFER_SIZE=10000+`: Large buffer for burst traffic handling
 pub struct CdcClient {
     config: Config,
     replication_manager: Option<ReplicationManager>,
     destination_handler: Option<Box<dyn DestinationHandler>>,
-    event_sender: Option<mpsc::Sender<ChangeEvent>>,
-    event_receiver: Option<mpsc::Receiver<ChangeEvent>>,
+    transaction_sender: Option<mpsc::Sender<Transaction>>,
+    transaction_receiver: Option<mpsc::Receiver<Transaction>>,
     cancellation_token: CancellationToken,
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     consumer_handles: Vec<tokio::task::JoinHandle<Result<()>>>,
@@ -71,15 +65,14 @@ impl CdcClient {
 
         let replication_manager = ReplicationManager::new(config.clone());
 
-        // Create event channel
-        let (event_sender, event_receiver) = mpsc::channel(config.buffer_size);
+        let (transaction_sender, transaction_receiver) = mpsc::channel(config.buffer_size);
 
         Ok(Self {
             config,
             replication_manager: Some(replication_manager),
             destination_handler: Some(destination_handler),
-            event_sender: Some(event_sender),
-            event_receiver: Some(event_receiver),
+            transaction_sender: Some(transaction_sender),
+            transaction_receiver: Some(transaction_receiver),
             cancellation_token: CancellationToken::new(),
             producer_handle: None,
             consumer_handles: Vec::new(),
@@ -126,11 +119,11 @@ impl CdcClient {
         // Start the replication stream
         replication_stream.start(start_lsn).await?;
 
-        // Start the producer task (reads from PostgreSQL)
-        let event_sender = self
-            .event_sender
+        // Start the producer task (reads from PostgreSQL and builds transactions)
+        let transaction_sender = self
+            .transaction_sender
             .take()
-            .ok_or_else(|| CdcError::generic("Event sender not available"))?;
+            .ok_or_else(|| CdcError::generic("Transaction sender not available"))?;
 
         let producer_handle = {
             let token = self.cancellation_token.clone();
@@ -139,7 +132,7 @@ impl CdcClient {
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
-                event_sender,
+                transaction_sender,
                 token,
                 start_lsn,
                 metrics,
@@ -148,32 +141,32 @@ impl CdcClient {
 
         // Start consumer worker tasks with per-worker destination connections
         let num_workers = self.config.consumer_workers;
-        let event_receiver = self
-            .event_receiver
+        let transaction_receiver = self
+            .transaction_receiver
             .take()
-            .ok_or_else(|| CdcError::generic("Event receiver not available"))?;
+            .ok_or_else(|| CdcError::generic("Transaction receiver not available"))?;
 
-        // Discard the pre-created destination handler from init() since we'll create per-worker handlers
-        let _ = self.destination_handler.take();
+        // // Discard the pre-created destination handler from init() since we'll create per-worker handlers
+        // let _ = self.destination_handler.take();
 
         let dest_type = &self.config.destination_type;
-        let dest_connection_string = self.config.destination_connection_string.clone();
+        let dest_connection_string = &self.config.destination_connection_string;
         let schema_mappings = self.config.schema_mappings.clone();
 
         info!(
-            "Starting {} consumer worker(s) for TRUE parallel processing (per-worker connections)",
+            "Starting {} consumer worker(s) for transaction-based parallel processing",
             num_workers
         );
 
         // Share the receiver among all workers for work-stealing pattern
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(transaction_receiver));
 
         for worker_id in 0..num_workers {
             // Create a new destination handler for each worker
             let mut worker_destination = DestinationFactory::create(dest_type.clone())?;
 
             // Connect the worker's destination handler
-            worker_destination.connect(&dest_connection_string).await?;
+            worker_destination.connect(dest_connection_string).await?;
 
             // Apply schema mappings to the worker's handler
             if !schema_mappings.is_empty() {
@@ -186,7 +179,6 @@ impl CdcClient {
             let metrics = self.metrics_collector.clone();
             let dest_type_str = dest_type.to_string();
             let shared_recv = shared_receiver.clone();
-            let is_primary = worker_id == 0;
 
             let consumer_handle = tokio::spawn(Self::run_consumer_loop(
                 worker_id,
@@ -195,7 +187,6 @@ impl CdcClient {
                 token,
                 metrics,
                 dest_type_str,
-                is_primary,
             ));
             self.consumer_handles.push(consumer_handle);
         }
@@ -236,18 +227,24 @@ impl CdcClient {
         });
     }
 
-    /// Producer task: reads events from PostgreSQL replication stream
+    /// Producer task: reads events from PostgreSQL replication stream and builds transactions
+    ///
+    /// This producer collects events between BEGIN and COMMIT into complete Transaction objects,
+    /// ensuring that each worker processes an entire transaction atomically.
     async fn run_producer(
         mut replication_stream: ReplicationStream,
-        event_sender: mpsc::Sender<ChangeEvent>,
+        transaction_sender: mpsc::Sender<Transaction>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
     ) -> Result<()> {
-        info!("Starting replication producer (single event mode)");
+        info!("Starting replication producer (transaction mode)");
 
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
+
+        // Current transaction being built
+        let mut current_transaction: Option<Transaction> = None;
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
@@ -262,18 +259,75 @@ impl CdcClient {
                         metrics_collector.record_received_lsn(current_lsn.0);
                     }
 
-                    debug!("Producer received single event: {:?}", event.event_type);
+                    // Handle transaction boundaries
+                    match &event.event_type {
+                        EventType::Begin {
+                            transaction_id,
+                            commit_timestamp,
+                        } => {
+                            // Start a new transaction
+                            if current_transaction.is_some() {
+                                warn!("Received BEGIN while transaction is in progress, discarding incomplete transaction");
+                            }
+                            debug!("Starting transaction {} commit_timestamp: {}", transaction_id, commit_timestamp);
+                            current_transaction =
+                                Some(Transaction::new(*transaction_id, *commit_timestamp));
+                        }
 
-                    if let Err(e) = event_sender.send(event).await {
-                        error!("Failed to send event to consumer: {}", e);
-                        metrics_collector.record_error("event_send_failed", "producer");
-                        break;
+                        EventType::Commit { .. } => {
+                            // Complete and send the transaction
+                            if let Some(mut tx) = current_transaction.take() {
+                                if let Some(lsn) = event.lsn {
+                                    tx.set_commit_lsn(lsn);
+                                }
+
+                                // Send the completed transaction
+                                if let Err(e) = transaction_sender.send(tx).await {
+                                    error!("Failed to send transaction to consumer: {}", e);
+                                    metrics_collector
+                                        .record_error("transaction_send_failed", "producer");
+                                    break;
+                                }
+                            } else {
+                                warn!("Received COMMIT without BEGIN, ignoring");
+                            }
+                        }
+
+                        // Add DML events to the current transaction
+                        EventType::Insert { .. }
+                        | EventType::Update { .. }
+                        | EventType::Delete { .. }
+                        | EventType::Truncate(_) => {
+                            if let Some(ref mut tx) = current_transaction {
+                                tx.add_event(event);
+                            } else {
+                                // Event outside of transaction - create implicit transaction, this handles edge cases where we might receive events without BEGIN
+                                warn!("Received DML event outside of transaction context, creating implicit transaction");
+                                let mut implicit_tx = Transaction::new(0, chrono::Utc::now());
+                                if let Some(lsn) = event.lsn {
+                                    implicit_tx.set_commit_lsn(lsn);
+                                }
+                                implicit_tx.add_event(event);
+
+                                if let Err(e) = transaction_sender.send(implicit_tx).await {
+                                    error!("Failed to send implicit transaction: {}", e);
+                                    metrics_collector
+                                        .record_error("transaction_send_failed", "producer");
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Skip metadata events (Relation, Type, Origin, Message)
+                        _ => {
+                            debug!("Skipping metadata event: {:?}", event.event_type);
+                        }
                     }
                 }
                 Ok(None) => {
                     // No event available
                     if cancellation_token.is_cancelled() {
-                        info!("Ok(None) Producer received cancellation signal");
+                        info!("Producer received cancellation signal");
                         break;
                     }
                 }
@@ -285,7 +339,16 @@ impl CdcClient {
             }
         }
 
-        info!("Producer received cancellation signal");
+        info!("Producer shutting down");
+
+        // If there's an incomplete transaction, log a warning
+        if let Some(tx) = current_transaction.take() {
+            warn!(
+                "Discarding incomplete transaction {} with {} events due to shutdown",
+                tx.transaction_id,
+                tx.event_count()
+            );
+        }
 
         // Update connection status on shutdown
         metrics_collector.update_source_connection_status(false);
@@ -297,35 +360,30 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Unified consumer loop for all worker modes (work-stealing pattern with per-worker connections)
+    /// Unified consumer loop for transaction processing (work-stealing pattern with per-worker connections)
+    ///
+    /// Each worker receives complete transactions and processes them atomically.
+    /// This ensures that all events within a transaction are applied together.
     ///
     /// # Arguments
     /// * `worker_id` - Identifier for this worker (0 for single worker mode)
-    /// * `event_receiver` - Shared receiver for change events (work-stealing)
+    /// * `transaction_receiver` - Shared receiver for transactions (work-stealing)
     /// * `destination_handler` - Per-worker destination handler (no mutex needed!)
     /// * `cancellation_token` - Token for graceful shutdown
     /// * `metrics_collector` - Metrics collector
     /// * `destination_type` - Type of destination for metrics labeling
-    /// * `is_primary` - Whether this worker handles connection status and event draining
     async fn run_consumer_loop(
         worker_id: usize,
-        event_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<ChangeEvent>>>,
+        transaction_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Transaction>>>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
-        is_primary: bool,
     ) -> Result<()> {
-        info!(
-            "Starting consumer worker {}{}",
-            worker_id,
-            if is_primary { " (primary)" } else { "" }
-        );
+        info!("Starting consumer worker {}", worker_id);
 
-        // Initialize destination connection status (only primary worker)
-        if is_primary {
-            metrics_collector.update_destination_connection_status(&destination_type, true);
-        }
+        // Update destination connection status for this worker
+        metrics_collector.update_destination_connection_status(&format!("{}:worker_{}", destination_type, worker_id), true);
 
         let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
@@ -336,39 +394,38 @@ impl CdcClient {
                 // Handle graceful shutdown
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer worker {} received cancellation signal", worker_id);
-                    // Only primary worker drains remaining events
-                    if is_primary {
-                        Self::drain_remaining_events_per_worker(
-                            &event_receiver,
-                            &mut destination_handler,
-                            &metrics_collector,
-                            &destination_type,
-                            worker_id,
-                        ).await;
-                    }
+
+                    Self::drain_remaining_transactions(
+                        &transaction_receiver,
+                        &mut destination_handler,
+                        &metrics_collector,
+                        &destination_type,
+                        worker_id,
+                    ).await;
                     break;
                 }
 
-                // Periodic queue size reporting (only primary worker)
+                // Periodic queue size reporting for this worker
                 _ = queue_size_interval.tick() => {
-                    if is_primary {
-                        let receiver = event_receiver.lock().await;
-                        let queue_length = receiver.len();
-                        debug!("Consumer worker {} queue length: {}", worker_id, queue_length);
-                        metrics_collector.update_consumer_queue_length(queue_length);
-                    }
+                    let receiver = transaction_receiver.lock().await;
+                    let queue_length = receiver.len();
+                    debug!("Consumer worker {} transaction queue length: {}", worker_id, queue_length);
+                    metrics_collector.update_consumer_queue_length(queue_length);
                 }
 
-                // Efficiently receive and process events (blocking recv, not polling!)
-                event = async {
-                    let mut receiver = event_receiver.lock().await;
+                // Efficiently receive and process transactions (blocking recv, not polling!)
+                transaction = async {
+                    let mut receiver = transaction_receiver.lock().await;
                     receiver.recv().await
                 } => {
-                    match event {
-                        Some(event) => {
-                            debug!("Consumer worker {} processing event: {:?}", worker_id, event.event_type);
-                            Self::process_event_per_worker(
-                                event,
+                    match transaction {
+                        Some(tx) => {
+                            debug!(
+                                "Consumer worker {} processing transaction {} with {} events",
+                                worker_id, tx.transaction_id, tx.event_count()
+                            );
+                            Self::process_transaction_per_worker(
+                                tx,
                                 &mut destination_handler,
                                 &metrics_collector,
                                 &destination_type,
@@ -393,18 +450,15 @@ impl CdcClient {
             );
         }
 
-        // Update destination connection status on shutdown (only primary worker)
-        if is_primary {
-            metrics_collector.update_destination_connection_status(&destination_type, false);
-        }
+        metrics_collector.update_destination_connection_status(&format!("{}:worker_{}", destination_type, worker_id), false);
 
         info!("Consumer worker {} stopped gracefully", worker_id);
         Ok(())
     }
 
-    /// Drain any remaining events from the channel during shutdown (per-worker version)
-    async fn drain_remaining_events_per_worker(
-        event_receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<ChangeEvent>>>,
+    /// Drain any remaining transactions from the channel during shutdown
+    async fn drain_remaining_transactions(
+        transaction_receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<Transaction>>>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
@@ -412,16 +466,19 @@ impl CdcClient {
     ) {
         let mut count = 0;
         loop {
-            let event = {
-                let mut receiver = event_receiver.lock().await;
+            let tx = {
+                let mut receiver = transaction_receiver.lock().await;
                 receiver.try_recv().ok()
             };
 
-            match event {
-                Some(event) => {
-                    debug!("Processing remaining event during shutdown: {:?}", event);
-                    Self::process_event_per_worker(
-                        event,
+            match tx {
+                Some(transaction) => {
+                    debug!(
+                        "Processing remaining transaction {} during shutdown",
+                        transaction.transaction_id
+                    );
+                    Self::process_transaction_per_worker(
+                        transaction,
                         destination_handler,
                         metrics_collector,
                         destination_type,
@@ -435,31 +492,38 @@ impl CdcClient {
         }
 
         info!(
-            "Worker {} processed {} remaining events during graceful shutdown",
+            "Worker {} processed {} remaining transactions during graceful shutdown",
             worker_id, count
         );
     }
 
-    /// Process a single change event with per-worker destination handler (no mutex!)
-    async fn process_event_per_worker(
-        event: ChangeEvent,
+    /// Process a complete transaction with per-worker destination handler
+    async fn process_transaction_per_worker(
+        transaction: Transaction,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
         worker_id: usize,
     ) {
-        let event_type = event.event_type_str();
-        let timer = ProcessingTimer::start(event_type, destination_type);
+        let start_time = std::time::Instant::now();
+        let event_count = transaction.event_count();
 
-        // Process event directly without mutex lock - each worker has its own handler!
-        match destination_handler.process_event(&event).await {
+        // Process transaction atomically - each worker has its own handler!
+        match destination_handler.process_transaction(&transaction).await {
             Ok(_) => {
-                metrics_collector.record_event(&event, destination_type);
-                timer.finish(metrics_collector.as_ref());
+                let duration = start_time.elapsed();
+                metrics_collector.record_transaction_processed(&transaction, destination_type);
+                debug!(
+                    "Worker {} successfully processed transaction {} ({} events) in {:?}",
+                    worker_id, transaction.transaction_id, event_count, duration
+                );
             }
             Err(e) => {
-                error!("Worker {} failed to process event: {}", worker_id, e);
-                metrics_collector.record_error("event_processing_failed", "consumer");
+                error!(
+                    "Worker {} failed to process transaction {}: {}",
+                    worker_id, transaction.transaction_id, e
+                );
+                metrics_collector.record_error("transaction_processing_failed", "consumer");
             }
         }
     }
@@ -627,14 +691,31 @@ impl Drop for CdcClient {
 mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
-    use crate::types::ChangeEvent;
+    use crate::types::{ChangeEvent, Transaction};
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ProcessedTransactionInfo {
+        pub transaction_id: u32,
+        pub commit_lsn: Option<Lsn>,
+        pub event_count: usize,
+    }
+
+    impl From<&Transaction> for ProcessedTransactionInfo {
+        fn from(tx: &Transaction) -> Self {
+            Self {
+                transaction_id: tx.transaction_id,
+                commit_lsn: tx.commit_lsn,
+                event_count: tx.event_count(),
+            }
+        }
+    }
+
     // Mock destination handler for testing
     pub struct MockDestinationHandler {
-        pub events_processed: std::sync::Arc<std::sync::Mutex<Vec<ChangeEvent>>>,
+        pub transactions_processed: std::sync::Arc<std::sync::Mutex<Vec<ProcessedTransactionInfo>>>,
         pub should_fail: bool,
         pub processing_delay: Duration,
     }
@@ -649,7 +730,7 @@ mod tests {
             // Mock implementation - no-op
         }
 
-        async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
+        async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
             if self.processing_delay > Duration::ZERO {
                 sleep(self.processing_delay).await;
             }
@@ -658,8 +739,8 @@ mod tests {
                 return Err(CdcError::generic("Mock error"));
             }
 
-            let mut events = self.events_processed.lock().unwrap();
-            events.push(event.clone());
+            let mut transactions = self.transactions_processed.lock().unwrap();
+            transactions.push(ProcessedTransactionInfo::from(transaction));
             Ok(())
         }
 
@@ -699,6 +780,21 @@ mod tests {
             12345,
             std::collections::HashMap::new(),
         )
+    }
+
+    fn create_test_transaction() -> Transaction {
+        let mut tx = Transaction::new(1, chrono::Utc::now());
+        tx.add_event(create_test_event());
+        tx
+    }
+
+    fn create_test_transaction_with_lsn(lsn: u64) -> Transaction {
+        let mut tx = Transaction::new(1, chrono::Utc::now());
+        let mut event = create_test_event();
+        event.lsn = Some(Lsn::new(lsn));
+        tx.add_event(event);
+        tx.set_commit_lsn(Lsn::new(lsn));
+        tx
     }
 
     #[tokio::test]
@@ -759,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_producer_task_cancellation() {
-        let (_event_sender, _event_receiver) = mpsc::channel::<ChangeEvent>(10);
+        let (_tx_sender, _tx_receiver) = mpsc::channel::<Transaction>(10);
         let cancellation_token = CancellationToken::new();
 
         let token_clone = cancellation_token.clone();
@@ -799,12 +895,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_consumer_task_cancellation() {
-        let (_event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
+        let (_tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
         let cancellation_token = CancellationToken::new();
 
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
+            transactions_processed: transactions_processed.clone(),
             should_fail: false,
             processing_delay: Duration::ZERO,
         });
@@ -813,7 +909,7 @@ mod tests {
         let metrics_collector = Arc::new(MetricsCollector::new());
 
         // Use new per-worker API - pass Box directly, not Arc<Mutex>
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
         let consumer_task = tokio::spawn(async move {
@@ -824,7 +920,6 @@ mod tests {
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
-                true, // is_primary
             )
             .await
         });
@@ -845,37 +940,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_consumer_processes_remaining_events_on_shutdown() {
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
+    async fn test_consumer_processes_remaining_transactions_on_shutdown() {
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
         let cancellation_token = CancellationToken::new();
 
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
+            transactions_processed: transactions_processed.clone(),
             should_fail: false,
             processing_delay: Duration::from_millis(10), // Small delay to simulate processing
         });
 
-        // Send some test events
-        let test_events = vec![
-            create_test_event(),
-            create_test_event(),
-            create_test_event(),
-        ];
-
-        for event in &test_events {
-            event_sender
-                .send(event.clone())
+        // Send some test transactions
+        for _ in 0..3 {
+            tx_sender
+                .send(create_test_transaction())
                 .await
-                .expect("Failed to send event");
+                .expect("Failed to send transaction");
         }
 
         let token_clone = cancellation_token.clone();
-        let events_clone = events_processed.clone();
+        let tx_clone = transactions_processed.clone();
         let metrics_collector = Arc::new(MetricsCollector::new());
 
         // Use new per-worker API - pass Box directly, not Arc<Mutex>
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
         let consumer_task = tokio::spawn(async move {
@@ -886,7 +975,6 @@ mod tests {
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
-                true, // is_primary
             )
             .await
         });
@@ -905,11 +993,11 @@ mod tests {
 
         assert!(result.is_ok());
 
-        // Check that some events were processed
-        let processed_events = events_clone.lock().unwrap();
+        // Check that some transactions were processed
+        let processed_transactions = tx_clone.lock().unwrap();
         assert!(
-            !processed_events.is_empty(),
-            "Consumer should have processed some events before shutdown"
+            !processed_transactions.is_empty(),
+            "Consumer should have processed some transactions before shutdown"
         );
     }
 
@@ -1028,21 +1116,21 @@ mod tests {
     #[tokio::test]
     async fn test_per_worker_connection_architecture() {
         // Test that multiple workers each get their own destination handler
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(100);
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(100);
         let cancellation_token = CancellationToken::new();
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
 
         // Create multiple workers with their own handlers
         let num_workers = 3;
         let mut worker_handles = Vec::new();
-        let mut events_trackers = Vec::new();
+        let mut tx_trackers = Vec::new();
 
         for worker_id in 0..num_workers {
-            let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            events_trackers.push(events_processed.clone());
+            let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            tx_trackers.push(transactions_processed.clone());
 
             let mock_handler = Box::new(MockDestinationHandler {
-                events_processed,
+                transactions_processed,
                 should_fail: false,
                 processing_delay: Duration::from_millis(5),
             });
@@ -1059,22 +1147,20 @@ mod tests {
                     token,
                     metrics,
                     "test".to_string(),
-                    worker_id == 0,
                 )
                 .await
             });
             worker_handles.push(handle);
         }
 
-        // Send test events
-        let num_events = 30;
-        for i in 0..num_events {
-            let mut event = create_test_event();
-            event.lsn = Some(Lsn::new(i as u64)); // Use LSN to track event ID
-            event_sender
-                .send(event)
+        // Send test transactions
+        let num_transactions = 30;
+        for i in 0..num_transactions {
+            let tx = create_test_transaction_with_lsn(i as u64);
+            tx_sender
+                .send(tx)
                 .await
-                .expect("Failed to send event");
+                .expect("Failed to send transaction");
         }
 
         // Let workers process
@@ -1090,47 +1176,47 @@ mod tests {
             assert!(result.is_ok());
         }
 
-        // Verify all events were processed
+        // Verify all transactions were processed
         let mut total_processed = 0;
-        for tracker in &events_trackers {
+        for tracker in &tx_trackers {
             let count = tracker.lock().unwrap().len();
             total_processed += count;
-            println!("Worker processed {} events", count);
+            println!("Worker processed {} transactions", count);
         }
 
         assert_eq!(
-            total_processed, num_events,
-            "All events should be processed by workers"
+            total_processed, num_transactions,
+            "All transactions should be processed by workers"
         );
 
-        // Verify work was distributed (at least 2 workers should have processed events)
-        let workers_with_events = events_trackers
+        // Verify work was distributed (at least 2 workers should have processed transactions)
+        let workers_with_transactions = tx_trackers
             .iter()
             .filter(|tracker| !tracker.lock().unwrap().is_empty())
             .count();
         assert!(
-            workers_with_events >= 2,
+            workers_with_transactions >= 2,
             "Work should be distributed across multiple workers"
         );
     }
 
     #[tokio::test]
     async fn test_worker_independence_no_mutex_contention() {
-        // Test that workers can process events independently without blocking each other
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(100);
+        // Test that workers can process transactions independently without blocking each other
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(100);
         let cancellation_token = CancellationToken::new();
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
 
         let num_workers = 4;
         let mut worker_handles = Vec::new();
         let processing_times = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         for worker_id in 0..num_workers {
-            let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let times = processing_times.clone();
 
             let mock_handler = Box::new(MockDestinationHandler {
-                events_processed,
+                transactions_processed,
                 should_fail: false,
                 processing_delay: Duration::from_millis(20), // Simulate slow writes
             });
@@ -1148,7 +1234,6 @@ mod tests {
                     token,
                     metrics,
                     "test".to_string(),
-                    worker_id == 0,
                 )
                 .await;
                 let elapsed = start.elapsed();
@@ -1158,11 +1243,11 @@ mod tests {
             worker_handles.push(handle);
         }
 
-        // Send events
-        let num_events = 20;
-        for _ in 0..num_events {
-            event_sender
-                .send(create_test_event())
+        // Send transactions
+        let num_transactions = 20;
+        for _ in 0..num_transactions {
+            tx_sender
+                .send(create_test_transaction())
                 .await
                 .expect("Failed to send");
         }
@@ -1179,7 +1264,7 @@ mod tests {
                 .expect("Worker should succeed");
         }
 
-        // With 4 workers processing 20 events (each taking 20ms),
+        // With 4 workers processing 20 transactions (each taking 20ms),
         // if they were sequential (mutex bottleneck), it would take 400ms+
         // With parallel processing, it should take much less (around 100-150ms)
         let times = processing_times.lock().unwrap();
@@ -1187,7 +1272,7 @@ mod tests {
         println!("Max worker time: {:?}", max_time);
 
         // The key test: parallel processing should complete faster than sequential
-        // Sequential would be: 20 events * 20ms = 400ms minimum
+        // Sequential would be: 20 transactions * 20ms = 400ms minimum
         // Parallel with 4 workers: ~100-150ms expected
         assert!(
             max_time.as_millis() < 300,
@@ -1197,11 +1282,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_event_per_worker_direct_no_mutex() {
-        // Test that process_event_per_worker doesn't use mutex (direct mutable access)
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    async fn test_process_transaction_per_worker_direct_no_mutex() {
+        // Test that process_transaction_per_worker doesn't use mutex (direct mutable access)
+        let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler: Box<dyn DestinationHandler> = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
+            transactions_processed: transactions_processed.clone(),
             should_fail: false,
             processing_delay: Duration::ZERO,
         });
@@ -1209,27 +1294,27 @@ mod tests {
         // Need to use a mutable variable for the trait object
         let mut handler = mock_handler;
         let metrics = Arc::new(MetricsCollector::new());
-        let mut event = create_test_event();
-        event.lsn = Some(Lsn::new(12345)); // Set identifiable LSN
+        let transaction = create_test_transaction_with_lsn(12345);
+        let expected_lsn = transaction.commit_lsn;
 
         // This should work with direct mutable reference (no mutex)
-        CdcClient::process_event_per_worker(event.clone(), &mut handler, &metrics, "test", 0).await;
+        CdcClient::process_transaction_per_worker(transaction, &mut handler, &metrics, "test", 0).await;
 
-        // Verify event was processed
-        let processed = events_processed.lock().unwrap();
+        // Verify transaction was processed
+        let processed = transactions_processed.lock().unwrap();
         assert_eq!(processed.len(), 1);
-        assert_eq!(processed[0].lsn, event.lsn);
+        assert_eq!(processed[0].commit_lsn, expected_lsn);
     }
 
     #[tokio::test]
-    async fn test_drain_remaining_events_per_worker() {
-        // Test that primary worker drains remaining events on shutdown
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+    async fn test_drain_remaining_transactions_per_worker() {
+        // Test that primary worker drains remaining transactions on shutdown
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
 
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler: Box<dyn DestinationHandler> = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
+            transactions_processed: transactions_processed.clone(),
             should_fail: false,
             processing_delay: Duration::ZERO,
         });
@@ -1237,20 +1322,20 @@ mod tests {
         // Need mutable variable for trait object
         let mut handler = mock_handler;
 
-        // Send events before draining
-        let num_events = 5;
-        for _ in 0..num_events {
-            event_sender
-                .send(create_test_event())
+        // Send transactions before draining
+        let num_transactions = 5;
+        for _ in 0..num_transactions {
+            tx_sender
+                .send(create_test_transaction())
                 .await
                 .expect("Send failed");
         }
-        drop(event_sender); // Close sender
+        drop(tx_sender); // Close sender
 
         let metrics = Arc::new(MetricsCollector::new());
 
-        // Drain events
-        CdcClient::drain_remaining_events_per_worker(
+        // Drain transactions
+        CdcClient::drain_remaining_transactions(
             &shared_receiver,
             &mut handler,
             &metrics,
@@ -1259,25 +1344,25 @@ mod tests {
         )
         .await;
 
-        // Verify all events were drained and processed
-        let processed = events_processed.lock().unwrap();
+        // Verify all transactions were drained and processed
+        let processed = transactions_processed.lock().unwrap();
         assert_eq!(
             processed.len(),
-            num_events,
-            "All remaining events should be drained"
+            num_transactions,
+            "All remaining transactions should be drained"
         );
     }
 
     #[tokio::test]
     async fn test_worker_error_handling() {
-        // Test that worker continues processing even if some events fail
-        let (event_sender, event_receiver) = mpsc::channel::<ChangeEvent>(10);
+        // Test that worker continues processing even if some transactions fail
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
         let cancellation_token = CancellationToken::new();
-        let shared_receiver = Arc::new(tokio::sync::Mutex::new(event_receiver));
+        let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
 
-        let events_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mock_handler = Box::new(MockDestinationHandler {
-            events_processed: events_processed.clone(),
+            transactions_processed: transactions_processed.clone(),
             should_fail: true, // Simulate errors
             processing_delay: Duration::ZERO,
         });
@@ -1293,15 +1378,14 @@ mod tests {
                 token,
                 metrics,
                 "test".to_string(),
-                true,
             )
             .await
         });
 
-        // Send events (they will fail but worker should continue)
+        // Send transactions (they will fail but worker should continue)
         for _ in 0..5 {
-            event_sender
-                .send(create_test_event())
+            tx_sender
+                .send(create_test_transaction())
                 .await
                 .expect("Send failed");
         }

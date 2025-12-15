@@ -117,6 +117,12 @@ lazy_static! {
         "Build information",
         &["version"]
     ).expect("metric can be created");
+
+    /// Total number of transactions processed by consumers
+    pub static ref TRANSACTIONS_PROCESSED_TOTAL: Counter = register_counter!(
+        "pg2any_transactions_processed_total",
+        "Total number of transactions successfully processed"
+    ).expect("metric can be created");
 }
 
 /// Initialize all metrics with the global registry
@@ -172,6 +178,10 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
     REGISTRY
         .register(Box::new(BUILD_INFO.clone()))
         .map_err(|e| format!("Failed to register BUILD_INFO: {}", e))?;
+
+    REGISTRY
+        .register(Box::new(TRANSACTIONS_PROCESSED_TOTAL.clone()))
+        .map_err(|e| format!("Failed to register TRANSACTIONS_PROCESSED_TOTAL: {}", e))?;
 
     debug!("All metrics registered successfully");
     Ok(())

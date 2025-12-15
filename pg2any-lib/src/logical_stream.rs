@@ -556,6 +556,62 @@ impl LogicalReplicationStream {
                 }
             }
 
+            // Streaming transaction messages (protocol v2+)
+            LogicalReplicationMessage::StreamStart { xid, first_segment } => {
+                debug!("Stream start: xid={}, first_segment={}", xid, first_segment);
+                ChangeEvent {
+                    event_type: EventType::StreamStart {
+                        transaction_id: xid,
+                        first_segment,
+                    },
+                    lsn: Some(Lsn::new(lsn)),
+                    metadata: None,
+                }
+            }
+
+            LogicalReplicationMessage::StreamStop => {
+                debug!("Stream stop");
+                ChangeEvent {
+                    event_type: EventType::StreamStop,
+                    lsn: Some(Lsn::new(lsn)),
+                    metadata: None,
+                }
+            }
+
+            LogicalReplicationMessage::StreamCommit {
+                xid,
+                timestamp,
+                commit_lsn,
+                end_lsn,
+                ..
+            } => {
+                debug!(
+                    "Stream commit: xid={}, commit_lsn={}, end_lsn={}",
+                    xid,
+                    format_lsn(commit_lsn),
+                    format_lsn(end_lsn)
+                );
+                ChangeEvent {
+                    event_type: EventType::StreamCommit {
+                        transaction_id: xid,
+                        commit_timestamp: postgres_timestamp_to_chrono(timestamp),
+                    },
+                    lsn: Some(Lsn::new(lsn)),
+                    metadata: None,
+                }
+            }
+
+            LogicalReplicationMessage::StreamAbort { xid, .. } => {
+                debug!("Stream abort: xid={}", xid);
+                ChangeEvent {
+                    event_type: EventType::StreamAbort {
+                        transaction_id: xid,
+                    },
+                    lsn: Some(Lsn::new(lsn)),
+                    metadata: None,
+                }
+            }
+
             _ => {
                 debug!("Ignoring message type: {:?}", message.message);
                 return Ok(None);

@@ -74,7 +74,9 @@ impl MetricsServer {
                     .serve_connection(io, service_fn(metrics_handler))
                     .await
                 {
-                    error!("Error serving connection: {:?}", err);
+                    if !err.is_incomplete_message() {
+                        error!("Error serving connection: {:?}", err);
+                    }
                 }
             });
         }

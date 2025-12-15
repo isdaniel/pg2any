@@ -1,19 +1,78 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType},
+    types::{ChangeEvent, EventType, ReplicaIdentity, Transaction},
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tracing::{debug, info};
+
+/// Maximum number of rows per batch INSERT statement for SQL Server
+const MAX_BATCH_INSERT_SIZE: usize = 1000;
+
+/// Represents a group of INSERT events for the same table that can be batched
+struct InsertBatch<'a> {
+    schema: String,
+    table: String,
+    /// Column names in consistent order
+    columns: Vec<String>,
+    /// Values for each row, in the same column order
+    rows: Vec<Vec<&'a serde_json::Value>>,
+}
+
+impl<'a> InsertBatch<'a> {
+    fn new(schema: String, table: String, columns: Vec<String>) -> Self {
+        Self {
+            schema,
+            table,
+            columns,
+            rows: Vec::new(),
+        }
+    }
+
+    fn add_row(&mut self, data: &'a HashMap<String, serde_json::Value>) {
+        let values: Vec<&serde_json::Value> = self
+            .columns
+            .iter()
+            .map(|col| data.get(col).unwrap_or(&serde_json::Value::Null))
+            .collect();
+        self.rows.push(values);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn can_add(&self, schema: &str, table: &str, columns: &[String]) -> bool {
+        self.schema == schema && self.table == table && self.columns == columns
+    }
+}
+
+/// State for an active streaming transaction
+/// Holds the open database transaction state
+struct ActiveStreamingTransaction {
+    /// PostgreSQL transaction ID
+    transaction_id: u32,
+    /// Indicates if we have an active transaction (SQL Server keeps the connection, not a separate transaction object)
+    has_open_transaction: bool,
+    /// Number of events processed so far
+    events_processed: usize,
+}
 
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
     client: Option<Client<Compat<TcpStream>>>,
     /// Schema mappings: maps source schema to destination schema
     schema_mappings: HashMap<String, String>,
+    /// Active streaming transaction state (if any)
+    active_streaming_tx: Option<ActiveStreamingTransaction>,
 }
 
 impl SqlServerDestination {
@@ -22,16 +81,438 @@ impl SqlServerDestination {
         Self {
             client: None,
             schema_mappings: HashMap::new(),
+            active_streaming_tx: None,
         }
     }
 
-    /// Map a source schema to the destination schema
-    /// If no mapping exists, returns the original schema name
-    fn map_schema(&self, source_schema: &str) -> String {
-        self.schema_mappings
-            .get(source_schema)
-            .cloned()
-            .unwrap_or_else(|| source_schema.to_string())
+    /// Helper function to escape SQL string values for SQL Server
+    fn escape_sql_string(value: &str) -> String {
+        value.replace("'", "''")
+    }
+
+    /// Helper function to format a JSON value as SQL Server literal
+    fn format_sql_value(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(s) => format!("'{}'", Self::escape_sql_string(s)),
+            serde_json::Value::Number(n) if n.is_i64() => n.to_string(),
+            serde_json::Value::Number(n) if n.is_f64() => n.to_string(),
+            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+            serde_json::Value::Null => "NULL".to_string(),
+            _ => format!("'{}'", Self::escape_sql_string(&value.to_string())),
+        }
+    }
+
+    /// Groups consecutive INSERT events for the same table and executes them as batch inserts
+    /// This is a static method to avoid borrowing issues
+    async fn process_events_with_batching_static<'a>(
+        client: &mut Client<Compat<TcpStream>>,
+        events: &'a [ChangeEvent],
+        schema_mappings: &HashMap<String, String>,
+    ) -> Result<()> {
+        let mut current_batch: Option<InsertBatch<'a>> = None;
+
+        for event in events {
+            match &event.event_type {
+                EventType::Insert {
+                    schema,
+                    table,
+                    data,
+                    ..
+                } => {
+                    let dest_schema = schema_mappings
+                        .get(schema)
+                        .cloned()
+                        .unwrap_or_else(|| schema.to_string());
+
+                    // Get column names in sorted order for consistency
+                    let mut columns: Vec<String> = data.keys().cloned().collect();
+                    columns.sort();
+
+                    // Check if we can add to current batch
+                    let can_add = current_batch
+                        .as_ref()
+                        .map(|b| b.can_add(&dest_schema, table, &columns))
+                        .unwrap_or(false);
+
+                    if can_add {
+                        // Add to existing batch
+                        let batch = current_batch.as_mut().unwrap();
+                        batch.add_row(data);
+
+                        // Execute if batch is full
+                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                            Self::execute_batch_insert_static(client, batch).await?;
+                            current_batch = None;
+                        }
+                    } else {
+                        // Flush existing batch and start new one
+                        if let Some(batch) = current_batch.take() {
+                            Self::execute_batch_insert_static(client, &batch).await?;
+                        }
+
+                        let mut new_batch = InsertBatch::new(dest_schema, table.clone(), columns);
+                        new_batch.add_row(data);
+                        current_batch = Some(new_batch);
+                    }
+                }
+                EventType::Update { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        Self::execute_batch_insert_static(client, &batch).await?;
+                    }
+                    Self::process_event_static(client, event, schema_mappings).await?;
+                }
+                EventType::Delete { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        Self::execute_batch_insert_static(client, &batch).await?;
+                    }
+                    Self::process_event_static(client, event, schema_mappings).await?;
+                }
+                _ => {
+                    // Other events: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        Self::execute_batch_insert_static(client, &batch).await?;
+                    }
+                    Self::process_event_static(client, event, schema_mappings).await?;
+                }
+            }
+        }
+
+        // Flush any remaining batch
+        if let Some(batch) = current_batch.take() {
+            Self::execute_batch_insert_static(client, &batch).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Static version of execute_batch_insert for use in static context
+    async fn execute_batch_insert_static<'a>(
+        client: &mut Client<Compat<TcpStream>>,
+        batch: &InsertBatch<'a>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let columns: Vec<String> = batch.columns.iter().map(|k| format!("[{}]", k)).collect();
+
+        // Build VALUES rows: (val1, val2), (val3, val4), ...
+        let rows_sql: Vec<String> = batch
+            .rows
+            .iter()
+            .map(|row| {
+                let values: Vec<String> = row.iter().map(|v| Self::format_sql_value(v)).collect();
+                format!("({})", values.join(", "))
+            })
+            .collect();
+
+        let sql = format!(
+            "INSERT INTO [{}].[{}] ({}) VALUES {}",
+            batch.schema,
+            batch.table,
+            columns.join(", "),
+            rows_sql.join(", ")
+        );
+
+        let batch_start = std::time::Instant::now();
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|e| CdcError::generic(format!("SQL Server batch INSERT failed: {}", e)))?;
+        let batch_duration = batch_start.elapsed();
+
+        info!(
+            "SQL Server Batch INSERT: {} rows into [{}].[{}] in {:?}",
+            batch.rows.len(),
+            batch.schema,
+            batch.table,
+            batch_duration
+        );
+
+        Ok(())
+    }
+
+    /// Static version of process_event_in_transaction for use in static context
+    async fn process_event_static<'a>(
+        client: &mut Client<Compat<TcpStream>>,
+        event: &'a ChangeEvent,
+        schema_mappings: &HashMap<String, String>,
+    ) -> Result<()> {
+        match &event.event_type {
+            EventType::Insert {
+                schema,
+                table,
+                data,
+                ..
+            } => {
+                let dest_schema = schema_mappings
+                    .get(schema)
+                    .cloned()
+                    .unwrap_or_else(|| schema.to_string());
+                let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
+                let values: Vec<String> =
+                    data.values().map(|v| Self::format_sql_value(v)).collect();
+
+                let sql = format!(
+                    "INSERT INTO [{}].[{}] ({}) VALUES ({})",
+                    dest_schema,
+                    table,
+                    columns.join(", "),
+                    values.join(", ")
+                );
+
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
+                debug!(
+                    "Successfully inserted record into {}.{}",
+                    dest_schema, table
+                );
+            }
+            EventType::Update {
+                schema,
+                table,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+                ..
+            } => {
+                let dest_schema = schema_mappings
+                    .get(schema)
+                    .cloned()
+                    .unwrap_or_else(|| schema.to_string());
+                let set_clauses: Vec<String> = new_data
+                    .iter()
+                    .map(|(k, v)| format!("[{}] = {}", k, Self::format_sql_value(v)))
+                    .collect();
+
+                let where_clause = Self::build_where_clause_for_update_static(
+                    old_data,
+                    new_data,
+                    replica_identity,
+                    key_columns,
+                    schema,
+                    table,
+                )?;
+
+                let sql = format!(
+                    "UPDATE [{}].[{}] SET {} WHERE {}",
+                    dest_schema,
+                    table,
+                    set_clauses.join(", "),
+                    where_clause
+                );
+
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
+                debug!("Successfully updated record in {}.{}", dest_schema, table);
+            }
+            EventType::Delete {
+                schema,
+                table,
+                old_data,
+                replica_identity,
+                key_columns,
+                ..
+            } => {
+                let dest_schema = schema_mappings
+                    .get(schema)
+                    .cloned()
+                    .unwrap_or_else(|| schema.to_string());
+                let where_clause = Self::build_where_clause_for_delete_static(
+                    old_data,
+                    replica_identity,
+                    key_columns,
+                    schema,
+                    table,
+                )?;
+
+                let sql = format!(
+                    "DELETE FROM [{}].[{}] WHERE {}",
+                    dest_schema, table, where_clause
+                );
+
+                client
+                    .execute(&sql, &[])
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQL Server DELETE failed: {}", e)))?;
+                debug!("Successfully deleted record from {}.{}", dest_schema, table);
+            }
+            EventType::Truncate(truncate_tables) => {
+                for table_full_name in truncate_tables {
+                    let mut parts = table_full_name.splitn(2, '.');
+                    let sql = match (parts.next(), parts.next()) {
+                        (Some(schema), Some(table)) => {
+                            let dest_schema = schema_mappings
+                                .get(schema)
+                                .cloned()
+                                .unwrap_or_else(|| schema.to_string());
+                            format!("TRUNCATE TABLE [{}].[{}]", dest_schema, table)
+                        }
+                        _ => format!("TRUNCATE TABLE [{}]", table_full_name),
+                    };
+                    client.execute(&sql, &[]).await.map_err(|e| {
+                        CdcError::generic(format!("SQL Server TRUNCATE failed: {}", e))
+                    })?;
+                }
+            }
+            _ => {
+                debug!("Skipping non-DML event: {:?}", event.event_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build WHERE clause for UPDATE operations
+    fn build_where_clause_for_update_static(
+        old_data: &Option<HashMap<String, serde_json::Value>>,
+        new_data: &HashMap<String, serde_json::Value>,
+        replica_identity: &ReplicaIdentity,
+        key_columns: &[String],
+        schema: &str,
+        table: &str,
+    ) -> Result<String> {
+        match replica_identity {
+            ReplicaIdentity::Full => {
+                if let Some(old) = old_data {
+                    let conditions: Vec<String> = old
+                        .iter()
+                        .map(|(column, value)| {
+                            format!("[{}] = {}", column, Self::format_sql_value(value))
+                        })
+                        .collect();
+                    Ok(conditions.join(" AND "))
+                } else {
+                    Err(CdcError::generic(format!(
+                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during UPDATE",
+                        schema, table
+                    )))
+                }
+            }
+            ReplicaIdentity::Default | ReplicaIdentity::Index => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No key columns available for UPDATE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
+                    )));
+                }
+
+                let data_source = match old_data {
+                    Some(old) => old,
+                    None => new_data,
+                };
+
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                for key_column in key_columns {
+                    if let Some(value) = data_source.get(key_column) {
+                        conditions.push(format!(
+                            "[{}] = {}",
+                            key_column,
+                            Self::format_sql_value(value)
+                        ));
+                    } else {
+                        return Err(CdcError::generic(format!(
+                            "Key column '{}' not found in data for UPDATE on {}.{}",
+                            key_column, schema, table
+                        )));
+                    }
+                }
+
+                Ok(conditions.join(" AND "))
+            }
+            ReplicaIdentity::Nothing => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "Cannot perform UPDATE on {}.{} with REPLICA IDENTITY NOTHING and no key columns.",
+                        schema, table
+                    )));
+                }
+
+                let mut conditions = Vec::new();
+                for key_column in key_columns {
+                    if let Some(value) = new_data.get(key_column) {
+                        conditions.push(format!(
+                            "[{}] = {}",
+                            key_column,
+                            Self::format_sql_value(value)
+                        ));
+                    }
+                }
+
+                if conditions.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No usable key columns found for UPDATE on {}.{} with REPLICA IDENTITY NOTHING",
+                        schema, table
+                    )));
+                }
+
+                debug!(
+                    "WARNING: Using potentially unreliable WHERE clause for UPDATE on {}.{} due to REPLICA IDENTITY NOTHING",
+                    schema, table
+                );
+
+                Ok(conditions.join(" AND "))
+            }
+        }
+    }
+
+    /// Build WHERE clause for DELETE operations
+    fn build_where_clause_for_delete_static(
+        old_data: &HashMap<String, serde_json::Value>,
+        replica_identity: &ReplicaIdentity,
+        key_columns: &[String],
+        schema: &str,
+        table: &str,
+    ) -> Result<String> {
+        match replica_identity {
+            ReplicaIdentity::Full => {
+                let conditions: Vec<String> = old_data
+                    .iter()
+                    .map(|(column, value)| {
+                        format!("[{}] = {}", column, Self::format_sql_value(value))
+                    })
+                    .collect();
+                Ok(conditions.join(" AND "))
+            }
+            ReplicaIdentity::Default | ReplicaIdentity::Index => {
+                if key_columns.is_empty() {
+                    return Err(CdcError::generic(format!(
+                        "No key columns available for DELETE operation on {}.{}. Check table's replica identity setting.",
+                        schema, table
+                    )));
+                }
+
+                let mut conditions = Vec::with_capacity(key_columns.len());
+                for key_column in key_columns {
+                    if let Some(value) = old_data.get(key_column) {
+                        conditions.push(format!(
+                            "[{}] = {}",
+                            key_column,
+                            Self::format_sql_value(value)
+                        ));
+                    } else {
+                        return Err(CdcError::generic(format!(
+                            "Key column '{}' not found in data for DELETE on {}.{}",
+                            key_column, schema, table
+                        )));
+                    }
+                }
+
+                Ok(conditions.join(" AND "))
+            }
+            ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
+                "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
+                DELETE requires a replica identity.",
+                schema, table
+            ))),
+        }
     }
 }
 
@@ -60,125 +541,260 @@ impl DestinationHandler for SqlServerDestination {
 
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
         self.schema_mappings = mappings;
+        if !self.schema_mappings.is_empty() {
+            debug!(
+                "SQL Server destination schema mappings set: {:?}",
+                self.schema_mappings
+            );
+        }
     }
 
-    async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
-        // Extract schema mappings before borrowing client
-        let dest_schema = match &event.event_type {
-            EventType::Insert { schema, .. }
-            | EventType::Update { schema, .. }
-            | EventType::Delete { schema, .. } => self.map_schema(schema),
-            _ => String::new(),
-        };
+    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
+        // Skip empty transactions
+        if transaction.is_empty() {
+            debug!(
+                "Skipping empty transaction {} (streaming={}, final={})",
+                transaction.transaction_id, transaction.is_streaming, transaction.is_final_batch
+            );
+            return Ok(());
+        }
+
+        let tx_start = std::time::Instant::now();
+
+        debug!(
+            "SQL Server: Starting to process transaction {} with {} events (streaming={}, final={})",
+            transaction.transaction_id,
+            transaction.event_count(),
+            transaction.is_streaming,
+            transaction.is_final_batch
+        );
+
+        // Copy schema_mappings to avoid borrowing self
+        let schema_mappings = self.schema_mappings.clone();
 
         let client = self
             .client
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
-        match &event.event_type {
-            EventType::Insert { table, data, .. } => {
-                let columns: Vec<String> = data.keys().map(|k| format!("[{}]", k)).collect();
-                let placeholders: Vec<String> =
-                    (1..=columns.len()).map(|i| format!("@P{}", i)).collect();
+        // Begin transaction
+        let begin_time = std::time::Instant::now();
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("Failed to begin SQL Server transaction: {}", e))
+            })?;
+        debug!("SQL Server: BEGIN took {:?}", begin_time.elapsed());
 
-                let sql = format!(
-                    "INSERT INTO [{}].[{}] ({}) VALUES ({})",
-                    dest_schema,
-                    table,
-                    columns.join(", "),
-                    placeholders.join(", ")
+        // Process events with batching optimization
+        let process_time = std::time::Instant::now();
+        let result = Self::process_events_with_batching_static(
+            client,
+            &transaction.events,
+            &schema_mappings,
+        )
+        .await;
+        debug!(
+            "SQL Server: Event processing took {:?}",
+            process_time.elapsed()
+        );
+
+        if let Err(e) = result {
+            // Rollback on error
+            let _ = client.simple_query("ROLLBACK TRANSACTION").await;
+            return Err(e);
+        }
+
+        // Commit transaction
+        let commit_time = std::time::Instant::now();
+        client
+            .simple_query("COMMIT TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("Failed to commit SQL Server transaction: {}", e))
+            })?;
+        let commit_duration = commit_time.elapsed();
+
+        debug!(
+            "SQL Server: COMMIT took {:?} for transaction {} ({} events, total time: {:?})",
+            commit_duration,
+            transaction.transaction_id,
+            transaction.event_count(),
+            tx_start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    async fn process_streaming_batch(&mut self, transaction: &Transaction) -> Result<()> {
+        if !transaction.is_streaming {
+            return self.process_transaction(transaction).await;
+        }
+
+        if transaction.is_empty() && !transaction.is_final_batch {
+            debug!(
+                "Skipping empty non-final streaming batch for transaction {}",
+                transaction.transaction_id
+            );
+            return Ok(());
+        }
+
+        let tx_id = transaction.transaction_id;
+        let is_final = transaction.is_final_batch;
+
+        debug!(
+            "SQL Server: Processing streaming batch for transaction {} ({} events, final={})",
+            tx_id,
+            transaction.event_count(),
+            is_final
+        );
+
+        if let Some(ref active) = self.active_streaming_tx {
+            if active.transaction_id != tx_id {
+                tracing::warn!(
+                    "SQL Server: Received batch for transaction {} but have active transaction {}. Rolling back active.",
+                    tx_id, active.transaction_id
                 );
+                self.rollback_streaming_transaction().await?;
+            }
+        }
 
-                // Note: This is a simplified implementation
-                // In a real implementation, you'd need to handle parameters properly
-                let _params: Vec<&dyn tiberius::ToSql> = Vec::new();
-                let mut value_holders: Vec<String> = Vec::new();
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
 
-                for (_, _value) in data {
-                    value_holders.push("?".to_string());
-                    // Note: This is a simplified approach
-                    // In a real implementation, you'd need to handle different types properly
+        if self.active_streaming_tx.is_none() {
+            client
+                .simple_query("BEGIN TRANSACTION")
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to begin SQL Server streaming transaction: {}",
+                        e
+                    ))
+                })?;
+
+            info!(
+                "SQL Server: Started streaming transaction {} (first batch)",
+                tx_id
+            );
+
+            self.active_streaming_tx = Some(ActiveStreamingTransaction {
+                transaction_id: tx_id,
+                has_open_transaction: true,
+                events_processed: 0,
+            });
+        }
+
+        if !transaction.is_empty() {
+            let mut active = self.active_streaming_tx.take().unwrap();
+            let schema_mappings = self.schema_mappings.clone();
+
+            let result = Self::process_events_with_batching_static(
+                client,
+                &transaction.events,
+                &schema_mappings,
+            )
+            .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    "SQL Server: Error processing streaming batch, rolling back transaction {}: {}",
+                    tx_id,
+                    e
+                );
+                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
+                active.has_open_transaction = false;
+                return Err(e);
+            }
+
+            active.events_processed += transaction.event_count();
+
+            debug!(
+                "SQL Server: Processed {} events for streaming transaction {} (total: {})",
+                transaction.event_count(),
+                tx_id,
+                active.events_processed
+            );
+
+            self.active_streaming_tx = Some(active);
+        }
+
+        if is_final {
+            self.commit_streaming_transaction().await?;
+        }
+
+        Ok(())
+    }
+
+    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
+        self.active_streaming_tx
+            .as_ref()
+            .filter(|tx| tx.has_open_transaction)
+            .map(|tx| tx.transaction_id)
+    }
+
+    async fn commit_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active_streaming_tx.take() {
+            if !active.has_open_transaction {
+                return Ok(());
+            }
+
+            let commit_start = std::time::Instant::now();
+
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
+
+            client
+                .simple_query("COMMIT TRANSACTION")
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to commit SQL Server streaming transaction {}: {}",
+                        active.transaction_id, e
+                    ))
+                })?;
+
+            active.has_open_transaction = false;
+
+            info!(
+                "SQL Server: Committed streaming transaction {} ({} events) in {:?}",
+                active.transaction_id,
+                active.events_processed,
+                commit_start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active_streaming_tx.take() {
+            if !active.has_open_transaction {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                "SQL Server: Rolling back streaming transaction {} ({} events processed)",
+                active.transaction_id,
+                active.events_processed
+            );
+
+            if let Some(client) = self.client.as_mut() {
+                if let Err(e) = client.simple_query("ROLLBACK TRANSACTION").await {
+                    tracing::warn!(
+                        "SQL Server: Failed to rollback streaming transaction {}: {}",
+                        active.transaction_id,
+                        e
+                    );
                 }
-
-                let _sql_with_placeholders = format!(
-                    "INSERT INTO [{dest_schema}].[{table}] ({columns}) VALUES ({values})",
-                    dest_schema = dest_schema,
-                    table = table,
-                    columns = columns.join(", "),
-                    values = value_holders.join(", ")
-                );
-
-                // For now, use a simple execute without parameters
-                // This is a limitation of this simplified implementation
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server INSERT failed: {}", e)))?;
             }
-            EventType::Update {
-                table,
-                old_data,
-                new_data,
-                ..
-            } => {
-                let set_clauses: Vec<String> =
-                    new_data.keys().map(|k| format!("[{k}] = ?")).collect();
 
-                // Use old_data to build WHERE clause for proper row identification
-                // This uses the replica identity (primary key, unique index, or full row)
-                let (where_clause, _where_values) = if let Some(old_data) = old_data {
-                    let where_clauses: Vec<String> =
-                        old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
-                    (where_clauses.join(" AND "), old_data)
-                } else {
-                    // Fallback: use primary key/unique columns from new_data if old_data is not available
-                    // This happens with REPLICA IDENTITY NOTHING, but it's not ideal
-                    let where_clauses: Vec<String> = new_data
-                        .keys()
-                        .take(1) // Take first column as a fallback (not ideal)
-                        .map(|k| format!("[{}] = ?", k))
-                        .collect();
-                    (where_clauses.join(" AND "), new_data)
-                };
-
-                let sql = format!(
-                    "UPDATE [{}].[{}] SET {} WHERE {}",
-                    dest_schema,
-                    table,
-                    set_clauses.join(", "),
-                    where_clause
-                );
-
-                // Note: This is still a simplified implementation without proper parameter binding
-                // In a real implementation, you'd need to properly handle parameters with tiberius
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server UPDATE failed: {}", e)))?;
-            }
-            EventType::Delete {
-                table, old_data, ..
-            } => {
-                let where_clauses: Vec<String> =
-                    old_data.keys().map(|k| format!("[{}] = ?", k)).collect();
-
-                let sql = format!(
-                    "DELETE FROM [{}].[{}] WHERE {}",
-                    dest_schema,
-                    table,
-                    where_clauses.join(" AND ")
-                );
-
-                // Simplified implementation - in production you'd handle parameters properly
-                client
-                    .execute(&sql, &[])
-                    .await
-                    .map_err(|e| CdcError::generic(format!("SQL Server DELETE failed: {}", e)))?;
-            }
-            _ => {
-                // Skip non-DML events for now
-            }
+            active.has_open_transaction = false;
         }
 
         Ok(())
@@ -197,10 +813,23 @@ impl DestinationHandler for SqlServerDestination {
     }
 
     async fn close(&mut self) -> Result<()> {
+        if self.active_streaming_tx.is_some() {
+            tracing::warn!("SQL Server: Closing with active streaming transaction - rolling back");
+            self.rollback_streaming_transaction().await?;
+        }
+
         if let Some(client) = self.client.take() {
             let _ = client.close().await;
         }
+        self.client = None;
+        info!("SQL Server connection closed successfully");
         Ok(())
+    }
+}
+
+impl Default for SqlServerDestination {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

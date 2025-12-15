@@ -86,6 +86,15 @@ pub trait MetricsCollectorTrait: Send + Sync {
     ///
     /// This method is thread-safe and handles any necessary locking internally.
     fn init_build_info(&self, version: &str);
+
+    /// Record a transaction being successfully processed
+    ///
+    /// This method is thread-safe and handles any necessary locking internally.
+    fn record_transaction_processed(
+        &self,
+        transaction: &crate::types::Transaction,
+        destination_type: &str,
+    );
 }
 
 /// Abstract processing timer trait
@@ -287,6 +296,34 @@ mod real_metrics {
         fn init_build_info(&self, version: &str) {
             BUILD_INFO.with_label_values(&[version]).set(1.0);
         }
+
+        fn record_transaction_processed(
+            &self,
+            transaction: &crate::types::Transaction,
+            destination_type: &str,
+        ) {
+            TRANSACTIONS_PROCESSED_TOTAL.inc();
+
+            // Track events for rate calculation (events_per_second)
+            let event_count = transaction.event_count();
+            self.events_in_window
+                .fetch_add(event_count as u64, Ordering::Relaxed);
+
+            // Update last event time for rate calculation
+            let now_nanos = self.now_nanos();
+            self.last_event_time_nanos
+                .store(now_nanos, Ordering::Relaxed);
+
+            // Update last processed LSN if available
+            if let Some(lsn) = transaction.commit_lsn {
+                LAST_PROCESSED_LSN.set(lsn.0 as f64);
+            }
+
+            debug!(
+                "Recorded transaction processed: transaction_id={:?}, events={}, destination={}",
+                transaction.transaction_id, event_count, destination_type
+            );
+        }
     }
 
     /// Real processing timer that wraps the actual timer
@@ -367,6 +404,13 @@ mod noop_metrics {
         }
 
         fn init_build_info(&self, _version: &str) {}
+
+        fn record_transaction_processed(
+            &self,
+            _transaction: &crate::types::Transaction,
+            _destination_type: &str,
+        ) {
+        }
     }
 
     /// No-op processing timer that does nothing

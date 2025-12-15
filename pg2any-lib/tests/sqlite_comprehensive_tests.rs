@@ -2,12 +2,20 @@ use chrono::Utc;
 use pg2any_lib::{
     destinations::{DestinationFactory, DestinationHandler},
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
+    Transaction,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Helper function to wrap a single event in a transaction for testing
+fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
+    let mut tx = Transaction::new(1, Utc::now());
+    tx.add_event(event);
+    tx
+}
 
 #[cfg(feature = "sqlite")]
 use pg2any_lib::destinations::sqlite::SQLiteDestination;
@@ -128,7 +136,9 @@ async fn test_sqlite_empty_string_handling() {
         123,
         data,
     );
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify empty strings are preserved
@@ -174,7 +184,9 @@ async fn test_sqlite_null_value_handling() {
         123,
         data,
     );
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify null values are handled correctly
@@ -229,7 +241,9 @@ async fn test_sqlite_unicode_and_special_characters() {
         123,
         data,
     );
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify unicode characters are preserved
@@ -285,7 +299,9 @@ async fn test_sqlite_large_data_handling() {
         123,
         data,
     );
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify large data is stored correctly
@@ -338,7 +354,9 @@ async fn test_sqlite_numeric_precision() {
             123,
             data,
         );
-        let result = destination.process_event(&event).await;
+        let result = destination
+            .process_transaction(&wrap_in_transaction(event))
+            .await;
         assert!(result.is_ok(), "Failed to insert value: {:?}", value);
     }
 
@@ -403,7 +421,9 @@ async fn test_sqlite_constraint_violations() {
         123,
         data1,
     );
-    let result1 = destination.process_event(&event1).await;
+    let result1 = destination
+        .process_transaction(&wrap_in_transaction(event1))
+        .await;
     assert!(result1.is_ok());
 
     // Try to insert duplicate unique value - should fail
@@ -417,7 +437,9 @@ async fn test_sqlite_constraint_violations() {
         124,
         data2,
     );
-    let result2 = destination.process_event(&event2).await;
+    let result2 = destination
+        .process_transaction(&wrap_in_transaction(event2))
+        .await;
     assert!(
         result2.is_err(),
         "Should fail due to unique constraint violation"
@@ -452,7 +474,9 @@ async fn test_sqlite_missing_key_columns_error() {
         123,
         data.clone(),
     );
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Try UPDATE with empty key columns - should fail
@@ -466,7 +490,9 @@ async fn test_sqlite_missing_key_columns_error() {
         vec![], // Empty key columns
     );
 
-    let result = destination.process_event(&update_event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(update_event))
+        .await;
     assert!(result.is_err(), "Should fail due to missing key columns");
 
     pool.close().await;
@@ -510,7 +536,9 @@ async fn test_sqlite_bulk_operations_performance() {
             123 + i as u32,
             data,
         );
-        let result = destination.process_event(&event).await;
+        let result = destination
+            .process_transaction(&wrap_in_transaction(event))
+            .await;
         assert!(result.is_ok(), "Failed to insert record {}", i);
     }
 
@@ -555,7 +583,9 @@ async fn test_sqlite_bulk_operations_performance() {
             vec!["id".to_string()],
         );
 
-        let result = destination.process_event(&event).await;
+        let result = destination
+            .process_transaction(&wrap_in_transaction(event))
+            .await;
         assert!(result.is_ok(), "Failed to update record {}", i);
     }
 
@@ -625,7 +655,9 @@ async fn test_sqlite_concurrent_operations() {
                 record_id as u32,
                 data,
             );
-            let result = destination.process_event(&event).await;
+            let result = destination
+                .process_transaction(&wrap_in_transaction(event))
+                .await;
             assert!(
                 result.is_ok(),
                 "Session {} failed to insert record {}: {:?}",
@@ -681,7 +713,9 @@ async fn test_sqlite_transaction_events() {
     let commit_event = ChangeEvent::commit(110, Utc::now());
 
     // These should not fail (even though SQLite handles transactions automatically)
-    let begin_result = destination.process_event(&begin_event).await;
+    let begin_result = destination
+        .process_transaction(&wrap_in_transaction(begin_event))
+        .await;
     assert!(begin_result.is_ok());
 
     // Insert some data between transaction events
@@ -691,10 +725,14 @@ async fn test_sqlite_transaction_events() {
     data.insert("email".to_string(), json!("txn@example.com"));
 
     let insert_event = ChangeEvent::insert("main".to_string(), "users".to_string(), 105, data);
-    let insert_result = destination.process_event(&insert_event).await;
+    let insert_result = destination
+        .process_transaction(&wrap_in_transaction(insert_event))
+        .await;
     assert!(insert_result.is_ok());
 
-    let commit_result = destination.process_event(&commit_event).await;
+    let commit_result = destination
+        .process_transaction(&wrap_in_transaction(commit_event))
+        .await;
     assert!(commit_result.is_ok());
 
     // Verify data was inserted
@@ -727,7 +765,9 @@ async fn test_sqlite_metadata_events() {
     ];
 
     for event in metadata_events {
-        let result = destination.process_event(&event).await;
+        let result = destination
+            .process_transaction(&wrap_in_transaction(event.clone()))
+            .await;
         assert!(
             result.is_ok(),
             "Metadata event should not fail: {:?}",
@@ -865,7 +905,9 @@ async fn test_sqlite_complete_crud_cycle() {
         1,
         create_data.clone(),
     );
-    let create_result = destination.process_event(&create_event).await;
+    let create_result = destination
+        .process_transaction(&wrap_in_transaction(create_event))
+        .await;
     assert!(create_result.is_ok());
 
     // Verify insertion
@@ -905,7 +947,9 @@ async fn test_sqlite_complete_crud_cycle() {
         vec!["id".to_string()],
     );
 
-    let update_result = destination.process_event(&update_event).await;
+    let update_result = destination
+        .process_transaction(&wrap_in_transaction(update_event))
+        .await;
     assert!(update_result.is_ok());
 
     // Verify update
@@ -935,7 +979,9 @@ async fn test_sqlite_complete_crud_cycle() {
         vec!["id".to_string()],
     );
 
-    let delete_result = destination.process_event(&delete_event).await;
+    let delete_result = destination
+        .process_transaction(&wrap_in_transaction(delete_event))
+        .await;
     assert!(delete_result.is_ok());
 
     // Verify deletion
@@ -978,7 +1024,9 @@ async fn test_sqlite_destination_factory_integration() {
     data.insert("name".to_string(), json!("Factory Test"));
 
     let event = ChangeEvent::insert("main".to_string(), "users".to_string(), 1, data);
-    let process_result = destination.process_event(&event).await;
+    let process_result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(process_result.is_ok());
 
     pool.close().await;

@@ -1,11 +1,20 @@
+use chrono::Utc;
 use pg2any_lib::{
     destinations::{DestinationFactory, DestinationHandler},
     types::{ChangeEvent, DestinationType, EventType, ReplicaIdentity},
+    Transaction,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Helper function to wrap a single event in a transaction for testing
+fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
+    let mut tx = Transaction::new(1, Utc::now());
+    tx.add_event(event);
+    tx
+}
 
 #[cfg(feature = "sqlite")]
 use pg2any_lib::destinations::sqlite::SQLiteDestination;
@@ -186,7 +195,9 @@ async fn test_sqlite_destination_process_insert_event() {
     let event = ChangeEvent::insert("main".to_string(), "users".to_string(), 123, data);
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was inserted
@@ -238,7 +249,9 @@ async fn test_sqlite_destination_process_update_event() {
     );
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was updated
@@ -298,7 +311,9 @@ async fn test_sqlite_destination_process_delete_event() {
     );
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was deleted
@@ -360,7 +375,9 @@ async fn test_sqlite_destination_process_truncate_event() {
     };
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the table was truncated
@@ -431,7 +448,9 @@ async fn test_sqlite_destination_replica_identity_full() {
     );
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was updated
@@ -469,7 +488,9 @@ async fn test_sqlite_destination_replica_identity_nothing_error() {
     );
 
     // Process the event - should fail
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_err());
 
     // Clean up
@@ -515,7 +536,9 @@ async fn test_sqlite_destination_complex_data_types() {
     let event = ChangeEvent::insert("main".to_string(), "complex_data".to_string(), 123, data);
 
     // Process the event
-    let result = destination.process_event(&event).await;
+    let result = destination
+        .process_transaction(&wrap_in_transaction(event))
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was inserted

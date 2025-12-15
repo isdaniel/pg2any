@@ -38,6 +38,22 @@ pub enum EventType {
     Commit {
         commit_timestamp: DateTime<Utc>,
     },
+    /// Streaming transaction start (protocol v2+)
+    StreamStart {
+        transaction_id: u32,
+        first_segment: bool,
+    },
+    /// Streaming transaction stop (end of current segment)
+    StreamStop,
+    /// Streaming transaction commit (final commit of streamed transaction)
+    StreamCommit {
+        transaction_id: u32,
+        commit_timestamp: DateTime<Utc>,
+    },
+    /// Streaming transaction abort
+    StreamAbort {
+        transaction_id: u32,
+    },
     Relation,
     Type,
     Origin,
@@ -374,5 +390,108 @@ impl From<u64> for Lsn {
 impl From<Lsn> for u64 {
     fn from(lsn: Lsn) -> Self {
         lsn.0
+    }
+}
+
+/// Represents a complete PostgreSQL transaction from BEGIN to COMMIT
+///
+/// A Transaction contains all the change events that occurred within a single
+/// database transaction. Workers process entire transactions atomically to
+/// ensure consistency at the destination.
+///
+/// When PostgreSQL streaming mode is enabled (protocol v2+), large in-progress
+/// transactions are sent in chunks between `StreamStart` and `StreamStop` messages.
+/// The final commit is signaled by `StreamCommit`. This struct supports both modes:
+///
+/// - **Normal Mode**: Events collected between BEGIN and COMMIT
+/// - **Streaming Mode**: Events collected between StreamStart and StreamStop, with batch processing for high-performance ingestion
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Transaction {
+    /// Transaction ID from PostgreSQL
+    pub transaction_id: u32,
+
+    /// Commit timestamp of the transaction
+    pub commit_timestamp: DateTime<Utc>,
+
+    /// LSN of the commit
+    pub commit_lsn: Option<Lsn>,
+
+    /// All change events in this transaction (INSERT, UPDATE, DELETE, TRUNCATE)
+    /// Events are in the order they occurred within the transaction
+    pub events: Vec<ChangeEvent>,
+
+    /// Whether this transaction came from streaming mode (protocol v2+)
+    /// Streaming transactions may be sent in batches before final commit
+    #[serde(default)]
+    pub is_streaming: bool,
+
+    /// Whether this is the final batch of a streaming transaction
+    /// When true, destination should commit the database transaction
+    #[serde(default)]
+    pub is_final_batch: bool,
+}
+
+impl Transaction {
+    /// Create a new transaction with the given ID and timestamp
+    pub fn new(transaction_id: u32, commit_timestamp: DateTime<Utc>) -> Self {
+        Self {
+            transaction_id,
+            commit_timestamp,
+            commit_lsn: None,
+            events: Vec::new(),
+            is_streaming: false,
+            is_final_batch: true, // Normal transactions are always final
+        }
+    }
+
+    /// Create a new streaming transaction batch
+    pub fn new_streaming(
+        transaction_id: u32,
+        commit_timestamp: DateTime<Utc>,
+        is_final: bool,
+    ) -> Self {
+        Self {
+            transaction_id,
+            commit_timestamp,
+            commit_lsn: None,
+            events: Vec::new(),
+            is_streaming: true,
+            is_final_batch: is_final,
+        }
+    }
+
+    /// Add an event to this transaction
+    pub fn add_event(&mut self, event: ChangeEvent) {
+        self.events.push(event);
+    }
+
+    /// Set the commit LSN
+    pub fn set_commit_lsn(&mut self, lsn: Lsn) {
+        self.commit_lsn = Some(lsn);
+    }
+
+    /// Get the number of events in this transaction
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if this transaction is empty (no events)
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Mark this transaction as a streaming transaction
+    pub fn set_streaming(&mut self, is_streaming: bool) {
+        self.is_streaming = is_streaming;
+    }
+
+    /// Mark this as the final batch of a streaming transaction
+    pub fn set_final_batch(&mut self, is_final: bool) {
+        self.is_final_batch = is_final;
+    }
+
+    /// Take all events from this transaction, leaving it empty
+    pub fn take_events(&mut self) -> Vec<ChangeEvent> {
+        std::mem::take(&mut self.events)
     }
 }

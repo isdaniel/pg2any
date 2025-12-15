@@ -1,7 +1,7 @@
 use super::destination_factory::DestinationHandler;
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType, ReplicaIdentity},
+    types::{ChangeEvent, EventType, ReplicaIdentity, Transaction},
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
@@ -10,13 +10,78 @@ use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, error, info};
 
-/// SQLite destination implementation
+/// Maximum number of rows per batch INSERT statement for SQLite
+/// SQLite has a limit on the number of variables per statement (SQLITE_MAX_VARIABLE_NUMBER, default 999)
+const MAX_BATCH_INSERT_SIZE: usize = 500;
+
+/// Helper struct for building WHERE clauses with proper parameter binding
+/// Uses references to avoid unnecessary cloning of JSON values
+#[derive(Debug)]
+struct WhereClause<'a> {
+    sql: String,
+    bind_values: Vec<&'a serde_json::Value>,
+}
+
+/// State for an active streaming transaction
+/// Holds the open database transaction across multiple batches
+struct ActiveStreamingTransaction {
+    /// PostgreSQL transaction ID
+    transaction_id: u32,
+    /// The open SQLite transaction
+    transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    /// Number of events processed so far
+    events_processed: usize,
+}
+
+/// SQLite destination implementation with batch INSERT support
 ///
 /// This implementation uses sqlx for database operations with async support.
 /// SQLite connections are managed through sqlx's connection pool.
 pub struct SQLiteDestination {
     pool: Option<SqlitePool>,
     database_path: Option<String>,
+    /// Active streaming transaction state (if any)
+    active_streaming_tx: Option<ActiveStreamingTransaction>,
+}
+
+/// Represents a group of INSERT events for the same table that can be batched
+struct InsertBatch<'a> {
+    table: String,
+    /// Column names in consistent order
+    columns: Vec<String>,
+    /// Values for each row, in the same column order
+    rows: Vec<Vec<&'a serde_json::Value>>,
+}
+
+impl<'a> InsertBatch<'a> {
+    fn new(table: String, columns: Vec<String>) -> Self {
+        Self {
+            table,
+            columns,
+            rows: Vec::new(),
+        }
+    }
+
+    fn add_row(&mut self, data: &'a HashMap<String, serde_json::Value>) {
+        let values: Vec<&serde_json::Value> = self
+            .columns
+            .iter()
+            .map(|col| data.get(col).unwrap_or(&serde_json::Value::Null))
+            .collect();
+        self.rows.push(values);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn can_add(&self, table: &str, columns: &[String]) -> bool {
+        self.table == table && self.columns == columns
+    }
 }
 
 impl SQLiteDestination {
@@ -25,6 +90,7 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
+            active_streaming_tx: None,
         }
     }
 
@@ -45,7 +111,6 @@ impl SQLiteDestination {
     }
 
     /// Build WHERE clause for UPDATE operations
-    /// Returns the SQL WHERE clause string and a vector of references to the bind values
     fn build_where_clause_for_update<'a>(
         &self,
         old_data: &'a Option<HashMap<String, serde_json::Value>>,
@@ -54,10 +119,10 @@ impl SQLiteDestination {
         key_columns: &[String],
         schema: &str,
         table: &str,
-    ) -> Result<(String, Vec<&'a serde_json::Value>)> {
+    ) -> Result<WhereClause<'a>> {
         match replica_identity {
             ReplicaIdentity::Full => {
-                // Use all old data for WHERE clause
+                // Always require old_data for FULL replica identity
                 if let Some(old) = old_data {
                     let mut conditions = Vec::with_capacity(old.len());
                     let mut bind_values = Vec::with_capacity(old.len());
@@ -67,11 +132,14 @@ impl SQLiteDestination {
                         bind_values.push(value);
                     }
 
-                    Ok((conditions.join(" AND "), bind_values))
+                    Ok(WhereClause {
+                        sql: conditions.join(" AND "),
+                        bind_values,
+                    })
                 } else {
                     Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {} during UPDATE",
-                        table
+                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during UPDATE",
+                        schema, table
                     )))
                 }
             }
@@ -105,7 +173,10 @@ impl SQLiteDestination {
                     }
                 }
 
-                Ok((conditions.join(" AND "), bind_values))
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
             }
 
             ReplicaIdentity::Nothing => {
@@ -139,12 +210,15 @@ impl SQLiteDestination {
                     schema, table
                 );
 
-                Ok((conditions.join(" AND "), bind_values))
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
             }
         }
     }
 
-    /// Build WHERE clause specifically for DELETE operations (where old_data is always provided)
+    /// Build WHERE clause specifically for DELETE operations
     fn build_where_clause_for_delete<'a>(
         &self,
         old_data: &'a HashMap<String, serde_json::Value>,
@@ -152,7 +226,7 @@ impl SQLiteDestination {
         key_columns: &[String],
         schema: &str,
         table: &str,
-    ) -> Result<(String, Vec<&'a serde_json::Value>)> {
+    ) -> Result<WhereClause<'a>> {
         match replica_identity {
             ReplicaIdentity::Full => {
                 let mut conditions = Vec::with_capacity(old_data.len());
@@ -163,7 +237,10 @@ impl SQLiteDestination {
                     bind_values.push(value);
                 }
 
-                Ok((conditions.join(" AND "), bind_values))
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
             }
 
             ReplicaIdentity::Default | ReplicaIdentity::Index => {
@@ -189,7 +266,10 @@ impl SQLiteDestination {
                     }
                 }
 
-                Ok((conditions.join(" AND "), bind_values))
+                Ok(WhereClause {
+                    sql: conditions.join(" AND "),
+                    bind_values,
+                })
             }
 
             ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
@@ -200,184 +280,261 @@ impl SQLiteDestination {
         }
     }
 
-    /// Execute INSERT operation
-    async fn execute_insert(
+    /// Process a single event within an existing database transaction
+    async fn process_event_in_transaction<'a>(
         &self,
-        pool: &SqlitePool,
-        table: &str,
-        data: &HashMap<String, serde_json::Value>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        event: &'a ChangeEvent,
     ) -> Result<()> {
-        let columns: Vec<String> = data.keys().map(|k| format!("\"{}\"", k)).collect();
-        let placeholders: Vec<String> = (0..data.len()).map(|_| "?".to_string()).collect();
+        match &event.event_type {
+            EventType::Insert { table, data, .. } => {
+                let columns: Vec<String> = data.keys().map(|k| format!("\"{}\"", k)).collect();
+                let placeholders: Vec<String> = (0..data.len()).map(|_| "?".to_string()).collect();
+                let table_ref = format!("\"{}\"", table);
 
-        // Use only table name without schema
-        let table_ref = format!("\"{}\"", table);
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    table_ref,
+                    columns.join(", "),
+                    placeholders.join(", ")
+                );
 
+                let mut query = sqlx::query(&sql);
+                for (_, value) in data {
+                    query = self.bind_value(query, value);
+                }
+
+                query
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQLite INSERT failed: {}", e)))?;
+                debug!("Successfully inserted record into {}", table);
+            }
+
+            EventType::Update {
+                table,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+                ..
+            } => {
+                let set_clauses: Vec<String> =
+                    new_data.keys().map(|k| format!("\"{}\" = ?", k)).collect();
+                let where_clause = self.build_where_clause_for_update(
+                    old_data,
+                    new_data,
+                    replica_identity,
+                    key_columns,
+                    "main",
+                    table,
+                )?;
+
+                let table_ref = format!("\"{}\"", table);
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    table_ref,
+                    set_clauses.join(", "),
+                    where_clause.sql
+                );
+
+                let mut query = sqlx::query(&sql);
+                for (_, value) in new_data {
+                    query = self.bind_value(query, value);
+                }
+                for value in where_clause.bind_values {
+                    query = self.bind_value(query, value);
+                }
+
+                query
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQLite UPDATE failed: {}", e)))?;
+                debug!("Successfully updated record in {}", table);
+            }
+
+            EventType::Delete {
+                table,
+                old_data,
+                replica_identity,
+                key_columns,
+                ..
+            } => {
+                let where_clause = self.build_where_clause_for_delete(
+                    old_data,
+                    replica_identity,
+                    key_columns,
+                    "main",
+                    table,
+                )?;
+
+                let table_ref = format!("\"{}\"", table);
+                let sql = format!("DELETE FROM {} WHERE {}", table_ref, where_clause.sql);
+
+                let mut query = sqlx::query(&sql);
+                for value in where_clause.bind_values {
+                    query = self.bind_value(query, value);
+                }
+
+                query
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| CdcError::generic(format!("SQLite DELETE failed: {}", e)))?;
+                debug!("Successfully deleted record from {}", table);
+            }
+
+            EventType::Truncate(tables) => {
+                for table_ref in tables {
+                    let parts: Vec<&str> = table_ref.split('.').collect();
+                    let table = if parts.len() >= 2 { parts[1] } else { parts[0] };
+                    let table_name = format!("\"{}\"", table);
+                    let sql = format!("DELETE FROM {}", table_name);
+
+                    sqlx::query(&sql)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| CdcError::generic(format!("SQLite TRUNCATE failed: {}", e)))?;
+                }
+                debug!("Successfully truncated {} table(s)", tables.len());
+            }
+
+            _ => {
+                // Skip non-DML events (BEGIN, COMMIT, RELATION, etc.)
+                debug!("Skipping non-DML event: {:?}", event.event_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a batch INSERT statement for multiple rows
+    async fn execute_batch_insert<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        batch: &InsertBatch<'a>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let columns: Vec<String> = batch.columns.iter().map(|k| format!("\"{}\"", k)).collect();
+        let num_columns = columns.len();
+
+        // Build placeholders for one row: (?, ?, ?)
+        let row_placeholder = format!(
+            "({})",
+            (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ")
+        );
+
+        // Build all row placeholders: (?, ?, ?), (?, ?, ?), ...
+        let all_placeholders: Vec<String> = (0..batch.rows.len())
+            .map(|_| row_placeholder.clone())
+            .collect();
+
+        let table_ref = format!("\"{}\"", batch.table);
         let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
+            "INSERT INTO {} ({}) VALUES {}",
             table_ref,
             columns.join(", "),
-            placeholders.join(", ")
+            all_placeholders.join(", ")
         );
 
-        debug!("Executing SQLite INSERT: {}", sql);
-
         let mut query = sqlx::query(&sql);
-        for (_, value) in data {
-            query = self.bind_value(query, value);
+
+        // Bind all values for all rows
+        for row in &batch.rows {
+            for value in row {
+                query = self.bind_value(query, value);
+            }
         }
 
+        let batch_start = std::time::Instant::now();
         query
-            .execute(pool)
+            .execute(&mut **tx)
             .await
-            .map_err(|e| CdcError::generic(format!("SQLite INSERT failed: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("SQLite batch INSERT failed: {}", e)))?;
+        let batch_duration = batch_start.elapsed();
 
-        Ok(())
-    }
-
-    /// Execute UPDATE operation
-    async fn execute_update(
-        &self,
-        pool: &SqlitePool,
-        schema: &str,
-        table: &str,
-        old_data: &Option<HashMap<String, serde_json::Value>>,
-        new_data: &HashMap<String, serde_json::Value>,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
-    ) -> Result<()> {
-        let set_clauses: Vec<String> = new_data.keys().map(|k| format!("\"{}\" = ?", k)).collect();
-
-        let (where_clause, where_values) = self.build_where_clause_for_update(
-            old_data,
-            new_data,
-            replica_identity,
-            key_columns,
-            schema,
-            table,
-        )?;
-
-        // Use only table name without schema
-        let table_ref = format!("\"{}\"", table);
-
-        let sql = format!(
-            "UPDATE {} SET {} WHERE {}",
-            table_ref,
-            set_clauses.join(", "),
-            where_clause
+        info!(
+            "SQLite Batch INSERT: {} rows into \"{}\" in {:?}",
+            batch.rows.len(),
+            batch.table,
+            batch_duration
         );
 
-        debug!("Executing SQLite UPDATE: {}", sql);
-
-        let mut query = sqlx::query(&sql);
-
-        // Bind SET values first
-        for (_, value) in new_data {
-            query = self.bind_value(query, value);
-        }
-
-        // Then bind WHERE values
-        for value in where_values {
-            query = self.bind_value(query, value);
-        }
-
-        let result = query
-            .execute(pool)
-            .await
-            .map_err(|e| CdcError::generic(format!("SQLite UPDATE failed: {}", e)))?;
-
-        if result.rows_affected() == 0 {
-            error!(
-                "UPDATE operation affected 0 rows for table {}.{}",
-                schema, table
-            );
-        } else {
-            debug!("UPDATE operation affected {} rows", result.rows_affected());
-        }
-
         Ok(())
     }
 
-    /// Execute DELETE operation
-    async fn execute_delete(
+    /// Process events with batch INSERT optimization
+    /// Groups consecutive INSERT events for the same table and executes them as batch inserts
+    async fn process_events_with_batching<'a>(
         &self,
-        pool: &SqlitePool,
-        schema: &str,
-        table: &str,
-        old_data: &HashMap<String, serde_json::Value>,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        events: &'a [ChangeEvent],
     ) -> Result<()> {
-        // Build WHERE clause directly from old_data without wrapping in Option
-        let (where_clause, where_values) = self.build_where_clause_for_delete(
-            old_data,
-            replica_identity,
-            key_columns,
-            schema,
-            table,
-        )?;
+        let mut current_batch: Option<InsertBatch<'a>> = None;
 
-        // Use only table name without schema
-        let table_ref = format!("\"{}\"", table);
+        for event in events {
+            match &event.event_type {
+                EventType::Insert { table, data, .. } => {
+                    // Get column names in sorted order for consistency
+                    let mut columns: Vec<String> = data.keys().cloned().collect();
+                    columns.sort();
 
-        let sql = format!("DELETE FROM {} WHERE {}", table_ref, where_clause);
+                    // Check if we can add to current batch
+                    let can_add = current_batch
+                        .as_ref()
+                        .map(|b| b.can_add(table, &columns))
+                        .unwrap_or(false);
 
-        debug!("Executing SQLite DELETE: {}", sql);
+                    if can_add {
+                        // Add to existing batch
+                        let batch = current_batch.as_mut().unwrap();
+                        batch.add_row(data);
 
-        let mut query = sqlx::query(&sql);
-        for value in where_values {
-            query = self.bind_value(query, value);
+                        // Execute if batch is full
+                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                            self.execute_batch_insert(tx, batch).await?;
+                            current_batch = None;
+                        }
+                    } else {
+                        // Flush existing batch and start new one
+                        if let Some(batch) = current_batch.take() {
+                            self.execute_batch_insert(tx, &batch).await?;
+                        }
+
+                        let mut new_batch = InsertBatch::new(table.clone(), columns);
+                        new_batch.add_row(data);
+                        current_batch = Some(new_batch);
+                    }
+                }
+                EventType::Update { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+                EventType::Delete { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+                _ => {
+                    // Other events: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+            }
         }
 
-        let result = query
-            .execute(pool)
-            .await
-            .map_err(|e| CdcError::generic(format!("SQLite DELETE failed: {}", e)))?;
-
-        if result.rows_affected() == 0 {
-            error!(
-                "DELETE operation affected 0 rows for table {}.{}",
-                schema, table
-            );
-        } else {
-            debug!("DELETE operation affected {} rows", result.rows_affected());
-        }
-
-        Ok(())
-    }
-
-    /// Execute TRUNCATE operation (implemented as DELETE FROM table)
-    /// SQLite doesn't have a native TRUNCATE command, so we use DELETE FROM table
-    /// with optimizations for better performance
-    async fn execute_truncate(&self, pool: &SqlitePool, tables: &[String]) -> Result<()> {
-        for table_ref in tables {
-            // Parse table reference: "schema.table" or just "table"
-            let parts: Vec<&str> = table_ref.split('.').collect();
-            let (_schema, table) = if parts.len() >= 2 {
-                (parts[0], parts[1])
-            } else {
-                ("main", parts[0]) // Default schema in SQLite is "main"
-            };
-
-            // Use only table name without schema
-            let table_name = format!("\"{}\"", table);
-
-            // SQLite doesn't have TRUNCATE, but DELETE without WHERE clause is equivalent
-            // We could also use: DELETE FROM table; DELETE FROM sqlite_sequence WHERE name='table';
-            // to reset auto-increment counters, but we'll keep it simple for now
-            let sql = format!("DELETE FROM {}", table_name);
-
-            debug!("Executing SQLite TRUNCATE (DELETE): {}", sql);
-
-            let result = sqlx::query(&sql).execute(pool).await.map_err(|e| {
-                CdcError::generic(format!("SQLite TRUNCATE failed for {}: {}", table_name, e))
-            })?;
-
-            info!(
-                "Successfully truncated table {} (deleted {} rows)",
-                table_name,
-                result.rows_affected()
-            );
+        // Flush any remaining batch
+        if let Some(batch) = current_batch.take() {
+            self.execute_batch_insert(tx, &batch).await?;
         }
 
         Ok(())
@@ -450,69 +607,211 @@ impl DestinationHandler for SQLiteDestination {
     // SQLite does not use schema/database namespacing like MySQL, so schema mappings are not needed - tables are referenced by name only
     fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
 
-    async fn process_event(&mut self, event: &ChangeEvent) -> Result<()> {
+    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
         let pool = self
             .pool
             .as_ref()
             .ok_or_else(|| CdcError::generic("SQLite connection not established"))?;
 
-        match &event.event_type {
-            EventType::Insert { table, data, .. } => {
-                self.execute_insert(pool, table, data).await?;
-                debug!("Successfully inserted record into {}", table);
+        // Skip empty transactions
+        if transaction.is_empty() {
+            debug!(
+                "Skipping empty transaction {} (streaming={}, final={})",
+                transaction.transaction_id, transaction.is_streaming, transaction.is_final_batch
+            );
+            return Ok(());
+        }
+
+        let tx_start = std::time::Instant::now();
+
+        debug!(
+            "SQLite: Starting to process transaction {} with {} events (streaming={}, final={})",
+            transaction.transaction_id,
+            transaction.event_count(),
+            transaction.is_streaming,
+            transaction.is_final_batch
+        );
+
+        // Start a database transaction
+        let begin_time = std::time::Instant::now();
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to begin SQLite transaction: {}", e)))?;
+        debug!("SQLite: BEGIN took {:?}", begin_time.elapsed());
+
+        // Process events with batching optimization
+        let process_time = std::time::Instant::now();
+        let result = self
+            .process_events_with_batching(&mut tx, &transaction.events)
+            .await;
+        debug!("SQLite: Event processing took {:?}", process_time.elapsed());
+
+        if let Err(e) = result {
+            // Rollback on error
+            tx.rollback().await.map_err(|re| {
+                CdcError::generic(format!(
+                    "Failed to rollback transaction after error '{}': {}",
+                    e, re
+                ))
+            })?;
+            return Err(e);
+        }
+
+        // Commit the transaction
+        let commit_time = std::time::Instant::now();
+        tx.commit().await.map_err(|e| {
+            CdcError::generic(format!("Failed to commit SQLite transaction: {}", e))
+        })?;
+        let commit_duration = commit_time.elapsed();
+
+        debug!(
+            "SQLite: COMMIT took {:?} for transaction {} ({} events, total time: {:?})",
+            commit_duration,
+            transaction.transaction_id,
+            transaction.event_count(),
+            tx_start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    async fn process_streaming_batch(&mut self, transaction: &Transaction) -> Result<()> {
+        if !transaction.is_streaming {
+            return self.process_transaction(transaction).await;
+        }
+
+        let pool = self
+            .pool
+            .clone()
+            .ok_or_else(|| CdcError::generic("SQLite connection not established"))?;
+
+        if transaction.is_empty() && !transaction.is_final_batch {
+            debug!(
+                "Skipping empty non-final streaming batch for transaction {}",
+                transaction.transaction_id
+            );
+            return Ok(());
+        }
+
+        let tx_id = transaction.transaction_id;
+        let is_final = transaction.is_final_batch;
+
+        debug!(
+            "SQLite: Processing streaming batch for transaction {} ({} events, final={})",
+            tx_id,
+            transaction.event_count(),
+            is_final
+        );
+
+        if let Some(ref active) = self.active_streaming_tx {
+            if active.transaction_id != tx_id {
+                tracing::warn!(
+                    "SQLite: Received batch for transaction {} but have active transaction {}. Rolling back active.",
+                    tx_id, active.transaction_id
+                );
+                self.rollback_streaming_transaction().await?;
+            }
+        }
+
+        if self.active_streaming_tx.is_none() {
+            let tx = pool.begin().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to begin SQLite streaming transaction: {}",
+                    e
+                ))
+            })?;
+
+            info!(
+                "SQLite: Started streaming transaction {} (first batch)",
+                tx_id
+            );
+
+            self.active_streaming_tx = Some(ActiveStreamingTransaction {
+                transaction_id: tx_id,
+                transaction: tx,
+                events_processed: 0,
+            });
+        }
+
+        if !transaction.is_empty() {
+            let mut active = self.active_streaming_tx.take().unwrap();
+
+            let result = self
+                .process_events_with_batching(&mut active.transaction, &transaction.events)
+                .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    "SQLite: Error processing streaming batch, rolling back transaction {}: {}",
+                    tx_id,
+                    e
+                );
+                let _ = active.transaction.rollback().await;
+                return Err(e);
             }
 
-            EventType::Update {
-                table,
-                old_data,
-                new_data,
-                replica_identity,
-                key_columns,
-                ..
-            } => {
-                self.execute_update(
-                    pool,
-                    "main",
-                    table,
-                    old_data,
-                    new_data,
-                    replica_identity,
-                    key_columns,
-                )
-                .await?;
-                debug!("Successfully updated record in main.{}", table);
-            }
+            active.events_processed += transaction.event_count();
 
-            EventType::Delete {
-                table,
-                old_data,
-                replica_identity,
-                key_columns,
-                ..
-            } => {
-                self.execute_delete(pool, "main", table, old_data, replica_identity, key_columns)
-                    .await?;
-                debug!("Successfully deleted record from main.{}", table);
-            }
+            debug!(
+                "SQLite: Processed {} events for streaming transaction {} (total: {})",
+                transaction.event_count(),
+                tx_id,
+                active.events_processed
+            );
 
-            EventType::Truncate(tables) => {
-                self.execute_truncate(pool, tables).await?;
-                debug!("Successfully truncated {} table(s)", tables.len());
-            }
+            self.active_streaming_tx = Some(active);
+        }
 
-            EventType::Begin { .. } => {
-                // SQLite with WAL mode handles transactions automatically
-                debug!("Transaction BEGIN received (SQLite with WAL mode handles transactions automatically)");
-            }
+        if is_final {
+            self.commit_streaming_transaction().await?;
+        }
 
-            EventType::Commit { .. } => {
-                // SQLite with WAL mode handles transactions automatically
-                debug!("Transaction COMMIT received (SQLite with WAL mode handles transactions automatically)");
-            }
+        Ok(())
+    }
 
-            EventType::Relation | EventType::Type | EventType::Origin | EventType::Message => {
-                // These are metadata events that don't require action for SQLite
-                debug!("Received metadata event: {:?}", event.event_type);
+    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
+        self.active_streaming_tx
+            .as_ref()
+            .map(|tx| tx.transaction_id)
+    }
+
+    async fn commit_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(active) = self.active_streaming_tx.take() {
+            let commit_start = std::time::Instant::now();
+
+            active.transaction.commit().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to commit SQLite streaming transaction {}: {}",
+                    active.transaction_id, e
+                ))
+            })?;
+
+            info!(
+                "SQLite: Committed streaming transaction {} ({} events) in {:?}",
+                active.transaction_id,
+                active.events_processed,
+                commit_start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(active) = self.active_streaming_tx.take() {
+            tracing::warn!(
+                "SQLite: Rolling back streaming transaction {} ({} events processed)",
+                active.transaction_id,
+                active.events_processed
+            );
+
+            if let Err(e) = active.transaction.rollback().await {
+                tracing::warn!(
+                    "SQLite: Failed to rollback streaming transaction {}: {}",
+                    active.transaction_id,
+                    e
+                );
             }
         }
 
@@ -539,12 +838,17 @@ impl DestinationHandler for SQLiteDestination {
     }
 
     async fn close(&mut self) -> Result<()> {
-        if let Some(pool) = self.pool.take() {
-            pool.close().await;
-            info!("SQLite connection pool closed successfully");
+        if self.active_streaming_tx.is_some() {
+            tracing::warn!("SQLite: Closing with active streaming transaction - rolling back");
+            self.rollback_streaming_transaction().await?;
         }
 
+        if let Some(pool) = &self.pool {
+            pool.close().await;
+        }
+        self.pool = None;
         self.database_path = None;
+        info!("SQLite connection closed successfully");
         Ok(())
     }
 }

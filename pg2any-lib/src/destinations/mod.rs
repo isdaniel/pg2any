@@ -13,8 +13,6 @@ pub mod sqlite;
 /// Destination factory and trait definitions
 pub mod destination_factory;
 
-mod operation;
-
 // Re-export the implementations for easy access
 #[cfg(feature = "mysql")]
 pub use mysql::MySQLDestination;

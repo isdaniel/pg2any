@@ -81,6 +81,11 @@ pub struct Config {
     /// Default: 1 (single consumer)
     pub consumer_workers: usize,
 
+    /// Batch size for multi-value INSERT statements in destination database
+    /// Higher values improve throughput for large streaming transactions
+    /// but may increase memory usage. Default: 1000
+    pub batch_size: usize,
+
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
 }
@@ -180,6 +185,7 @@ impl Default for Config {
             table_mappings: HashMap::new(),
             schema_mappings: HashMap::new(),
             consumer_workers: 1,
+            batch_size: 1000,
             extra_options: HashMap::new(),
         }
     }
@@ -329,6 +335,12 @@ impl ConfigBuilder {
     /// Setting this to a value greater than 1 enables parallel consumers
     pub fn consumer_workers(mut self, workers: usize) -> Self {
         self.config.consumer_workers = workers.max(1);
+        self
+    }
+
+    /// Higher values improve throughput for large streaming transactions
+    pub fn batch_size(mut self, size: usize) -> Self {
+        self.config.batch_size = size.max(1);
         self
     }
 

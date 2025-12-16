@@ -2,8 +2,7 @@ use chrono::Utc;
 use pg2any_lib::{
     destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationFactory},
     types::{ChangeEvent, EventType, ReplicaIdentity},
-    DestinationType,
-    Transaction,
+    DestinationType, Transaction,
 };
 use std::collections::HashMap;
 
@@ -57,7 +56,9 @@ async fn test_destination_handler_interface() {
 
         // Test single event processing interface
         for event in &events {
-            let event_result = destination.process_transaction(&wrap_in_transaction(event.clone())).await;
+            let event_result = destination
+                .process_transaction(&wrap_in_transaction(event.clone()))
+                .await;
             // Should fail due to no connection, but not panic
             assert!(event_result.is_err());
         }
@@ -73,7 +74,9 @@ async fn test_destination_handler_interface() {
 
         // Test single event processing interface
         for event in &events {
-            let event_result = destination.process_transaction(&wrap_in_transaction(event.clone())).await;
+            let event_result = destination
+                .process_transaction(&wrap_in_transaction(event.clone()))
+                .await;
             // Should fail due to no connection, but not panic
             assert!(event_result.is_err());
         }

@@ -49,6 +49,9 @@ use std::time::Duration;
 /// - `CDC_BUFFER_SIZE`: Size of the event channel buffer (default: "1000")
 ///   Larger buffers can smooth out burst traffic but consume more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
+/// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
+///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
+///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
 ///
 /// # Errors
 ///
@@ -101,6 +104,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let heartbeat_interval_secs = parse_u64_env("CDC_HEARTBEAT_INTERVAL", 10)?;
     let consumer_workers = parse_usize_env("CDC_CONSUMER_WORKERS", 1)?;
     let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
+    let batch_size = parse_usize_env("CDC_BATCH_SIZE", 1000)?;
 
     tracing::info!(
         "CDC Config - Slot: {}, Publication: {}, Protocol: {}, Streaming: {}, Binary: {}",
@@ -119,9 +123,10 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     );
 
     tracing::info!(
-        "Performance - Consumer Workers: {}, Buffer Size: {}",
+        "Performance - Consumer Workers: {}, Buffer Size: {}, Batch Size: {}",
         consumer_workers,
-        buffer_size
+        buffer_size,
+        batch_size
     );
 
     // Build the configuration
@@ -140,6 +145,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .schema_mappings(schema_mappings)
         .consumer_workers(consumer_workers)
         .buffer_size(buffer_size)
+        .batch_size(batch_size)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");

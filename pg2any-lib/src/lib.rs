@@ -76,6 +76,9 @@ pub mod replication_protocol;
 // High-level client interface
 pub mod client;
 
+// Streaming transaction management for protocol v2+
+mod streaming_transaction_manager;
+
 // Monitoring and metrics
 pub mod monitoring;
 

@@ -8,6 +8,9 @@ use sqlx::MySqlPool;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+/// Maximum number of rows per batch INSERT statement, This is limited by MySQL's max_allowed_packet and number of placeholders
+const MAX_BATCH_INSERT_SIZE: usize = 1000;
+
 /// MySQL destination implementation
 pub struct MySQLDestination {
     pool: Option<MySqlPool>,
@@ -22,6 +25,48 @@ pub struct MySQLDestination {
 struct WhereClause<'a> {
     sql: String,
     bind_values: Vec<&'a serde_json::Value>,
+}
+
+/// Represents a group of INSERT events for the same table that can be batched
+struct InsertBatch<'a> {
+    schema: String,
+    table: String,
+    /// Column names in consistent order
+    columns: Vec<String>,
+    /// Values for each row, in the same column order
+    rows: Vec<Vec<&'a serde_json::Value>>,
+}
+
+impl<'a> InsertBatch<'a> {
+    fn new(schema: String, table: String, columns: Vec<String>) -> Self {
+        Self {
+            schema,
+            table,
+            columns,
+            rows: Vec::new(),
+        }
+    }
+
+    fn add_row(&mut self, data: &'a HashMap<String, serde_json::Value>) {
+        let values: Vec<&serde_json::Value> = self
+            .columns
+            .iter()
+            .map(|col| data.get(col).unwrap_or(&serde_json::Value::Null))
+            .collect();
+        self.rows.push(values);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn can_add(&self, schema: &str, table: &str, columns: &[String]) -> bool {
+        self.schema == schema && self.table == table && self.columns == columns
+    }
 }
 
 impl MySQLDestination {
@@ -365,6 +410,144 @@ impl MySQLDestination {
 
         Ok(())
     }
+
+    /// Uses multi-value INSERT: INSERT INTO table (cols) VALUES (v1), (v2), ...
+    async fn execute_batch_insert<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        batch: &InsertBatch<'a>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let dest_schema = self.map_schema(&batch.schema);
+        let columns: Vec<String> = batch.columns.iter().map(|k| format!("`{}`", k)).collect();
+        let num_columns = columns.len();
+
+        // Build placeholders for one row: (?, ?, ?)
+        let row_placeholder = format!(
+            "({})",
+            (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ")
+        );
+
+        // Build all row placeholders: (?, ?, ?), (?, ?, ?), ...
+        let all_placeholders: Vec<String> = (0..batch.rows.len())
+            .map(|_| row_placeholder.clone())
+            .collect();
+
+        let sql = format!(
+            "INSERT INTO `{}`.`{}` ({}) VALUES {}",
+            dest_schema,
+            batch.table,
+            columns.join(", "),
+            all_placeholders.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql);
+
+        // Bind all values for all rows
+        for row in &batch.rows {
+            for value in row {
+                query = self.bind_value(query, value);
+            }
+        }
+
+        let batch_start = std::time::Instant::now();
+        query.execute(&mut **tx).await?;
+        let batch_duration = batch_start.elapsed();
+
+        info!(
+            "MySQL Batch INSERT: {} rows into `{}`.`{}` in {:?}",
+            batch.rows.len(),
+            dest_schema,
+            batch.table,
+            batch_duration
+        );
+
+        Ok(())
+    }
+
+    /// Process events with batch INSERT optimization for streaming transactions
+    /// Groups consecutive INSERT events for the same table and executes them as batch inserts
+    async fn process_events_with_batching<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        events: &'a [ChangeEvent],
+    ) -> Result<()> {
+        let mut current_batch: Option<InsertBatch<'a>> = None;
+
+        for event in events {
+            match &event.event_type {
+                EventType::Insert {
+                    schema,
+                    table,
+                    data,
+                    ..
+                } => {
+                    let dest_schema = self.map_schema(schema);
+                    // Get column names in sorted order for consistency
+                    let mut columns: Vec<String> = data.keys().cloned().collect();
+                    columns.sort();
+
+                    // Check if we can add to current batch
+                    let can_add = current_batch
+                        .as_ref()
+                        .map(|b| b.can_add(&dest_schema, table, &columns))
+                        .unwrap_or(false);
+
+                    if can_add {
+                        // Add to existing batch
+                        let batch = current_batch.as_mut().unwrap();
+                        batch.add_row(data);
+
+                        // Execute if batch is full
+                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                            self.execute_batch_insert(tx, batch).await?;
+                            current_batch = None;
+                        }
+                    } else {
+                        // Flush existing batch and start new one
+                        if let Some(batch) = current_batch.take() {
+                            self.execute_batch_insert(tx, &batch).await?;
+                        }
+
+                        let mut new_batch = InsertBatch::new(dest_schema, table.clone(), columns);
+                        new_batch.add_row(data);
+                        current_batch = Some(new_batch);
+                    }
+                }
+                EventType::Update { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+                EventType::Delete { .. } => {
+                    // Non-INSERT event: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+                _ => {
+                    // Other events: flush any pending batch and process event
+                    if let Some(batch) = current_batch.take() {
+                        self.execute_batch_insert(tx, &batch).await?;
+                    }
+                    self.process_event_in_transaction(tx, event).await?;
+                }
+            }
+        }
+
+        // Flush any remaining batch
+        if let Some(batch) = current_batch.take() {
+            self.execute_batch_insert(tx, &batch).await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -394,46 +577,60 @@ impl DestinationHandler for MySQLDestination {
         // Skip empty transactions
         if transaction.is_empty() {
             debug!(
-                "Skipping empty transaction {}",
-                transaction.transaction_id
+                "Skipping empty transaction {} (streaming={}, final={})",
+                transaction.transaction_id, transaction.is_streaming, transaction.is_final_batch
             );
             return Ok(());
         }
 
+        let tx_start = std::time::Instant::now();
+
         debug!(
-            "Processing transaction {} with {} events",
+            "MySQL: Starting to process transaction {} with {} events (streaming={}, final={})",
             transaction.transaction_id,
-            transaction.event_count()
+            transaction.event_count(),
+            transaction.is_streaming,
+            transaction.is_final_batch
         );
 
         // Start a database transaction
-        let mut tx = pool.begin().await.map_err(|e| {
-            CdcError::generic(format!("Failed to begin MySQL transaction: {}", e))
-        })?;
+        let begin_time = std::time::Instant::now();
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to begin MySQL transaction: {}", e)))?;
+        debug!("MySQL: BEGIN took {:?}", begin_time.elapsed());
 
-        // Process each event within the transaction
-        for event in &transaction.events {
-            if let Err(e) = self.process_event_in_transaction(&mut tx, event).await {
-                // Rollback on error
-                tx.rollback().await.map_err(|re| {
-                    CdcError::generic(format!(
-                        "Failed to rollback transaction after error '{}': {}",
-                        e, re
-                    ))
-                })?;
-                return Err(e);
-            }
+        let process_time = std::time::Instant::now();
+        let result = self
+            .process_events_with_batching(&mut tx, &transaction.events)
+            .await;
+        debug!("MySQL: Event processing took {:?}", process_time.elapsed());
+
+        if let Err(e) = result {
+            // Rollback on error
+            tx.rollback().await.map_err(|re| {
+                CdcError::generic(format!(
+                    "Failed to rollback transaction after error '{}': {}",
+                    e, re
+                ))
+            })?;
+            return Err(e);
         }
 
         // Commit the transaction
-        tx.commit().await.map_err(|e| {
-            CdcError::generic(format!("Failed to commit MySQL transaction: {}", e))
-        })?;
+        let commit_time = std::time::Instant::now();
+        tx.commit()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to commit MySQL transaction: {}", e)))?;
+        let commit_duration = commit_time.elapsed();
 
-        info!(
-            "Transaction {} committed successfully ({} events)",
+        debug!(
+            "MySQL: COMMIT took {:?} for transaction {} ({} events, total time: {:?})",
+            commit_duration,
             transaction.transaction_id,
-            transaction.event_count()
+            transaction.event_count(),
+            tx_start.elapsed()
         );
 
         Ok(())

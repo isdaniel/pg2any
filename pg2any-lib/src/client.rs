@@ -3,6 +3,7 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
+use crate::streaming_transaction_manager::{StreamingTransactionManager, TransactionContext};
 use crate::types::{EventType, Lsn, Transaction};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -129,6 +130,7 @@ impl CdcClient {
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
+            let batch_size = self.config.batch_size;
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
@@ -136,6 +138,7 @@ impl CdcClient {
                 token,
                 start_lsn,
                 metrics,
+                batch_size,
             ))
         };
 
@@ -213,7 +216,7 @@ impl CdcClient {
         let token = self.cancellation_token.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
             loop {
                 tokio::select! {
@@ -231,20 +234,34 @@ impl CdcClient {
     ///
     /// This producer collects events between BEGIN and COMMIT into complete Transaction objects,
     /// ensuring that each worker processes an entire transaction atomically.
+    ///
+    /// ## Streaming Mode Support (Protocol v2+)
+    ///
+    /// When PostgreSQL streaming mode is enabled, large in-progress transactions are sent in chunks:
+    /// - StreamStart → DML events → StreamStop (repeated for each chunk)
+    /// - StreamCommit (final commit) or StreamAbort (rollback)
+    ///
+    /// This producer batches streaming events and sends them when:
+    /// 1. StreamStop is received and batch_size is reached
+    /// 2. StreamCommit is received (final batch)
+    ///
+    /// This enables high-performance batch INSERT operations for large transactions.
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         transaction_sender: mpsc::Sender<Transaction>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
+        batch_size: usize,
     ) -> Result<()> {
-        info!("Starting replication producer (transaction mode)");
+        info!("Starting replication producer (transaction mode with streaming support, batch_size={})", batch_size);
 
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // Current transaction being built
-        let mut current_transaction: Option<Transaction> = None;
+        // Streaming transaction manager for protocol v2+ streaming transactions
+        let mut streaming_manager = StreamingTransactionManager::new(batch_size);
+        let mut current_context = TransactionContext::None;
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
@@ -265,55 +282,205 @@ impl CdcClient {
                             transaction_id,
                             commit_timestamp,
                         } => {
-                            // Start a new transaction
-                            if current_transaction.is_some() {
+                            // Start a new normal transaction
+                            if !matches!(current_context, TransactionContext::None) {
                                 warn!("Received BEGIN while transaction is in progress, discarding incomplete transaction");
                             }
-                            debug!("Starting transaction {} commit_timestamp: {}", transaction_id, commit_timestamp);
-                            current_transaction =
-                                Some(Transaction::new(*transaction_id, *commit_timestamp));
+                            debug!(
+                                "Starting transaction {} commit_timestamp: {}",
+                                transaction_id, commit_timestamp
+                            );
+                            current_context = TransactionContext::Normal(Transaction::new(
+                                *transaction_id,
+                                *commit_timestamp,
+                            ));
                         }
 
                         EventType::Commit { .. } => {
-                            // Complete and send the transaction
-                            if let Some(mut tx) = current_transaction.take() {
+                            // Complete and send the normal transaction
+                            if let TransactionContext::Normal(mut tx) =
+                                std::mem::replace(&mut current_context, TransactionContext::None)
+                            {
                                 if let Some(lsn) = event.lsn {
                                     tx.set_commit_lsn(lsn);
                                 }
 
+                                let tx_id = tx.transaction_id;
+                                let event_count = tx.event_count();
+                                info!(
+                                    "Producer: Sending normal transaction {} with {} events",
+                                    tx_id, event_count
+                                );
+
                                 // Send the completed transaction
-                                if let Err(e) = transaction_sender.send(tx).await {
-                                    error!("Failed to send transaction to consumer: {}", e);
-                                    metrics_collector
-                                        .record_error("transaction_send_failed", "producer");
-                                    break;
+                                match transaction_sender.send(tx).await {
+                                    Ok(_) => {
+                                        info!("Producer: Successfully sent transaction {} with {} events", 
+                                               tx_id, event_count);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Producer: Failed to send transaction to consumer: {}",
+                                            e
+                                        );
+                                        metrics_collector
+                                            .record_error("transaction_send_failed", "producer");
+                                        break;
+                                    }
                                 }
                             } else {
                                 warn!("Received COMMIT without BEGIN, ignoring");
                             }
                         }
 
-                        // Add DML events to the current transaction
+                        EventType::StreamStart {
+                            transaction_id,
+                            first_segment,
+                        } => {
+                            debug!(
+                                "StreamStart: transaction_id={}, first_segment={}",
+                                transaction_id, first_segment
+                            );
+                            streaming_manager.handle_stream_start(
+                                *transaction_id,
+                                *first_segment,
+                                event.lsn,
+                            );
+                            current_context = TransactionContext::Streaming(*transaction_id);
+                        }
+
+                        EventType::StreamStop => {
+                            if let TransactionContext::Streaming(xid) = current_context {
+                                // Check if we should send a batch
+                                if let Some(batch_tx) =
+                                    streaming_manager.handle_stream_stop(xid, event.lsn)
+                                {
+                                    let batch_count = batch_tx.event_count();
+                                    info!("Producer: StreamStop - sending batch with {} events for transaction {}", 
+                                           batch_count, xid);
+
+                                    match transaction_sender.send(batch_tx).await {
+                                        Ok(_) => {
+                                            info!("Producer: Successfully sent StreamStop batch for transaction {}", xid);
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Producer: Failed to send StreamStop batch: {}",
+                                                e
+                                            );
+                                            metrics_collector.record_error(
+                                                "streaming_batch_send_failed",
+                                                "producer",
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        EventType::StreamCommit {
+                            transaction_id,
+                            commit_timestamp,
+                        } => {
+                            info!("Producer: StreamCommit for transaction {}", transaction_id);
+                            if let Some(final_tx) = streaming_manager.handle_stream_commit(
+                                *transaction_id,
+                                *commit_timestamp,
+                                event.lsn,
+                            ) {
+                                let final_count = final_tx.event_count();
+                                info!("Producer: Sending final streaming transaction {} with {} events", 
+                                       transaction_id, final_count);
+
+                                match transaction_sender.send(final_tx).await {
+                                    Ok(_) => {
+                                        info!("Producer: Successfully sent final transaction {} with {} events", 
+                                               transaction_id, final_count);
+                                    }
+                                    Err(e) => {
+                                        error!("Producer: Failed to send final streaming transaction: {}", e);
+                                        metrics_collector.record_error(
+                                            "streaming_commit_send_failed",
+                                            "producer",
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            if let TransactionContext::Streaming(xid) = current_context {
+                                if xid == *transaction_id {
+                                    current_context = TransactionContext::None;
+                                }
+                            }
+                        }
+
+                        EventType::StreamAbort { transaction_id } => {
+                            debug!("StreamAbort: transaction_id={}", transaction_id);
+                            streaming_manager.handle_stream_abort(*transaction_id);
+                            if let TransactionContext::Streaming(xid) = current_context {
+                                if xid == *transaction_id {
+                                    current_context = TransactionContext::None;
+                                }
+                            }
+                        }
                         EventType::Insert { .. }
                         | EventType::Update { .. }
                         | EventType::Delete { .. }
                         | EventType::Truncate(_) => {
-                            if let Some(ref mut tx) = current_transaction {
-                                tx.add_event(event);
-                            } else {
-                                // Event outside of transaction - create implicit transaction, this handles edge cases where we might receive events without BEGIN
-                                warn!("Received DML event outside of transaction context, creating implicit transaction");
-                                let mut implicit_tx = Transaction::new(0, chrono::Utc::now());
-                                if let Some(lsn) = event.lsn {
-                                    implicit_tx.set_commit_lsn(lsn);
-                                }
-                                implicit_tx.add_event(event);
+                            match &mut current_context {
+                                TransactionContext::Streaming(xid) => {
+                                    let xid = *xid;
+                                    // Add to streaming transaction
+                                    streaming_manager.add_event(xid, event);
 
-                                if let Err(e) = transaction_sender.send(implicit_tx).await {
-                                    error!("Failed to send implicit transaction: {}", e);
-                                    metrics_collector
-                                        .record_error("transaction_send_failed", "producer");
-                                    break;
+                                    // Check if we should send a batch (accumulated enough events)
+                                    if streaming_manager.should_send_batch(xid) {
+                                        debug!(
+                                            "Producer: Batch threshold reached for transaction {}",
+                                            xid
+                                        );
+                                        if let Some(batch_tx) = streaming_manager.take_batch(xid) {
+                                            let batch_count = batch_tx.event_count();
+                                            info!("Producer: Sending mid-stream batch with {} events for transaction {}", 
+                                                   batch_count, xid);
+
+                                            match transaction_sender.send(batch_tx).await {
+                                                Ok(_) => {
+                                                    info!("Producer: Successfully sent batch of {} events for transaction {}", 
+                                                           batch_count, xid);
+                                                }
+                                                Err(e) => {
+                                                    error!("Producer: Failed to send mid-stream batch: {}", e);
+                                                    metrics_collector.record_error(
+                                                        "streaming_batch_send_failed",
+                                                        "producer",
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                TransactionContext::Normal(ref mut tx) => {
+                                    // Normal transaction mode
+                                    tx.add_event(event);
+                                }
+                                TransactionContext::None => {
+                                    // Event outside of transaction - create implicit transaction
+                                    warn!("Received DML event outside of transaction context, creating implicit transaction");
+                                    let mut implicit_tx = Transaction::new(0, chrono::Utc::now());
+                                    if let Some(lsn) = event.lsn {
+                                        implicit_tx.set_commit_lsn(lsn);
+                                    }
+                                    implicit_tx.add_event(event);
+
+                                    if let Err(e) = transaction_sender.send(implicit_tx).await {
+                                        error!("Failed to send implicit transaction: {}", e);
+                                        metrics_collector
+                                            .record_error("transaction_send_failed", "producer");
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -342,11 +509,29 @@ impl CdcClient {
         info!("Producer shutting down");
 
         // If there's an incomplete transaction, log a warning
-        if let Some(tx) = current_transaction.take() {
+        match current_context {
+            TransactionContext::Normal(tx) => {
+                warn!(
+                    "Discarding incomplete transaction {} with {} events due to shutdown",
+                    tx.transaction_id,
+                    tx.event_count()
+                );
+            }
+            TransactionContext::Streaming(xid) => {
+                warn!(
+                    "Discarding incomplete streaming transaction {} due to shutdown",
+                    xid
+                );
+            }
+            TransactionContext::None => {}
+        }
+
+        // Clear any incomplete streaming transactions from the manager
+        if streaming_manager.has_active_transactions() {
+            let count = streaming_manager.clear();
             warn!(
-                "Discarding incomplete transaction {} with {} events due to shutdown",
-                tx.transaction_id,
-                tx.event_count()
+                "Discarding {} incomplete streaming transaction(s) due to shutdown",
+                count
             );
         }
 
@@ -383,7 +568,10 @@ impl CdcClient {
         info!("Starting consumer worker {}", worker_id);
 
         // Update destination connection status for this worker
-        metrics_collector.update_destination_connection_status(&format!("{}:worker_{}", destination_type, worker_id), true);
+        metrics_collector.update_destination_connection_status(
+            &format!("{}:worker_{}", destination_type, worker_id),
+            true,
+        );
 
         let mut queue_size_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
@@ -413,16 +601,18 @@ impl CdcClient {
                     metrics_collector.update_consumer_queue_length(queue_length);
                 }
 
-                // Efficiently receive and process transactions (blocking recv, not polling!)
                 transaction = async {
                     let mut receiver = transaction_receiver.lock().await;
                     receiver.recv().await
                 } => {
+
                     match transaction {
                         Some(tx) => {
-                            debug!(
-                                "Consumer worker {} processing transaction {} with {} events",
-                                worker_id, tx.transaction_id, tx.event_count()
+                            let tx_id = tx.transaction_id;
+                            let event_count = tx.event_count();
+                            info!(
+                                "Consumer worker {} received transaction {} with {} events",
+                                worker_id, tx_id, event_count
                             );
                             Self::process_transaction_per_worker(
                                 tx,
@@ -431,6 +621,8 @@ impl CdcClient {
                                 &destination_type,
                                 worker_id,
                             ).await;
+
+                            info!("Consumer worker {} completed transaction {}", worker_id, tx_id);
                         }
                         None => {
                             // Channel closed, break loop
@@ -450,7 +642,10 @@ impl CdcClient {
             );
         }
 
-        metrics_collector.update_destination_connection_status(&format!("{}:worker_{}", destination_type, worker_id), false);
+        metrics_collector.update_destination_connection_status(
+            &format!("{}:worker_{}", destination_type, worker_id),
+            false,
+        );
 
         info!("Consumer worker {} stopped gracefully", worker_id);
         Ok(())
@@ -465,6 +660,7 @@ impl CdcClient {
         worker_id: usize,
     ) {
         let mut count = 0;
+
         loop {
             let tx = {
                 let mut receiver = transaction_receiver.lock().await;
@@ -474,8 +670,8 @@ impl CdcClient {
             match tx {
                 Some(transaction) => {
                     debug!(
-                        "Processing remaining transaction {} during shutdown",
-                        transaction.transaction_id
+                        "Worker {}: Processing remaining transaction {} during shutdown",
+                        worker_id, transaction.transaction_id
                     );
                     Self::process_transaction_per_worker(
                         transaction,
@@ -596,7 +792,7 @@ impl CdcClient {
             (Ok(_), Ok(_)) => {
                 info!(
                     "All CDC tasks completed successfully!! ({} consumer workers)",
-                    num_workers.max(1)
+                    num_workers
                 );
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -895,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consumer_task_cancellation() {
-        let (_tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
+        let (tx_sender, tx_receiver) = mpsc::channel::<Transaction>(10);
         let cancellation_token = CancellationToken::new();
 
         let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -926,6 +1122,9 @@ mod tests {
 
         // Let the consumer run for a bit
         sleep(Duration::from_millis(50)).await;
+
+        // Drop the sender to close the channel properly, This prevents the drain logic from waiting with timeout
+        drop(tx_sender);
 
         // Cancel the token
         cancellation_token.cancel();
@@ -1163,8 +1362,8 @@ mod tests {
                 .expect("Failed to send transaction");
         }
 
-        // Let workers process
-        sleep(Duration::from_millis(200)).await;
+        // Give workers time to process all transactions
+        sleep(Duration::from_millis(500)).await;
 
         // Cancel and wait
         cancellation_token.cancel();
@@ -1298,7 +1497,8 @@ mod tests {
         let expected_lsn = transaction.commit_lsn;
 
         // This should work with direct mutable reference (no mutex)
-        CdcClient::process_transaction_per_worker(transaction, &mut handler, &metrics, "test", 0).await;
+        CdcClient::process_transaction_per_worker(transaction, &mut handler, &metrics, "test", 0)
+            .await;
 
         // Verify transaction was processed
         let processed = transactions_processed.lock().unwrap();

@@ -10,6 +10,8 @@ pub mod sqlserver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+pub mod function;
+
 /// Destination factory and trait definitions
 pub mod destination_factory;
 
@@ -22,6 +24,9 @@ pub use sqlserver::SqlServerDestination;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SQLiteDestination;
+
+// Re-export function destination
+pub use function::FunctionDestination;
 
 // Re-export factory and trait
 pub use destination_factory::{DestinationFactory, DestinationHandler};

@@ -19,8 +19,10 @@ use std::time::Duration;
 ///   (default: constructed from individual parameters below)
 ///
 /// ## Destination Configuration
-/// - `CDC_DEST_TYPE`: Destination type ("MySQL", "SqlServer", or "SQLite", default: "MySQL")
+/// - `CDC_DEST_TYPE`: Destination type ("MySQL", "SqlServer", "SQLite", or "custom:<name>", default: "MySQL")
+///   For custom destinations, use "custom:<name>" where <name> matches a registered custom handler
 /// - `CDC_DEST_URI`: Destination URI/host/file path (default: "localhost" for databases, "./cdc_target.db" for SQLite)
+///   For custom destinations, this can be any connection string your handler expects
 /// - `CDC_DEST_PORT`: Destination port (default: "3306" for MySQL, "1433" for SqlServer) - Not used for SQLite
 /// - `CDC_DEST_DB`: Destination database name (default: "cdc_target") - For SQLite, this is the database file path
 /// - `CDC_DEST_USER`: Destination username (default: "cdc_user") - Not used for SQLite
@@ -66,18 +68,10 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
 
     // Destination configuration
     let dest_type_str = std::env::var("CDC_DEST_TYPE").unwrap_or_else(|_| "MySQL".to_string());
-    let dest_type = match dest_type_str.as_str() {
-        "MySQL" | "mysql" => DestinationType::MySQL,
-        "SqlServer" | "sqlserver" => DestinationType::SqlServer,
-        "SQLite" | "sqlite" => DestinationType::SQLite,
-        _ => {
-            tracing::warn!(
-                "Unknown destination type '{}', defaulting to MySQL",
-                dest_type_str
-            );
-            DestinationType::MySQL
-        }
-    };
+    let dest_type = dest_type_str.parse::<DestinationType>().unwrap_or_else(|err| {
+        tracing::warn!("Error parsing destination type: {}. Defaulting to MySQL", err);
+        DestinationType::MySQL
+    });
 
     let destination_connection_string = std::env::var("CDC_DEST_URI").expect(
         "CDC_DEST_URI environment variable is required. Example for MySQL mysql://replicator:pass.123@127.0.0.1:3306/publif or ./cdc_target.db for SQLite ..etc",

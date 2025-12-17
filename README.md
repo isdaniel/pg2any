@@ -31,6 +31,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
 - **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
+- **Custom Destinations**: Create your own handlers for APIs, message queues, or custom processing
 - **Parallel Processing**: Configurable worker threads with per-worker connections for high throughput
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
 - **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
@@ -274,7 +275,7 @@ pg2any supports comprehensive configuration through environment variables or the
 | **Source PostgreSQL** | | | | | |
 | | `CDC_SOURCE_CONNECTION_STRING` | Complete PostgreSQL connection string | | `postgresql://user:pass@host:port/db?replication=database` | Required for PostgreSQL logical replication |
 | **Destination** | | | | | |
-| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `MySQL`, `SqlServer`, `SQLite` | Case-insensitive |
+| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `MySQL`, `SqlServer`, `SQLite`, `custom:<name>` | Case-insensitive. Use `custom:<name>` for custom handlers |
 | | `CDC_DEST_URI` | **Complete destination connection string** | | See destination-specific examples below | **Primary connection method - replaces individual host/port/user/password variables** |
 | **CDC Settings** | | | | | |
 | | `CDC_REPLICATION_SLOT` | PostgreSQL replication slot | `cdc_slot` | `my_app_slot` | |
@@ -385,6 +386,7 @@ CDC_STREAMING=true
 | **MySQL** | `mysql://user:password@host:port/database` | `mysql://root:pass123@localhost:3306/mydb` |
 | **SQL Server** | `sqlserver://user:password@host:port/database` | `sqlserver://sa:pass123@localhost:1433/master` |
 | **SQLite** | `./path/to/file.db` or `/absolute/path/file.db` | `./replica.db` or `/data/replica.db` |
+| **Custom** | `custom:<name>` (any connection string your handler needs) | `custom:my-api` with `https://api.example.com/events` |
 
 ### Schema Mapping Configuration
 
@@ -490,6 +492,16 @@ The configuration system provides comprehensive validation:
 - **Type Safety**: Proper enum handling for destination types
 - **Default Values**: Sensible defaults for all optional parameters
 - **Error Handling**: Clear error messages for invalid configurations
+
+## Custom Destination Handlers
+
+pg2any supports custom destination handlers, allowing you to process CDC events with your own logic instead of writing to a traditional database. This is perfect for:
+
+- **API Integration**: Send CDC events to REST APIs or webhooks
+- **Message Queues**: Forward events to Kafka, RabbitMQ, or other message brokers
+- **Custom Processing**: Implement filtering, transformation, or routing logic
+- **Monitoring & Auditing**: Send events to logging or audit systems
+- **Multi-destination**: Fan out events to multiple targets
 
 ## Development Status
 

@@ -9,7 +9,8 @@
 //!
 //! - PostgreSQL logical replication support
 //! - Real-time change streaming (INSERT, UPDATE, DELETE, TRUNCATE)
-//! - Multiple destination database support (SQL Server, MySQL)
+//! - Multiple destination database support (SQL Server, MySQL, SQLite)
+//! - **Custom destination handlers** for APIs, webhooks, and custom processing
 //! - Async/await support with Tokio
 //! - Comprehensive error handling
 //! - Thread-safe operations
@@ -104,7 +105,8 @@ pub use crate::destinations::SqlServerDestination;
 #[cfg(feature = "sqlite")]
 pub use crate::destinations::SQLiteDestination;
 
-pub use crate::destinations::{DestinationFactory, DestinationHandler};
+// Custom destination support
+pub use crate::destinations::{DestinationFactory, DestinationHandler, FunctionDestination};
 pub use crate::replication_protocol::{
     ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
     ReplicationState, TupleData,

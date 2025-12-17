@@ -4,6 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
 
 // Import destination implementations
 #[cfg(feature = "mysql")]
@@ -98,10 +99,85 @@ pub trait DestinationHandler: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Type alias for a factory function that creates destination handlers
+pub type DestinationHandlerFactory = Arc<dyn Fn() -> Box<dyn DestinationHandler> + Send + Sync>;
+
+/// Global registry for custom destination handlers
+static CUSTOM_HANDLERS: OnceLock<RwLock<HashMap<String, DestinationHandlerFactory>>> = OnceLock::new();
+
+/// Get or initialize the custom handlers registry
+fn get_custom_handlers() -> &'static RwLock<HashMap<String, DestinationHandlerFactory>> {
+    CUSTOM_HANDLERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 /// Factory for creating destination handlers
 pub struct DestinationFactory;
 
 impl DestinationFactory {
+    /// Register a custom destination handler factory
+    ///
+    /// This allows users to register their own destination handlers that can be
+    /// instantiated by name using `DestinationType::Custom(name)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - A unique name for this custom destination type
+    /// * `factory` - A function that creates new instances of the handler
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pg2any_lib::destinations::{DestinationFactory, FunctionDestination};
+    ///
+    /// DestinationFactory::register_custom(
+    ///     "my-api",
+    ///     Box::new(|| {
+    ///         Box::new(FunctionDestination::new(|transaction| async move {
+    ///             // Custom processing logic
+    ///             Ok(())
+    ///         }))
+    ///     })
+    /// );
+    /// ```
+    pub fn register_custom<F>(name: impl Into<String>, factory: F)
+    where
+        F: Fn() -> Box<dyn DestinationHandler> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        let mut registry = get_custom_handlers()
+            .write()
+            .expect("Failed to acquire write lock on custom handlers registry");
+        registry.insert(name, Arc::new(factory));
+    }
+
+    /// Register a custom destination handler instance directly
+    ///
+    /// This is a convenience method for registering a pre-configured handler.
+    /// Note that the handler will be cloned for each worker, so it must be cloneable
+    /// or you should use `register_custom` with a factory function instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - A unique name for this custom destination type
+    /// * `_handler` - The handler instance to register (currently unused - use register_custom instead)
+    pub fn register_handler(name: impl Into<String>, _handler: Box<dyn DestinationHandler>) {
+        let name = name.into();
+        let mut registry = get_custom_handlers()
+            .write()
+            .expect("Failed to acquire write lock on custom handlers registry");
+        
+        // Store the handler in an Arc so we can clone it
+        // Note: This requires the handler to be cloneable or recreatable
+        registry.insert(
+            name.clone(),
+            Arc::new(move || {
+                // For now, we can't clone arbitrary trait objects
+                // Users should use register_custom with a factory instead
+                panic!("Handler for '{}' must be registered with register_custom factory function", name)
+            }),
+        );
+    }
+
     /// Create a new destination handler for the specified type
     pub fn create(destination_type: DestinationType) -> Result<Box<dyn DestinationHandler>> {
         match destination_type {
@@ -113,6 +189,21 @@ impl DestinationFactory {
 
             #[cfg(feature = "sqlite")]
             DestinationType::SQLite => Ok(Box::new(SQLiteDestination::new())),
+
+            DestinationType::Custom(ref name) => {
+                let registry = get_custom_handlers()
+                    .read()
+                    .expect("Failed to acquire read lock on custom handlers registry");
+                
+                if let Some(factory) = registry.get(name) {
+                    Ok(factory())
+                } else {
+                    Err(CdcError::unsupported(format!(
+                        "Custom destination type '{}' is not registered. Use DestinationFactory::register_custom() to register it.",
+                        name
+                    )))
+                }
+            }
 
             _ => Err(CdcError::unsupported(format!(
                 "Destination type {:?} is not supported or not enabled",
@@ -169,5 +260,32 @@ mod tests {
 
         let sqlite_deserialized: DestinationType = serde_json::from_str(&sqlite_json).unwrap();
         assert_eq!(sqlite_deserialized, sqlite_type);
+
+        let custom_type = DestinationType::Custom("my-api".to_string());
+        let custom_json = serde_json::to_string(&custom_type).unwrap();
+        assert_eq!(custom_json, r#"{"Custom":"my-api"}"#);
+
+        let custom_deserialized: DestinationType = serde_json::from_str(&custom_json).unwrap();
+        assert_eq!(custom_deserialized, custom_type);
+    }
+
+    #[test]
+    fn test_custom_destination_registration() {
+        use super::super::FunctionDestination;
+
+        // Register a custom destination
+        DestinationFactory::register_custom("test-handler", || {
+            Box::new(FunctionDestination::new(|_transaction| async move {
+                Ok(())
+            }))
+        });
+
+        // Try to create it
+        let result = DestinationFactory::create(DestinationType::Custom("test-handler".to_string()));
+        assert!(result.is_ok());
+
+        // Try to create non-existent custom handler
+        let result = DestinationFactory::create(DestinationType::Custom("nonexistent".to_string()));
+        assert!(result.is_err());
     }
 }

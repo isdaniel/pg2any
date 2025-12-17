@@ -67,6 +67,8 @@ pub enum DestinationType {
     // Future support for other databases
     PostgreSQL,
     SQLite,
+    /// Custom destination - requires registering a handler with DestinationFactory
+    Custom(String),
 }
 
 impl std::fmt::Display for DestinationType {
@@ -76,6 +78,32 @@ impl std::fmt::Display for DestinationType {
             DestinationType::SqlServer => write!(f, "sqlserver"),
             DestinationType::PostgreSQL => write!(f, "postgresql"),
             DestinationType::SQLite => write!(f, "sqlite"),
+            DestinationType::Custom(name) => write!(f, "custom:{}", name),
+        }
+    }
+}
+
+impl std::str::FromStr for DestinationType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mysql" => Ok(DestinationType::MySQL),
+            "sqlserver" | "sql-server" | "mssql" => Ok(DestinationType::SqlServer),
+            "postgresql" | "postgres" | "pg" => Ok(DestinationType::PostgreSQL),
+            "sqlite" | "sqlite3" => Ok(DestinationType::SQLite),
+            s if s.starts_with("custom:") => {
+                let name = s.strip_prefix("custom:").unwrap_or(s);
+                if name.is_empty() {
+                    Err("Custom destination type must have a name after 'custom:'".to_string())
+                } else {
+                    Ok(DestinationType::Custom(name.to_string()))
+                }
+            }
+            _ => Err(format!(
+                "Unknown destination type '{}'. Valid types: mysql, sqlserver, postgresql, sqlite, or custom:<name>",
+                s
+            )),
         }
     }
 }
@@ -405,7 +433,7 @@ impl From<Lsn> for u64 {
 ///
 /// - **Normal Mode**: Events collected between BEGIN and COMMIT
 /// - **Streaming Mode**: Events collected between StreamStart and StreamStop, with batch processing for high-performance ingestion
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     /// Transaction ID from PostgreSQL
     pub transaction_id: u32,

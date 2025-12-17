@@ -28,7 +28,8 @@ use tracing::{debug, error, info, warn};
 /// - Configurable number of worker threads (CDC_CONSUMER_WORKERS)
 /// - **Each worker has its own destination database connection**
 /// - **Each worker processes complete transactions atomically**
-/// - Workers use a work-stealing pattern via shared channel
+/// - **Streaming transactions are routed to a specific worker based on transaction_id**
+/// - Normal transactions use work-stealing pattern via shared channel
 /// - TRUE parallelism: workers can write to destination simultaneously
 /// - Transaction consistency: all events in a transaction succeed or fail together
 ///
@@ -126,6 +127,18 @@ impl CdcClient {
             .take()
             .ok_or_else(|| CdcError::generic("Transaction sender not available"))?;
 
+        // Create per-worker dedicated channels for streaming transactions (affinity routing)
+        let num_workers = self.config.consumer_workers;
+        let mut streaming_senders: Vec<mpsc::Sender<Transaction>> = Vec::with_capacity(num_workers);
+        let mut streaming_receivers: Vec<mpsc::Receiver<Transaction>> =
+            Vec::with_capacity(num_workers);
+
+        for _ in 0..num_workers {
+            let (tx, rx) = mpsc::channel::<Transaction>(self.config.buffer_size);
+            streaming_senders.push(tx);
+            streaming_receivers.push(rx);
+        }
+
         let producer_handle = {
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
@@ -135,6 +148,7 @@ impl CdcClient {
             tokio::spawn(Self::run_producer(
                 replication_stream,
                 transaction_sender,
+                streaming_senders,
                 token,
                 start_lsn,
                 metrics,
@@ -143,7 +157,6 @@ impl CdcClient {
         };
 
         // Start consumer worker tasks with per-worker destination connections
-        let num_workers = self.config.consumer_workers;
         let transaction_receiver = self
             .transaction_receiver
             .take()
@@ -157,7 +170,7 @@ impl CdcClient {
         let schema_mappings = self.config.schema_mappings.clone();
 
         info!(
-            "Starting {} consumer worker(s) for transaction-based parallel processing",
+            "Starting {} consumer worker(s) for transaction-based parallel processing with streaming affinity",
             num_workers
         );
 
@@ -183,9 +196,13 @@ impl CdcClient {
             let dest_type_str = dest_type.to_string();
             let shared_recv = shared_receiver.clone();
 
+            // Each worker gets its own streaming receiver
+            let streaming_recv = streaming_receivers.remove(0);
+
             let consumer_handle = tokio::spawn(Self::run_consumer_loop(
                 worker_id,
                 shared_recv,
+                streaming_recv,
                 worker_destination,
                 token,
                 metrics,
@@ -245,16 +262,25 @@ impl CdcClient {
     /// 1. StreamStop is received and batch_size is reached
     /// 2. StreamCommit is received (final batch)
     ///
-    /// This enables high-performance batch INSERT operations for large transactions.
+    /// ## Streaming Transaction Affinity
+    ///
+    /// Streaming transactions are routed to a specific worker based on `transaction_id % num_workers`.
+    /// This ensures all batches from the same PostgreSQL transaction go to the same worker,
+    /// allowing the destination database transaction to stay open across batches.
+    ///
+    /// Normal transactions use the shared channel for work-stealing pattern.
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         transaction_sender: mpsc::Sender<Transaction>,
+        streaming_senders: Vec<mpsc::Sender<Transaction>>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
         batch_size: usize,
     ) -> Result<()> {
-        info!("Starting replication producer (transaction mode with streaming support, batch_size={})", batch_size);
+        let num_workers = streaming_senders.len();
+        info!("Starting replication producer (transaction mode with streaming affinity, batch_size={}, workers={})", 
+              batch_size, num_workers);
 
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
@@ -297,7 +323,7 @@ impl CdcClient {
                         }
 
                         EventType::Commit { .. } => {
-                            // Complete and send the normal transaction
+                            // Complete and send the normal transaction via shared channel (work-stealing)
                             if let TransactionContext::Normal(mut tx) =
                                 std::mem::replace(&mut current_context, TransactionContext::None)
                             {
@@ -308,11 +334,11 @@ impl CdcClient {
                                 let tx_id = tx.transaction_id;
                                 let event_count = tx.event_count();
                                 info!(
-                                    "Producer: Sending normal transaction {} with {} events",
+                                    "Producer: Sending normal transaction {} with {} events (work-stealing)",
                                     tx_id, event_count
                                 );
 
-                                // Send the completed transaction
+                                // Send the completed normal transaction to shared channel
                                 match transaction_sender.send(tx).await {
                                     Ok(_) => {
                                         info!("Producer: Successfully sent transaction {} with {} events", 
@@ -356,12 +382,16 @@ impl CdcClient {
                                     streaming_manager.handle_stream_stop(xid, event.lsn)
                                 {
                                     let batch_count = batch_tx.event_count();
-                                    info!("Producer: StreamStop - sending batch with {} events for transaction {}", 
-                                           batch_count, xid);
 
-                                    match transaction_sender.send(batch_tx).await {
+                                    // Route to specific worker based on transaction_id (affinity)
+                                    let worker_id = (xid as usize) % num_workers;
+                                    info!("Producer: StreamStop - sending batch with {} events for transaction {} to worker {}", 
+                                           batch_count, xid, worker_id);
+
+                                    match streaming_senders[worker_id].send(batch_tx).await {
                                         Ok(_) => {
-                                            info!("Producer: Successfully sent StreamStop batch for transaction {}", xid);
+                                            info!("Producer: Successfully sent StreamStop batch for transaction {} to worker {}", 
+                                                  xid, worker_id);
                                         }
                                         Err(e) => {
                                             error!(
@@ -390,13 +420,16 @@ impl CdcClient {
                                 event.lsn,
                             ) {
                                 let final_count = final_tx.event_count();
-                                info!("Producer: Sending final streaming transaction {} with {} events", 
-                                       transaction_id, final_count);
 
-                                match transaction_sender.send(final_tx).await {
+                                // Route to specific worker based on transaction_id (affinity)
+                                let worker_id = (*transaction_id as usize) % num_workers;
+                                info!("Producer: Sending final streaming transaction {} with {} events to worker {}", 
+                                       transaction_id, final_count, worker_id);
+
+                                match streaming_senders[worker_id].send(final_tx).await {
                                     Ok(_) => {
-                                        info!("Producer: Successfully sent final transaction {} with {} events", 
-                                               transaction_id, final_count);
+                                        info!("Producer: Successfully sent final transaction {} with {} events to worker {}", 
+                                               transaction_id, final_count, worker_id);
                                     }
                                     Err(e) => {
                                         error!("Producer: Failed to send final streaming transaction: {}", e);
@@ -442,13 +475,17 @@ impl CdcClient {
                                         );
                                         if let Some(batch_tx) = streaming_manager.take_batch(xid) {
                                             let batch_count = batch_tx.event_count();
-                                            info!("Producer: Sending mid-stream batch with {} events for transaction {}", 
-                                                   batch_count, xid);
 
-                                            match transaction_sender.send(batch_tx).await {
+                                            // Route to specific worker based on transaction_id (affinity)
+                                            let worker_id = (xid as usize) % num_workers;
+                                            info!("Producer: Sending mid-stream batch with {} events for transaction {} to worker {}", 
+                                                   batch_count, xid, worker_id);
+
+                                            match streaming_senders[worker_id].send(batch_tx).await
+                                            {
                                                 Ok(_) => {
-                                                    info!("Producer: Successfully sent batch of {} events for transaction {}", 
-                                                           batch_count, xid);
+                                                    info!("Producer: Successfully sent batch of {} events for transaction {} to worker {}", 
+                                                           batch_count, xid, worker_id);
                                                 }
                                                 Err(e) => {
                                                     error!("Producer: Failed to send mid-stream batch: {}", e);
@@ -560,12 +597,16 @@ impl CdcClient {
     async fn run_consumer_loop(
         worker_id: usize,
         transaction_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Transaction>>>,
+        mut streaming_receiver: mpsc::Receiver<Transaction>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
     ) -> Result<()> {
-        info!("Starting consumer worker {}", worker_id);
+        info!(
+            "Starting consumer worker {} (dual-channel: normal + streaming)",
+            worker_id
+        );
 
         // Update destination connection status for this worker
         metrics_collector.update_destination_connection_status(
@@ -583,8 +624,19 @@ impl CdcClient {
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer worker {} received cancellation signal", worker_id);
 
+                    // First, rollback any active streaming transaction
+                    if let Some(active_tx_id) = destination_handler.get_active_streaming_transaction_id() {
+                        warn!("Worker {}: Rolling back active streaming transaction {} due to shutdown",
+                              worker_id, active_tx_id);
+                        if let Err(e) = destination_handler.rollback_streaming_transaction().await {
+                            error!("Worker {}: Failed to rollback streaming transaction: {}", worker_id, e);
+                        }
+                    }
+
+                    // Then drain remaining transactions
                     Self::drain_remaining_transactions(
                         &transaction_receiver,
+                        &mut streaming_receiver,
                         &mut destination_handler,
                         &metrics_collector,
                         &destination_type,
@@ -593,25 +645,43 @@ impl CdcClient {
                     break;
                 }
 
-                // Periodic queue size reporting for this worker
-                _ = queue_size_interval.tick() => {
-                    let receiver = transaction_receiver.lock().await;
-                    let queue_length = receiver.len();
-                    debug!("Consumer worker {} transaction queue length: {}", worker_id, queue_length);
-                    metrics_collector.update_consumer_queue_length(queue_length);
+                // Wait for streaming transaction
+                streaming_result = streaming_receiver.recv() => {
+                    match streaming_result {
+                        Some(tx) => {
+                            let tx_id = tx.transaction_id;
+                            let event_count = tx.event_count();
+                            info!(
+                                "Consumer worker {} received streaming transaction {} with {} events",
+                                worker_id, tx_id, event_count
+                            );
+                            Self::process_streaming_transaction_per_worker(
+                                tx,
+                                &mut destination_handler,
+                                &metrics_collector,
+                                &destination_type,
+                                worker_id,
+                            ).await;
+
+                            info!("Consumer worker {} completed streaming transaction {}", worker_id, tx_id);
+                        }
+                        None => {
+                            // No streaming transaction available, continue
+                        }
+                    }
                 }
 
+                // Normal transactions
                 transaction = async {
                     let mut receiver = transaction_receiver.lock().await;
                     receiver.recv().await
                 } => {
-
                     match transaction {
                         Some(tx) => {
                             let tx_id = tx.transaction_id;
                             let event_count = tx.event_count();
                             info!(
-                                "Consumer worker {} received transaction {} with {} events",
+                                "Consumer worker {} received normal transaction {} with {} events",
                                 worker_id, tx_id, event_count
                             );
                             Self::process_transaction_per_worker(
@@ -625,10 +695,19 @@ impl CdcClient {
                             info!("Consumer worker {} completed transaction {}", worker_id, tx_id);
                         }
                         None => {
-                            // Channel closed, break loop
-                            info!("Consumer worker {} detected channel closure", worker_id);
-                            break;
+                            // Timeout or channel closed - that's OK, loop will continue
                         }
+                    }
+                }
+
+                // Periodic queue size reporting for this worker
+                _ = queue_size_interval.tick() => {
+                    if let Ok(normal_receiver) = transaction_receiver.try_lock() {
+                        let normal_queue_length = normal_receiver.len();
+                        let streaming_queue_length = streaming_receiver.len();
+                        debug!("Consumer worker {} queue lengths - normal: {}, streaming: {}",
+                               worker_id, normal_queue_length, streaming_queue_length);
+                        metrics_collector.update_consumer_queue_length(normal_queue_length + streaming_queue_length);
                     }
                 }
             }
@@ -651,26 +730,51 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Drain any remaining transactions from the channel during shutdown
+    /// Drain any remaining transactions from both channels during shutdown
     async fn drain_remaining_transactions(
-        transaction_receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<Transaction>>>,
+        normal_transaction_receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<Transaction>>>,
+        streaming_receiver: &mut mpsc::Receiver<Transaction>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
         worker_id: usize,
     ) {
-        let mut count = 0;
+        let mut normal_count = 0;
+        let mut streaming_count = 0;
 
+        // First, drain streaming transactions (priority, as they may have open transactions)
+        loop {
+            match streaming_receiver.try_recv() {
+                Ok(transaction) => {
+                    debug!(
+                        "Worker {}: Processing remaining streaming transaction {} during shutdown",
+                        worker_id, transaction.transaction_id
+                    );
+                    Self::process_streaming_transaction_per_worker(
+                        transaction,
+                        destination_handler,
+                        metrics_collector,
+                        destination_type,
+                        worker_id,
+                    )
+                    .await;
+                    streaming_count += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Then drain normal transactions
         loop {
             let tx = {
-                let mut receiver = transaction_receiver.lock().await;
+                let mut receiver = normal_transaction_receiver.lock().await;
                 receiver.try_recv().ok()
             };
 
             match tx {
                 Some(transaction) => {
                     debug!(
-                        "Worker {}: Processing remaining transaction {} during shutdown",
+                        "Worker {}: Processing remaining normal transaction {} during shutdown",
                         worker_id, transaction.transaction_id
                     );
                     Self::process_transaction_per_worker(
@@ -681,16 +785,68 @@ impl CdcClient {
                         worker_id,
                     )
                     .await;
-                    count += 1;
+                    normal_count += 1;
                 }
                 None => break,
             }
         }
 
         info!(
-            "Worker {} processed {} remaining transactions during graceful shutdown",
-            worker_id, count
+            "Worker {} processed {} streaming + {} normal = {} total remaining transactions during graceful shutdown",
+            worker_id, streaming_count, normal_count, streaming_count + normal_count
         );
+    }
+
+    /// Process a streaming transaction batch with per-worker destination handler
+    ///
+    /// This method handles streaming transactions which may span multiple batches.
+    /// The destination handler keeps the database transaction open until is_final_batch is true.
+    async fn process_streaming_transaction_per_worker(
+        transaction: Transaction,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metrics_collector: &Arc<MetricsCollector>,
+        destination_type: &str,
+        worker_id: usize,
+    ) {
+        let start_time = std::time::Instant::now();
+        let event_count = transaction.event_count();
+        let tx_id = transaction.transaction_id;
+        let is_final = transaction.is_final_batch;
+
+        // Process streaming batch - destination handler manages open transaction state
+        match destination_handler
+            .process_streaming_batch(&transaction)
+            .await
+        {
+            Ok(_) => {
+                let duration = start_time.elapsed();
+                if is_final {
+                    // Only record metrics when the transaction is complete
+                    metrics_collector.record_transaction_processed(&transaction, destination_type);
+                }
+                debug!(
+                    "Worker {} successfully processed streaming batch for transaction {} ({} events, is_final: {}) in {:?}",
+                    worker_id, tx_id, event_count, is_final, duration
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Worker {} failed to process streaming batch for transaction {}: {}",
+                    worker_id, tx_id, e
+                );
+                metrics_collector.record_error("streaming_batch_processing_failed", "consumer");
+
+                // Attempt to rollback on error
+                if let Err(rollback_err) =
+                    destination_handler.rollback_streaming_transaction().await
+                {
+                    error!(
+                        "Worker {} failed to rollback streaming transaction {}: {}",
+                        worker_id, tx_id, rollback_err
+                    );
+                }
+            }
+        }
     }
 
     /// Process a complete transaction with per-worker destination handler
@@ -940,6 +1096,18 @@ mod tests {
             Ok(())
         }
 
+        fn get_active_streaming_transaction_id(&self) -> Option<u32> {
+            None
+        }
+
+        async fn commit_streaming_transaction(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rollback_streaming_transaction(&mut self) -> Result<()> {
+            Ok(())
+        }
+
         async fn close(&mut self) -> Result<()> {
             Ok(())
         }
@@ -1108,10 +1276,14 @@ mod tests {
         let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
+        // Create streaming receiver for test (empty, no streaming transactions)
+        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 0,
                 shared_receiver,
+                streaming_receiver,
                 boxed_handler,
                 token_clone,
                 metrics_collector,
@@ -1166,10 +1338,14 @@ mod tests {
         let shared_receiver = Arc::new(tokio::sync::Mutex::new(tx_receiver));
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
+        // Create streaming receiver for test (empty, no streaming transactions)
+        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 0,
                 shared_receiver,
+                streaming_receiver,
                 boxed_handler,
                 token_clone,
                 metrics_collector,
@@ -1323,6 +1499,7 @@ mod tests {
         let num_workers = 3;
         let mut worker_handles = Vec::new();
         let mut tx_trackers = Vec::new();
+        let mut streaming_senders = Vec::new();
 
         for worker_id in 0..num_workers {
             let transactions_processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1338,10 +1515,15 @@ mod tests {
             let metrics = Arc::new(MetricsCollector::new());
             let receiver = shared_receiver.clone();
 
+            // Create streaming receiver for each worker
+            let (streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(100);
+            streaming_senders.push(streaming_sender);
+
             let handle = tokio::spawn(async move {
                 CdcClient::run_consumer_loop(
                     worker_id,
                     receiver,
+                    streaming_receiver,
                     mock_handler,
                     token,
                     metrics,
@@ -1424,11 +1606,15 @@ mod tests {
             let metrics = Arc::new(MetricsCollector::new());
             let receiver = shared_receiver.clone();
 
+            // Create streaming receiver for each worker
+            let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(100);
+
             let handle = tokio::spawn(async move {
                 let start = std::time::Instant::now();
                 let result = CdcClient::run_consumer_loop(
                     worker_id,
                     receiver,
+                    streaming_receiver,
                     mock_handler,
                     token,
                     metrics,
@@ -1534,9 +1720,13 @@ mod tests {
 
         let metrics = Arc::new(MetricsCollector::new());
 
+        // Create streaming receiver for test (empty)
+        let (_streaming_sender, mut streaming_receiver) = mpsc::channel::<Transaction>(10);
+
         // Drain transactions
         CdcClient::drain_remaining_transactions(
             &shared_receiver,
+            &mut streaming_receiver,
             &mut handler,
             &metrics,
             "test",
@@ -1570,10 +1760,14 @@ mod tests {
         let token = cancellation_token.clone();
         let metrics = Arc::new(MetricsCollector::new());
 
+        // Create streaming receiver for test (empty)
+        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
+
         let worker_handle = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 0,
                 shared_receiver,
+                streaming_receiver,
                 mock_handler,
                 token,
                 metrics,

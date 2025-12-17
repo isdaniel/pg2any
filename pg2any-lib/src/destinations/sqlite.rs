@@ -22,6 +22,17 @@ struct WhereClause<'a> {
     bind_values: Vec<&'a serde_json::Value>,
 }
 
+/// State for an active streaming transaction
+/// Holds the open database transaction across multiple batches
+struct ActiveStreamingTransaction {
+    /// PostgreSQL transaction ID
+    transaction_id: u32,
+    /// The open SQLite transaction
+    transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
+    /// Number of events processed so far
+    events_processed: usize,
+}
+
 /// SQLite destination implementation with batch INSERT support
 ///
 /// This implementation uses sqlx for database operations with async support.
@@ -29,6 +40,8 @@ struct WhereClause<'a> {
 pub struct SQLiteDestination {
     pool: Option<SqlitePool>,
     database_path: Option<String>,
+    /// Active streaming transaction state (if any)
+    active_streaming_tx: Option<ActiveStreamingTransaction>,
 }
 
 /// Represents a group of INSERT events for the same table that can be batched
@@ -77,6 +90,7 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
+            active_streaming_tx: None,
         }
     }
 
@@ -662,6 +676,148 @@ impl DestinationHandler for SQLiteDestination {
         Ok(())
     }
 
+    async fn process_streaming_batch(&mut self, transaction: &Transaction) -> Result<()> {
+        if !transaction.is_streaming {
+            return self.process_transaction(transaction).await;
+        }
+
+        let pool = self
+            .pool
+            .clone()
+            .ok_or_else(|| CdcError::generic("SQLite connection not established"))?;
+
+        if transaction.is_empty() && !transaction.is_final_batch {
+            debug!(
+                "Skipping empty non-final streaming batch for transaction {}",
+                transaction.transaction_id
+            );
+            return Ok(());
+        }
+
+        let tx_id = transaction.transaction_id;
+        let is_final = transaction.is_final_batch;
+
+        debug!(
+            "SQLite: Processing streaming batch for transaction {} ({} events, final={})",
+            tx_id,
+            transaction.event_count(),
+            is_final
+        );
+
+        if let Some(ref active) = self.active_streaming_tx {
+            if active.transaction_id != tx_id {
+                tracing::warn!(
+                    "SQLite: Received batch for transaction {} but have active transaction {}. Rolling back active.",
+                    tx_id, active.transaction_id
+                );
+                self.rollback_streaming_transaction().await?;
+            }
+        }
+
+        if self.active_streaming_tx.is_none() {
+            let tx = pool.begin().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to begin SQLite streaming transaction: {}",
+                    e
+                ))
+            })?;
+
+            info!(
+                "SQLite: Started streaming transaction {} (first batch)",
+                tx_id
+            );
+
+            self.active_streaming_tx = Some(ActiveStreamingTransaction {
+                transaction_id: tx_id,
+                transaction: tx,
+                events_processed: 0,
+            });
+        }
+
+        if !transaction.is_empty() {
+            let mut active = self.active_streaming_tx.take().unwrap();
+
+            let result = self
+                .process_events_with_batching(&mut active.transaction, &transaction.events)
+                .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    "SQLite: Error processing streaming batch, rolling back transaction {}: {}",
+                    tx_id,
+                    e
+                );
+                let _ = active.transaction.rollback().await;
+                return Err(e);
+            }
+
+            active.events_processed += transaction.event_count();
+
+            debug!(
+                "SQLite: Processed {} events for streaming transaction {} (total: {})",
+                transaction.event_count(),
+                tx_id,
+                active.events_processed
+            );
+
+            self.active_streaming_tx = Some(active);
+        }
+
+        if is_final {
+            self.commit_streaming_transaction().await?;
+        }
+
+        Ok(())
+    }
+
+    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
+        self.active_streaming_tx
+            .as_ref()
+            .map(|tx| tx.transaction_id)
+    }
+
+    async fn commit_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(active) = self.active_streaming_tx.take() {
+            let commit_start = std::time::Instant::now();
+
+            active.transaction.commit().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to commit SQLite streaming transaction {}: {}",
+                    active.transaction_id, e
+                ))
+            })?;
+
+            info!(
+                "SQLite: Committed streaming transaction {} ({} events) in {:?}",
+                active.transaction_id,
+                active.events_processed,
+                commit_start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
+        if let Some(active) = self.active_streaming_tx.take() {
+            tracing::warn!(
+                "SQLite: Rolling back streaming transaction {} ({} events processed)",
+                active.transaction_id,
+                active.events_processed
+            );
+
+            if let Err(e) = active.transaction.rollback().await {
+                tracing::warn!(
+                    "SQLite: Failed to rollback streaming transaction {}: {}",
+                    active.transaction_id,
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn health_check(&mut self) -> Result<bool> {
         let pool = self
             .pool
@@ -682,6 +838,11 @@ impl DestinationHandler for SQLiteDestination {
     }
 
     async fn close(&mut self) -> Result<()> {
+        if self.active_streaming_tx.is_some() {
+            tracing::warn!("SQLite: Closing with active streaming transaction - rolling back");
+            self.rollback_streaming_transaction().await?;
+        }
+
         if let Some(pool) = &self.pool {
             pool.close().await;
         }

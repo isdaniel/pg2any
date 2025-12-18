@@ -55,9 +55,9 @@ impl<'a> InsertBatch<'a> {
     }
 }
 
-/// State for an active streaming transaction
-/// Holds the open database transaction state
-struct ActiveStreamingTransaction {
+/// State for an open transaction
+/// Only used for streaming transactions (normal transactions commit immediately)
+struct OpenTransaction {
     /// PostgreSQL transaction ID
     transaction_id: u32,
     /// Indicates if we have an active transaction (SQL Server keeps the connection, not a separate transaction object)
@@ -66,13 +66,23 @@ struct ActiveStreamingTransaction {
     events_processed: usize,
 }
 
+impl OpenTransaction {
+    fn new(transaction_id: u32) -> Self {
+        Self {
+            transaction_id,
+            has_open_transaction: true,
+            events_processed: 0,
+        }
+    }
+}
+
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
     client: Option<Client<Compat<TcpStream>>>,
     /// Schema mappings: maps source schema to destination schema
     schema_mappings: HashMap<String, String>,
-    /// Active streaming transaction state (if any)
-    active_streaming_tx: Option<ActiveStreamingTransaction>,
+    /// Active transaction state (if any) - used for both streaming and normal transactions
+    active_tx: Option<OpenTransaction>,
 }
 
 impl SqlServerDestination {
@@ -81,7 +91,7 @@ impl SqlServerDestination {
         Self {
             client: None,
             schema_mappings: HashMap::new(),
-            active_streaming_tx: None,
+            active_tx: None,
         }
     }
 
@@ -514,6 +524,206 @@ impl SqlServerDestination {
             ))),
         }
     }
+
+    /// Begin a new streaming transaction on the connection
+    async fn begin_transaction(&mut self, transaction_id: u32) -> Result<()> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
+
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("Failed to begin SQL Server transaction: {}", e))
+            })?;
+
+        info!(
+            "SQL Server: Started streaming transaction {} (first batch)",
+            transaction_id
+        );
+
+        self.active_tx = Some(OpenTransaction::new(transaction_id));
+        Ok(())
+    }
+
+    /// Commit the active streaming transaction
+    async fn commit_active_transaction(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active_tx.take() {
+            if !active.has_open_transaction {
+                return Ok(());
+            }
+
+            let commit_start = std::time::Instant::now();
+
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
+
+            client
+                .simple_query("COMMIT TRANSACTION")
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to commit SQL Server streaming transaction {}: {}",
+                        active.transaction_id, e
+                    ))
+                })?;
+
+            active.has_open_transaction = false;
+
+            info!(
+                "SQL Server: Committed streaming transaction {} ({} events) in {:?}",
+                active.transaction_id,
+                active.events_processed,
+                commit_start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Rollback the active streaming transaction
+    async fn rollback_active_transaction(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active_tx.take() {
+            if !active.has_open_transaction {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                "SQL Server: Rolling back streaming transaction {} ({} events processed)",
+                active.transaction_id,
+                active.events_processed
+            );
+
+            if let Some(client) = self.client.as_mut() {
+                if let Err(e) = client.simple_query("ROLLBACK TRANSACTION").await {
+                    tracing::warn!(
+                        "SQL Server: Failed to rollback streaming transaction {}: {}",
+                        active.transaction_id,
+                        e
+                    );
+                }
+            }
+
+            active.has_open_transaction = false;
+        }
+
+        Ok(())
+    }
+
+    /// Unified method to process a transaction batch
+    ///
+    /// This method handles both normal and streaming transactions:
+    /// - Normal transactions: BEGIN → process → COMMIT in one call
+    /// - Streaming transactions: BEGIN (first batch) → process → ... → COMMIT (final batch)
+    async fn process_transaction_batch(&mut self, transaction: &Transaction) -> Result<()> {
+        let tx_id = transaction.transaction_id;
+        let is_streaming = transaction.is_streaming;
+        let is_final = transaction.is_final_batch;
+
+        // Skip empty non-final batches
+        if transaction.is_empty() && !is_final {
+            debug!(
+                "Skipping empty non-final batch for transaction {} (streaming={})",
+                tx_id, is_streaming
+            );
+            return Ok(());
+        }
+
+        // Skip empty final batches for non-streaming transactions
+        if transaction.is_empty() && !is_streaming {
+            debug!(
+                "Skipping empty transaction {} (streaming={}, final={})",
+                tx_id, is_streaming, is_final
+            );
+            return Ok(());
+        }
+
+        let tx_start = std::time::Instant::now();
+        let tx_type = if is_streaming { "streaming" } else { "normal" };
+
+        debug!(
+            "SQL Server: Processing {} transaction {} ({} events, final={})",
+            tx_type,
+            tx_id,
+            transaction.event_count(),
+            is_final
+        );
+
+        // Check for mismatched streaming transactions
+        if let Some(ref active) = self.active_tx {
+            if active.transaction_id != tx_id {
+                tracing::warn!(
+                    "SQL Server: Received batch for transaction {} but have active transaction {}. Rolling back active.",
+                    tx_id, active.transaction_id
+                );
+                self.rollback_active_transaction().await?;
+            }
+        }
+
+        // Begin transaction if not already active
+        if self.active_tx.is_none() {
+            if is_streaming {
+                // Streaming transaction: keep transaction open across batches
+                self.begin_transaction(tx_id).await?;
+            } else {
+                // Normal transaction: begin inline, will be committed immediately
+                self.begin_transaction(tx_id).await?;
+            }
+        }
+
+        // Process events if not empty
+        if !transaction.is_empty() {
+            let mut active = self.active_tx.take().unwrap();
+            let schema_mappings = self.schema_mappings.clone();
+
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
+
+            let result = Self::process_events_with_batching_static(
+                client,
+                &transaction.events,
+                &schema_mappings,
+            )
+            .await;
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    "SQL Server: Error processing batch, rolling back transaction {}: {}",
+                    tx_id,
+                    e
+                );
+                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
+                active.has_open_transaction = false;
+                return Err(e);
+            }
+
+            active.events_processed += transaction.event_count();
+
+            debug!(
+                "SQL Server: Processed {} events for {} transaction {} (total: {}, elapsed: {:?})",
+                transaction.event_count(),
+                tx_type,
+                tx_id,
+                active.events_processed,
+                tx_start.elapsed()
+            );
+
+            self.active_tx = Some(active);
+        }
+
+        // Commit if final batch or non-streaming (normal transactions always commit immediately)
+        if is_final || !is_streaming {
+            self.commit_active_transaction().await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -550,272 +760,25 @@ impl DestinationHandler for SqlServerDestination {
     }
 
     async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
-        // Skip empty transactions
-        if transaction.is_empty() {
-            debug!(
-                "Skipping empty transaction {} (streaming={}, final={})",
-                transaction.transaction_id, transaction.is_streaming, transaction.is_final_batch
-            );
-            return Ok(());
-        }
-
-        let tx_start = std::time::Instant::now();
-
-        debug!(
-            "SQL Server: Starting to process transaction {} with {} events (streaming={}, final={})",
-            transaction.transaction_id,
-            transaction.event_count(),
-            transaction.is_streaming,
-            transaction.is_final_batch
-        );
-
-        // Copy schema_mappings to avoid borrowing self
-        let schema_mappings = self.schema_mappings.clone();
-
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-        // Begin transaction
-        let begin_time = std::time::Instant::now();
-        client
-            .simple_query("BEGIN TRANSACTION")
-            .await
-            .map_err(|e| {
-                CdcError::generic(format!("Failed to begin SQL Server transaction: {}", e))
-            })?;
-        debug!("SQL Server: BEGIN took {:?}", begin_time.elapsed());
-
-        // Process events with batching optimization
-        let process_time = std::time::Instant::now();
-        let result = Self::process_events_with_batching_static(
-            client,
-            &transaction.events,
-            &schema_mappings,
-        )
-        .await;
-        debug!(
-            "SQL Server: Event processing took {:?}",
-            process_time.elapsed()
-        );
-
-        if let Err(e) = result {
-            // Rollback on error
-            let _ = client.simple_query("ROLLBACK TRANSACTION").await;
-            return Err(e);
-        }
-
-        // Commit transaction
-        let commit_time = std::time::Instant::now();
-        client
-            .simple_query("COMMIT TRANSACTION")
-            .await
-            .map_err(|e| {
-                CdcError::generic(format!("Failed to commit SQL Server transaction: {}", e))
-            })?;
-        let commit_duration = commit_time.elapsed();
-
-        debug!(
-            "SQL Server: COMMIT took {:?} for transaction {} ({} events, total time: {:?})",
-            commit_duration,
-            transaction.transaction_id,
-            transaction.event_count(),
-            tx_start.elapsed()
-        );
-
-        Ok(())
-    }
-
-    async fn process_streaming_batch(&mut self, transaction: &Transaction) -> Result<()> {
-        if !transaction.is_streaming {
-            return self.process_transaction(transaction).await;
-        }
-
-        if transaction.is_empty() && !transaction.is_final_batch {
-            debug!(
-                "Skipping empty non-final streaming batch for transaction {}",
-                transaction.transaction_id
-            );
-            return Ok(());
-        }
-
-        let tx_id = transaction.transaction_id;
-        let is_final = transaction.is_final_batch;
-
-        debug!(
-            "SQL Server: Processing streaming batch for transaction {} ({} events, final={})",
-            tx_id,
-            transaction.event_count(),
-            is_final
-        );
-
-        if let Some(ref active) = self.active_streaming_tx {
-            if active.transaction_id != tx_id {
-                tracing::warn!(
-                    "SQL Server: Received batch for transaction {} but have active transaction {}. Rolling back active.",
-                    tx_id, active.transaction_id
-                );
-                self.rollback_streaming_transaction().await?;
-            }
-        }
-
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-        if self.active_streaming_tx.is_none() {
-            client
-                .simple_query("BEGIN TRANSACTION")
-                .await
-                .map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to begin SQL Server streaming transaction: {}",
-                        e
-                    ))
-                })?;
-
-            info!(
-                "SQL Server: Started streaming transaction {} (first batch)",
-                tx_id
-            );
-
-            self.active_streaming_tx = Some(ActiveStreamingTransaction {
-                transaction_id: tx_id,
-                has_open_transaction: true,
-                events_processed: 0,
-            });
-        }
-
-        if !transaction.is_empty() {
-            let mut active = self.active_streaming_tx.take().unwrap();
-            let schema_mappings = self.schema_mappings.clone();
-
-            let result = Self::process_events_with_batching_static(
-                client,
-                &transaction.events,
-                &schema_mappings,
-            )
-            .await;
-
-            if let Err(e) = result {
-                tracing::warn!(
-                    "SQL Server: Error processing streaming batch, rolling back transaction {}: {}",
-                    tx_id,
-                    e
-                );
-                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
-                active.has_open_transaction = false;
-                return Err(e);
-            }
-
-            active.events_processed += transaction.event_count();
-
-            debug!(
-                "SQL Server: Processed {} events for streaming transaction {} (total: {})",
-                transaction.event_count(),
-                tx_id,
-                active.events_processed
-            );
-
-            self.active_streaming_tx = Some(active);
-        }
-
-        if is_final {
-            self.commit_streaming_transaction().await?;
-        }
-
-        Ok(())
+        // Unified transaction processing handles both normal and streaming transactions
+        self.process_transaction_batch(transaction).await
     }
 
     fn get_active_streaming_transaction_id(&self) -> Option<u32> {
-        self.active_streaming_tx
+        self.active_tx
             .as_ref()
             .filter(|tx| tx.has_open_transaction)
             .map(|tx| tx.transaction_id)
     }
 
-    async fn commit_streaming_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_streaming_tx.take() {
-            if !active.has_open_transaction {
-                return Ok(());
-            }
-
-            let commit_start = std::time::Instant::now();
-
-            let client = self
-                .client
-                .as_mut()
-                .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-            client
-                .simple_query("COMMIT TRANSACTION")
-                .await
-                .map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to commit SQL Server streaming transaction {}: {}",
-                        active.transaction_id, e
-                    ))
-                })?;
-
-            active.has_open_transaction = false;
-
-            info!(
-                "SQL Server: Committed streaming transaction {} ({} events) in {:?}",
-                active.transaction_id,
-                active.events_processed,
-                commit_start.elapsed()
-            );
-        }
-
-        Ok(())
-    }
-
     async fn rollback_streaming_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_streaming_tx.take() {
-            if !active.has_open_transaction {
-                return Ok(());
-            }
-
-            tracing::warn!(
-                "SQL Server: Rolling back streaming transaction {} ({} events processed)",
-                active.transaction_id,
-                active.events_processed
-            );
-
-            if let Some(client) = self.client.as_mut() {
-                if let Err(e) = client.simple_query("ROLLBACK TRANSACTION").await {
-                    tracing::warn!(
-                        "SQL Server: Failed to rollback streaming transaction {}: {}",
-                        active.transaction_id,
-                        e
-                    );
-                }
-            }
-
-            active.has_open_transaction = false;
-        }
-
-        Ok(())
-    }
-
-    async fn health_check(&mut self) -> Result<bool> {
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-        match client.simple_query("SELECT 1").await {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        self.rollback_active_transaction().await
     }
 
     async fn close(&mut self) -> Result<()> {
-        if self.active_streaming_tx.is_some() {
-            tracing::warn!("SQL Server: Closing with active streaming transaction - rolling back");
-            self.rollback_streaming_transaction().await?;
+        if self.active_tx.is_some() {
+            tracing::warn!("SQL Server: Closing with active transaction - rolling back");
+            self.rollback_active_transaction().await?;
         }
 
         if let Some(client) = self.client.take() {

@@ -1,47 +1,22 @@
-use super::destination_factory::DestinationHandler;
+use super::{common, destination_factory::DestinationHandler};
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType, ReplicaIdentity, Transaction},
+    types::{ChangeEvent, EventType, Transaction},
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Maximum number of rows per batch INSERT statement for SQLite
 /// SQLite has a limit on the number of variables per statement (SQLITE_MAX_VARIABLE_NUMBER, default 999)
 const MAX_BATCH_INSERT_SIZE: usize = 500;
 
-/// Helper struct for building WHERE clauses with proper parameter binding
-/// Uses references to avoid unnecessary cloning of JSON values
-#[derive(Debug)]
-struct WhereClause<'a> {
-    sql: String,
-    bind_values: Vec<&'a serde_json::Value>,
-}
-
-/// State for an open transaction
-/// Only used for streaming transactions (normal transactions are committed immediately)
-struct OpenTransaction {
-    /// PostgreSQL transaction ID
-    transaction_id: u32,
-    /// The open SQLite transaction
-    transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
-    /// Number of events processed so far
-    events_processed: usize,
-}
-
-impl OpenTransaction {
-    fn new(transaction_id: u32, transaction: sqlx::Transaction<'static, sqlx::Sqlite>) -> Self {
-        Self {
-            transaction_id,
-            transaction,
-            events_processed: 0,
-        }
-    }
-}
+/// Type alias for SQLite's open transaction
+/// Uses generic OpenTransaction with SQLite-specific transaction type
+type OpenTransaction = common::OpenTransaction<sqlx::Transaction<'static, sqlx::Sqlite>>;
 
 /// SQLite destination implementation with batch INSERT support
 ///
@@ -52,46 +27,6 @@ pub struct SQLiteDestination {
     database_path: Option<String>,
     /// Active transaction state (if any) - used for both streaming and normal transactions
     active_tx: Option<OpenTransaction>,
-}
-
-/// Represents a group of INSERT events for the same table that can be batched
-struct InsertBatch<'a> {
-    table: String,
-    /// Column names in consistent order
-    columns: Vec<String>,
-    /// Values for each row, in the same column order
-    rows: Vec<Vec<&'a serde_json::Value>>,
-}
-
-impl<'a> InsertBatch<'a> {
-    fn new(table: String, columns: Vec<String>) -> Self {
-        Self {
-            table,
-            columns,
-            rows: Vec::new(),
-        }
-    }
-
-    fn add_row(&mut self, data: &'a HashMap<String, serde_json::Value>) {
-        let values: Vec<&serde_json::Value> = self
-            .columns
-            .iter()
-            .map(|col| data.get(col).unwrap_or(&serde_json::Value::Null))
-            .collect();
-        self.rows.push(values);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn can_add(&self, table: &str, columns: &[String]) -> bool {
-        self.table == table && self.columns == columns
-    }
 }
 
 impl SQLiteDestination {
@@ -125,169 +60,63 @@ impl SQLiteDestination {
         &self,
         old_data: &'a Option<HashMap<String, serde_json::Value>>,
         new_data: &'a HashMap<String, serde_json::Value>,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
+        replica_identity: &crate::types::ReplicaIdentity,
+        key_columns: &'a [String],
         schema: &str,
         table: &str,
-    ) -> Result<WhereClause<'a>> {
-        match replica_identity {
-            ReplicaIdentity::Full => {
-                // Always require old_data for FULL replica identity
-                if let Some(old) = old_data {
-                    let mut conditions = Vec::with_capacity(old.len());
-                    let mut bind_values = Vec::with_capacity(old.len());
+    ) -> Result<common::WhereClause<'a>> {
+        let conditions = common::build_where_conditions_for_update(
+            old_data,
+            new_data,
+            replica_identity,
+            key_columns,
+            schema,
+            table,
+        )?;
 
-                    for (column, value) in old {
-                        conditions.push(format!("\"{}\" = ?", column));
-                        bind_values.push(value);
-                    }
+        let mut sql_conditions = Vec::with_capacity(conditions.len());
+        let mut bind_values = Vec::with_capacity(conditions.len());
 
-                    Ok(WhereClause {
-                        sql: conditions.join(" AND "),
-                        bind_values,
-                    })
-                } else {
-                    Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during UPDATE",
-                        schema, table
-                    )))
-                }
-            }
-
-            ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No key columns available for UPDATE operation on {}.{}. Check table's replica identity setting.",
-                        schema, table
-                    )));
-                }
-
-                let mut conditions = Vec::with_capacity(key_columns.len());
-                let mut bind_values = Vec::with_capacity(key_columns.len());
-
-                // Use old_data if available, otherwise fall back to new_data
-                let data_source: &HashMap<String, serde_json::Value> = match old_data {
-                    Some(old) => old,
-                    None => new_data,
-                };
-
-                for key_column in key_columns {
-                    if let Some(value) = data_source.get(key_column) {
-                        conditions.push(format!("\"{}\" = ?", key_column));
-                        bind_values.push(value);
-                    } else {
-                        return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for UPDATE on {}.{}",
-                            key_column, schema, table
-                        )));
-                    }
-                }
-
-                Ok(WhereClause {
-                    sql: conditions.join(" AND "),
-                    bind_values,
-                })
-            }
-
-            ReplicaIdentity::Nothing => {
-                // For UPDATE with NOTHING, try to use key columns if available
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "Cannot perform UPDATE on {}.{} with REPLICA IDENTITY NOTHING and no key columns.",
-                        schema, table
-                    )));
-                }
-
-                let mut conditions = Vec::with_capacity(key_columns.len());
-                let mut bind_values = Vec::with_capacity(key_columns.len());
-
-                for key_column in key_columns {
-                    if let Some(value) = new_data.get(key_column) {
-                        conditions.push(format!("\"{}\" = ?", key_column));
-                        bind_values.push(value);
-                    }
-                }
-
-                if conditions.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No usable key columns found for UPDATE on {}.{} with REPLICA IDENTITY NOTHING",
-                        schema, table
-                    )));
-                }
-
-                debug!(
-                    "WARNING: Using potentially unreliable WHERE clause for UPDATE on {}.{} due to REPLICA IDENTITY NOTHING",
-                    schema, table
-                );
-
-                Ok(WhereClause {
-                    sql: conditions.join(" AND "),
-                    bind_values,
-                })
-            }
+        for (column, value) in conditions {
+            sql_conditions.push(format!("\"{}\" = ?", column));
+            bind_values.push(value);
         }
+
+        Ok(common::WhereClause {
+            sql: sql_conditions.join(" AND "),
+            bind_values,
+        })
     }
 
-    /// Build WHERE clause specifically for DELETE operations
+    /// Build WHERE clause specifically for DELETE operations using common utilities
     fn build_where_clause_for_delete<'a>(
         &self,
         old_data: &'a HashMap<String, serde_json::Value>,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
+        replica_identity: &crate::types::ReplicaIdentity,
+        key_columns: &'a [String],
         schema: &str,
         table: &str,
-    ) -> Result<WhereClause<'a>> {
-        match replica_identity {
-            ReplicaIdentity::Full => {
-                let mut conditions = Vec::with_capacity(old_data.len());
-                let mut bind_values = Vec::with_capacity(old_data.len());
+    ) -> Result<common::WhereClause<'a>> {
+        let conditions = common::build_where_conditions_for_delete(
+            old_data,
+            replica_identity,
+            key_columns,
+            schema,
+            table,
+        )?;
 
-                for (column, value) in old_data {
-                    conditions.push(format!("\"{}\" = ?", column));
-                    bind_values.push(value);
-                }
+        let mut sql_conditions = Vec::with_capacity(conditions.len());
+        let mut bind_values = Vec::with_capacity(conditions.len());
 
-                Ok(WhereClause {
-                    sql: conditions.join(" AND "),
-                    bind_values,
-                })
-            }
-
-            ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No key columns available for DELETE operation on {}.{}. Check table's replica identity setting.",
-                        schema, table
-                    )));
-                }
-
-                let mut conditions = Vec::with_capacity(key_columns.len());
-                let mut bind_values = Vec::with_capacity(key_columns.len());
-
-                for key_column in key_columns {
-                    if let Some(value) = old_data.get(key_column) {
-                        conditions.push(format!("\"{}\" = ?", key_column));
-                        bind_values.push(value);
-                    } else {
-                        return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for DELETE on {}.{}",
-                            key_column, schema, table
-                        )));
-                    }
-                }
-
-                Ok(WhereClause {
-                    sql: conditions.join(" AND "),
-                    bind_values,
-                })
-            }
-
-            ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
-                "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
-                DELETE requires a replica identity.",
-                schema, table
-            ))),
+        for (column, value) in conditions {
+            sql_conditions.push(format!("\"{}\" = ?", column));
+            bind_values.push(value);
         }
+
+        Ok(common::WhereClause {
+            sql: sql_conditions.join(" AND "),
+            bind_values,
+        })
     }
 
     /// Process a single event within an existing database transaction
@@ -421,7 +250,7 @@ impl SQLiteDestination {
     async fn execute_batch_insert<'a>(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        batch: &InsertBatch<'a>,
+        batch: &common::InsertBatch<'a>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -481,7 +310,7 @@ impl SQLiteDestination {
         open_tx: &mut OpenTransaction,
         events: &'a [ChangeEvent],
     ) -> Result<()> {
-        let mut current_batch: Option<InsertBatch<'a>> = None;
+        let mut current_batch: Option<common::InsertBatch<'a>> = None;
 
         for event in events {
             match &event.event_type {
@@ -491,7 +320,7 @@ impl SQLiteDestination {
 
                     let can_add = current_batch
                         .as_ref()
-                        .map(|b| b.can_add(table, &columns))
+                        .map(|b| b.can_add(None, table, &columns))
                         .unwrap_or(false);
 
                     if can_add {
@@ -499,34 +328,34 @@ impl SQLiteDestination {
                         batch.add_row(data);
 
                         if batch.len() >= MAX_BATCH_INSERT_SIZE {
-                            self.execute_batch_insert(&mut open_tx.transaction, batch)
+                            self.execute_batch_insert(&mut open_tx.handle, batch)
                                 .await?;
                             current_batch = None;
                         }
                     } else {
                         if let Some(batch) = current_batch.take() {
-                            self.execute_batch_insert(&mut open_tx.transaction, &batch)
+                            self.execute_batch_insert(&mut open_tx.handle, &batch)
                                 .await?;
                         }
 
-                        let mut new_batch = InsertBatch::new(table.clone(), columns);
+                        let mut new_batch = common::InsertBatch::new(table.clone(), columns);
                         new_batch.add_row(data);
                         current_batch = Some(new_batch);
                     }
                 }
                 _ => {
                     if let Some(batch) = current_batch.take() {
-                        self.execute_batch_insert(&mut open_tx.transaction, &batch)
+                        self.execute_batch_insert(&mut open_tx.handle, &batch)
                             .await?;
                     }
-                    self.process_event_in_transaction(&mut open_tx.transaction, event)
+                    self.process_event_in_transaction(&mut open_tx.handle, event)
                         .await?;
                 }
             }
         }
 
         if let Some(batch) = current_batch.take() {
-            self.execute_batch_insert(&mut open_tx.transaction, &batch)
+            self.execute_batch_insert(&mut open_tx.handle, &batch)
                 .await?;
         }
 
@@ -550,7 +379,7 @@ impl SQLiteDestination {
             transaction_id
         );
 
-        self.active_tx = Some(OpenTransaction::new(transaction_id, tx));
+        self.active_tx = Some(common::OpenTransaction::new(transaction_id, tx));
         Ok(())
     }
 
@@ -559,10 +388,10 @@ impl SQLiteDestination {
         if let Some(active) = self.active_tx.take() {
             let commit_start = std::time::Instant::now();
             // Extract values before consuming transaction
-            let tx_id = active.transaction_id;
-            let events_processed = active.events_processed;
+            let tx_id = active.state.transaction_id;
+            let events_processed = active.state.events_processed;
 
-            active.transaction.commit().await.map_err(|e| {
+            active.handle.commit().await.map_err(|e| {
                 CdcError::generic(format!(
                     "Failed to commit SQLite streaming transaction {}: {}",
                     tx_id, e
@@ -584,8 +413,8 @@ impl SQLiteDestination {
     async fn rollback_active_transaction(&mut self) -> Result<()> {
         if let Some(active) = self.active_tx.take() {
             // Extract values before consuming transaction
-            let tx_id = active.transaction_id;
-            let events_processed = active.events_processed;
+            let tx_id = active.state.transaction_id;
+            let events_processed = active.state.events_processed;
 
             tracing::warn!(
                 "SQLite: Rolling back streaming transaction {} ({} events processed)",
@@ -593,7 +422,7 @@ impl SQLiteDestination {
                 events_processed
             );
 
-            if let Err(e) = active.transaction.rollback().await {
+            if let Err(e) = active.handle.rollback().await {
                 tracing::warn!(
                     "SQLite: Failed to rollback streaming transaction {}: {}",
                     tx_id,
@@ -646,10 +475,10 @@ impl SQLiteDestination {
 
         // Check for mismatched streaming transactions
         if let Some(ref active) = self.active_tx {
-            if active.transaction_id != tx_id {
-                tracing::warn!(
+            if active.state.transaction_id != tx_id {
+                warn!(
                     "SQLite: Received batch for transaction {} but have active transaction {}. Rolling back active.",
-                    tx_id, active.transaction_id
+                    tx_id, active.state.transaction_id
                 );
                 self.rollback_active_transaction().await?;
             }
@@ -680,18 +509,18 @@ impl SQLiteDestination {
                     tx_id,
                     e
                 );
-                let _ = active.transaction.rollback().await;
+                let _ = active.handle.rollback().await;
                 return Err(e);
             }
 
-            active.events_processed += transaction.event_count();
+            active.state.events_processed += transaction.event_count();
 
             debug!(
                 "SQLite: Processed {} events for {} transaction {} (total: {}, elapsed: {:?})",
                 transaction.event_count(),
                 tx_type,
                 tx_id,
-                active.events_processed,
+                active.state.events_processed,
                 tx_start.elapsed()
             );
 
@@ -779,7 +608,7 @@ impl DestinationHandler for SQLiteDestination {
     }
 
     fn get_active_streaming_transaction_id(&self) -> Option<u32> {
-        self.active_tx.as_ref().map(|tx| tx.transaction_id)
+        self.active_tx.as_ref().map(|tx| tx.state.transaction_id)
     }
 
     async fn rollback_streaming_transaction(&mut self) -> Result<()> {

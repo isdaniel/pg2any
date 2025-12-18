@@ -1,3 +1,5 @@
+pub mod common;
+
 /// MySQL destination implementation
 #[cfg(feature = "mysql")]
 pub mod mysql;

@@ -76,11 +76,6 @@ pub struct Config {
     /// Maps source schema (e.g., "public") to destination schema/database (e.g., "cdc_db")
     pub schema_mappings: HashMap<String, String>,
 
-    /// Number of consumer worker tasks for parallel event processing
-    /// Higher values can improve throughput but may increase resource usage
-    /// Default: 1 (single consumer)
-    pub consumer_workers: usize,
-
     /// Batch size for multi-value INSERT statements in destination database
     /// Higher values improve throughput for large streaming transactions
     /// but may increase memory usage. Default: 1000
@@ -184,7 +179,6 @@ impl Default for Config {
             buffer_size: 1000,
             table_mappings: HashMap::new(),
             schema_mappings: HashMap::new(),
-            consumer_workers: 1,
             batch_size: 1000,
             extra_options: HashMap::new(),
         }
@@ -328,13 +322,6 @@ impl ConfigBuilder {
     /// Set buffer size
     pub fn buffer_size(mut self, size: usize) -> Self {
         self.config.buffer_size = size;
-        self
-    }
-
-    /// Set number of consumer workers for parallel event processing
-    /// Setting this to a value greater than 1 enables parallel consumers
-    pub fn consumer_workers(mut self, workers: usize) -> Self {
-        self.config.consumer_workers = workers.max(1);
         self
     }
 

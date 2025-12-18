@@ -43,9 +43,6 @@ use std::time::Duration;
 /// - `CDC_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: "10")
 ///
 /// ## Performance Configuration
-/// - `CDC_CONSUMER_WORKERS`: Number of parallel consumer workers for processing events (default: "1")
-///   Higher values can improve throughput when processing to destinations that support concurrent writes.
-///   Recommended: 2-4 for most workloads, up to 8-16 for high-throughput scenarios.
 /// - `CDC_BUFFER_SIZE`: Size of the event channel buffer (default: "1000")
 ///   Larger buffers can smooth out burst traffic but consume more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
@@ -102,7 +99,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
     let heartbeat_interval_secs = parse_u64_env("CDC_HEARTBEAT_INTERVAL", 10)?;
-    let consumer_workers = parse_usize_env("CDC_CONSUMER_WORKERS", 1)?;
     let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
     let batch_size = parse_usize_env("CDC_BATCH_SIZE", 1000)?;
 
@@ -123,8 +119,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     );
 
     tracing::info!(
-        "Performance - Consumer Workers: {}, Buffer Size: {}, Batch Size: {}",
-        consumer_workers,
+        "Performance - Buffer Size: {}, Batch Size: {}",
         buffer_size,
         batch_size
     );
@@ -143,7 +138,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .query_timeout(Duration::from_secs(query_timeout_secs))
         .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
         .schema_mappings(schema_mappings)
-        .consumer_workers(consumer_workers)
         .buffer_size(buffer_size)
         .batch_size(batch_size)
         .build()?;

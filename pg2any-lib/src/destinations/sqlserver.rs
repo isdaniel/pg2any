@@ -1,4 +1,4 @@
-use super::destination_factory::DestinationHandler;
+use super::{common, destination_factory::DestinationHandler};
 use crate::{
     error::{CdcError, Result},
     types::{ChangeEvent, EventType, ReplicaIdentity, Transaction},
@@ -13,68 +13,15 @@ use tracing::{debug, info};
 /// Maximum number of rows per batch INSERT statement for SQL Server
 const MAX_BATCH_INSERT_SIZE: usize = 1000;
 
-/// Represents a group of INSERT events for the same table that can be batched
-struct InsertBatch<'a> {
-    schema: String,
-    table: String,
-    /// Column names in consistent order
-    columns: Vec<String>,
-    /// Values for each row, in the same column order
-    rows: Vec<Vec<&'a serde_json::Value>>,
-}
-
-impl<'a> InsertBatch<'a> {
-    fn new(schema: String, table: String, columns: Vec<String>) -> Self {
-        Self {
-            schema,
-            table,
-            columns,
-            rows: Vec::new(),
-        }
-    }
-
-    fn add_row(&mut self, data: &'a HashMap<String, serde_json::Value>) {
-        let values: Vec<&serde_json::Value> = self
-            .columns
-            .iter()
-            .map(|col| data.get(col).unwrap_or(&serde_json::Value::Null))
-            .collect();
-        self.rows.push(values);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn can_add(&self, schema: &str, table: &str, columns: &[String]) -> bool {
-        self.schema == schema && self.table == table && self.columns == columns
-    }
-}
-
-/// State for an open transaction
-/// Only used for streaming transactions (normal transactions commit immediately)
-struct OpenTransaction {
-    /// PostgreSQL transaction ID
-    transaction_id: u32,
+/// SQL Server-specific transaction handle (just a flag since connection is stored separately)
+pub struct SqlServerTransactionHandle {
     /// Indicates if we have an active transaction (SQL Server keeps the connection, not a separate transaction object)
-    has_open_transaction: bool,
-    /// Number of events processed so far
-    events_processed: usize,
+    pub has_open_transaction: bool,
 }
 
-impl OpenTransaction {
-    fn new(transaction_id: u32) -> Self {
-        Self {
-            transaction_id,
-            has_open_transaction: true,
-            events_processed: 0,
-        }
-    }
-}
+/// Type alias for SQL Server's open transaction
+/// Uses generic OpenTransaction with SQL Server-specific handle
+type OpenTransaction = common::OpenTransaction<SqlServerTransactionHandle>;
 
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
@@ -119,7 +66,7 @@ impl SqlServerDestination {
         events: &'a [ChangeEvent],
         schema_mappings: &HashMap<String, String>,
     ) -> Result<()> {
-        let mut current_batch: Option<InsertBatch<'a>> = None;
+        let mut current_batch: Option<common::InsertBatch<'a>> = None;
 
         for event in events {
             match &event.event_type {
@@ -129,10 +76,7 @@ impl SqlServerDestination {
                     data,
                     ..
                 } => {
-                    let dest_schema = schema_mappings
-                        .get(schema)
-                        .cloned()
-                        .unwrap_or_else(|| schema.to_string());
+                    let dest_schema = common::map_schema(schema_mappings, schema);
 
                     // Get column names in sorted order for consistency
                     let mut columns: Vec<String> = data.keys().cloned().collect();
@@ -141,7 +85,7 @@ impl SqlServerDestination {
                     // Check if we can add to current batch
                     let can_add = current_batch
                         .as_ref()
-                        .map(|b| b.can_add(&dest_schema, table, &columns))
+                        .map(|b| b.can_add(Some(&dest_schema), table, &columns))
                         .unwrap_or(false);
 
                     if can_add {
@@ -160,7 +104,11 @@ impl SqlServerDestination {
                             Self::execute_batch_insert_static(client, &batch).await?;
                         }
 
-                        let mut new_batch = InsertBatch::new(dest_schema, table.clone(), columns);
+                        let mut new_batch = common::InsertBatch::new_with_schema(
+                            dest_schema,
+                            table.clone(),
+                            columns,
+                        );
                         new_batch.add_row(data);
                         current_batch = Some(new_batch);
                     }
@@ -200,7 +148,7 @@ impl SqlServerDestination {
     /// Static version of execute_batch_insert for use in static context
     async fn execute_batch_insert_static<'a>(
         client: &mut Client<Compat<TcpStream>>,
-        batch: &InsertBatch<'a>,
+        batch: &common::InsertBatch<'a>,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -218,9 +166,10 @@ impl SqlServerDestination {
             })
             .collect();
 
+        let schema = batch.schema.as_ref().unwrap();
         let sql = format!(
             "INSERT INTO [{}].[{}] ({}) VALUES {}",
-            batch.schema,
+            schema,
             batch.table,
             columns.join(", "),
             rows_sql.join(", ")
@@ -236,7 +185,7 @@ impl SqlServerDestination {
         info!(
             "SQL Server Batch INSERT: {} rows into [{}].[{}] in {:?}",
             batch.rows.len(),
-            batch.schema,
+            schema,
             batch.table,
             batch_duration
         );
@@ -389,88 +338,22 @@ impl SqlServerDestination {
         schema: &str,
         table: &str,
     ) -> Result<String> {
-        match replica_identity {
-            ReplicaIdentity::Full => {
-                if let Some(old) = old_data {
-                    let conditions: Vec<String> = old
-                        .iter()
-                        .map(|(column, value)| {
-                            format!("[{}] = {}", column, Self::format_sql_value(value))
-                        })
-                        .collect();
-                    Ok(conditions.join(" AND "))
-                } else {
-                    Err(CdcError::generic(format!(
-                        "REPLICA IDENTITY FULL requires old_data but none provided for {}.{} during UPDATE",
-                        schema, table
-                    )))
-                }
-            }
-            ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No key columns available for UPDATE operation on {}.{}. Check table's replica identity setting.",
-                        schema, table
-                    )));
-                }
+        let conditions = common::build_where_conditions_for_update(
+            old_data,
+            new_data,
+            replica_identity,
+            key_columns,
+            schema,
+            table,
+        )?;
 
-                let data_source = match old_data {
-                    Some(old) => old,
-                    None => new_data,
-                };
+        // Format conditions for SQL Server (using brackets)
+        let formatted_conditions: Vec<String> = conditions
+            .iter()
+            .map(|(column, value)| format!("[{}] = {}", column, Self::format_sql_value(value)))
+            .collect();
 
-                let mut conditions = Vec::with_capacity(key_columns.len());
-                for key_column in key_columns {
-                    if let Some(value) = data_source.get(key_column) {
-                        conditions.push(format!(
-                            "[{}] = {}",
-                            key_column,
-                            Self::format_sql_value(value)
-                        ));
-                    } else {
-                        return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for UPDATE on {}.{}",
-                            key_column, schema, table
-                        )));
-                    }
-                }
-
-                Ok(conditions.join(" AND "))
-            }
-            ReplicaIdentity::Nothing => {
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "Cannot perform UPDATE on {}.{} with REPLICA IDENTITY NOTHING and no key columns.",
-                        schema, table
-                    )));
-                }
-
-                let mut conditions = Vec::new();
-                for key_column in key_columns {
-                    if let Some(value) = new_data.get(key_column) {
-                        conditions.push(format!(
-                            "[{}] = {}",
-                            key_column,
-                            Self::format_sql_value(value)
-                        ));
-                    }
-                }
-
-                if conditions.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No usable key columns found for UPDATE on {}.{} with REPLICA IDENTITY NOTHING",
-                        schema, table
-                    )));
-                }
-
-                debug!(
-                    "WARNING: Using potentially unreliable WHERE clause for UPDATE on {}.{} due to REPLICA IDENTITY NOTHING",
-                    schema, table
-                );
-
-                Ok(conditions.join(" AND "))
-            }
-        }
+        Ok(formatted_conditions.join(" AND "))
     }
 
     /// Build WHERE clause for DELETE operations
@@ -481,48 +364,21 @@ impl SqlServerDestination {
         schema: &str,
         table: &str,
     ) -> Result<String> {
-        match replica_identity {
-            ReplicaIdentity::Full => {
-                let conditions: Vec<String> = old_data
-                    .iter()
-                    .map(|(column, value)| {
-                        format!("[{}] = {}", column, Self::format_sql_value(value))
-                    })
-                    .collect();
-                Ok(conditions.join(" AND "))
-            }
-            ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                if key_columns.is_empty() {
-                    return Err(CdcError::generic(format!(
-                        "No key columns available for DELETE operation on {}.{}. Check table's replica identity setting.",
-                        schema, table
-                    )));
-                }
+        let conditions = common::build_where_conditions_for_delete(
+            old_data,
+            replica_identity,
+            key_columns,
+            schema,
+            table,
+        )?;
 
-                let mut conditions = Vec::with_capacity(key_columns.len());
-                for key_column in key_columns {
-                    if let Some(value) = old_data.get(key_column) {
-                        conditions.push(format!(
-                            "[{}] = {}",
-                            key_column,
-                            Self::format_sql_value(value)
-                        ));
-                    } else {
-                        return Err(CdcError::generic(format!(
-                            "Key column '{}' not found in data for DELETE on {}.{}",
-                            key_column, schema, table
-                        )));
-                    }
-                }
+        // Format conditions for SQL Server (using brackets)
+        let formatted_conditions: Vec<String> = conditions
+            .iter()
+            .map(|(column, value)| format!("[{}] = {}", column, Self::format_sql_value(value)))
+            .collect();
 
-                Ok(conditions.join(" AND "))
-            }
-            ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
-                "Cannot perform DELETE on {}.{} with REPLICA IDENTITY NOTHING. \
-                DELETE requires a replica identity.",
-                schema, table
-            ))),
-        }
+        Ok(formatted_conditions.join(" AND "))
     }
 
     /// Begin a new streaming transaction on the connection
@@ -544,14 +400,19 @@ impl SqlServerDestination {
             transaction_id
         );
 
-        self.active_tx = Some(OpenTransaction::new(transaction_id));
+        self.active_tx = Some(common::OpenTransaction::new(
+            transaction_id,
+            SqlServerTransactionHandle {
+                has_open_transaction: true,
+            },
+        ));
         Ok(())
     }
 
     /// Commit the active streaming transaction
     async fn commit_active_transaction(&mut self) -> Result<()> {
         if let Some(mut active) = self.active_tx.take() {
-            if !active.has_open_transaction {
+            if !active.handle.has_open_transaction {
                 return Ok(());
             }
 
@@ -568,16 +429,16 @@ impl SqlServerDestination {
                 .map_err(|e| {
                     CdcError::generic(format!(
                         "Failed to commit SQL Server streaming transaction {}: {}",
-                        active.transaction_id, e
+                        active.state.transaction_id, e
                     ))
                 })?;
 
-            active.has_open_transaction = false;
+            active.handle.has_open_transaction = false;
 
             info!(
                 "SQL Server: Committed streaming transaction {} ({} events) in {:?}",
-                active.transaction_id,
-                active.events_processed,
+                active.state.transaction_id,
+                active.state.events_processed,
                 commit_start.elapsed()
             );
         }
@@ -588,27 +449,27 @@ impl SqlServerDestination {
     /// Rollback the active streaming transaction
     async fn rollback_active_transaction(&mut self) -> Result<()> {
         if let Some(mut active) = self.active_tx.take() {
-            if !active.has_open_transaction {
+            if !active.handle.has_open_transaction {
                 return Ok(());
             }
 
             tracing::warn!(
                 "SQL Server: Rolling back streaming transaction {} ({} events processed)",
-                active.transaction_id,
-                active.events_processed
+                active.state.transaction_id,
+                active.state.events_processed
             );
 
             if let Some(client) = self.client.as_mut() {
                 if let Err(e) = client.simple_query("ROLLBACK TRANSACTION").await {
                     tracing::warn!(
                         "SQL Server: Failed to rollback streaming transaction {}: {}",
-                        active.transaction_id,
+                        active.state.transaction_id,
                         e
                     );
                 }
             }
 
-            active.has_open_transaction = false;
+            active.handle.has_open_transaction = false;
         }
 
         Ok(())
@@ -655,10 +516,10 @@ impl SqlServerDestination {
 
         // Check for mismatched streaming transactions
         if let Some(ref active) = self.active_tx {
-            if active.transaction_id != tx_id {
+            if active.state.transaction_id != tx_id {
                 tracing::warn!(
                     "SQL Server: Received batch for transaction {} but have active transaction {}. Rolling back active.",
-                    tx_id, active.transaction_id
+                    tx_id, active.state.transaction_id
                 );
                 self.rollback_active_transaction().await?;
             }
@@ -699,18 +560,18 @@ impl SqlServerDestination {
                     e
                 );
                 let _ = client.simple_query("ROLLBACK TRANSACTION").await;
-                active.has_open_transaction = false;
+                active.handle.has_open_transaction = false;
                 return Err(e);
             }
 
-            active.events_processed += transaction.event_count();
+            active.state.events_processed += transaction.event_count();
 
             debug!(
                 "SQL Server: Processed {} events for {} transaction {} (total: {}, elapsed: {:?})",
                 transaction.event_count(),
                 tx_type,
                 tx_id,
-                active.events_processed,
+                active.state.events_processed,
                 tx_start.elapsed()
             );
 
@@ -767,8 +628,8 @@ impl DestinationHandler for SqlServerDestination {
     fn get_active_streaming_transaction_id(&self) -> Option<u32> {
         self.active_tx
             .as_ref()
-            .filter(|tx| tx.has_open_transaction)
-            .map(|tx| tx.transaction_id)
+            .filter(|tx| tx.handle.has_open_transaction)
+            .map(|tx| tx.state.transaction_id)
     }
 
     async fn rollback_streaming_transaction(&mut self) -> Result<()> {

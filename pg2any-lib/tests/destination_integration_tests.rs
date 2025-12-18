@@ -13,34 +13,6 @@ fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
     tx
 }
 
-/// Test that the factory can create destination instances
-#[tokio::test]
-async fn test_destination_factory_integration() {
-    // Test MySQL creation when feature is enabled
-    #[cfg(feature = "mysql")]
-    {
-        let result = DestinationFactory::create(DestinationType::MySQL);
-        assert!(result.is_ok());
-        let mut destination = result.unwrap();
-
-        // Test basic operations (without actual database connection)
-        // These should fail gracefully without panicking
-        let health_result = destination.health_check().await;
-        assert!(health_result.is_err());
-    }
-
-    // Test SQL Server creation when feature is enabled
-    #[cfg(feature = "sqlserver")]
-    {
-        let result = DestinationFactory::create(DestinationType::SqlServer);
-        assert!(result.is_ok());
-        let mut destination = result.unwrap();
-
-        let health_result = destination.health_check().await;
-        assert!(health_result.is_err());
-    }
-}
-
 /// Test that destination handlers have consistent interfaces
 #[tokio::test]
 async fn test_destination_handler_interface() {

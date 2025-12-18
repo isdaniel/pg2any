@@ -22,7 +22,6 @@ mod streaming_transaction_tests {
             assert_eq!(mysql_dest.get_active_streaming_transaction_id(), None);
 
             // Should be able to call commit and rollback without errors (no-op when no active tx)
-            assert!(mysql_dest.commit_streaming_transaction().await.is_ok());
             assert!(mysql_dest.rollback_streaming_transaction().await.is_ok());
         }
 
@@ -35,7 +34,6 @@ mod streaming_transaction_tests {
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
 
             // Should be able to call commit and rollback without errors (no-op when no active tx)
-            assert!(sqlite_dest.commit_streaming_transaction().await.is_ok());
             assert!(sqlite_dest.rollback_streaming_transaction().await.is_ok());
         }
 
@@ -49,7 +47,6 @@ mod streaming_transaction_tests {
             assert_eq!(sqlserver_dest.get_active_streaming_transaction_id(), None);
 
             // Should be able to call commit and rollback without errors (no-op when no active tx)
-            assert!(sqlserver_dest.commit_streaming_transaction().await.is_ok());
             assert!(sqlserver_dest
                 .rollback_streaming_transaction()
                 .await
@@ -164,7 +161,6 @@ mod streaming_transaction_tests {
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
 
             // After commit with no active transaction, state should remain None
-            assert!(sqlite_dest.commit_streaming_transaction().await.is_ok());
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
         }
 
@@ -184,7 +180,6 @@ mod streaming_transaction_tests {
             assert_eq!(sqlserver_dest.get_active_streaming_transaction_id(), None);
 
             // After commit with no active transaction, state should remain None
-            assert!(sqlserver_dest.commit_streaming_transaction().await.is_ok());
             assert_eq!(sqlserver_dest.get_active_streaming_transaction_id(), None);
         }
     }

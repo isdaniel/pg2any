@@ -142,24 +142,20 @@ pub fn init_logging() {
                                           │ (Bounded Buffer)     │
                                           └──────────┬───────────┘
                                                      │
-                    ┌────────────────────────────────┼────────────────────────────────┐
-                    │                                │                                │
-                    ▼                                ▼                                ▼
-          ┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
-          │   Worker 1      │              │   Worker 2      │              │   Worker N      │
-          │ (Own Connection)│              │ (Own Connection)│              │ (Own Connection)│
-          └────────┬────────┘              └────────┬────────┘              └────────┬────────┘
-                   │                                │                                │
-                   └────────────────────────────────┼────────────────────────────────┘
-                                                    │
-                                                    ▼
+                                                     ▼
+                                          ┌──────────────────────┐
+                                          │   Consumer Task      │
+                                          │  (Single Thread)     │
+                                          └──────────┬───────────┘
+                                                     │
+                                                     ▼
                                           ┌──────────────────────┐
                                           │  Target Database     │
                                           │ (MySQL/SQLServer/    │
                                           │      SQLite)         │
                                           └──────────────────────┘
 
-Key: Each worker has its own destination connection for TRUE parallel writes
+Key: Single consumer with dedicated destination connection for reliable, ordered writes
 ```
 
 ## Project Structure
@@ -289,7 +285,6 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
 | | `CDC_HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | `10` | `15` | Integer |
 | **Performance** | | | | | |
-| | `CDC_CONSUMER_WORKERS` | Number of parallel consumer workers (each with own connection) | `1` | `4`, `8` | Integer (1-16 recommended). Each worker gets its own destination connection for TRUE parallel processing |
 | | `CDC_BUFFER_SIZE` | Size of the event channel buffer | `1000` | `5000`, `10000` | Integer. Larger buffers handle burst traffic better but use more memory |
 | **System** | | | | | |
 | | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
@@ -404,41 +399,34 @@ CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
 
 ### Performance Tuning
 
-#### Parallel Processing Architecture
+#### Producer-Consumer Architecture
 
-pg2any uses a **producer-consumer architecture with per-worker connections** for high-throughput CDC:
+pg2any uses a **single producer-single consumer architecture** for reliable CDC:
 
-- **Single Producer**: Reads from PostgreSQL logical replication stream
-- **Multiple Consumers**: Each worker has its **own destination database connection**
-- **Work Stealing**: Workers share a bounded channel and compete for events
-- **TRUE Parallelism**: No mutex contention - workers write to destination simultaneously
-
-```bash
-# Enable parallel processing with 4 workers
-CDC_CONSUMER_WORKERS=4
-CDC_BUFFER_SIZE=2000
-```
+- **Single Producer**: Reads from PostgreSQL logical replication stream and pushes events to channel
+- **Single Consumer**: Processes events from channel and writes to destination database
+- **Bounded Channel**: Acts as buffer between producer and consumer for burst traffic handling
+- **Transaction Ordering**: Single consumer ensures strict transaction ordering and consistency
 
 #### Performance Configuration Parameters
 
-**CDC_CONSUMER_WORKERS** (Per-Worker Connections)
 **CDC_BUFFER_SIZE** (Event Channel Buffer)
+
+The buffer size determines how many events can be queued between the producer and consumer:
+- **Smaller buffers** (100-1000): Lower memory usage, better for steady-state workloads
+- **Larger buffers** (5000-10000): Better burst handling, more memory usage
 
 #### Performance Examples
 
 **Low Volume / Low Latency**
 ```bash
-CDC_CONSUMER_WORKERS=1
 CDC_BUFFER_SIZE=100
-# Best for: <100 events/sec, minimal latency
 ```
 
 **Burst Traffic Handling**
 ```bash
-CDC_CONSUMER_WORKERS=4
 CDC_BUFFER_SIZE=10000
 # Best for: Intermittent high-volume bursts
-# Large buffer absorbs spikes
 ```
 
 ### Programmatic Configuration

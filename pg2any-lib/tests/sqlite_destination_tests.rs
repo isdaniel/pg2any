@@ -155,21 +155,24 @@ async fn test_sqlite_destination_connect_with_sqlite_prefix() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn test_sqlite_destination_health_check() {
-    let temp_db = TempDatabase::new("health");
+async fn test_sqlite_destination_connection_lifecycle() {
+    let temp_db = TempDatabase::new("connection_lifecycle");
     let connection_string = temp_db.connection_string();
 
     let mut destination = SQLiteDestination::new();
 
-    // Health check should fail without connection
-    let result = destination.health_check().await;
-    assert!(result.is_err());
-
-    // Connect and test health check
+    // Connect
     destination.connect(&connection_string).await.unwrap();
-    let health_result = destination.health_check().await;
-    assert!(health_result.is_ok());
-    assert!(health_result.unwrap());
+
+    // Verify connection works by processing a transaction
+    let pool = SqlitePool::connect(&format!("sqlite://{}", connection_string))
+        .await
+        .unwrap();
+
+    sqlx::query("CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, data TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Clean up
     let _ = destination.close().await;

@@ -791,25 +791,36 @@ async fn test_sqlite_connection_recovery() {
     let mut destination = SQLiteDestination::new();
     destination.connect(&connection_string).await.unwrap();
 
-    // Verify health check works
-    let health1 = destination.health_check().await;
-    assert!(health1.is_ok() && health1.unwrap());
+    // Verify connection works by creating a simple transaction
+    let pool = SqlitePool::connect(&format!("sqlite://{}", connection_string))
+        .await
+        .unwrap();
+    create_users_table(&pool).await.unwrap();
+
+    let mut values = HashMap::new();
+    values.insert("id".to_string(), json!(1));
+    values.insert("name".to_string(), json!("Alice"));
+    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 1, values);
+    let transaction = wrap_in_transaction(event);
+    let process_result = destination.process_transaction(&transaction).await;
+    assert!(process_result.is_ok());
 
     // Close and reconnect
     let close_result = destination.close().await;
     assert!(close_result.is_ok());
 
-    // Health check should fail after close
-    let health2 = destination.health_check().await;
-    assert!(health2.is_err());
-
     // Reconnect
     let reconnect_result = destination.connect(&connection_string).await;
     assert!(reconnect_result.is_ok());
 
-    // Health check should work again
-    let health3 = destination.health_check().await;
-    assert!(health3.is_ok() && health3.unwrap());
+    // Verify connection works again
+    let mut values2 = HashMap::new();
+    values2.insert("id".to_string(), json!(2));
+    values2.insert("name".to_string(), json!("Bob"));
+    let event2 = ChangeEvent::insert("public".to_string(), "users".to_string(), 2, values2);
+    let transaction2 = wrap_in_transaction(event2);
+    let process_result2 = destination.process_transaction(&transaction2).await;
+    assert!(process_result2.is_ok());
 
     let _ = destination.close().await;
 }
@@ -1008,10 +1019,6 @@ async fn test_sqlite_destination_factory_integration() {
     // Test connection through factory-created destination
     let connect_result = destination.connect(&connection_string).await;
     assert!(connect_result.is_ok());
-
-    // Test health check
-    let health_result = destination.health_check().await;
-    assert!(health_result.is_ok() && health_result.unwrap());
 
     // Test basic operation
     let pool = SqlitePool::connect(&format!("sqlite://{}", connection_string))

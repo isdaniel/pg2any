@@ -222,7 +222,6 @@ CDC_PUBLICATION=cdc_pub                 # PostgreSQL publication name
 CDC_PROTOCOL_VERSION=1                  # Logical replication protocol version
 CDC_CONNECTION_TIMEOUT=30               # Connection timeout in seconds
 CDC_QUERY_TIMEOUT=10                   # Query timeout in seconds  
-CDC_HEARTBEAT_INTERVAL=10              # Heartbeat interval in seconds
 ```
 
 ### Application Settings
@@ -641,7 +640,6 @@ docker run -d \
 | `CDC_PROTOCOL_VERSION` | `1` | Logical replication protocol version |
 | `CDC_CONNECTION_TIMEOUT` | `30` | Database connection timeout (seconds) |
 | `CDC_QUERY_TIMEOUT` | `10` | Database query timeout (seconds) |
-| `CDC_HEARTBEAT_INTERVAL` | `10` | Replication heartbeat interval (seconds) |
 
 ### Application Settings
 | Variable | Default | Description |

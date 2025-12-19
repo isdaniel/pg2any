@@ -283,46 +283,6 @@ where
     Ok(())
 }
 
-/// Process TRUNCATE events on a connection
-async fn process_truncate_on_connection(
-    conn: &mut sqlx::pool::PoolConnection<MySql>,
-    tables: &[String],
-    schema_mappings: &HashMap<String, String>,
-) -> Result<()> {
-    for table_full_name in tables {
-        let mut parts = table_full_name.splitn(2, '.');
-        let sql = match (parts.next(), parts.next()) {
-            (Some(schema), Some(table)) => {
-                let dest_schema = common::map_schema(schema_mappings, schema);
-                format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
-            }
-            _ => format!("TRUNCATE TABLE `{}`", table_full_name),
-        };
-        sqlx::query(&sql).execute(&mut **conn).await?;
-    }
-    Ok(())
-}
-
-/// Process TRUNCATE events in a transaction
-async fn process_truncate_in_tx(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    tables: &[String],
-    schema_mappings: &HashMap<String, String>,
-) -> Result<()> {
-    for table_full_name in tables {
-        let mut parts = table_full_name.splitn(2, '.');
-        let sql = match (parts.next(), parts.next()) {
-            (Some(schema), Some(table)) => {
-                let dest_schema = common::map_schema(schema_mappings, schema);
-                format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
-            }
-            _ => format!("TRUNCATE TABLE `{}`", table_full_name),
-        };
-        sqlx::query(&sql).execute(&mut **tx).await?;
-    }
-    Ok(())
-}
-
 // ============================================================================
 // MySQL Destination Implementation
 // ============================================================================
@@ -331,7 +291,7 @@ pub struct MySQLDestination {
     pool: Option<MySqlPool>,
     /// Schema mappings: maps source schema to destination database
     schema_mappings: HashMap<String, String>,
-    /// Active open transaction state
+    /// Active open transaction state (kept for compatibility with rollback_streaming_transaction)
     active_tx: Option<OpenTransaction>,
 }
 
@@ -345,14 +305,62 @@ impl MySQLDestination {
         }
     }
 
-    async fn process_events_with_batching(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        events: &[ChangeEvent],
-    ) -> Result<()> {
+    /// Rollback the active streaming transaction (for graceful shutdown)
+    async fn rollback_active_transaction(&mut self) -> Result<()> {
+        if let Some(mut active) = self.active_tx.take() {
+            warn!(
+                "MySQL: Rolling back streaming transaction {} ({} events processed)",
+                active.state.transaction_id, active.state.events_processed
+            );
+
+            if let Err(e) = active.handle.execute("ROLLBACK").await {
+                warn!(
+                    "MySQL: Failed to rollback streaming transaction {}: {}",
+                    active.state.transaction_id, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a transaction batch
+    ///
+    /// Each batch is processed and committed immediately in its own transaction.
+    /// This applies to both intermediate batches (batch_size reached) and
+    /// final batches (Commit/StreamCommit received).
+    async fn process_transaction_batch(&mut self, transaction: &Transaction) -> Result<()> {
+        let tx_id = transaction.transaction_id;
+
+        // Skip empty batches
+        if transaction.is_empty() {
+            debug!("Skipping empty batch for transaction {}", tx_id);
+            return Ok(());
+        }
+
+        let tx_start = std::time::Instant::now();
+
+        debug!(
+            "MySQL: Processing transaction {} ({} events)",
+            tx_id,
+            transaction.event_count()
+        );
+
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
+
+        // Start a new transaction for this batch
+        let mut db_tx = pool
+            .begin()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to begin MySQL transaction: {}", e)))?;
+
+        // Process all events in this batch
         let mut current_batch: Option<common::InsertBatch<'_>> = None;
 
-        for event in events {
+        for event in &transaction.events {
             match &event.event_type {
                 EventType::Insert {
                     schema,
@@ -374,84 +382,12 @@ impl MySQLDestination {
                         batch.add_row(data);
 
                         if batch.len() >= MAX_BATCH_INSERT_SIZE {
-                            execute_batch_insert(&mut **tx, batch, &self.schema_mappings).await?;
+                            execute_batch_insert(&mut *db_tx, batch, &self.schema_mappings).await?;
                             current_batch = None;
                         }
                     } else {
                         if let Some(batch) = current_batch.take() {
-                            execute_batch_insert(&mut **tx, &batch, &self.schema_mappings).await?;
-                        }
-
-                        let mut new_batch = common::InsertBatch::new_with_schema(
-                            dest_schema,
-                            table.clone(),
-                            columns,
-                        );
-                        new_batch.add_row(data);
-                        current_batch = Some(new_batch);
-                    }
-                }
-                EventType::Truncate(tables) => {
-                    // Flush any pending batch before TRUNCATE
-                    if let Some(batch) = current_batch.take() {
-                        execute_batch_insert(&mut **tx, &batch, &self.schema_mappings).await?;
-                    }
-                    process_truncate_in_tx(tx, tables, &self.schema_mappings).await?;
-                }
-                _ => {
-                    // Flush any pending batch before processing non-INSERT events
-                    if let Some(batch) = current_batch.take() {
-                        execute_batch_insert(&mut **tx, &batch, &self.schema_mappings).await?;
-                    }
-                    process_single_event(&mut **tx, event, &self.schema_mappings).await?;
-                }
-            }
-        }
-
-        if let Some(batch) = current_batch.take() {
-            execute_batch_insert(&mut **tx, &batch, &self.schema_mappings).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Process events with batching on an open transaction (unified for streaming and normal)
-    async fn process_events_on_open_transaction(
-        open_tx: &mut OpenTransaction,
-        events: &[ChangeEvent],
-        schema_mappings: &HashMap<String, String>,
-    ) -> Result<()> {
-        let mut current_batch: Option<common::InsertBatch<'_>> = None;
-
-        for event in events {
-            match &event.event_type {
-                EventType::Insert {
-                    schema,
-                    table,
-                    data,
-                    ..
-                } => {
-                    let dest_schema = common::map_schema(schema_mappings, schema);
-                    let mut columns: Vec<String> = data.keys().cloned().collect();
-                    columns.sort();
-
-                    let can_add = current_batch
-                        .as_ref()
-                        .map(|b| b.can_add(Some(&dest_schema), table, &columns))
-                        .unwrap_or(false);
-
-                    if can_add {
-                        let batch = current_batch.as_mut().unwrap();
-                        batch.add_row(data);
-
-                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
-                            execute_batch_insert(&mut *open_tx.handle, batch, schema_mappings)
-                                .await?;
-                            current_batch = None;
-                        }
-                    } else {
-                        if let Some(batch) = current_batch.take() {
-                            execute_batch_insert(&mut *open_tx.handle, &batch, schema_mappings)
+                            execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings)
                                 .await?;
                         }
 
@@ -466,230 +402,46 @@ impl MySQLDestination {
                 }
                 EventType::Truncate(tables) => {
                     if let Some(batch) = current_batch.take() {
-                        execute_batch_insert(&mut *open_tx.handle, &batch, schema_mappings).await?;
+                        execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
                     }
-                    process_truncate_on_connection(&mut open_tx.handle, tables, schema_mappings)
-                        .await?;
+                    for table_full_name in tables {
+                        let mut parts = table_full_name.splitn(2, '.');
+                        let sql = match (parts.next(), parts.next()) {
+                            (Some(schema), Some(table)) => {
+                                let dest_schema = common::map_schema(&self.schema_mappings, schema);
+                                format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
+                            }
+                            _ => format!("TRUNCATE TABLE `{}`", table_full_name),
+                        };
+                        sqlx::query(&sql).execute(&mut *db_tx).await?;
+                    }
                 }
                 _ => {
                     if let Some(batch) = current_batch.take() {
-                        execute_batch_insert(&mut *open_tx.handle, &batch, schema_mappings).await?;
+                        execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
                     }
-                    process_single_event(&mut *open_tx.handle, event, schema_mappings).await?;
+                    process_single_event(&mut *db_tx, event, &self.schema_mappings).await?;
                 }
             }
         }
 
+        // Flush any remaining batch
         if let Some(batch) = current_batch.take() {
-            execute_batch_insert(&mut *open_tx.handle, &batch, schema_mappings).await?;
+            execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
         }
 
-        Ok(())
-    }
-
-    /// Begin a new streaming transaction on the connection pool
-    async fn begin_transaction(&mut self, transaction_id: u32) -> Result<()> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
-
-        let mut conn = pool
-            .acquire()
+        // Commit the transaction
+        db_tx
+            .commit()
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to acquire MySQL connection: {}", e)))?;
-
-        conn.execute("START TRANSACTION")
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to start MySQL transaction: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to commit MySQL transaction: {}", e)))?;
 
         info!(
-            "MySQL: Started streaming transaction {} (first batch)",
-            transaction_id
-        );
-
-        self.active_tx = Some(common::OpenTransaction::new(transaction_id, conn));
-        Ok(())
-    }
-
-    /// Commit the active streaming transaction
-    async fn commit_active_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_tx.take() {
-            let commit_start = std::time::Instant::now();
-
-            active.handle.execute("COMMIT").await.map_err(|e| {
-                CdcError::generic(format!(
-                    "Failed to commit MySQL streaming transaction {}: {}",
-                    active.state.transaction_id, e
-                ))
-            })?;
-
-            info!(
-                "MySQL: Committed streaming transaction {} ({} events) in {:?}",
-                active.state.transaction_id,
-                active.state.events_processed,
-                commit_start.elapsed()
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Rollback the active streaming transaction
-    async fn rollback_active_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_tx.take() {
-            warn!(
-                "MySQL: Rolling back streaming transaction {} ({} events processed)",
-                active.state.transaction_id, active.state.events_processed
-            );
-
-            if let Err(e) = active.handle.execute("ROLLBACK").await {
-                warn!(
-                    "MySQL: Failed to rollback streaming transaction {}: {}",
-                    active.state.transaction_id, e
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// This method handles both normal and streaming transactions:
-    /// - Normal transactions: BEGIN → process → COMMIT in one call
-    /// - Streaming transactions: BEGIN (first batch) → process → ... → COMMIT (final batch)
-    async fn process_transaction_batch(&mut self, transaction: &Transaction) -> Result<()> {
-        // Clone pool early to avoid borrow issues
-        let pool = self
-            .pool
-            .clone()
-            .ok_or_else(|| CdcError::generic("MySQL connection not established"))?;
-
-        let tx_id = transaction.transaction_id;
-        let is_streaming = transaction.is_streaming;
-        let is_final = transaction.is_final_batch;
-
-        // Skip empty non-final batches
-        if transaction.is_empty() && !is_final {
-            debug!(
-                "Skipping empty non-final batch for transaction {} (streaming={})",
-                tx_id, is_streaming
-            );
-            return Ok(());
-        }
-
-        // Skip empty final batches for non-streaming transactions
-        if transaction.is_empty() && !is_streaming {
-            debug!(
-                "Skipping empty transaction {} (streaming={}, final={})",
-                tx_id, is_streaming, is_final
-            );
-            return Ok(());
-        }
-
-        let tx_start = std::time::Instant::now();
-        let tx_type = if is_streaming { "streaming" } else { "normal" };
-
-        debug!(
-            "MySQL: Processing {} transaction {} ({} events, final={})",
-            tx_type,
+            "MySQL: Committed batch for transaction {} ({} events) in {:?}",
             tx_id,
             transaction.event_count(),
-            is_final
+            tx_start.elapsed()
         );
-
-        // Check for mismatched streaming transactions
-        if let Some(ref active) = self.active_tx {
-            if active.state.transaction_id != tx_id {
-                warn!(
-                    "MySQL: Received batch for transaction {} but have active transaction {}. Rolling back active.",
-                    tx_id, active.state.transaction_id
-                );
-                self.rollback_active_transaction().await?;
-            }
-        }
-
-        // Begin transaction if not already active
-        if self.active_tx.is_none() {
-            if is_streaming {
-                // Streaming transaction: use raw connection with explicit BEGIN
-                self.begin_transaction(tx_id).await?;
-            } else {
-                // Normal transaction: use sqlx::Transaction for simple atomic operation
-                let begin_time = std::time::Instant::now();
-                let mut tx = pool.begin().await.map_err(|e| {
-                    CdcError::generic(format!("Failed to begin MySQL transaction: {}", e))
-                })?;
-                debug!("MySQL: BEGIN took {:?}", begin_time.elapsed());
-
-                let process_time = std::time::Instant::now();
-                let result = self
-                    .process_events_with_batching(&mut tx, &transaction.events)
-                    .await;
-                debug!("MySQL: Event processing took {:?}", process_time.elapsed());
-
-                if let Err(e) = result {
-                    tx.rollback().await.map_err(|re| {
-                        CdcError::generic(format!(
-                            "Failed to rollback transaction after error '{}': {}",
-                            e, re
-                        ))
-                    })?;
-                    return Err(e);
-                }
-
-                let commit_time = std::time::Instant::now();
-                tx.commit().await.map_err(|e| {
-                    CdcError::generic(format!("Failed to commit MySQL transaction: {}", e))
-                })?;
-
-                debug!(
-                    "MySQL: COMMIT took {:?} for transaction {} ({} events, total time: {:?})",
-                    commit_time.elapsed(),
-                    tx_id,
-                    transaction.event_count(),
-                    tx_start.elapsed()
-                );
-
-                return Ok(());
-            }
-        }
-
-        // Process events on the open transaction (streaming mode)
-        if !transaction.is_empty() {
-            let mut active = self.active_tx.take().unwrap();
-
-            let result = Self::process_events_on_open_transaction(
-                &mut active,
-                &transaction.events,
-                &self.schema_mappings,
-            )
-            .await;
-
-            if let Err(e) = result {
-                warn!(
-                    "MySQL: Error processing batch, rolling back transaction {}: {}",
-                    tx_id, e
-                );
-                let _ = active.handle.execute("ROLLBACK").await;
-                return Err(e);
-            }
-
-            active.state.events_processed += transaction.event_count();
-
-            debug!(
-                "MySQL: Processed {} events for transaction {} (total: {})",
-                transaction.event_count(),
-                tx_id,
-                active.state.events_processed
-            );
-
-            self.active_tx = Some(active);
-        }
-
-        // Commit if this is the final batch
-        if is_final {
-            self.commit_active_transaction().await?;
-        }
 
         Ok(())
     }

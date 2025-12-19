@@ -40,7 +40,6 @@ use std::time::Duration;
 /// ## Timeout Configuration
 /// - `CDC_CONNECTION_TIMEOUT`: Connection timeout in seconds (default: "30")
 /// - `CDC_QUERY_TIMEOUT`: Query timeout in seconds (default: "10")
-/// - `CDC_HEARTBEAT_INTERVAL`: Heartbeat interval in seconds (default: "10")
 ///
 /// ## Performance Configuration
 /// - `CDC_BUFFER_SIZE`: Size of the event channel buffer (default: "1000")
@@ -98,7 +97,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     // Timeout configurations
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
-    let heartbeat_interval_secs = parse_u64_env("CDC_HEARTBEAT_INTERVAL", 10)?;
     let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
     let batch_size = parse_usize_env("CDC_BATCH_SIZE", 1000)?;
 
@@ -112,10 +110,9 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     );
 
     tracing::info!(
-        "Timeouts - Connection: {}s, Query: {}s, Heartbeat: {}s",
+        "Timeouts - Connection: {}s, Query: {}s",
         connection_timeout_secs,
-        query_timeout_secs,
-        heartbeat_interval_secs
+        query_timeout_secs
     );
 
     tracing::info!(
@@ -136,7 +133,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .streaming(streaming)
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
         .query_timeout(Duration::from_secs(query_timeout_secs))
-        .heartbeat_interval(Duration::from_secs(heartbeat_interval_secs))
         .schema_mappings(schema_mappings)
         .buffer_size(buffer_size)
         .batch_size(batch_size)

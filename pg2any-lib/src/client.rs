@@ -3,7 +3,7 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::streaming_transaction_manager::{StreamingTransactionManager, TransactionContext};
+use crate::transaction_manager::{TransactionContext, TransactionManager};
 use crate::types::{EventType, Lsn, Transaction};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -112,10 +112,6 @@ impl CdcClient {
             .take()
             .ok_or_else(|| CdcError::generic("Transaction sender not available"))?;
 
-        // Create dedicated channel for streaming transactions
-        let (streaming_sender, streaming_receiver) =
-            mpsc::channel::<Transaction>(self.config.buffer_size);
-
         let producer_handle = {
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
@@ -125,7 +121,6 @@ impl CdcClient {
             tokio::spawn(Self::run_producer(
                 replication_stream,
                 transaction_sender,
-                streaming_sender,
                 token,
                 start_lsn,
                 metrics,
@@ -143,7 +138,7 @@ impl CdcClient {
         let dest_connection_string = &self.config.destination_connection_string;
         let schema_mappings = self.config.schema_mappings.clone();
 
-        info!("Starting consumer for transaction processing with streaming support");
+        info!("Starting consumer for transaction processing");
 
         // Create destination handler for the consumer
         let mut consumer_destination = DestinationFactory::create(dest_type.clone())?;
@@ -164,7 +159,6 @@ impl CdcClient {
 
         let consumer_handle = tokio::spawn(Self::run_consumer_loop(
             transaction_receiver,
-            streaming_receiver,
             consumer_destination,
             token,
             metrics,
@@ -210,24 +204,21 @@ impl CdcClient {
     /// This producer collects events between BEGIN and COMMIT into complete Transaction objects,
     /// ensuring that the consumer processes an entire transaction atomically.
     ///
-    /// ## Streaming Mode Support (Protocol v2+)
+    /// ## Batch Processing
     ///
-    /// When PostgreSQL streaming mode is enabled, large in-progress transactions are sent in chunks:
-    /// - StreamStart → DML events → StreamStop (repeated for each chunk)
-    /// - StreamCommit (final commit) or StreamAbort (rollback)
+    /// When the number of events in a transaction reaches batch_size, a batch is sent
+    /// to the consumer immediately. This enables:
+    /// - Incremental LSN updates for graceful shutdown recovery
+    /// - Prevention of double consumption after restart
+    /// - Better memory management for large transactions
     ///
-    /// This producer batches streaming events and sends them when:
-    /// 1. StreamStop is received and batch_size is reached
-    /// 2. StreamCommit is received (final batch)
+    /// ## Transaction Types
     ///
-    /// Streaming transactions are sent via a dedicated channel to maintain transaction ordering
-    /// and allow the destination database transaction to stay open across batches.
-    ///
-    /// Normal transactions use the shared channel.
+    /// - Normal transactions (BEGIN...COMMIT): Single transaction processed atomically
+    /// - Streaming transactions (StreamStart...StreamCommit): Large transactions sent in batches
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         transaction_sender: mpsc::Sender<Transaction>,
-        streaming_sender: mpsc::Sender<Transaction>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
@@ -238,8 +229,8 @@ impl CdcClient {
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // Streaming transaction manager for protocol v2+ streaming transactions
-        let mut streaming_manager = StreamingTransactionManager::new(batch_size);
+        // Unified transaction manager for both normal and streaming transactions
+        let mut tx_manager = TransactionManager::new(batch_size);
         let mut current_context = TransactionContext::None;
 
         while !cancellation_token.is_cancelled() {
@@ -254,7 +245,7 @@ impl CdcClient {
                         // Record current LSN
                         metrics_collector.record_received_lsn(current_lsn.0);
                     }
-
+                    metrics_collector.record_event(&event);
                     // Handle transaction boundaries
                     match &event.event_type {
                         EventType::Begin {
@@ -269,35 +260,21 @@ impl CdcClient {
                                 "Starting transaction {} commit_timestamp: {}",
                                 transaction_id, commit_timestamp
                             );
-                            current_context = TransactionContext::Normal(Transaction::new(
-                                *transaction_id,
-                                *commit_timestamp,
-                            ));
+                            tx_manager.handle_begin(*transaction_id, *commit_timestamp, event.lsn);
+                            current_context = TransactionContext::Normal(*transaction_id);
                         }
 
                         EventType::Commit { .. } => {
-                            // Complete and send the normal transaction via shared channel (work-stealing)
-                            if let TransactionContext::Normal(mut tx) =
-                                std::mem::replace(&mut current_context, TransactionContext::None)
-                            {
-                                if let Some(lsn) = event.lsn {
-                                    tx.set_commit_lsn(lsn);
-                                }
+                            // Complete and send the normal transaction
+                            if let TransactionContext::Normal(tx_id) = current_context {
+                                if let Some(tx) = tx_manager.handle_commit(tx_id, event.lsn) {
+                                    let event_count = tx.event_count();
+                                    info!(
+                                        "Producer: Sending normal transaction {} with {} events",
+                                        tx_id, event_count
+                                    );
 
-                                let tx_id = tx.transaction_id;
-                                let event_count = tx.event_count();
-                                info!(
-                                    "Producer: Sending normal transaction {} with {} events (work-stealing)",
-                                    tx_id, event_count
-                                );
-
-                                // Send the completed normal transaction to shared channel
-                                match transaction_sender.send(tx).await {
-                                    Ok(_) => {
-                                        info!("Producer: Successfully sent transaction {} with {} events", 
-                                               tx_id, event_count);
-                                    }
-                                    Err(e) => {
+                                    if let Err(e) = transaction_sender.send(tx).await {
                                         error!(
                                             "Producer: Failed to send transaction to consumer: {}",
                                             e
@@ -306,7 +283,12 @@ impl CdcClient {
                                             .record_error("transaction_send_failed", "producer");
                                         break;
                                     }
+                                    info!(
+                                        "Producer: Successfully sent transaction {} with {} events",
+                                        tx_id, event_count
+                                    );
                                 }
+                                current_context = TransactionContext::None;
                             } else {
                                 warn!("Received COMMIT without BEGIN, ignoring");
                             }
@@ -320,7 +302,7 @@ impl CdcClient {
                                 "StreamStart: transaction_id={}, first_segment={}",
                                 transaction_id, first_segment
                             );
-                            streaming_manager.handle_stream_start(
+                            tx_manager.handle_stream_start(
                                 *transaction_id,
                                 *first_segment,
                                 event.lsn,
@@ -332,7 +314,7 @@ impl CdcClient {
                             if let TransactionContext::Streaming(xid) = current_context {
                                 // Check if we should send a batch
                                 if let Some(batch_tx) =
-                                    streaming_manager.handle_stream_stop(xid, event.lsn)
+                                    tx_manager.handle_stream_stop(xid, event.lsn)
                                 {
                                     let batch_count = batch_tx.event_count();
 
@@ -341,25 +323,16 @@ impl CdcClient {
                                         batch_count, xid
                                     );
 
-                                    match streaming_sender.send(batch_tx).await {
-                                        Ok(_) => {
-                                            info!(
-                                                "Producer: Successfully sent StreamStop batch for transaction {}",
-                                                xid
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Producer: Failed to send StreamStop batch: {}",
-                                                e
-                                            );
-                                            metrics_collector.record_error(
-                                                "streaming_batch_send_failed",
-                                                "producer",
-                                            );
-                                            break;
-                                        }
+                                    if let Err(e) = transaction_sender.send(batch_tx).await {
+                                        error!("Producer: Failed to send StreamStop batch: {}", e);
+                                        metrics_collector
+                                            .record_error("batch_send_failed", "producer");
+                                        break;
                                     }
+                                    info!(
+                                        "Producer: Successfully sent StreamStop batch for transaction {}",
+                                        xid
+                                    );
                                 }
                             }
                         }
@@ -369,7 +342,7 @@ impl CdcClient {
                             commit_timestamp,
                         } => {
                             info!("Producer: StreamCommit for transaction {}", transaction_id);
-                            if let Some(final_tx) = streaming_manager.handle_stream_commit(
+                            if let Some(final_tx) = tx_manager.handle_stream_commit(
                                 *transaction_id,
                                 *commit_timestamp,
                                 event.lsn,
@@ -381,25 +354,19 @@ impl CdcClient {
                                     transaction_id, final_count
                                 );
 
-                                match streaming_sender.send(final_tx).await {
-                                    Ok(_) => {
-                                        info!(
-                                            "Producer: Successfully sent final transaction {} with {} events",
-                                            transaction_id, final_count
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Producer: Failed to send final streaming transaction: {}",
-                                            e
-                                        );
-                                        metrics_collector.record_error(
-                                            "streaming_commit_send_failed",
-                                            "producer",
-                                        );
-                                        break;
-                                    }
+                                if let Err(e) = transaction_sender.send(final_tx).await {
+                                    error!(
+                                        "Producer: Failed to send final streaming transaction: {}",
+                                        e
+                                    );
+                                    metrics_collector
+                                        .record_error("transaction_send_failed", "producer");
+                                    break;
                                 }
+                                info!(
+                                    "Producer: Successfully sent final transaction {} with {} events",
+                                    transaction_id, final_count
+                                );
                             }
                             if let TransactionContext::Streaming(xid) = current_context {
                                 if xid == *transaction_id {
@@ -410,30 +377,31 @@ impl CdcClient {
 
                         EventType::StreamAbort { transaction_id } => {
                             debug!("StreamAbort: transaction_id={}", transaction_id);
-                            streaming_manager.handle_stream_abort(*transaction_id);
+                            tx_manager.handle_stream_abort(*transaction_id);
                             if let TransactionContext::Streaming(xid) = current_context {
                                 if xid == *transaction_id {
                                     current_context = TransactionContext::None;
                                 }
                             }
                         }
+
                         EventType::Insert { .. }
                         | EventType::Update { .. }
                         | EventType::Delete { .. }
                         | EventType::Truncate(_) => {
-                            match &mut current_context {
+                            match &current_context {
                                 TransactionContext::Streaming(xid) => {
                                     let xid = *xid;
                                     // Add to streaming transaction
-                                    streaming_manager.add_event(xid, event);
+                                    tx_manager.add_event(xid, event);
 
                                     // Check if we should send a batch (accumulated enough events)
-                                    if streaming_manager.should_send_batch(xid) {
+                                    if tx_manager.should_send_batch(xid) {
                                         debug!(
-                                            "Producer: Batch threshold reached for transaction {}",
+                                            "Producer: Batch threshold reached for streaming transaction {}",
                                             xid
                                         );
-                                        if let Some(batch_tx) = streaming_manager.take_batch(xid) {
+                                        if let Some(batch_tx) = tx_manager.take_batch(xid) {
                                             let batch_count = batch_tx.event_count();
 
                                             info!(
@@ -441,31 +409,55 @@ impl CdcClient {
                                                 batch_count, xid
                                             );
 
-                                            match streaming_sender.send(batch_tx).await {
-                                                Ok(_) => {
-                                                    info!(
-                                                        "Producer: Successfully sent batch of {} events for transaction {}",
-                                                        batch_count, xid
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "Producer: Failed to send mid-stream batch: {}",
-                                                        e
-                                                    );
-                                                    metrics_collector.record_error(
-                                                        "streaming_batch_send_failed",
-                                                        "producer",
-                                                    );
-                                                    break;
-                                                }
+                                            if let Err(e) = transaction_sender.send(batch_tx).await
+                                            {
+                                                error!(
+                                                    "Producer: Failed to send mid-stream batch: {}",
+                                                    e
+                                                );
+                                                metrics_collector
+                                                    .record_error("batch_send_failed", "producer");
+                                                break;
                                             }
+                                            info!(
+                                                "Producer: Successfully sent batch of {} events for transaction {}",
+                                                batch_count, xid
+                                            );
                                         }
                                     }
                                 }
-                                TransactionContext::Normal(ref mut tx) => {
-                                    // Normal transaction mode
-                                    tx.add_event(event);
+                                TransactionContext::Normal(tx_id) => {
+                                    let tx_id = *tx_id;
+                                    // Add event to normal transaction
+                                    tx_manager.add_event(tx_id, event);
+
+                                    // Check if we should send a batch for normal transaction too
+                                    if tx_manager.should_send_batch(tx_id) {
+                                        debug!(
+                                            "Producer: Batch threshold reached for normal transaction {}",
+                                            tx_id
+                                        );
+                                        if let Some(batch_tx) = tx_manager.take_batch(tx_id) {
+                                            let batch_count = batch_tx.event_count();
+
+                                            info!(
+                                                "Producer: Sending batch with {} events for normal transaction {}",
+                                                batch_count, tx_id
+                                            );
+
+                                            if let Err(e) = transaction_sender.send(batch_tx).await
+                                            {
+                                                error!("Producer: Failed to send batch: {}", e);
+                                                metrics_collector
+                                                    .record_error("batch_send_failed", "producer");
+                                                break;
+                                            }
+                                            info!(
+                                                "Producer: Successfully sent batch of {} events for transaction {}",
+                                                batch_count, tx_id
+                                            );
+                                        }
+                                    }
                                 }
                                 TransactionContext::None => {
                                     // Event outside of transaction - create implicit transaction
@@ -511,11 +503,11 @@ impl CdcClient {
 
         // If there's an incomplete transaction, log a warning
         match current_context {
-            TransactionContext::Normal(tx) => {
+            TransactionContext::Normal(tx_id) => {
+                let event_count = tx_manager.event_count(tx_id);
                 warn!(
-                    "Discarding incomplete transaction {} with {} events due to shutdown",
-                    tx.transaction_id,
-                    tx.event_count()
+                    "Discarding incomplete normal transaction {} with {} events due to shutdown",
+                    tx_id, event_count
                 );
             }
             TransactionContext::Streaming(xid) => {
@@ -527,11 +519,11 @@ impl CdcClient {
             TransactionContext::None => {}
         }
 
-        // Clear any incomplete streaming transactions from the manager
-        if streaming_manager.has_active_transactions() {
-            let count = streaming_manager.clear();
+        // Clear any incomplete transactions from the manager
+        if tx_manager.has_active_transactions() {
+            let count = tx_manager.clear();
             warn!(
-                "Discarding {} incomplete streaming transaction(s) due to shutdown",
+                "Discarding {} incomplete transaction(s) due to shutdown",
                 count
             );
         }
@@ -552,15 +544,13 @@ impl CdcClient {
     /// This ensures that all events within a transaction are applied together.
     ///
     /// # Arguments
-    /// * `transaction_receiver` - Receiver for normal transactions
-    /// * `streaming_receiver` - Receiver for streaming transactions
+    /// * `transaction_receiver` - Receiver for all transactions (both normal and streaming)
     /// * `destination_handler` - Destination handler (no mutex needed!)
     /// * `cancellation_token` - Token for graceful shutdown
     /// * `metrics_collector` - Metrics collector
     /// * `destination_type` - Type of destination for metrics labeling
     async fn run_consumer_loop(
         mut transaction_receiver: mpsc::Receiver<Transaction>,
-        mut streaming_receiver: mpsc::Receiver<Transaction>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
@@ -593,7 +583,6 @@ impl CdcClient {
                     // Then drain remaining transactions
                     Self::drain_remaining_transactions(
                         &mut transaction_receiver,
-                        &mut streaming_receiver,
                         &mut destination_handler,
                         &metrics_collector,
                         &destination_type,
@@ -601,41 +590,19 @@ impl CdcClient {
                     break;
                 }
 
-                // Wait for streaming transaction
-                streaming_result = streaming_receiver.recv() => {
-                    match streaming_result {
-                        Some(tx) => {
-                            let tx_id = tx.transaction_id;
-                            let event_count = tx.event_count();
-                            info!(
-                                "Consumer received streaming transaction {} with {} events",
-                                tx_id, event_count
-                            );
-                            Self::process_transaction(
-                                tx,
-                                &mut destination_handler,
-                                &metrics_collector,
-                                &destination_type,
-                            ).await;
-
-                            info!("Consumer completed streaming transaction {}", tx_id);
-                        }
-                        None => {
-                            // Channel closed
-                        }
-                    }
-                }
-
-                // Normal transactions
+                // Process transactions from single channel
                 transaction = transaction_receiver.recv() => {
                     match transaction {
                         Some(tx) => {
                             let tx_id = tx.transaction_id;
                             let event_count = tx.event_count();
+                            let is_final = tx.is_final_batch;
+
                             info!(
-                                "Consumer received normal transaction {} with {} events",
-                                tx_id, event_count
+                                "Consumer received transaction {} with {} events (final={})",
+                                tx_id, event_count, is_final
                             );
+
                             Self::process_transaction(
                                 tx,
                                 &mut destination_handler,
@@ -646,18 +613,18 @@ impl CdcClient {
                             info!("Consumer completed transaction {}", tx_id);
                         }
                         None => {
-                            // Channel closed
+                            // Channel closed - producer has finished
+                            info!("Consumer: Transaction channel closed");
+                            break;
                         }
                     }
                 }
 
                 // Periodic queue size reporting
                 _ = queue_size_interval.tick() => {
-                    let normal_queue_length = transaction_receiver.len();
-                    let streaming_queue_length = streaming_receiver.len();
-                    debug!("Consumer queue lengths - normal: {}, streaming: {}",
-                           normal_queue_length, streaming_queue_length);
-                    metrics_collector.update_consumer_queue_length(normal_queue_length + streaming_queue_length);
+                    let queue_length = transaction_receiver.len();
+                    debug!("Consumer queue length: {}", queue_length);
+                    metrics_collector.update_consumer_queue_length(queue_length);
                 }
             }
         }
@@ -673,23 +640,21 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Drain any remaining transactions from both channels during shutdown
+    /// Drain any remaining transactions from the channel during shutdown
     async fn drain_remaining_transactions(
-        normal_transaction_receiver: &mut mpsc::Receiver<Transaction>,
-        streaming_receiver: &mut mpsc::Receiver<Transaction>,
+        transaction_receiver: &mut mpsc::Receiver<Transaction>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
     ) {
-        let mut normal_count = 0;
-        let mut streaming_count = 0;
+        let mut count = 0;
 
-        // First, drain streaming transactions (priority, as they may have open transactions)
+        // Drain all remaining transactions
         loop {
-            match streaming_receiver.try_recv() {
+            match transaction_receiver.try_recv() {
                 Ok(transaction) => {
                     debug!(
-                        "Consumer: Processing remaining streaming transaction {} during shutdown",
+                        "Consumer: Processing remaining transaction {} during shutdown",
                         transaction.transaction_id
                     );
                     Self::process_transaction(
@@ -699,46 +664,22 @@ impl CdcClient {
                         destination_type,
                     )
                     .await;
-                    streaming_count += 1;
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Then drain normal transactions
-        loop {
-            match normal_transaction_receiver.try_recv() {
-                Ok(transaction) => {
-                    debug!(
-                        "Consumer: Processing remaining normal transaction {} during shutdown",
-                        transaction.transaction_id
-                    );
-                    Self::process_transaction(
-                        transaction,
-                        destination_handler,
-                        metrics_collector,
-                        destination_type,
-                    )
-                    .await;
-                    normal_count += 1;
+                    count += 1;
                 }
                 Err(_) => break,
             }
         }
 
         info!(
-            "Consumer processed {} streaming + {} normal = {} total remaining transactions during graceful shutdown",
-            streaming_count, normal_count, streaming_count + normal_count
+            "Consumer processed {} remaining transactions during graceful shutdown",
+            count
         );
     }
 
-    /// Unified method to process both normal and streaming transactions
+    /// Process a transaction batch
     ///
-    /// This method handles:
-    /// - Normal transactions: BEGIN → process → COMMIT in one call (transaction.is_streaming = false)
-    /// - Streaming transactions: BEGIN → process batch → ... → COMMIT (transaction.is_streaming = true)
-    ///
-    /// The destination handler manages the transaction state based on the transaction flags.
+    /// Executes events batch by batch. Destination handler commits only when
+    /// is_final_batch=true (triggered by COMMIT or StreamCommit events).
     async fn process_transaction(
         transaction: Transaction,
         destination_handler: &mut Box<dyn DestinationHandler>,
@@ -748,56 +689,33 @@ impl CdcClient {
         let start_time = std::time::Instant::now();
         let event_count = transaction.event_count();
         let tx_id = transaction.transaction_id;
-        let is_streaming = transaction.is_streaming;
         let is_final = transaction.is_final_batch;
 
-        // process_transaction now handles both normal and streaming transactions
         let result = destination_handler.process_transaction(&transaction).await;
 
         match result {
             Ok(_) => {
                 let duration = start_time.elapsed();
 
-                // For streaming transactions, only record metrics when complete (final batch)
-                // For normal transactions, always record metrics
-                if !is_streaming || is_final {
+                // Only record metrics when transaction is complete (final batch)
+                if is_final {
                     metrics_collector.record_transaction_processed(&transaction, destination_type);
                 }
 
-                let tx_type = if is_streaming { "streaming" } else { "normal" };
-                if is_streaming {
-                    debug!(
-                        "Successfully processed {} transaction {} batch ({} events, is_final: {}) in {:?}",
-                        tx_type, tx_id, event_count, is_final, duration
-                    );
-                } else {
-                    debug!(
-                        "Successfully processed {} transaction {} ({} events) in {:?}",
-                        tx_type, tx_id, event_count, duration
-                    );
-                }
+                debug!(
+                    "Successfully processed transaction {} batch ({} events, final={}) in {:?}",
+                    tx_id, event_count, is_final, duration
+                );
             }
             Err(e) => {
-                let tx_type = if is_streaming { "streaming" } else { "normal" };
-                error!("Failed to process {} transaction {}: {}", tx_type, tx_id, e);
+                error!("Failed to process transaction {}: {}", tx_id, e);
+                metrics_collector.record_error("transaction_processing_failed", "consumer");
 
-                let error_label = if is_streaming {
-                    "streaming_batch_processing_failed"
-                } else {
-                    "transaction_processing_failed"
-                };
-                metrics_collector.record_error(error_label, "consumer");
-
-                // For streaming transactions, attempt to rollback on error
-                if is_streaming {
-                    if let Err(rollback_err) =
-                        destination_handler.rollback_streaming_transaction().await
-                    {
-                        error!(
-                            "Failed to rollback streaming transaction {}: {}",
-                            tx_id, rollback_err
-                        );
-                    }
+                // Attempt to rollback on error
+                if let Err(rollback_err) =
+                    destination_handler.rollback_streaming_transaction().await
+                {
+                    error!("Failed to rollback transaction {}: {}", tx_id, rollback_err);
                 }
             }
         }
@@ -1134,13 +1052,9 @@ mod tests {
         // Use new API - pass Receiver directly
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
-        // Create streaming receiver for test (empty, no streaming transactions)
-        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
-
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
-                streaming_receiver,
                 boxed_handler,
                 token_clone,
                 metrics_collector,
@@ -1194,13 +1108,9 @@ mod tests {
         // Use new API - pass Receiver directly
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
-        // Create streaming receiver for test (empty, no streaming transactions)
-        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
-
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
-                streaming_receiver,
                 boxed_handler,
                 token_clone,
                 metrics_collector,
@@ -1361,13 +1271,9 @@ mod tests {
         let token = cancellation_token.clone();
         let metrics = Arc::new(MetricsCollector::new());
 
-        // Create streaming receiver
-        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(100);
-
         let consumer_handle = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
-                streaming_receiver,
                 mock_handler,
                 token,
                 metrics,
@@ -1457,18 +1363,9 @@ mod tests {
 
         let metrics = Arc::new(MetricsCollector::new());
 
-        // Create streaming receiver for test (empty)
-        let (_streaming_sender, mut streaming_receiver) = mpsc::channel::<Transaction>(10);
-
         // Drain transactions
-        CdcClient::drain_remaining_transactions(
-            &mut tx_receiver,
-            &mut streaming_receiver,
-            &mut handler,
-            &metrics,
-            "test",
-        )
-        .await;
+        CdcClient::drain_remaining_transactions(&mut tx_receiver, &mut handler, &metrics, "test")
+            .await;
 
         // Verify all transactions were drained and processed
         let processed = transactions_processed.lock().unwrap();
@@ -1495,13 +1392,9 @@ mod tests {
         let token = cancellation_token.clone();
         let metrics = Arc::new(MetricsCollector::new());
 
-        // Create streaming receiver for test (empty)
-        let (_streaming_sender, streaming_receiver) = mpsc::channel::<Transaction>(10);
-
         let consumer_handle = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
-                streaming_receiver,
                 mock_handler,
                 token,
                 metrics,

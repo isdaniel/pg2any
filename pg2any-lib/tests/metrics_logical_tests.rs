@@ -104,16 +104,16 @@ mod tests {
 
         // Test recording different types of events
         let insert_event = create_test_insert_event();
-        collector.record_event(&insert_event, "mysql");
+        collector.record_event(&insert_event);
 
         let update_event = create_test_update_event();
-        collector.record_event(&update_event, "mysql");
+        collector.record_event(&update_event);
 
         let delete_event = create_test_delete_event();
-        collector.record_event(&delete_event, "postgresql");
+        collector.record_event(&delete_event);
 
         let truncate_event = create_test_truncate_event();
-        collector.record_event(&truncate_event, "sqlite");
+        collector.record_event(&truncate_event);
 
         // All events should be recorded without panicking
         // This tests the event recording logic for different event types
@@ -250,8 +250,8 @@ mod tests {
 
         // Record some events
         let event = create_test_insert_event();
-        collector.record_event(&event, "mysql");
-        collector.record_event(&event, "mysql");
+        collector.record_event(&event);
+        collector.record_event(&event);
 
         // Update rate again
         collector.update_events_rate();
@@ -282,7 +282,7 @@ mod tests {
         event.lsn = Some(Lsn(54321));
 
         // Record event with LSN
-        collector.record_event(&event, "mysql");
+        collector.record_event(&event);
 
         // Event with LSN should be recorded properly
         // This tests the LSN extraction from events
@@ -294,7 +294,7 @@ mod tests {
 
         // Record some data
         let event = create_test_insert_event();
-        collector.record_event(&event, "mysql");
+        collector.record_event(&event);
         collector.record_processing_duration(Duration::from_millis(100), "insert", "mysql");
         collector.record_error("test_error", "test_component");
         collector.update_source_connection_status(true);
@@ -396,7 +396,7 @@ mod tests {
             let collector_clone = Arc::clone(&collector);
             let handle = thread::spawn(move || {
                 let event = create_test_insert_event();
-                collector_clone.record_event(&event, "mysql");
+                collector_clone.record_event(&event);
                 collector_clone.record_processing_duration(
                     Duration::from_millis(i * 10),
                     "insert",
@@ -432,12 +432,12 @@ mod tests {
         // Record some events with timers
         let timer1 = ProcessingTimer::start("insert", "mysql");
         let insert_event = create_test_insert_event();
-        collector.record_event(&insert_event, "mysql");
+        collector.record_event(&insert_event);
         timer1.finish(&collector);
 
         let timer2 = ProcessingTimer::start("update", "mysql");
         let update_event = create_test_update_event();
-        collector.record_event(&update_event, "mysql");
+        collector.record_event(&update_event);
         timer2.finish(&collector);
 
         // Record LSNs

@@ -24,7 +24,7 @@ pub trait MetricsCollectorTrait: Send + Sync {
     /// Record an event being processed
     ///
     /// This method is thread-safe and handles any necessary locking internally.
-    fn record_event(&self, event: &crate::types::ChangeEvent, destination_type: &str);
+    fn record_event(&self, event: &crate::types::ChangeEvent);
 
     /// Record event processing duration
     ///
@@ -165,7 +165,7 @@ mod real_metrics {
             }
         }
 
-        fn record_event(&self, event: &crate::types::ChangeEvent, destination_type: &str) {
+        fn record_event(&self, event: &crate::types::ChangeEvent) {
             let now = Instant::now();
             let now_nanos = self.instant_to_nanos(now);
 
@@ -198,11 +198,6 @@ mod real_metrics {
             // Update last event time atomically
             self.last_event_time_nanos
                 .store(now_nanos, Ordering::Relaxed);
-
-            debug!(
-                "Recorded event: type={}, table={}, destination={}",
-                event_type, table_name, destination_type
-            );
         }
 
         fn record_processing_duration(
@@ -373,7 +368,7 @@ mod noop_metrics {
             Self
         }
 
-        fn record_event(&self, _event: &crate::types::ChangeEvent, _destination_type: &str) {}
+        fn record_event(&self, _event: &crate::types::ChangeEvent) {}
 
         fn record_processing_duration(
             &self,

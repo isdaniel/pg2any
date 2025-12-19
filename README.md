@@ -18,8 +18,8 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Production-Ready Architecture**: Async/await with Tokio, structured error handling, graceful shutdown
 - **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
 - **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
-- **Transaction Consistency**: BEGIN/COMMIT boundary handling with LSN persistence
-- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with type mapping
+- **Transaction Consistency**: Transaction-level atomicity with BEGIN/COMMIT boundary handling and LSN persistence
+- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with shared utilities
 - **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
 - **Configuration Management**: Environment variables and builder pattern with validation
 - **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
@@ -31,9 +31,10 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
 - **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
-- **Parallel Processing**: Configurable worker threads with per-worker connections for high throughput
+- **Transaction-Level Processing**: Complete transactions processed atomically from BEGIN to COMMIT
+- **Streaming Transaction Support**: Handles large transactions with mid-stream batching
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
-- **Transaction Safety**: ACID compliance with BEGIN/COMMIT boundary handling
+- **Transaction Safety**: ACID compliance with full transaction atomicity and ordering
 - **Configuration**: Environment variables, builder pattern, and validation
 - **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
 - **Real-time Streaming**: Live change capture for all DML operations
@@ -138,8 +139,14 @@ pub fn init_logging() {
                                                      │
                                                      ▼
                                           ┌──────────────────────┐
-                                          │   Event Channel      │
-                                          │ (Bounded Buffer)     │
+                                          │   Transaction        │
+                                          │   Assembler          │
+                                          └──────────┬───────────┘
+                                                     │
+                                                     ▼
+                                          ┌──────────────────────┐
+                                          │   Transaction        │
+                                          │   Channel (Bounded)  │
                                           └──────────┬───────────┘
                                                      │
                                                      ▼
@@ -155,7 +162,7 @@ pub fn init_logging() {
                                           │      SQLite)         │
                                           └──────────────────────┘
 
-Key: Single consumer with dedicated destination connection for reliable, ordered writes
+Key: Single producer-single consumer with transaction-level atomicity and ordering
 ```
 
 ## Project Structure
@@ -213,7 +220,7 @@ pg2any/                          # Workspace root
 │   │   ├── destinations/        # Database destination implementations
 │   │   │   ├── mod.rs           # Destination trait and factory pattern
 │   │   │   ├── destination_factory.rs # Factory for creating destinations
-│   │   │   ├── operation.rs     # Operation types and handling
+│   │   │   ├── common.rs        # Common transaction handling utilities
 │   │   │   ├── mysql.rs         # MySQL destination with SQLx
 │   │   │   ├── sqlserver.rs     # SQL Server destination with Tiberius
 │   │   │   └── sqlite.rs        # SQLite destination with SQLx
@@ -283,7 +290,6 @@ pg2any supports comprehensive configuration through environment variables or the
 | **Timeouts** | | | | | |
 | | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
-| | `CDC_HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | `10` | `15` | Integer |
 | **Performance** | | | | | |
 | | `CDC_BUFFER_SIZE` | Size of the event channel buffer | `1000` | `5000`, `10000` | Integer. Larger buffers handle burst traffic better but use more memory |
 | **System** | | | | | |
@@ -401,7 +407,7 @@ CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
 
 #### Producer-Consumer Architecture
 
-pg2any uses a **single producer-single consumer architecture** for reliable CDC:
+pg2any uses a **single producer-single consumer architecture** optimized for transaction consistency:
 
 - **Single Producer**: Reads from PostgreSQL logical replication stream and pushes events to channel
 - **Single Consumer**: Processes events from channel and writes to destination database

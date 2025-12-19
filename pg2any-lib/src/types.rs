@@ -405,6 +405,10 @@ impl From<Lsn> for u64 {
 ///
 /// - **Normal Mode**: Events collected between BEGIN and COMMIT
 /// - **Streaming Mode**: Events collected between StreamStart and StreamStop, with batch processing for high-performance ingestion
+///
+/// Both modes use batch-based processing where transactions are sent to the consumer
+/// when event count reaches batch_size. The `is_final_batch` flag indicates when
+/// to commit the database transaction.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Transaction {
     /// Transaction ID from PostgreSQL
@@ -420,15 +424,16 @@ pub struct Transaction {
     /// Events are in the order they occurred within the transaction
     pub events: Vec<ChangeEvent>,
 
-    /// Whether this transaction came from streaming mode (protocol v2+)
-    /// Streaming transactions may be sent in batches before final commit
-    #[serde(default)]
-    pub is_streaming: bool,
-
-    /// Whether this is the final batch of a streaming transaction
+    /// Whether this is the final batch of a transaction
     /// When true, destination should commit the database transaction
-    #[serde(default)]
+    /// When false, destination should keep the transaction open for more batches
+    #[serde(default = "default_is_final_batch")]
     pub is_final_batch: bool,
+}
+
+/// Default value for is_final_batch (true for backward compatibility)
+fn default_is_final_batch() -> bool {
+    true
 }
 
 impl Transaction {
@@ -439,25 +444,28 @@ impl Transaction {
             commit_timestamp,
             commit_lsn: None,
             events: Vec::new(),
-            is_streaming: false,
-            is_final_batch: true, // Normal transactions are always final
+            is_final_batch: true, // Normal transactions are final by default
         }
     }
 
-    /// Create a new streaming transaction batch
-    pub fn new_streaming(
-        transaction_id: u32,
-        commit_timestamp: DateTime<Utc>,
-        is_final: bool,
-    ) -> Self {
+    /// Create a new transaction batch (can be used for both normal and streaming)
+    pub fn new_batch(transaction_id: u32, commit_timestamp: DateTime<Utc>, is_final: bool) -> Self {
         Self {
             transaction_id,
             commit_timestamp,
             commit_lsn: None,
             events: Vec::new(),
-            is_streaming: true,
             is_final_batch: is_final,
         }
+    }
+
+    /// Create a new streaming transaction batch (alias for new_batch for compatibility)
+    pub fn new_streaming(
+        transaction_id: u32,
+        commit_timestamp: DateTime<Utc>,
+        is_final: bool,
+    ) -> Self {
+        Self::new_batch(transaction_id, commit_timestamp, is_final)
     }
 
     /// Add an event to this transaction
@@ -480,12 +488,7 @@ impl Transaction {
         self.events.is_empty()
     }
 
-    /// Mark this transaction as a streaming transaction
-    pub fn set_streaming(&mut self, is_streaming: bool) {
-        self.is_streaming = is_streaming;
-    }
-
-    /// Mark this as the final batch of a streaming transaction
+    /// Mark this as the final batch of a transaction
     pub fn set_final_batch(&mut self, is_final: bool) {
         self.is_final_batch = is_final;
     }

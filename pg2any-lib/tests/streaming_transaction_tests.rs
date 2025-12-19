@@ -61,15 +61,14 @@ mod streaming_transaction_tests {
         {
             let sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
 
-            // Create a non-streaming transaction
+            // Create a non-final batch transaction
             let mut transaction = Transaction::new(1, chrono::Utc::now());
-            transaction.is_streaming = false;
             transaction.is_final_batch = false;
 
             // Should have no active streaming transaction
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
 
-            // Processing a non-streaming batch should not create an active streaming transaction
+            // Processing a non-final batch should not create an active streaming transaction
             // (We can't actually test this without a real database connection, but we verify the methods exist)
         }
     }
@@ -81,9 +80,8 @@ mod streaming_transaction_tests {
         {
             let sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
 
-            // Create an empty streaming transaction (non-final)
+            // Create an empty non-final batch transaction
             let mut transaction = Transaction::new(1, chrono::Utc::now());
-            transaction.is_streaming = true;
             transaction.is_final_batch = false;
 
             // Empty non-final batches should be skipped (tested by calling the method without error)

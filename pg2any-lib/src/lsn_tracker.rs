@@ -304,7 +304,7 @@ impl LsnTracker {
         self.last_committed_lsn.load(Ordering::Acquire)
     }
 
-    /// Get the current last committed LSN as Option<Lsn>
+    /// Get the current last committed LSN as `Option<Lsn>`
     pub fn get_lsn(&self) -> Option<Lsn> {
         let v = self.get();
         if v == 0 {

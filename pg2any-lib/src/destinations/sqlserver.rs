@@ -383,7 +383,7 @@ impl SqlServerDestination {
 
     /// Rollback the active streaming transaction (for graceful shutdown)
     async fn rollback_active_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_tx.take() {
+        if let Some(active) = self.active_tx.take() {
             if !active.handle.has_open_transaction {
                 return Ok(());
             }
@@ -403,8 +403,6 @@ impl SqlServerDestination {
                     );
                 }
             }
-
-            active.handle.has_open_transaction = false;
         }
 
         Ok(())

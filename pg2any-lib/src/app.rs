@@ -5,10 +5,14 @@
 //! and replication management.
 
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 #[cfg(feature = "metrics")]
 use crate::MetricsServer;
-use crate::{client::CdcClient, config::Config, types::Lsn, CdcResult};
+use crate::{
+    client::CdcClient, config::Config, lsn_tracker::create_lsn_tracker_with_load, types::Lsn,
+    CdcResult,
+};
 
 /// Configuration for the CDC application
 #[derive(Debug, Clone)]
@@ -67,13 +71,13 @@ impl CdcApp {
     ///
     /// Returns `CdcError` if the CDC client cannot be created or initialized.
     pub async fn new(config: CdcAppConfig) -> CdcResult<Self> {
-        tracing::info!("🔧 Initializing CDC client");
+        info!("Initializing CDC client");
         let mut client = CdcClient::new(config.cdc_config.clone()).await?;
 
-        tracing::info!("⚙️  Performing CDC client initialization");
+        info!("Performing CDC client initialization");
         client.init().await?;
 
-        tracing::info!("✅ CDC client initialized successfully");
+        info!("CDC client initialized successfully");
 
         Ok(Self { client, config })
     }
@@ -126,22 +130,25 @@ impl CdcApp {
     pub async fn run(&mut self, lsn_file_path: Option<&str>) -> CdcResult<()> {
         self.client.init_build_info(&self.config.version);
 
-        // Load last known LSN
-        let start_lsn = load_last_lsn(lsn_file_path);
+        // Create LSN tracker and load last known LSN
+        let (lsn_tracker, start_lsn) = create_lsn_tracker_with_load(lsn_file_path);
 
-        tracing::info!("Starting CDC replication stream");
-        tracing::info!("This will continuously monitor PostgreSQL changes");
+        // Set the LSN tracker on the client for tracking committed LSN
+        self.client.set_lsn_tracker(lsn_tracker);
+
+        info!("Starting CDC replication stream");
+        info!("This will continuously monitor PostgreSQL changes");
 
         #[cfg(feature = "metrics")]
         {
             if let Some(port) = self.config.metrics_port {
-                tracing::info!("Starting metrics server on port {}", port);
+                info!("Starting metrics server on port {}", port);
                 let server = crate::create_metrics_server(port);
                 return self.run_with_optional_server(start_lsn, Some(server)).await;
             }
         }
 
-        tracing::info!("Starting CDC replication (metrics disabled)");
+        info!("Starting CDC replication (metrics disabled)");
         self.run_with_optional_server(start_lsn, None).await
     }
 
@@ -174,7 +181,7 @@ impl CdcApp {
             result = self.client.start_replication_from_lsn(start_lsn) => {
                 match result {
                     Ok(()) => {
-                        tracing::info!("CDC replication completed successfully");
+                        info!("CDC replication completed successfully");
                         Ok(())
                     }
                     Err(e) => {
@@ -184,9 +191,9 @@ impl CdcApp {
                 }
             }
             _ = shutdown_handler => {
-                tracing::info!("Shutdown signal received, stopping CDC replication gracefully");
+                info!("Shutdown signal received, stopping CDC replication gracefully");
                 self.client.stop().await?;
-                tracing::info!("CDC replication stopped successfully");
+                info!("CDC replication stopped successfully");
                 Ok(())
             }
         }
@@ -254,60 +261,6 @@ pub async fn run_cdc_app(config: Config, lsn_file_path: Option<&str>) -> CdcResu
     app.run(lsn_file_path).await
 }
 
-/// Load and parse the last LSN from a file
-///
-/// This function attempts to read a persisted LSN (Log Sequence Number) from a file,
-/// which allows the CDC process to resume from where it left off instead of starting
-/// from the beginning.
-///
-/// # Arguments
-///
-/// * `file_path` - Optional path to the LSN file. If None, uses the default from
-///   `CDC_LAST_LSN_FILE` environment variable or "./pg2any_last_lsn"
-///
-/// # Returns
-///
-/// Returns `Some(Lsn)` if a valid LSN was found and parsed, `None` otherwise.
-/// Logs warnings for parsing errors but doesn't fail the application.
-fn load_last_lsn(file_path: Option<&str>) -> Option<Lsn> {
-    let last_lsn_file = file_path
-        .map(String::from)
-        .or_else(|| std::env::var("CDC_LAST_LSN_FILE").ok())
-        .unwrap_or_else(|| "./pg2any_last_lsn".to_string());
-
-    match std::fs::read_to_string(&last_lsn_file) {
-        Ok(contents) => {
-            let s = contents.trim();
-            if s.is_empty() {
-                tracing::info!("LSN file {} is empty, starting from latest", last_lsn_file);
-                None
-            } else {
-                match crate::pg_replication::parse_lsn(s) {
-                    Ok(v) => {
-                        tracing::info!("Loaded LSN {} from {}", s, last_lsn_file);
-                        Some(crate::types::Lsn(v))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse persisted LSN from {}: {}",
-                            last_lsn_file,
-                            e
-                        );
-                        None
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            tracing::info!(
-                "No persisted LSN file found at {}, starting from latest",
-                last_lsn_file
-            );
-            None
-        }
-    }
-}
-
 /// Set up graceful shutdown signal handling
 ///
 /// This function creates an async task that listens for shutdown signals (SIGTERM, SIGINT)
@@ -334,11 +287,11 @@ async fn setup_shutdown_handler(shutdown_token: CancellationToken) {
 
         tokio::select! {
             _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                info!("Received SIGTERM, initiating graceful shutdown");
                 shutdown_token.cancel();
             }
             _ = sigint.recv() => {
-                tracing::info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
                 shutdown_token.cancel();
             }
         }
@@ -347,7 +300,7 @@ async fn setup_shutdown_handler(shutdown_token: CancellationToken) {
     #[cfg(windows)]
     {
         signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
-        tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+        info!("Received Ctrl+C, initiating graceful shutdown");
         shutdown_token.cancel();
     }
 }

@@ -215,7 +215,10 @@ pg2any/                          # Workspace root
 │   │   ├── logical_stream.rs    # Logical replication stream management
 │   │   ├── pg_replication.rs    # Low-level PostgreSQL replication
 │   │   ├── replication_protocol.rs # Message parsing and protocol handling
+│   │   ├── lsn_tracker.rs       # LSN tracking (SharedLsnFeedback & LsnTracker)
+│   │   ├── transaction_manager.rs # Streaming transaction management
 │   │   ├── buffer.rs            # Binary protocol buffer operations
+│   │   ├── retry.rs             # Retry logic and backoff strategies
 │   │   ├── types.rs             # Core data types and enums
 │   │   ├── destinations/        # Database destination implementations
 │   │   │   ├── mod.rs           # Destination trait and factory pattern

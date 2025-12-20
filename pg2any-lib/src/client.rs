@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
+use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::transaction_manager::{TransactionContext, TransactionManager};
@@ -23,6 +24,7 @@ use tracing::{debug, error, info, warn};
 /// - Collects events from BEGIN to COMMIT into Transaction objects
 /// - Sends complete transactions to bounded channels
 /// - Handles LSN tracking and heartbeats
+/// - Sends feedback to PostgreSQL with proper write/flush/replay LSN values
 ///
 /// ## Single Consumer (Destination Writer)
 /// - Dedicated destination database connection
@@ -30,6 +32,15 @@ use tracing::{debug, error, info, warn};
 /// - Streaming transactions maintain database transaction open across batches
 /// - Normal transactions use work-stealing pattern via shared channel
 /// - Transaction consistency: all events in a transaction succeed or fail together
+/// - Updates shared LSN feedback after successful commits
+///
+/// ## LSN Tracking
+///
+/// The client uses a shared `SharedLsnFeedback` to communicate committed LSN
+/// from the consumer back to the producer for accurate feedback to PostgreSQL:
+/// - write_lsn: Updated by producer when data is received
+/// - flush_lsn: Updated by consumer when data is written
+/// - replay_lsn: Updated by consumer when transaction is committed
 pub struct CdcClient {
     config: Config,
     replication_manager: Option<ReplicationManager>,
@@ -40,6 +51,10 @@ pub struct CdcClient {
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     metrics_collector: Arc<MetricsCollector>,
+    /// LSN tracker for tracking last committed LSN to destination (for file persistence)
+    lsn_tracker: Option<Arc<LsnTracker>>,
+    /// Shared LSN feedback for replication protocol (write/flush/replay separation)
+    shared_lsn_feedback: Arc<SharedLsnFeedback>,
 }
 
 impl CdcClient {
@@ -54,6 +69,9 @@ impl CdcClient {
 
         let (transaction_sender, transaction_receiver) = mpsc::channel(config.buffer_size);
 
+        // Create shared LSN feedback for proper replication protocol handling
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
+
         Ok(Self {
             config,
             replication_manager: Some(replication_manager),
@@ -64,7 +82,17 @@ impl CdcClient {
             producer_handle: None,
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
+            lsn_tracker: None,
+            shared_lsn_feedback,
         })
+    }
+
+    /// Set the LSN tracker for tracking committed LSN
+    ///
+    /// This should be called before starting replication to enable
+    /// LSN persistence after each successful commit to the destination.
+    pub fn set_lsn_tracker(&mut self, tracker: Arc<LsnTracker>) {
+        self.lsn_tracker = Some(tracker);
     }
 
     /// Initialize the CDC client
@@ -102,6 +130,11 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Replication manager not available"))?;
 
         let mut replication_stream = replication_manager.create_stream_async().await?;
+
+        // Set the shared LSN feedback on the replication stream
+        // This enables proper write/flush/replay LSN tracking for PostgreSQL feedback
+        replication_stream.set_shared_lsn_feedback(self.shared_lsn_feedback.clone());
+        info!("Shared LSN feedback configured for replication stream");
 
         // Start the replication stream
         replication_stream.start(start_lsn).await?;
@@ -156,6 +189,8 @@ impl CdcClient {
         let token = self.cancellation_token.clone();
         let metrics = self.metrics_collector.clone();
         let dest_type_str = dest_type.to_string();
+        let lsn_tracker = self.lsn_tracker.clone();
+        let shared_lsn_feedback = self.shared_lsn_feedback.clone();
 
         let consumer_handle = tokio::spawn(Self::run_consumer_loop(
             transaction_receiver,
@@ -163,6 +198,8 @@ impl CdcClient {
             token,
             metrics,
             dest_type_str,
+            lsn_tracker,
+            shared_lsn_feedback,
         ));
         self.consumer_handle = Some(consumer_handle);
 
@@ -543,18 +580,25 @@ impl CdcClient {
     /// The consumer receives complete transactions and processes them atomically.
     /// This ensures that all events within a transaction are applied together.
     ///
+    /// LSN tracking: After each successful transaction commit to the destination,
+    /// the LSN is updated and persisted to ensure graceful shutdown doesn't lose data.
+    ///
     /// # Arguments
     /// * `transaction_receiver` - Receiver for all transactions (both normal and streaming)
     /// * `destination_handler` - Destination handler (no mutex needed!)
     /// * `cancellation_token` - Token for graceful shutdown
     /// * `metrics_collector` - Metrics collector
     /// * `destination_type` - Type of destination for metrics labeling
+    /// * `lsn_tracker` - Optional LSN tracker for persisting committed LSN
+    /// * `shared_lsn_feedback` - Shared feedback for updating applied LSN for replication protocol
     async fn run_consumer_loop(
         mut transaction_receiver: mpsc::Receiver<Transaction>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
+        lsn_tracker: Option<Arc<LsnTracker>>,
+        shared_lsn_feedback: Arc<SharedLsnFeedback>,
     ) -> Result<()> {
         info!("Starting consumer loop for transaction processing");
 
@@ -586,7 +630,18 @@ impl CdcClient {
                         &mut destination_handler,
                         &metrics_collector,
                         &destination_type,
+                        &lsn_tracker,
+                        &shared_lsn_feedback,
                     ).await;
+
+                    // Final persist of LSN on shutdown
+                    if let Some(ref tracker) = lsn_tracker {
+                        info!("Consumer: Final LSN persistence on shutdown");
+                        tracker.persist_async();
+                    }
+
+                    // Log final LSN state
+                    shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                     break;
                 }
 
@@ -608,6 +663,8 @@ impl CdcClient {
                                 &mut destination_handler,
                                 &metrics_collector,
                                 &destination_type,
+                                &lsn_tracker,
+                                &shared_lsn_feedback,
                             ).await;
 
                             info!("Consumer completed transaction {}", tx_id);
@@ -646,6 +703,8 @@ impl CdcClient {
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
+        lsn_tracker: &Option<Arc<LsnTracker>>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
         let mut count = 0;
 
@@ -662,6 +721,8 @@ impl CdcClient {
                         destination_handler,
                         metrics_collector,
                         destination_type,
+                        lsn_tracker,
+                        shared_lsn_feedback,
                     )
                     .await;
                     count += 1;
@@ -680,22 +741,60 @@ impl CdcClient {
     ///
     /// Executes events batch by batch. Destination handler commits only when
     /// is_final_batch=true (triggered by COMMIT or StreamCommit events).
+    ///
+    /// After successful processing:
+    /// 1. The LSN is persisted to file (via lsn_tracker) for restart recovery
+    /// 2. The applied LSN is updated in shared_lsn_feedback for replication protocol
+    ///    This allows PostgreSQL to know what has been truly committed to destination
     async fn process_transaction(
         transaction: Transaction,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         destination_type: &str,
+        lsn_tracker: &Option<Arc<LsnTracker>>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
         let start_time = std::time::Instant::now();
         let event_count = transaction.event_count();
         let tx_id = transaction.transaction_id;
         let is_final = transaction.is_final_batch;
+        let commit_lsn = transaction.commit_lsn;
 
         let result = destination_handler.process_transaction(&transaction).await;
 
         match result {
             Ok(_) => {
                 let duration = start_time.elapsed();
+
+                // Update and persist LSN after successful commit
+                if let Some(lsn) = commit_lsn {
+                    // Update shared LSN feedback for replication protocol
+                    // This is crucial for proper PostgreSQL feedback
+                    if is_final {
+                        // Final batch - transaction is fully committed
+                        shared_lsn_feedback.update_applied_lsn(lsn.0);
+                        debug!(
+                            "Updated applied LSN to {} for transaction {} (committed)",
+                            lsn, tx_id
+                        );
+                    } else {
+                        // Non-final batch - data is flushed but not committed
+                        shared_lsn_feedback.update_flushed_lsn(lsn.0);
+                        debug!(
+                            "Updated flushed LSN to {} for transaction {} (batch written)",
+                            lsn, tx_id
+                        );
+                    }
+
+                    // Persist to file for restart recovery
+                    if let Some(ref tracker) = lsn_tracker {
+                        tracker.commit_lsn(lsn.0);
+                        debug!(
+                            "Persisted LSN {} for transaction {} (final={})",
+                            lsn, tx_id, is_final
+                        );
+                    }
+                }
 
                 // Only record metrics when transaction is complete (final batch)
                 if is_final {
@@ -1052,6 +1151,8 @@ mod tests {
         // Use new API - pass Receiver directly
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
+        let shared_lsn_feedback = Arc::new(SharedLsnFeedback::new());
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
@@ -1059,6 +1160,8 @@ mod tests {
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
+                None, // No LSN tracker for tests
+                shared_lsn_feedback,
             )
             .await
         });
@@ -1108,6 +1211,8 @@ mod tests {
         // Use new API - pass Receiver directly
         let boxed_handler: Box<dyn DestinationHandler> = mock_handler;
 
+        let shared_lsn_feedback = Arc::new(SharedLsnFeedback::new());
+
         let consumer_task = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
                 tx_receiver,
@@ -1115,6 +1220,8 @@ mod tests {
                 token_clone,
                 metrics_collector,
                 "test".to_string(),
+                None, // No LSN tracker for tests
+                shared_lsn_feedback,
             )
             .await
         });
@@ -1270,6 +1377,7 @@ mod tests {
 
         let token = cancellation_token.clone();
         let metrics = Arc::new(MetricsCollector::new());
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
 
         let consumer_handle = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
@@ -1278,6 +1386,8 @@ mod tests {
                 token,
                 metrics,
                 "test".to_string(),
+                None, // No LSN tracker for tests
+                shared_lsn_feedback,
             )
             .await
         });
@@ -1326,9 +1436,18 @@ mod tests {
         let metrics = Arc::new(MetricsCollector::new());
         let transaction = create_test_transaction_with_lsn(12345);
         let expected_lsn = transaction.commit_lsn;
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
 
         // This should work with direct mutable reference (no mutex)
-        CdcClient::process_transaction(transaction, &mut handler, &metrics, "test").await;
+        CdcClient::process_transaction(
+            transaction,
+            &mut handler,
+            &metrics,
+            "test",
+            &None,
+            &shared_lsn_feedback,
+        )
+        .await;
 
         // Verify transaction was processed
         let processed = transactions_processed.lock().unwrap();
@@ -1362,10 +1481,18 @@ mod tests {
         drop(tx_sender); // Close sender
 
         let metrics = Arc::new(MetricsCollector::new());
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
 
         // Drain transactions
-        CdcClient::drain_remaining_transactions(&mut tx_receiver, &mut handler, &metrics, "test")
-            .await;
+        CdcClient::drain_remaining_transactions(
+            &mut tx_receiver,
+            &mut handler,
+            &metrics,
+            "test",
+            &None,
+            &shared_lsn_feedback,
+        )
+        .await;
 
         // Verify all transactions were drained and processed
         let processed = transactions_processed.lock().unwrap();
@@ -1391,6 +1518,7 @@ mod tests {
 
         let token = cancellation_token.clone();
         let metrics = Arc::new(MetricsCollector::new());
+        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
 
         let consumer_handle = tokio::spawn(async move {
             CdcClient::run_consumer_loop(
@@ -1399,6 +1527,8 @@ mod tests {
                 token,
                 metrics,
                 "test".to_string(),
+                None, // No LSN tracker for tests
+                shared_lsn_feedback,
             )
             .await
         });

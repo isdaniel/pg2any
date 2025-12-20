@@ -6,6 +6,7 @@
 use crate::buffer::BufferReader;
 use crate::config::Config;
 use crate::error::{CdcError, Result};
+use crate::lsn_tracker::SharedLsnFeedback;
 use crate::pg_replication::{
     format_lsn, postgres_timestamp_to_chrono, PgReplicationConnection, XLogRecPtr,
     INVALID_XLOG_REC_PTR,
@@ -17,6 +18,7 @@ use crate::replication_protocol::{
 use crate::retry::{ReplicationConnectionRetry, RetryConfig};
 use crate::types::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
 use crate::{RelationInfo, TupleData};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -30,7 +32,9 @@ pub struct LogicalReplicationStream {
     slot_created: bool,
     retry_handler: ReplicationConnectionRetry,
     last_health_check: Instant,
-    //last_feedback_time: std::time::Instant,
+    /// Shared LSN feedback for communication with consumer
+    /// This allows the consumer to update flushed/applied LSN after commits
+    shared_lsn_feedback: Option<Arc<SharedLsnFeedback>>,
 }
 
 /// Configuration for the replication stream
@@ -78,7 +82,21 @@ impl LogicalReplicationStream {
             slot_created: false,
             retry_handler,
             last_health_check,
+            shared_lsn_feedback: None,
         })
+    }
+
+    /// Set the shared LSN feedback tracker
+    ///
+    /// This should be called before starting replication to enable proper
+    /// LSN tracking between producer and consumer.
+    pub fn set_shared_lsn_feedback(&mut self, feedback: Arc<SharedLsnFeedback>) {
+        self.shared_lsn_feedback = Some(feedback);
+    }
+
+    /// Get the shared LSN feedback tracker
+    pub fn get_shared_lsn_feedback(&self) -> Option<Arc<SharedLsnFeedback>> {
+        self.shared_lsn_feedback.clone()
     }
 
     /// Initialize the replication stream
@@ -662,21 +680,69 @@ impl LogicalReplicationStream {
     }
 
     /// Send feedback to the server
+    ///
+    /// This method sends a standby status update to PostgreSQL with three LSN values:
+    /// - write_lsn (received): Updated when data is received from the replication stream
+    /// - flush_lsn: Updated when data is written to the destination
+    /// - replay_lsn (applied): Updated when data is committed to the destination
+    ///
+    /// If a shared LSN feedback tracker is configured, it will use the flushed/applied
+    /// values from there (updated by the consumer). Otherwise, it falls back to the
+    /// local state values.
     pub fn send_feedback(&mut self) -> Result<()> {
         if self.state.last_received_lsn == 0 {
             return Ok(());
         }
 
+        // Get flushed and applied LSN from shared feedback if available
+        // This allows the consumer to update these values after committing to destination
+        let (flushed_lsn, applied_lsn) = if let Some(ref feedback) = self.shared_lsn_feedback {
+            let (f, a) = feedback.get_feedback_lsn();
+            // If shared feedback has values, use them; otherwise fall back to received LSN
+            // We can't report a flushed/applied LSN higher than what we've received
+            let flushed = if f > 0 && f <= self.state.last_received_lsn {
+                f
+            } else if f > self.state.last_received_lsn {
+                // Consumer is ahead - this shouldn't happen but handle gracefully
+                self.state.last_received_lsn
+            } else {
+                // No consumer updates yet, use 0 to indicate nothing flushed/applied
+                // This is accurate - we've received data but haven't confirmed it's applied
+                0
+            };
+            let applied = if a > 0 && a <= self.state.last_received_lsn {
+                a
+            } else if a > self.state.last_received_lsn {
+                self.state.last_received_lsn
+            } else {
+                0
+            };
+            (flushed, applied)
+        } else {
+            // No shared feedback - fall back to local state (legacy behavior)
+            (self.state.last_flushed_lsn, self.state.last_applied_lsn)
+        };
+
+        // Update local state from shared feedback for consistency
+        if flushed_lsn > self.state.last_flushed_lsn {
+            self.state.last_flushed_lsn = flushed_lsn;
+        }
+        if applied_lsn > self.state.last_applied_lsn {
+            self.state.last_applied_lsn = applied_lsn;
+        }
+
         self.connection.send_standby_status_update(
             self.state.last_received_lsn,
-            self.state.last_flushed_lsn,
-            self.state.last_applied_lsn,
+            flushed_lsn,
+            applied_lsn,
             false, // Don't request reply
         )?;
 
         debug!(
-            "Sent feedback: received={}",
-            format_lsn(self.state.last_received_lsn)
+            "Sent feedback: received={}, flushed={}, applied={}",
+            format_lsn(self.state.last_received_lsn),
+            format_lsn(flushed_lsn),
+            format_lsn(applied_lsn)
         );
         Ok(())
     }

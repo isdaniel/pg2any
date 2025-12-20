@@ -71,6 +71,7 @@ pub mod retry;
 
 // Unified replication protocol implementation
 pub mod logical_stream;
+pub mod lsn_tracker;
 pub mod replication_protocol;
 
 // High-level client interface
@@ -88,6 +89,7 @@ pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
 pub use env::load_config_from_env;
 pub use error::CdcError;
+pub use lsn_tracker::{create_lsn_tracker_with_load, LsnTracker};
 
 /// Result type for CDC operations
 pub type CdcResult<T> = Result<T, CdcError>;
@@ -105,6 +107,7 @@ pub use crate::destinations::SqlServerDestination;
 pub use crate::destinations::SQLiteDestination;
 
 pub use crate::destinations::{DestinationFactory, DestinationHandler};
+pub use crate::lsn_tracker::SharedLsnFeedback;
 pub use crate::replication_protocol::{
     ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
     ReplicationState, TupleData,

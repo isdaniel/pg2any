@@ -453,15 +453,33 @@ impl StreamingReplicationMessage {
 }
 
 /// State for managing replication relations and tracking
+///
+/// # LSN Tracking
+///
+/// This struct tracks three different LSN values according to PostgreSQL protocol:
+///
+/// - `last_received_lsn` (write_lsn): The location of the last WAL byte + 1 received
+///   from the PostgreSQL replication stream. Updated by the producer when data is received.
+///
+/// - `last_flushed_lsn` (flush_lsn): The location of the last WAL byte + 1 that has been
+///   successfully written/flushed to the destination. Updated when data is written to destination.
+///
+/// - `last_applied_lsn` (replay_lsn): The location of the last WAL byte + 1 that has been
+///   fully applied (committed) to the destination. Updated after transaction commit on destination.
+///
+/// The PostgreSQL server uses these values to:
+/// 1. Know which WAL can be recycled (based on replay_lsn)
+/// 2. Calculate replication lag (sent_lsn - replay_lsn)
+/// 3. Decide when to send keepalive messages
 #[derive(Debug)]
 pub struct ReplicationState {
     /// Relations by OID
     pub relations: HashMap<Oid, RelationInfo>,
-    /// Last received LSN
+    /// Last received LSN (write_lsn in pg_stat_replication), Updated when data is received from PostgreSQL replication stream
     pub last_received_lsn: XLogRecPtr,
-    /// Last flushed LSN
+    /// Last flushed LSN, Updated when data is written to destination (before commit)
     pub last_flushed_lsn: XLogRecPtr,
-    /// Last applied LSN
+    /// Last applied LSN, Updated when transaction is committed to destination
     pub last_applied_lsn: XLogRecPtr,
     /// Last feedback time
     pub last_feedback_time: std::time::Instant,
@@ -488,13 +506,52 @@ impl ReplicationState {
         self.relations.get(&relation_id)
     }
 
-    /// Update LSN positions
-    pub fn update_lsn(&mut self, lsn: XLogRecPtr) {
+    /// Update received (write) LSN when data is received from PostgreSQL
+    ///
+    /// This should be called when WAL data is received from the replication stream,
+    /// regardless of whether it has been applied to the destination yet.
+    #[inline]
+    pub fn update_received_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_received_lsn {
             self.last_received_lsn = lsn;
-            self.last_flushed_lsn = lsn;
-            self.last_applied_lsn = lsn;
         }
+    }
+
+    /// Update flushed LSN when data is written to destination (before commit)
+    ///
+    /// This should be called when data has been written/flushed to the destination
+    /// database, but not yet committed.
+    #[inline]
+    pub fn update_flushed_lsn(&mut self, lsn: XLogRecPtr) {
+        if lsn > self.last_flushed_lsn {
+            self.last_flushed_lsn = lsn;
+        }
+    }
+
+    /// Update applied LSN when transaction is committed to destination
+    ///
+    /// This should be called when a transaction has been successfully committed
+    /// to the destination database. This is the most important LSN for the
+    /// PostgreSQL server as it determines which WAL can be recycled.
+    #[inline]
+    pub fn update_applied_lsn(&mut self, lsn: XLogRecPtr) {
+        if lsn > self.last_applied_lsn {
+            self.last_applied_lsn = lsn;
+            // Applied data is implicitly flushed as well
+            if lsn > self.last_flushed_lsn {
+                self.last_flushed_lsn = lsn;
+            }
+        }
+    }
+
+    /// Legacy method - Update LSN positions (sets only received LSN)
+    ///
+    /// This is kept for backward compatibility but now only updates received LSN.
+    /// Use `update_received_lsn`, `update_flushed_lsn`, and `update_applied_lsn`
+    /// for proper LSN tracking.
+    #[inline]
+    pub fn update_lsn(&mut self, lsn: XLogRecPtr) {
+        self.update_received_lsn(lsn);
     }
 
     /// Check if feedback should be sent
@@ -1261,13 +1318,33 @@ mod tests {
     fn test_replication_state() {
         let mut state = ReplicationState::new();
 
+        // update_lsn now only updates last_received_lsn (write_lsn semantics)
         state.update_lsn(100);
         assert_eq!(state.last_received_lsn, 100);
-        assert_eq!(state.last_flushed_lsn, 100);
+        // flushed_lsn should remain 0 since we haven't called update_flushed_lsn
+        assert_eq!(state.last_flushed_lsn, 0);
+        // applied_lsn should remain 0 since we haven't called update_applied_lsn
+        assert_eq!(state.last_applied_lsn, 0);
 
         // LSN should not go backwards
         state.update_lsn(50);
         assert_eq!(state.last_received_lsn, 100);
+
+        // Test update_flushed_lsn
+        state.update_flushed_lsn(80);
+        assert_eq!(state.last_flushed_lsn, 80);
+
+        // flushed_lsn should not go backwards
+        state.update_flushed_lsn(50);
+        assert_eq!(state.last_flushed_lsn, 80);
+
+        // Test update_applied_lsn
+        state.update_applied_lsn(70);
+        assert_eq!(state.last_applied_lsn, 70);
+
+        // applied_lsn should not go backwards
+        state.update_applied_lsn(30);
+        assert_eq!(state.last_applied_lsn, 70);
     }
 
     fn write_u32_be(val: u32) -> [u8; 4] {

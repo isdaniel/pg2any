@@ -620,6 +620,13 @@ impl ReplicationStream {
         Ok(Self { logical_stream })
     }
 
+    pub fn set_shared_lsn_feedback(
+        &mut self,
+        feedback: std::sync::Arc<crate::lsn_tracker::SharedLsnFeedback>,
+    ) {
+        self.logical_stream.set_shared_lsn_feedback(feedback);
+    }
+
     pub async fn start(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting PostgreSQL logical replication stream");
 
@@ -672,19 +679,15 @@ impl ReplicationStream {
 
     pub async fn stop(&mut self) -> Result<()> {
         self.logical_stream.send_feedback()?;
-        let lsn_file =
-            std::env::var("CDC_LAST_LSN_FILE").unwrap_or_else(|_| "./pg2any_last_lsn".to_string());
 
-        match std::fs::write(&lsn_file, self.current_lsn().to_string()) {
-            Ok(_) => info!(
-                "Saved last LSN to file: {}, lsn_str {}",
-                lsn_file,
-                self.current_lsn().to_string()
-            ),
-            Err(e) => warn!("Failed to save last LSN to {}: {}", lsn_file, e),
-        }
+        // Note: LSN persistence is now handled by the consumer's LsnTracker
+        // which tracks the actually committed LSN to the destination.
+        // This ensures we don't save an LSN that wasn't successfully committed.
+        info!(
+            "Stopping logical replication stream (last received LSN: {})",
+            self.current_lsn()
+        );
 
-        info!("Stopping logical replication stream");
         self.logical_stream.stop().await?;
         Ok(())
     }

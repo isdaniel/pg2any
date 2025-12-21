@@ -600,7 +600,7 @@ impl Drop for LsnTracker {
 /// Create a shared LSN tracker with initial load from file
 ///
 /// The background persistence task is started automatically.
-/// The returned Arc<LsnTracker> should be used throughout the application lifecycle.
+/// The returned `Arc<LsnTracker>` should be used throughout the application lifecycle.
 /// Background persistence will be stopped when the tracker is dropped.
 pub async fn create_lsn_tracker_with_load_async(
     lsn_file_path: Option<&str>,

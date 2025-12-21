@@ -6,8 +6,8 @@ use pg2any_lib::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::fs;
 
 /// Helper function to wrap a single event in a transaction for testing
 fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
@@ -101,7 +101,7 @@ async fn create_test_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_sqlite_destination_factory() {
-    let destination = DestinationFactory::create(DestinationType::SQLite);
+    let destination = DestinationFactory::create(&DestinationType::SQLite);
     assert!(destination.is_ok());
 }
 

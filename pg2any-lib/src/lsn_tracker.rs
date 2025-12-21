@@ -249,7 +249,7 @@ impl LsnTracker {
         let tracker = Arc::new_cyclic(|weak_tracker: &std::sync::Weak<Self>| {
             let shutdown_token_clone = shutdown_token.clone();
             let persist_notify_clone = persist_notify.clone();
-            
+
             // Spawn the background task with a weak reference
             let weak_tracker_clone = weak_tracker.clone();
             let handle = tokio::spawn(async move {
@@ -342,7 +342,7 @@ impl LsnTracker {
     }
 
     /// Create a new LSN tracker with custom interval and load the initial value from file
-    /// 
+    ///
     /// The background persistence task is started automatically.
     pub async fn new_with_load_and_interval(
         lsn_file_path: Option<&str>,
@@ -371,7 +371,7 @@ impl LsnTracker {
         }
 
         info!("Shutting down LSN persistence task");
-        
+
         // Signal the background task to shutdown
         self.shutdown_token.cancel();
 
@@ -748,33 +748,33 @@ mod lsn_tracker_tests {
     #[tokio::test]
     async fn test_background_persistence_with_shutdown() {
         let path = "/tmp/test_lsn_bg_shutdown";
-        
+
         // Create tracker with short interval for testing
         let arc_tracker = LsnTracker::new_with_interval(Some(path), 100);
-        
+
         // Commit some LSNs
         arc_tracker.commit_lsn(100);
         arc_tracker.commit_lsn(200);
         arc_tracker.commit_lsn(300);
-        
+
         // Wait a bit for background task to persist
         tokio::time::sleep(Duration::from_millis(200)).await;
-        
+
         // Commit final LSN
         arc_tracker.commit_lsn(400);
-        
+
         // Shutdown gracefully - this should persist the final LSN
         arc_tracker.shutdown_async().await;
-        
+
         // Verify final LSN was persisted
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(!contents.is_empty());
-        
+
         // Load from file to verify
         let (new_tracker, loaded_lsn) = LsnTracker::new_with_load(Some(path)).await;
         assert!(loaded_lsn.is_some());
         assert_eq!(new_tracker.get(), 400);
-        
+
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -783,21 +783,21 @@ mod lsn_tracker_tests {
     async fn test_shutdown_without_background_task() {
         let path = "/tmp/test_lsn_no_bg_shutdown";
         let tracker = LsnTracker::new_with_interval(Some(path), 60000);
-        
+
         // Commit LSN (background task is already running from new_with_interval)
         tracker.commit_lsn(999);
-        
+
         // Shutdown should still persist
         tracker.shutdown_async().await;
-        
+
         // Verify LSN was persisted
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(!contents.is_empty());
-        
+
         let (new_tracker, loaded_lsn) = LsnTracker::new_with_load(Some(path)).await;
         assert!(loaded_lsn.is_some());
         assert_eq!(new_tracker.get(), 999);
-        
+
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -806,15 +806,15 @@ mod lsn_tracker_tests {
     async fn test_double_shutdown_is_safe() {
         let path = "/tmp/test_lsn_double_shutdown";
         let (arc_tracker, _) = LsnTracker::new_with_load(Some(path)).await;
-        
+
         arc_tracker.commit_lsn(555);
-        
+
         // First shutdown
         arc_tracker.shutdown_async().await;
-        
+
         // Second shutdown should be safe (no-op)
         arc_tracker.shutdown_async().await;
-        
+
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
     }

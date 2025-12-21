@@ -88,7 +88,6 @@ fn test_destination_type_serialization() {
 /// Test that unsupported destination types return proper errors
 #[test]
 fn test_unsupported_destination_types() {
-
     // SQLite is now supported, so it should succeed
     #[cfg(feature = "sqlite")]
     {

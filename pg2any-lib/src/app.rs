@@ -10,7 +10,7 @@ use tracing::info;
 #[cfg(feature = "metrics")]
 use crate::MetricsServer;
 use crate::{
-    client::CdcClient, config::Config, lsn_tracker::create_lsn_tracker_with_load, types::Lsn,
+    client::CdcClient, config::Config, lsn_tracker::create_lsn_tracker_with_load_async, types::Lsn,
     CdcResult,
 };
 
@@ -131,7 +131,7 @@ impl CdcApp {
         self.client.init_build_info(&self.config.version);
 
         // Create LSN tracker and load last known LSN
-        let (lsn_tracker, start_lsn) = create_lsn_tracker_with_load(lsn_file_path);
+        let (lsn_tracker, start_lsn) = create_lsn_tracker_with_load_async(lsn_file_path).await;
 
         // Set the LSN tracker on the client for tracking committed LSN
         self.client.set_lsn_tracker(lsn_tracker);

@@ -23,7 +23,6 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libpq-sys = { workspace = true }
-libc = { workspace = true }
 lazy_static = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

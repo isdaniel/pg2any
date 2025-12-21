@@ -64,8 +64,6 @@ pub enum EventType {
 pub enum DestinationType {
     MySQL,
     SqlServer,
-    // Future support for other databases
-    PostgreSQL,
     SQLite,
 }
 
@@ -74,7 +72,6 @@ impl std::fmt::Display for DestinationType {
         match self {
             DestinationType::MySQL => write!(f, "mysql"),
             DestinationType::SqlServer => write!(f, "sqlserver"),
-            DestinationType::PostgreSQL => write!(f, "postgresql"),
             DestinationType::SQLite => write!(f, "sqlite"),
         }
     }

@@ -24,7 +24,7 @@ async fn test_destination_handler_interface() {
 
     #[cfg(feature = "mysql")]
     {
-        let mut destination = DestinationFactory::create(DestinationType::MySQL).unwrap();
+        let mut destination = DestinationFactory::create(&DestinationType::MySQL).unwrap();
 
         // Test single event processing interface
         for event in &events {
@@ -42,7 +42,7 @@ async fn test_destination_handler_interface() {
 
     #[cfg(feature = "sqlserver")]
     {
-        let mut destination = DestinationFactory::create(DestinationType::SqlServer).unwrap();
+        let mut destination = DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
         // Test single event processing interface
         for event in &events {
@@ -66,18 +66,15 @@ fn test_destination_type_serialization() {
 
     let mysql_type = DestinationType::MySQL;
     let sqlserver_type = DestinationType::SqlServer;
-    let postgres_type = DestinationType::PostgreSQL;
     let sqlite_type = DestinationType::SQLite;
 
     // Test serialization
     let mysql_json = serde_json::to_string(&mysql_type).unwrap();
     let sqlserver_json = serde_json::to_string(&sqlserver_type).unwrap();
-    let postgres_json = serde_json::to_string(&postgres_type).unwrap();
     let sqlite_json = serde_json::to_string(&sqlite_type).unwrap();
 
     assert_eq!(mysql_json, "\"MySQL\"");
     assert_eq!(sqlserver_json, "\"SqlServer\"");
-    assert_eq!(postgres_json, "\"PostgreSQL\"");
     assert_eq!(sqlite_json, "\"SQLite\"");
 
     // Test deserialization
@@ -91,28 +88,18 @@ fn test_destination_type_serialization() {
 /// Test that unsupported destination types return proper errors
 #[test]
 fn test_unsupported_destination_types() {
-    let postgres_result = DestinationFactory::create(DestinationType::PostgreSQL);
-    assert!(postgres_result.is_err());
-
     // SQLite is now supported, so it should succeed
     #[cfg(feature = "sqlite")]
     {
-        let sqlite_result = DestinationFactory::create(DestinationType::SQLite);
+        let sqlite_result = DestinationFactory::create(&DestinationType::SQLite);
         assert!(sqlite_result.is_ok());
     }
 
     // If SQLite feature is not enabled, it should fail
     #[cfg(not(feature = "sqlite"))]
     {
-        let sqlite_result = DestinationFactory::create(DestinationType::SQLite);
+        let sqlite_result = DestinationFactory::create(&DestinationType::SQLite);
         assert!(sqlite_result.is_err());
-    }
-
-    // Verify error messages contain helpful information
-    if let Err(error) = postgres_result {
-        let error_msg = error.to_string();
-        assert!(error_msg.contains("PostgreSQL"));
-        assert!(error_msg.contains("not supported") || error_msg.contains("not enabled"));
     }
 }
 

@@ -264,7 +264,9 @@ impl TransactionManager {
             }
 
             let events = std::mem::take(&mut state.pending_events);
-            let mut tx = Transaction::new_batch(transaction_id, state.commit_timestamp, true);
+
+            // This ensures LSN is not persisted until the actual commit
+            let mut tx = Transaction::new_batch(transaction_id, state.commit_timestamp, false);
             tx.events = events;
 
             if let Some(lsn) = state.last_lsn {

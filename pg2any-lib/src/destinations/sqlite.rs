@@ -448,7 +448,7 @@ impl DestinationHandler for SQLiteDestination {
         // Create parent directory if it doesn't exist
         if let Some(parent) = Path::new(db_path).parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     CdcError::generic(format!(
                         "Failed to create directory for SQLite database: {}",
                         e

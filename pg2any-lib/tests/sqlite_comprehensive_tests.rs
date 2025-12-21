@@ -6,9 +6,9 @@ use pg2any_lib::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio::fs;
 
 /// Helper function to wrap a single event in a transaction for testing
 fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
@@ -1011,7 +1011,7 @@ async fn test_sqlite_complete_crud_cycle() {
 #[tokio::test]
 async fn test_sqlite_destination_factory_integration() {
     // Test that the factory creates a working SQLite destination
-    let mut destination = DestinationFactory::create(DestinationType::SQLite).unwrap();
+    let mut destination = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
     let temp_db = TempDatabase::new("factory_integration");
     let connection_string = temp_db.connection_string();

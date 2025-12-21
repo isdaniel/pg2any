@@ -30,7 +30,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tiberius = { version = "0.12", features = ["tds73", "sql-browser-tokio", "bigdecimal", "rust_decimal", "time", "chrono"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "sqlite", "chrono", "uuid"] }
 libpq-sys = "0.8"
-libc = "0.2.174"
 # Monitoring and metrics dependencies
 prometheus = { version = "0.14.0", features = ["process"] }
 lazy_static = "1.5"

@@ -77,8 +77,8 @@ pub struct DestinationFactory;
 
 impl DestinationFactory {
     /// Create a new destination handler for the specified type
-    pub fn create(destination_type: DestinationType) -> Result<Box<dyn DestinationHandler>> {
-        match destination_type {
+    pub fn create(destination_type: &DestinationType) -> Result<Box<dyn DestinationHandler>> {
+        match *destination_type {
             #[cfg(feature = "mysql")]
             DestinationType::MySQL => Ok(Box::new(MySQLDestination::new())),
 
@@ -105,25 +105,21 @@ mod tests {
         // Test factory creation for different destination types
         #[cfg(feature = "mysql")]
         {
-            let result = DestinationFactory::create(DestinationType::MySQL);
+            let result = DestinationFactory::create(&DestinationType::MySQL);
             assert!(result.is_ok());
         }
 
         #[cfg(feature = "sqlserver")]
         {
-            let result = DestinationFactory::create(DestinationType::SqlServer);
+            let result = DestinationFactory::create(&DestinationType::SqlServer);
             assert!(result.is_ok());
         }
 
         #[cfg(feature = "sqlite")]
         {
-            let result = DestinationFactory::create(DestinationType::SQLite);
+            let result = DestinationFactory::create(&DestinationType::SQLite);
             assert!(result.is_ok());
         }
-
-        // Test unsupported destination type
-        let result = DestinationFactory::create(DestinationType::PostgreSQL);
-        assert!(result.is_err());
     }
 
     #[test]

@@ -63,7 +63,7 @@ impl CdcClient {
         info!("Creating CDC client");
 
         // Create destination handler
-        let destination_handler = DestinationFactory::create(config.destination_type.clone())?;
+        let destination_handler = DestinationFactory::create(&config.destination_type)?;
 
         let replication_manager = ReplicationManager::new(config.clone());
 
@@ -174,7 +174,7 @@ impl CdcClient {
         info!("Starting consumer for transaction processing");
 
         // Create destination handler for the consumer
-        let mut consumer_destination = DestinationFactory::create(dest_type.clone())?;
+        let mut consumer_destination = DestinationFactory::create(&dest_type)?;
 
         // Connect the consumer's destination handler
         consumer_destination.connect(dest_connection_string).await?;
@@ -637,7 +637,7 @@ impl CdcClient {
                     // Final persist of LSN on shutdown
                     if let Some(ref tracker) = lsn_tracker {
                         info!("Consumer: Final LSN persistence on shutdown");
-                        tracker.persist_async();
+                        tracker.shutdown_async().await;
                     }
 
                     // Log final LSN state

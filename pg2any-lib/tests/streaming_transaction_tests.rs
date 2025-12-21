@@ -16,7 +16,7 @@ mod streaming_transaction_tests {
         // Test MySQL
         #[cfg(feature = "mysql")]
         {
-            let mut mysql_dest = DestinationFactory::create(DestinationType::MySQL).unwrap();
+            let mut mysql_dest = DestinationFactory::create(&DestinationType::MySQL).unwrap();
 
             // Should have no active streaming transaction initially
             assert_eq!(mysql_dest.get_active_streaming_transaction_id(), None);
@@ -28,7 +28,7 @@ mod streaming_transaction_tests {
         // Test SQLite
         #[cfg(feature = "sqlite")]
         {
-            let mut sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let mut sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             // Should have no active streaming transaction initially
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
@@ -41,7 +41,7 @@ mod streaming_transaction_tests {
         #[cfg(feature = "sqlserver")]
         {
             let mut sqlserver_dest =
-                DestinationFactory::create(DestinationType::SqlServer).unwrap();
+                DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
             // Should have no active streaming transaction initially
             assert_eq!(sqlserver_dest.get_active_streaming_transaction_id(), None);
@@ -59,7 +59,7 @@ mod streaming_transaction_tests {
     async fn test_non_streaming_transaction_processing() {
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             // Create a non-final batch transaction
             let mut transaction = Transaction::new(1, chrono::Utc::now());
@@ -78,7 +78,7 @@ mod streaming_transaction_tests {
     async fn test_empty_streaming_batch_handling() {
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             // Create an empty non-final batch transaction
             let mut transaction = Transaction::new(1, chrono::Utc::now());
@@ -97,7 +97,7 @@ mod streaming_transaction_tests {
 
         #[cfg(feature = "mysql")]
         {
-            let result = DestinationFactory::create(DestinationType::MySQL);
+            let result = DestinationFactory::create(&DestinationType::MySQL);
             assert!(
                 result.is_ok(),
                 "MySQL destination should be created successfully"
@@ -106,7 +106,7 @@ mod streaming_transaction_tests {
 
         #[cfg(feature = "sqlite")]
         {
-            let result = DestinationFactory::create(DestinationType::SQLite);
+            let result = DestinationFactory::create(&DestinationType::SQLite);
             assert!(
                 result.is_ok(),
                 "SQLite destination should be created successfully"
@@ -115,7 +115,7 @@ mod streaming_transaction_tests {
 
         #[cfg(feature = "sqlserver")]
         {
-            let result = DestinationFactory::create(DestinationType::SqlServer);
+            let result = DestinationFactory::create(&DestinationType::SqlServer);
             assert!(
                 result.is_ok(),
                 "SQL Server destination should be created successfully"
@@ -128,7 +128,7 @@ mod streaming_transaction_tests {
     async fn test_graceful_shutdown_with_streaming_transaction() {
         #[cfg(feature = "sqlite")]
         {
-            let mut sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let mut sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             // Closing without active transactions should succeed
             assert!(sqlite_dest.close().await.is_ok());
@@ -137,7 +137,7 @@ mod streaming_transaction_tests {
         #[cfg(feature = "sqlserver")]
         {
             let mut sqlserver_dest =
-                DestinationFactory::create(DestinationType::SqlServer).unwrap();
+                DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
             // Closing without active transactions should succeed
             assert!(sqlserver_dest.close().await.is_ok());
@@ -149,7 +149,7 @@ mod streaming_transaction_tests {
     async fn test_streaming_transaction_state_management() {
         #[cfg(feature = "sqlite")]
         {
-            let mut sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let mut sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             // Initial state should be no active transaction
             assert_eq!(sqlite_dest.get_active_streaming_transaction_id(), None);
@@ -165,7 +165,7 @@ mod streaming_transaction_tests {
         #[cfg(feature = "sqlserver")]
         {
             let mut sqlserver_dest =
-                DestinationFactory::create(DestinationType::SqlServer).unwrap();
+                DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
             // Initial state should be no active transaction
             assert_eq!(sqlserver_dest.get_active_streaming_transaction_id(), None);
@@ -187,7 +187,7 @@ mod streaming_transaction_tests {
     async fn test_schema_mappings_with_streaming_transactions() {
         #[cfg(feature = "sqlite")]
         {
-            let mut sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let mut sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
 
             let mut mappings = HashMap::new();
             mappings.insert("public".to_string(), "cdc_db".to_string());
@@ -202,7 +202,7 @@ mod streaming_transaction_tests {
         #[cfg(feature = "sqlserver")]
         {
             let mut sqlserver_dest =
-                DestinationFactory::create(DestinationType::SqlServer).unwrap();
+                DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
             let mut mappings = HashMap::new();
             mappings.insert("public".to_string(), "cdc_db".to_string());
@@ -222,21 +222,21 @@ mod streaming_transaction_tests {
 
         #[cfg(feature = "mysql")]
         {
-            let mysql_dest = DestinationFactory::create(DestinationType::MySQL).unwrap();
+            let mysql_dest = DestinationFactory::create(&DestinationType::MySQL).unwrap();
             // If this compiles and runs, the interface is compatible
             drop(mysql_dest);
         }
 
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_dest = DestinationFactory::create(DestinationType::SQLite).unwrap();
+            let sqlite_dest = DestinationFactory::create(&DestinationType::SQLite).unwrap();
             // If this compiles and runs, the interface is compatible
             drop(sqlite_dest);
         }
 
         #[cfg(feature = "sqlserver")]
         {
-            let sqlserver_dest = DestinationFactory::create(DestinationType::SqlServer).unwrap();
+            let sqlserver_dest = DestinationFactory::create(&DestinationType::SqlServer).unwrap();
             // If this compiles and runs, the interface is compatible
             drop(sqlserver_dest);
         }

@@ -294,7 +294,7 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
 | **Performance** | | | | | |
-| | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `1000` | `5000`, `10000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
+| | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `500` | `3000`, `6000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
 | **System** | | | | | |
 | | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
@@ -423,7 +423,7 @@ pg2any uses a **single producer-single consumer architecture** optimized for tra
 
 The transaction channel capacity determines how many complete transactions can be queued between the producer and consumer:
 - **Smaller capacity** (100-1000): Lower memory usage, better for steady-state workloads
-- **Larger capacity** (5000-10000): Better burst handling, more memory usage
+- **Larger capacity** (3000-6000): Better burst handling, more memory usage
 
 #### Performance Examples
 
@@ -434,7 +434,7 @@ CDC_BUFFER_SIZE=100
 
 **Burst Traffic Handling**
 ```bash
-CDC_BUFFER_SIZE=10000
+CDC_BUFFER_SIZE=6000
 # Best for: Intermittent high-volume bursts
 ```
 
@@ -505,6 +505,8 @@ pg2any includes comprehensive monitoring and observability features for producti
 # Core Replication Metrics
 pg2any_events_processed_total          # Total CDC events processed
 pg2any_events_by_type_total            # Events by type (insert/update/delete)
+pg2any_transactions_processed_total    # Total transaction batches processed (including sub-batches)
+pg2any_full_transactions_processed_total # Total complete transactions processed (final batches only)
 pg2any_replication_lag_seconds         # Current replication lag
 pg2any_events_per_second               # Event processing rate
 pg2any_last_processed_lsn              # Last processed LSN from PostgreSQL WAL

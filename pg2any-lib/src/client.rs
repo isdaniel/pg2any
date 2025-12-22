@@ -456,7 +456,7 @@ impl CdcClient {
                                                     .record_error("batch_send_failed", "producer");
                                                 break;
                                             }
-                                            info!(
+                                            debug!(
                                                 "Producer: Successfully sent batch of {} events for transaction {}",
                                                 batch_count, xid
                                             );
@@ -653,7 +653,7 @@ impl CdcClient {
                             let event_count = tx.event_count();
                             let is_final = tx.is_final_batch;
 
-                            info!(
+                            debug!(
                                 "Consumer received transaction {} with {} events (final={})",
                                 tx_id, event_count, is_final
                             );
@@ -779,10 +779,13 @@ impl CdcClient {
                     commit_lsn,
                 );
 
-                // Only record metrics when transaction is complete (final batch)
+                // Record full transaction metric for final batches (complete transactions)
                 if is_final {
-                    metrics_collector.record_transaction_processed(&transaction, destination_type);
+                    metrics_collector
+                        .record_full_transaction_processed(&transaction, destination_type);
                 }
+                // Record all transaction batches (including sub-batches for streaming transactions)
+                metrics_collector.record_transaction_processed(&transaction, destination_type);
 
                 info!(
                     "Successfully processed transaction {} batch ({} events, final={}) in {:?}",

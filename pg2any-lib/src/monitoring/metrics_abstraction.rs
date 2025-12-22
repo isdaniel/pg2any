@@ -95,6 +95,16 @@ pub trait MetricsCollectorTrait: Send + Sync {
         transaction: &crate::types::Transaction,
         destination_type: &str,
     );
+
+    /// Record a full transaction (final batch) being successfully processed
+    ///
+    /// This method is thread-safe and handles any necessary locking internally.
+    /// Only called for complete transactions (is_final_batch = true).
+    fn record_full_transaction_processed(
+        &self,
+        transaction: &crate::types::Transaction,
+        destination_type: &str,
+    );
 }
 
 /// Abstract processing timer trait
@@ -319,6 +329,19 @@ mod real_metrics {
                 transaction.transaction_id, event_count, destination_type
             );
         }
+
+        fn record_full_transaction_processed(
+            &self,
+            transaction: &crate::types::Transaction,
+            destination_type: &str,
+        ) {
+            FULL_TRANSACTIONS_PROCESSED_TOTAL.inc();
+
+            debug!(
+                "Recorded full transaction processed: transaction_id={:?}, events={}, destination={}",
+                transaction.transaction_id, transaction.event_count(), destination_type
+            );
+        }
     }
 
     /// Real processing timer that wraps the actual timer
@@ -401,6 +424,13 @@ mod noop_metrics {
         fn init_build_info(&self, _version: &str) {}
 
         fn record_transaction_processed(
+            &self,
+            _transaction: &crate::types::Transaction,
+            _destination_type: &str,
+        ) {
+        }
+
+        fn record_full_transaction_processed(
             &self,
             _transaction: &crate::types::Transaction,
             _destination_type: &str,

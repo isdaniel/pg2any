@@ -64,6 +64,7 @@ services:
     ports:
       - "8080:8080"  # Metrics endpoint
     restart: unless-stopped
+    stop_grace_period: 120s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"] 
       interval: 30s

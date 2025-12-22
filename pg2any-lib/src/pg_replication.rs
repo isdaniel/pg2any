@@ -347,8 +347,8 @@ impl PgReplicationConnection {
         tokio::select! {
             biased;
 
-            // Check for cancellation first (biased select)
             _ = cancellation_token.cancelled() => {
+                info!("Cancellation detected in get_copy_data_async");
                 if let Some(data) = self.try_read_buffered_data()? {
                     info!("Found buffered data after cancellation, returning it");
                     return Ok(Some(data));
@@ -452,8 +452,7 @@ impl PgReplicationConnection {
             if self.is_replication_conn {
                 debug!("Ending COPY mode before closing connection");
                 unsafe {
-                    // Try to end the copy operation gracefully
-                    // This is important to properly close the replication stream
+                    // Try to end the copy operation gracefully, This is important to properly close the replication stream
                     let result = PQputCopyEnd(self.conn, ptr::null());
                     if result != 1 {
                         warn!(

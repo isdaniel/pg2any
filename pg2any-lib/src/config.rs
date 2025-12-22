@@ -66,7 +66,7 @@ pub struct Config {
     /// Whether to add jitter to retry delays to prevent thundering herd
     pub retry_jitter: bool,
 
-    /// Buffer size for the event channel (kept for channel capacity)
+    /// Transaction channel capacity between producer and consumer
     pub buffer_size: usize,
 
     /// Table mapping for transformation between source and destination

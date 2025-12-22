@@ -234,52 +234,6 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Get copy data from replication stream
-    pub fn get_copy_data(&self, async_mode: i32) -> Result<Option<Vec<u8>>> {
-        if !self.is_replication_conn {
-            return Err(CdcError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
-
-        if async_mode != 0 {
-            let _ = unsafe { PQconsumeInput(self.conn) };
-        }
-
-        let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
-        let result = unsafe { PQgetCopyData(self.conn, &mut buffer, async_mode) };
-
-        match result {
-            -2 => {
-                let error_msg = self.last_error_message();
-                Err(CdcError::protocol(format!(
-                    "Copy operation failed: {}",
-                    error_msg
-                )))
-            }
-            -1 => Ok(None), // No more data available
-            0 => Ok(None),  // Timeout or no data available
-            len if len > 0 => {
-                if buffer.is_null() {
-                    return Err(CdcError::buffer(
-                        "Received null buffer from PQgetCopyData".to_string(),
-                    ));
-                }
-
-                let data = unsafe {
-                    std::slice::from_raw_parts(buffer as *const u8, len as usize).to_vec()
-                };
-
-                unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
-                Ok(Some(data))
-            }
-            _ => Err(CdcError::protocol(format!(
-                "Unexpected result from PQgetCopyData: {}",
-                result
-            ))),
-        }
-    }
-
     /// Send feedback to the server (standby status update)
     pub fn send_standby_status_update(
         &self,
@@ -384,8 +338,8 @@ impl PgReplicationConnection {
             .as_ref()
             .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
 
-        // First, try to read any buffered data without waiting
-        if let Some(data) = self.try_read_copy_data()? {
+        // First, try to read any buffered data without blocking
+        if let Some(data) = self.try_read_buffered_data()? {
             return Ok(Some(data));
         }
 
@@ -395,14 +349,10 @@ impl PgReplicationConnection {
 
             // Check for cancellation first (biased select)
             _ = cancellation_token.cancelled() => {
-                info!("Cancellation detected in get_copy_data_async");
-
-                // Try to read any remaining buffered data before cancelling
-                if let Some(data) = self.try_read_copy_data()? {
-                    info!("Found buffered data during cancellation, returning it");
+                if let Some(data) = self.try_read_buffered_data()? {
+                    info!("Found buffered data after cancellation, returning it");
                     return Ok(Some(data));
                 }
-
                 return Ok(None);
             }
 
@@ -412,7 +362,14 @@ impl PgReplicationConnection {
                     CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
                 })?;
 
-                if let Some(data) = self.try_read_copy_data()? {
+                // Socket is readable - consume input from the OS socket. This is the ONLY place we call PQconsumeInput, avoiding busy-loops
+                let consumed = unsafe { PQconsumeInput(self.conn) };
+                if consumed == 0 {
+                    return Err(CdcError::protocol(self.last_error_message()));
+                }
+
+                // Check if we have complete data now
+                if let Some(data) = self.try_read_buffered_data()? {
                     return Ok(Some(data));
                 }
 
@@ -422,13 +379,10 @@ impl PgReplicationConnection {
         }
     }
 
-    fn try_read_copy_data(&self) -> Result<Option<Vec<u8>>> {
-        // Read libpq socket buffer
-        let consumed = unsafe { PQconsumeInput(self.conn) };
-        if consumed == 0 {
-            return Err(CdcError::protocol(self.last_error_message()));
-        }
-
+    /// Try to read copy data from libpq's internal buffer without consuming OS socket
+    /// This should only be called after PQconsumeInput has been called
+    fn try_read_buffered_data(&self) -> Result<Option<Vec<u8>>> {
+        // Check if data is ready without blocking. PQisBusy returns 0 if a complete message is available
         if unsafe { PQisBusy(self.conn) } != 0 {
             return Ok(None); // Buffer not complete, wait for next socket readable event
         }

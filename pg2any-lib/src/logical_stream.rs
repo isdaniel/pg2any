@@ -32,8 +32,7 @@ pub struct LogicalReplicationStream {
     slot_created: bool,
     retry_handler: ReplicationConnectionRetry,
     last_health_check: Instant,
-    /// Shared LSN feedback for communication with consumer
-    /// This allows the consumer to update flushed/applied LSN after commits
+    /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
     shared_lsn_feedback: Option<Arc<SharedLsnFeedback>>,
 }
 
@@ -640,6 +639,7 @@ impl LogicalReplicationStream {
     }
 
     /// Convert tuple data to a HashMap for ChangeEvent
+    #[inline]
     fn convert_tuple_to_data(
         &self,
         tuple: &TupleData,
@@ -667,6 +667,7 @@ impl LogicalReplicationStream {
     }
 
     /// Check if feedback should be sent and send it
+    #[inline]
     pub fn maybe_send_feedback(&mut self) {
         if self
             .state
@@ -698,16 +699,14 @@ impl LogicalReplicationStream {
         // This allows the consumer to update these values after committing to destination
         let (flushed_lsn, applied_lsn) = if let Some(ref feedback) = self.shared_lsn_feedback {
             let (f, a) = feedback.get_feedback_lsn();
-            // If shared feedback has values, use them; otherwise fall back to received LSN
-            // We can't report a flushed/applied LSN higher than what we've received
+            // If shared feedback has values, use them; otherwise fall back to received LSN, We can't report a flushed/applied LSN higher than what we've received
             let flushed = if f > 0 && f <= self.state.last_received_lsn {
                 f
             } else if f > self.state.last_received_lsn {
                 // Consumer is ahead - this shouldn't happen but handle gracefully
                 self.state.last_received_lsn
             } else {
-                // No consumer updates yet, use 0 to indicate nothing flushed/applied
-                // This is accurate - we've received data but haven't confirmed it's applied
+                // No consumer updates yet, use 0 to indicate nothing flushed/applied, This is accurate - we've received data but haven't confirmed it's applied
                 0
             };
             let applied = if a > 0 && a <= self.state.last_received_lsn {

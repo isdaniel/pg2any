@@ -65,17 +65,18 @@ impl SharedLsnFeedback {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed (e.g., during batch writes).
-    #[inline]
+    #[inline(always)]
     pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
+
         loop {
             let current = self.flushed_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 return;
             }
-            match self.flushed_lsn.compare_exchange(
+            match self.flushed_lsn.compare_exchange_weak(
                 current,
                 lsn,
                 Ordering::Release,
@@ -98,18 +99,17 @@ impl SharedLsnFeedback {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN as PostgreSQL
     /// uses it to determine which WAL can be recycled.
-    #[inline]
+    #[inline(always)]
     pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
         if lsn == 0 {
             return;
         }
-        // Update applied LSN
         loop {
             let current = self.applied_lsn.load(Ordering::Acquire);
             if lsn <= current {
                 break;
             }
-            match self.applied_lsn.compare_exchange(
+            match self.applied_lsn.compare_exchange_weak(
                 current,
                 lsn,
                 Ordering::Release,
@@ -131,13 +131,13 @@ impl SharedLsnFeedback {
     }
 
     /// Get the current flushed LSN
-    #[inline]
+    #[inline(always)]
     pub fn get_flushed_lsn(&self) -> XLogRecPtr {
         self.flushed_lsn.load(Ordering::Acquire)
     }
 
     /// Get the current applied LSN
-    #[inline]
+    #[inline(always)]
     pub fn get_applied_lsn(&self) -> XLogRecPtr {
         self.applied_lsn.load(Ordering::Acquire)
     }
@@ -145,7 +145,7 @@ impl SharedLsnFeedback {
     /// Get both LSN values atomically for feedback
     ///
     /// Returns (flushed_lsn, applied_lsn)
-    #[inline]
+    #[inline(always)]
     pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
         let flushed = self.flushed_lsn.load(Ordering::Acquire);
         let applied = self.applied_lsn.load(Ordering::Acquire);

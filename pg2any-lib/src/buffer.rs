@@ -120,22 +120,13 @@ impl BufferReader {
     /// Read a null-terminated string
     #[inline]
     pub fn read_cstring(&mut self) -> Result<String> {
-        let mut bytes_to_read = 0;
         let data_slice = self.data.chunk();
 
         // Find the null terminator
-        for (i, &byte) in data_slice.iter().enumerate() {
-            if byte == 0 {
-                bytes_to_read = i;
-                break;
-            }
-        }
-
-        if bytes_to_read == 0 && !data_slice.is_empty() && data_slice[0] != 0 {
-            return Err(CdcError::protocol(
-                "Unterminated string in buffer".to_string(),
-            ));
-        }
+        let bytes_to_read = data_slice
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| CdcError::protocol("Unterminated string in buffer".to_string()))?;
 
         // Read the string bytes
         let string_bytes = self.data.copy_to_bytes(bytes_to_read);

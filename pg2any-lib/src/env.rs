@@ -42,8 +42,8 @@ use std::time::Duration;
 /// - `CDC_QUERY_TIMEOUT`: Query timeout in seconds (default: "10")
 ///
 /// ## Performance Configuration
-/// - `CDC_BUFFER_SIZE`: Size of the event channel buffer (default: "1000")
-///   Larger buffers can smooth out burst traffic but consume more memory.
+/// - `CDC_BUFFER_SIZE`: Capacity of the transaction channel between producer and consumer (default: "1000")
+///   Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
 /// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
 ///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
@@ -116,7 +116,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     );
 
     tracing::info!(
-        "Performance - Buffer Size: {}, Batch Size: {}",
+        "Performance - Transaction Channel Size: {}, Batch Size: {}",
         buffer_size,
         batch_size
     );

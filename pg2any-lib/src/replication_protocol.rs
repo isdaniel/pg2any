@@ -228,6 +228,7 @@ pub struct ColumnInfo {
 }
 
 impl ColumnInfo {
+    #[inline(always)]
     pub fn new(flags: u8, name: String, type_id: Oid, type_modifier: i32) -> Self {
         Self {
             flags,
@@ -238,6 +239,7 @@ impl ColumnInfo {
     }
 
     /// Check if this column is part of the primary/replica key
+    #[inline(always)]
     pub fn is_key(&self) -> bool {
         self.flags & 0x01 != 0
     }
@@ -250,38 +252,43 @@ pub struct TupleData {
 }
 
 impl TupleData {
+    #[inline(always)]
     pub fn new(columns: Vec<ColumnData>) -> Self {
         Self { columns }
     }
 
     /// Get column data by index
+    #[inline(always)]
     pub fn get_column(&self, index: usize) -> Option<&ColumnData> {
         self.columns.get(index)
     }
 
     /// Get the number of columns
+    #[inline(always)]
     pub fn column_count(&self) -> usize {
         self.columns.len()
     }
 
     /// Convert to a HashMap with column names as keys
     pub fn to_hash_map(&self, relation: &RelationInfo) -> HashMap<String, serde_json::Value> {
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(self.columns.len());
 
         for (i, col_data) in self.columns.iter().enumerate() {
-            let column_name = relation
-                .get_column_by_index(i)
-                .map(|col| col.name.clone())
-                .unwrap_or_else(|| format!("col_{}", i));
-
-            let value = match col_data.data_type {
-                'n' => serde_json::Value::Null,
-                't' => serde_json::Value::String(col_data.as_string().unwrap_or_default()),
-                'u' => continue, // Skip unchanged TOAST values
-                _ => serde_json::Value::String(col_data.as_string().unwrap_or_default()),
-            };
-
-            map.insert(column_name, value);
+            if let Some(column_info) = relation.get_column_by_index(i) {
+                let value = match col_data.data_type {
+                    'n' => serde_json::Value::Null,
+                    't' | 'b' => {
+                        // Use as_str() which returns Cow for zero-copy when possible
+                        match col_data.as_str() {
+                            Some(s) => serde_json::Value::String(s.into_owned()),
+                            None => serde_json::Value::Null,
+                        }
+                    }
+                    'u' => continue, // Skip unchanged TOAST values
+                    _ => serde_json::Value::Null,
+                };
+                map.insert(column_info.name.clone(), value);
+            }
         }
 
         map
@@ -296,15 +303,15 @@ pub struct ColumnData {
 }
 
 impl ColumnData {
-    #[inline]
-    pub fn null() -> Self {
+    #[inline(always)]
+    pub const fn null() -> Self {
         Self {
             data_type: 'n',
             data: Vec::new(),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn text(data: Vec<u8>) -> Self {
         Self {
             data_type: 't',
@@ -312,7 +319,7 @@ impl ColumnData {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn binary(data: Vec<u8>) -> Self {
         Self {
             data_type: 'b',
@@ -320,30 +327,30 @@ impl ColumnData {
         }
     }
 
-    #[inline]
-    pub fn unchanged() -> Self {
+    #[inline(always)]
+    pub const fn unchanged() -> Self {
         Self {
             data_type: 'u',
             data: Vec::new(),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_null(&self) -> bool {
         self.data_type == 'n'
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_unchanged(&self) -> bool {
         self.data_type == 'u'
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_binary(&self) -> bool {
         self.data_type == 'b'
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_text(&self) -> bool {
         self.data_type == 't'
     }
@@ -353,14 +360,16 @@ impl ColumnData {
     /// Works for both text ('t') and binary ('b') format columns
     #[inline]
     pub fn as_str(&self) -> Option<Cow<'_, str>> {
-        if (self.data_type == 't' || self.data_type == 'b') && !self.data.is_empty() {
-            // Try to borrow first (zero-copy), fall back to lossy conversion
-            match std::str::from_utf8(&self.data) {
-                Ok(s) => Some(Cow::Borrowed(s)),
-                Err(_) => Some(Cow::Owned(String::from_utf8_lossy(&self.data).into_owned())),
+        if self.data.is_empty() || (self.data_type != 't' && self.data_type != 'b') {
+            return None;
+        }
+
+        match std::str::from_utf8(&self.data) {
+            Ok(s) => Some(Cow::Borrowed(s)),
+            Err(_) => {
+                // Fallback: Use lossy conversion (rare case)
+                Some(Cow::Owned(String::from_utf8_lossy(&self.data).into_owned()))
             }
-        } else {
-            None
         }
     }
 
@@ -372,7 +381,7 @@ impl ColumnData {
     }
 
     /// Get raw bytes data (zero-copy reference)
-    #[inline]
+    #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
@@ -389,6 +398,7 @@ pub struct RelationInfo {
 }
 
 impl RelationInfo {
+    #[inline]
     pub fn new(
         relation_id: Oid,
         namespace: String,
@@ -406,21 +416,25 @@ impl RelationInfo {
     }
 
     /// Get the full table name (namespace.relation_name)
+    #[inline]
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.namespace, self.relation_name)
     }
 
     /// Get column by name
+    #[inline]
     pub fn get_column_by_name(&self, name: &str) -> Option<&ColumnInfo> {
         self.columns.iter().find(|col| col.name == name)
     }
 
     /// Get column by index
+    #[inline(always)]
     pub fn get_column_by_index(&self, index: usize) -> Option<&ColumnInfo> {
         self.columns.get(index)
     }
 
     /// Get key columns
+    #[inline]
     pub fn get_key_columns(&self) -> Vec<&ColumnInfo> {
         self.columns.iter().filter(|col| col.is_key()).collect()
     }
@@ -486,9 +500,10 @@ pub struct ReplicationState {
 }
 
 impl ReplicationState {
+    #[inline]
     pub fn new() -> Self {
         Self {
-            relations: HashMap::new(),
+            relations: HashMap::with_capacity(64),
             last_received_lsn: 0,
             last_flushed_lsn: 0,
             last_applied_lsn: 0,
@@ -497,11 +512,13 @@ impl ReplicationState {
     }
 
     /// Add or update relation information
+    #[inline]
     pub fn add_relation(&mut self, relation: RelationInfo) {
         self.relations.insert(relation.relation_id, relation);
     }
 
     /// Get relation by OID
+    #[inline(always)]
     pub fn get_relation(&self, relation_id: Oid) -> Option<&RelationInfo> {
         self.relations.get(&relation_id)
     }
@@ -510,7 +527,7 @@ impl ReplicationState {
     ///
     /// This should be called when WAL data is received from the replication stream,
     /// regardless of whether it has been applied to the destination yet.
-    #[inline]
+    #[inline(always)]
     pub fn update_received_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_received_lsn {
             self.last_received_lsn = lsn;
@@ -521,7 +538,7 @@ impl ReplicationState {
     ///
     /// This should be called when data has been written/flushed to the destination
     /// database, but not yet committed.
-    #[inline]
+    #[inline(always)]
     pub fn update_flushed_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_flushed_lsn {
             self.last_flushed_lsn = lsn;
@@ -533,7 +550,7 @@ impl ReplicationState {
     /// This should be called when a transaction has been successfully committed
     /// to the destination database. This is the most important LSN for the
     /// PostgreSQL server as it determines which WAL can be recycled.
-    #[inline]
+    #[inline(always)]
     pub fn update_applied_lsn(&mut self, lsn: XLogRecPtr) {
         if lsn > self.last_applied_lsn {
             self.last_applied_lsn = lsn;
@@ -555,6 +572,7 @@ impl ReplicationState {
     }
 
     /// Check if feedback should be sent
+    #[inline]
     pub fn should_send_feedback(&self, interval: std::time::Duration) -> bool {
         self.last_feedback_time.elapsed() >= interval
     }
@@ -580,6 +598,7 @@ pub struct LogicalReplicationParser {
 
 impl LogicalReplicationParser {
     /// Create a new parser with specified protocol version
+    #[inline]
     pub fn with_protocol_version(protocol_version: u32) -> Self {
         Self {
             streaming_context: None,
@@ -588,12 +607,13 @@ impl LogicalReplicationParser {
     }
 
     /// Check if we're currently inside a streaming transaction context
-    #[inline]
+    #[inline(always)]
     fn is_streaming(&self) -> bool {
         self.streaming_context.is_some()
     }
 
     /// Parse a WAL data message from the replication stream
+    #[inline]
     pub fn parse_wal_message(&mut self, data: &[u8]) -> Result<StreamingReplicationMessage> {
         if data.is_empty() {
             return Err(CdcError::protocol("Empty WAL message".to_string()));
@@ -651,16 +671,16 @@ impl LogicalReplicationParser {
             }
         };
 
-        let streaming_message = if let Some(xid) = self.streaming_context {
-            StreamingReplicationMessage::new_streaming(message, xid)
-        } else {
-            StreamingReplicationMessage::new(message)
+        let streaming_message = match self.streaming_context {
+            Some(xid) => StreamingReplicationMessage::new_streaming(message, xid),
+            None => StreamingReplicationMessage::new(message),
         };
 
         Ok(streaming_message)
     }
 
     /// Parse BEGIN message
+    #[inline]
     fn parse_begin_message(
         &mut self,
         reader: &mut BufferReader,
@@ -755,6 +775,7 @@ impl LogicalReplicationParser {
     }
 
     /// Parse INSERT message
+    #[inline]
     fn parse_insert_message(
         &mut self,
         reader: &mut BufferReader,
@@ -788,6 +809,7 @@ impl LogicalReplicationParser {
     }
 
     /// Parse UPDATE message
+    #[inline]
     fn parse_update_message(
         &mut self,
         reader: &mut BufferReader,
@@ -841,6 +863,7 @@ impl LogicalReplicationParser {
     }
 
     /// Parse DELETE message
+    #[inline]
     fn parse_delete_message(
         &mut self,
         reader: &mut BufferReader,
@@ -1214,6 +1237,7 @@ impl LogicalReplicationParser {
     }
 
     /// Parse tuple data (column values)
+    #[inline]
     fn parse_tuple_data(&mut self, reader: &mut BufferReader) -> Result<TupleData> {
         let column_count = reader.read_u16()?;
         let mut columns = Vec::with_capacity(column_count as usize);

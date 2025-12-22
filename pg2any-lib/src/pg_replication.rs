@@ -128,7 +128,7 @@ impl PgReplicationConnection {
         // Check for errors
         let status = pg_result.status();
         info!(
-            "query : {}, pg_result.status() : {:?}",
+            "query : {} pg_result.status() : {:?}",
             query,
             pg_result.status()
         );
@@ -182,7 +182,6 @@ impl PgReplicationConnection {
             slot_name, output_plugin
         );
 
-        debug!("Creating replication slot: {}", slot_name);
         let result = self.exec(&create_slot_sql)?;
 
         if result.ntuples() > 0 {

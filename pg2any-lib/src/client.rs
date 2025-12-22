@@ -441,7 +441,7 @@ impl CdcClient {
                                         if let Some(batch_tx) = tx_manager.take_batch(xid) {
                                             let batch_count = batch_tx.event_count();
 
-                                            info!(
+                                            debug!(
                                                 "Producer: Sending mid-stream batch with {} events for transaction {}",
                                                 batch_count, xid
                                             );
@@ -665,6 +665,7 @@ impl CdcClient {
                                 &destination_type,
                                 &lsn_tracker,
                                 &shared_lsn_feedback,
+                                false, // shutdown_mode
                             ).await;
 
                             info!("Consumer completed transaction {}", tx_id);
@@ -716,6 +717,7 @@ impl CdcClient {
                         "Consumer: Processing remaining transaction {} during shutdown",
                         transaction.transaction_id
                     );
+                    // Pass shutdown_mode=true to force LSN persistence for all batches
                     Self::process_transaction(
                         transaction,
                         destination_handler,
@@ -723,6 +725,7 @@ impl CdcClient {
                         destination_type,
                         lsn_tracker,
                         shared_lsn_feedback,
+                        true, // shutdown_mode
                     )
                     .await;
                     count += 1;
@@ -753,6 +756,7 @@ impl CdcClient {
         destination_type: &str,
         lsn_tracker: &Option<Arc<LsnTracker>>,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        shutdown_mode: bool,
     ) {
         let start_time = std::time::Instant::now();
         let event_count = transaction.event_count();
@@ -766,42 +770,21 @@ impl CdcClient {
             Ok(_) => {
                 let duration = start_time.elapsed();
 
-                // Update and persist LSN after successful commit
-                if let Some(lsn) = commit_lsn {
-                    // Update shared LSN feedback for replication protocol
-                    // This is crucial for proper PostgreSQL feedback
-                    if is_final {
-                        // Final batch - transaction is fully committed
-                        shared_lsn_feedback.update_applied_lsn(lsn.0);
-                        debug!(
-                            "Updated applied LSN to {} for transaction {} (committed)",
-                            lsn, tx_id
-                        );
-                    } else {
-                        // Non-final batch - data is flushed but not committed
-                        shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                        debug!(
-                            "Updated flushed LSN to {} for transaction {} (batch written)",
-                            lsn, tx_id
-                        );
-                    }
-
-                    // Persist to file for restart recovery
-                    if let Some(ref tracker) = lsn_tracker {
-                        tracker.commit_lsn(lsn.0);
-                        debug!(
-                            "Persisted LSN {} for transaction {} (final={})",
-                            lsn, tx_id, is_final
-                        );
-                    }
-                }
+                handle_lsn_update(
+                    lsn_tracker,
+                    shared_lsn_feedback,
+                    shutdown_mode,
+                    tx_id,
+                    is_final,
+                    commit_lsn,
+                );
 
                 // Only record metrics when transaction is complete (final batch)
                 if is_final {
                     metrics_collector.record_transaction_processed(&transaction, destination_type);
                 }
 
-                debug!(
+                info!(
                     "Successfully processed transaction {} batch ({} events, final={}) in {:?}",
                     tx_id, event_count, is_final, duration
                 );
@@ -902,6 +885,54 @@ impl CdcClient {
             events_processed: 0, // In a real implementation, you'd track this
             last_processed_lsn: None,
             lag_seconds: None,
+        }
+    }
+}
+
+fn handle_lsn_update(
+    lsn_tracker: &Option<Arc<LsnTracker>>,
+    shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    shutdown_mode: bool,
+    tx_id: u32,
+    is_final: bool,
+    commit_lsn: Option<Lsn>,
+) {
+    let Some(lsn) = commit_lsn else {
+        return;
+    };
+
+    if is_final {
+        // Final batch - transaction is fully committed
+        shared_lsn_feedback.update_applied_lsn(lsn.0);
+        debug!(
+            "Updated applied LSN to {} for transaction {} (committed)",
+            lsn, tx_id
+        );
+
+        // Persist LSN for final batches (actual commits)
+        if let Some(ref tracker) = lsn_tracker {
+            tracker.commit_lsn(lsn.0);
+            debug!(
+                "Persisted commit LSN {} for transaction {} (final commit)",
+                lsn, tx_id
+            );
+        }
+    } else {
+        // Non-final batch - data is flushed but not committed
+        shared_lsn_feedback.update_flushed_lsn(lsn.0);
+        debug!(
+            "Updated flushed LSN to {} for transaction {} (batch written, not persisted)",
+            lsn, tx_id
+        );
+
+        if shutdown_mode {
+            if let Some(ref tracker) = lsn_tracker {
+                tracker.commit_lsn(lsn.0);
+                info!(
+                    "[SHUTDOWN] Persisted LSN {} for transaction {} (non-final batch, shutdown mode)",
+                    lsn, tx_id
+                );
+            }
         }
     }
 }
@@ -1446,6 +1477,7 @@ mod tests {
             "test",
             &None,
             &shared_lsn_feedback,
+            false, // shutdown_mode
         )
         .await;
 

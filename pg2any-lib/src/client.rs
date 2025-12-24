@@ -816,6 +816,12 @@ impl CdcClient {
         // Wait for both tasks to complete gracefully
         self.wait_for_tasks_completion().await?;
 
+        // Shutdown LSN tracker to persist final state
+        if let Some(ref tracker) = self.lsn_tracker {
+            info!("Shutting down LSN tracker");
+            tracker.shutdown_async().await;
+        }
+
         // Close destination connection
         if let Some(ref mut handler) = self.destination_handler {
             handler.close().await?;

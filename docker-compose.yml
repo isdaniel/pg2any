@@ -41,6 +41,9 @@ services:
       - "3306:3306"
     volumes:
       - ./examples/scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init_mysql.sql:ro
+    command:
+      - --max_allowed_packet=536870912  # 512MB
+      - --innodb_buffer_pool_size=4GB
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
       interval: 10s
@@ -64,7 +67,7 @@ services:
     ports:
       - "8080:8080"  # Metrics endpoint
     restart: unless-stopped
-    stop_grace_period: 120s
+    stop_grace_period: 300s
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"] 
       interval: 30s

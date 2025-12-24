@@ -45,7 +45,7 @@ use std::time::Duration;
 /// - `CDC_BUFFER_SIZE`: Capacity of the transaction channel between producer and consumer (default: "1000")
 ///   Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
-/// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
+/// - `CDC_COMMIT_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
 ///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
 ///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
 ///
@@ -98,7 +98,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
     let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
-    let batch_size = parse_usize_env("CDC_BATCH_SIZE", 1000)?;
+    let batch_size = parse_usize_env("CDC_COMMIT_BATCH_SIZE", 1000)?;
 
     tracing::info!(
         "CDC Config - Slot: {}, Publication: {}, Protocol: {}, Streaming: {}, Binary: {}",

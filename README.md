@@ -41,6 +41,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Production Ready**: Structured logging, graceful shutdown, and resource management
 - **Monitoring & Metrics**: Comprehensive Prometheus metrics, and health monitoring
 - **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
+- **Memory Profiling**: jemalloc allocator with heap profiling support for memory leak detection and performance optimization
 - **Development Tools**: Docker environment, Makefile automation, extensive testing
 
 ### PostgreSQL Setup
@@ -521,6 +522,13 @@ pg2any_event_processing_duration_seconds # Event processing time
 pg2any_queue_depth                     # Events waiting to be processed
 pg2any_network_bytes_received_total    # Network I/O from PostgreSQL
 pg2any_buffer_memory_usage_bytes       # Memory usage for event buffers
+
+# Memory Metrics (jemalloc)
+pg2any_memory_allocated_bytes          # Total allocated memory
+pg2any_memory_resident_bytes           # Physically resident memory
+pg2any_memory_active_bytes             # Active memory pages
+pg2any_memory_fragmentation_bytes      # Memory fragmentation
+pg2any_memory_utilization_percent      # Memory utilization efficiency
 ```
 
 ### Complete Monitoring Stack

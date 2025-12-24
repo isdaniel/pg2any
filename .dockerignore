@@ -1,0 +1,38 @@
+# Exclude build artifacts
+target/
+**/target/
+
+# Exclude heap profiles
+heap_profiles/
+*.heap
+jeprof.out*
+
+# Exclude git
+.git/
+.gitignore
+
+# Exclude documentation that's not needed in container
+docs/
+*.md
+!README.md
+
+# Exclude development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Exclude test artifacts  
+tests/
+pg2any_last_lsn
+
+# Exclude monitoring examples (not needed in container)
+examples/monitoring/
+
+# Exclude scripts not needed in container
+scripts/
+
+# Exclude environment files (will be mounted)
+.env
+env/.env.example

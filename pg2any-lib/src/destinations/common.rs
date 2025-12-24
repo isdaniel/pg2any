@@ -86,6 +86,165 @@ impl<'a> InsertBatch<'a> {
     }
 }
 
+/// Represents a group of UPDATE events for the same table that can be batched
+/// Uses CASE-style batch updates for efficient processing
+pub struct UpdateBatch<'a> {
+    pub schema: Option<String>,
+    pub table: String,
+    /// Columns to be updated (SET columns)
+    pub update_columns: Vec<String>,
+    /// Key columns used in WHERE clause
+    pub key_columns: Vec<String>,
+    /// Replica identity mode
+    pub replica_identity: ReplicaIdentity,
+    /// Each row contains: (key_values, update_values)
+    pub rows: Vec<(Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>)>,
+}
+
+impl<'a> UpdateBatch<'a> {
+    /// Create a new UPDATE batch with schema
+    pub fn new_with_schema(
+        schema: String,
+        table: String,
+        update_columns: Vec<String>,
+        key_columns: Vec<String>,
+        replica_identity: ReplicaIdentity,
+    ) -> Self {
+        Self {
+            schema: Some(schema),
+            table,
+            update_columns,
+            key_columns,
+            replica_identity,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Create a new UPDATE batch without schema (for SQLite)
+    pub fn new(
+        table: String,
+        update_columns: Vec<String>,
+        key_columns: Vec<String>,
+        replica_identity: ReplicaIdentity,
+    ) -> Self {
+        Self {
+            schema: None,
+            table,
+            update_columns,
+            key_columns,
+            replica_identity,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Add a row to the UPDATE batch
+    pub fn add_row(
+        &mut self,
+        new_data: &'a HashMap<String, serde_json::Value>,
+        key_values: Vec<&'a serde_json::Value>,
+    ) {
+        let update_values: Vec<&serde_json::Value> = self
+            .update_columns
+            .iter()
+            .map(|col| new_data.get(col).unwrap_or(&serde_json::Value::Null))
+            .collect();
+        self.rows.push((key_values, update_values));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Check if a new row can be added to this batch
+    pub fn can_add(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        update_columns: &[String],
+        key_columns: &[String],
+        replica_identity: &ReplicaIdentity,
+    ) -> bool {
+        self.schema.as_deref() == schema
+            && self.table == table
+            && self.update_columns == update_columns
+            && self.key_columns == key_columns
+            && &self.replica_identity == replica_identity
+    }
+}
+
+/// Represents a group of DELETE events for the same table that can be batched
+/// Uses WHERE IN clause for efficient batch deletion
+pub struct DeleteBatch<'a> {
+    pub schema: Option<String>,
+    pub table: String,
+    /// Key columns used in WHERE clause
+    pub key_columns: Vec<String>,
+    /// Replica identity mode
+    pub replica_identity: ReplicaIdentity,
+    /// Key values for each row to delete
+    pub rows: Vec<Vec<&'a serde_json::Value>>,
+}
+
+impl<'a> DeleteBatch<'a> {
+    /// Create a new DELETE batch with schema
+    pub fn new_with_schema(
+        schema: String,
+        table: String,
+        key_columns: Vec<String>,
+        replica_identity: ReplicaIdentity,
+    ) -> Self {
+        Self {
+            schema: Some(schema),
+            table,
+            key_columns,
+            replica_identity,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Create a new DELETE batch without schema (for SQLite)
+    pub fn new(table: String, key_columns: Vec<String>, replica_identity: ReplicaIdentity) -> Self {
+        Self {
+            schema: None,
+            table,
+            key_columns,
+            replica_identity,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Add a row to the DELETE batch
+    pub fn add_row(&mut self, key_values: Vec<&'a serde_json::Value>) {
+        self.rows.push(key_values);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Check if a new row can be added to this batch
+    pub fn can_add(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        key_columns: &[String],
+        replica_identity: &ReplicaIdentity,
+    ) -> bool {
+        self.schema.as_deref() == schema
+            && self.table == table
+            && self.key_columns == key_columns
+            && &self.replica_identity == replica_identity
+    }
+}
+
 /// Transaction state tracking for streaming transactions
 pub struct TransactionState {
     /// PostgreSQL transaction ID

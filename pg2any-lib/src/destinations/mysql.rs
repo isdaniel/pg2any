@@ -1,16 +1,12 @@
 use super::{common, destination_factory::DestinationHandler};
 use crate::{
     error::{CdcError, Result},
-    types::{ChangeEvent, EventType, Transaction},
+    types::{EventType, Transaction},
 };
 use async_trait::async_trait;
 use sqlx::{Executor, MySql, MySqlPool};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
-
-/// Maximum number of rows per batch INSERT statement
-/// Limited by MySQL's max_allowed_packet and number of placeholders
-const MAX_BATCH_INSERT_SIZE: usize = 1000;
 
 /// Type alias for MySQL's open transaction
 /// Uses generic OpenTransaction with MySQL-specific connection type
@@ -97,135 +93,6 @@ fn build_where_clause_for_delete<'a>(
     })
 }
 
-/// Process a single DML event using any MySQL executor
-async fn process_single_event<'c, E>(
-    executor: E,
-    event: &ChangeEvent,
-    schema_mappings: &HashMap<String, String>,
-) -> Result<()>
-where
-    E: sqlx::Executor<'c, Database = MySql>,
-{
-    match &event.event_type {
-        EventType::Insert {
-            schema,
-            table,
-            data,
-            ..
-        } => {
-            let dest_schema = common::map_schema(schema_mappings, schema);
-            let columns: Vec<String> = data.keys().map(|k| format!("`{}`", k)).collect();
-            let placeholders: Vec<String> = (0..columns.len()).map(|_| "?".to_string()).collect();
-
-            let sql = format!(
-                "INSERT INTO `{}`.`{}` ({}) VALUES ({})",
-                dest_schema,
-                table,
-                columns.join(", "),
-                placeholders.join(", ")
-            );
-
-            let mut query = sqlx::query(&sql);
-            for (_, value) in data {
-                query = bind_value(query, value);
-            }
-
-            query.execute(executor).await?;
-        }
-        EventType::Update {
-            schema,
-            table,
-            old_data,
-            new_data,
-            replica_identity,
-            key_columns,
-            ..
-        } => {
-            let dest_schema = common::map_schema(schema_mappings, schema);
-            let set_clauses: Vec<String> =
-                new_data.keys().map(|k| format!("`{}` = ?", k)).collect();
-
-            let where_clause = build_where_clause_for_update(
-                old_data,
-                new_data,
-                replica_identity,
-                key_columns,
-                schema,
-                table,
-            )?;
-
-            let sql = format!(
-                "UPDATE `{}`.`{}` SET {} WHERE {}",
-                dest_schema,
-                table,
-                set_clauses.join(", "),
-                where_clause.sql
-            );
-
-            let mut query = sqlx::query(&sql);
-
-            for (_, value) in new_data {
-                query = bind_value(query, value);
-            }
-            for value in where_clause.bind_values {
-                query = bind_value(query, value);
-            }
-
-            query.execute(executor).await?;
-        }
-        EventType::Delete {
-            schema,
-            table,
-            old_data,
-            replica_identity,
-            key_columns,
-            ..
-        } => {
-            let dest_schema = common::map_schema(schema_mappings, schema);
-            let where_clause = build_where_clause_for_delete(
-                old_data,
-                replica_identity,
-                key_columns,
-                schema,
-                table,
-            )?;
-
-            let sql = format!(
-                "DELETE FROM `{}`.`{}` WHERE {}",
-                dest_schema, table, where_clause.sql
-            );
-
-            let mut query = sqlx::query(&sql);
-            for value in where_clause.bind_values {
-                query = bind_value(query, value);
-            }
-
-            query.execute(executor).await?;
-        }
-        EventType::Truncate(truncate_tables) => {
-            for table_full_name in truncate_tables {
-                let mut parts = table_full_name.splitn(2, '.');
-                let sql = match (parts.next(), parts.next()) {
-                    (Some(schema), Some(table)) => {
-                        let dest_schema = common::map_schema(schema_mappings, schema);
-                        format!("TRUNCATE TABLE `{}`.`{}`", dest_schema, table)
-                    }
-                    _ => format!("TRUNCATE TABLE `{}`", table_full_name),
-                };
-                sqlx::query(&sql).execute(executor).await?;
-                // For TRUNCATE with multiple tables, each needs its own executor
-                break;
-            }
-        }
-        _ => {
-            // Skip non-DML events (BEGIN, COMMIT, RELATION, etc.)
-            debug!("Skipping non-DML event: {:?}", event.event_type);
-        }
-    }
-
-    Ok(())
-}
-
 /// Execute a batch INSERT using multi-value syntax
 async fn execute_batch_insert<'c, E>(
     executor: E,
@@ -283,6 +150,157 @@ where
     Ok(())
 }
 
+/// Execute a batch UPDATE using multiple UPDATE statements
+///
+/// Executes multiple simple UPDATE statements:
+/// UPDATE table SET col1=?, col2=? WHERE key1=? AND key2=?;
+///
+/// This approach is simpler and more maintainable than CASE-based batch updates.
+/// While it executes multiple statements, they're all within the same transaction.
+async fn execute_batch_update<'c>(
+    db_tx: &mut sqlx::Transaction<'c, MySql>,
+    batch: &common::UpdateBatch<'_>,
+    schema_mappings: &HashMap<String, String>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let dest_schema = common::map_schema(schema_mappings, batch.schema.as_ref().unwrap());
+
+    // Build SET clause (same for all rows)
+    let set_clause: Vec<String> = batch
+        .update_columns
+        .iter()
+        .map(|col| format!("`{}` = ?", col))
+        .collect();
+
+    // Build WHERE clause (same structure for all rows)
+    let where_clause: Vec<String> = batch
+        .key_columns
+        .iter()
+        .map(|col| format!("`{}` = ?", col))
+        .collect();
+
+    let base_sql = format!(
+        "UPDATE `{}`.`{}` SET {} WHERE {}",
+        dest_schema,
+        batch.table,
+        set_clause.join(", "),
+        where_clause.join(" AND ")
+    );
+
+    let batch_start = std::time::Instant::now();
+
+    // Execute each UPDATE statement - they all run in the same transaction
+    for (key_values, update_values) in &batch.rows {
+        let mut query = sqlx::query(&base_sql);
+
+        // Bind SET values
+        for value in update_values {
+            query = bind_value(query, value);
+        }
+
+        // Bind WHERE key values
+        for key_value in key_values {
+            query = bind_value(query, key_value);
+        }
+
+        // Reborrow the connection from the transaction for each query
+        query.execute(&mut **db_tx).await?;
+    }
+
+    let batch_duration = batch_start.elapsed();
+
+    info!(
+        "MySQL Batch UPDATE: {} statements on `{}`.`{}` in {:?}",
+        batch.rows.len(),
+        dest_schema,
+        batch.table,
+        batch_duration
+    );
+
+    Ok(())
+}
+
+/// Execute a batch DELETE using WHERE IN clause
+///
+/// Generates SQL like:
+/// DELETE FROM table WHERE (key1, key2) IN ((?, ?), (?, ?), ...)
+/// Or for single key: DELETE FROM table WHERE key IN (?, ?, ?)
+async fn execute_batch_delete<'c, E>(
+    executor: E,
+    batch: &common::DeleteBatch<'_>,
+    schema_mappings: &HashMap<String, String>,
+) -> Result<()>
+where
+    E: sqlx::Executor<'c, Database = MySql>,
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let dest_schema = common::map_schema(schema_mappings, batch.schema.as_ref().unwrap());
+
+    // Build WHERE IN clause for key columns
+    let where_clause = if batch.key_columns.len() == 1 {
+        // Single key column: WHERE key IN (?, ?, ?)
+        let placeholders = (0..batch.rows.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("`{}` IN ({})", batch.key_columns[0], placeholders)
+    } else {
+        // Multiple key columns: WHERE (key1, key2) IN ((?, ?), (?, ?))
+        let key_cols = batch
+            .key_columns
+            .iter()
+            .map(|k| format!("`{}`", k))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row_placeholder = format!(
+            "({})",
+            (0..batch.key_columns.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let all_placeholders = (0..batch.rows.len())
+            .map(|_| row_placeholder.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("({}) IN ({})", key_cols, all_placeholders)
+    };
+
+    let sql = format!(
+        "DELETE FROM `{}`.`{}` WHERE {}",
+        dest_schema, batch.table, where_clause
+    );
+
+    let mut query = sqlx::query(&sql);
+
+    // Bind key values
+    for key_values in &batch.rows {
+        for key_value in key_values {
+            query = bind_value(query, key_value);
+        }
+    }
+
+    let batch_start = std::time::Instant::now();
+    query.execute(executor).await?;
+    let batch_duration = batch_start.elapsed();
+
+    info!(
+        "MySQL Batch DELETE: {} rows from `{}`.`{}` in {:?}",
+        batch.rows.len(),
+        dest_schema,
+        batch.table,
+        batch_duration
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // MySQL Destination Implementation
 // ============================================================================
@@ -293,6 +311,8 @@ pub struct MySQLDestination {
     schema_mappings: HashMap<String, String>,
     /// Active open transaction state (kept for compatibility with rollback_streaming_transaction)
     active_tx: Option<OpenTransaction>,
+    /// MySQL max_allowed_packet value in bytes (default 64MB, max 1GB), Used to calculate safe batch sizes dynamically
+    max_allowed_packet: u64,
 }
 
 impl MySQLDestination {
@@ -302,7 +322,178 @@ impl MySQLDestination {
             pool: None,
             schema_mappings: HashMap::new(),
             active_tx: None,
+            max_allowed_packet: 67108864, // Default 64MB
         }
+    }
+
+    /// Generic batch size calculator
+    ///
+    /// Calculates the maximum safe batch size based on:
+    /// - Estimated bytes per row (data values)
+    /// - Statement-specific overhead (SQL keywords, syntax)
+    /// - MySQL max_allowed_packet limit with 75% safety margin
+    /// - Min/max bounds for different operation types
+    fn calculate_generic_batch_size(
+        &self,
+        estimated_bytes_per_row: usize,
+        statement_overhead: usize,
+        fixed_overhead: usize,
+        min_rows: usize,
+        max_rows: usize,
+    ) -> usize {
+        let total_bytes_per_row = estimated_bytes_per_row + statement_overhead;
+        let safe_packet_size = (self.max_allowed_packet as f64 * 0.75) as u64;
+        let calculated_max =
+            (safe_packet_size as usize).saturating_sub(fixed_overhead) / total_bytes_per_row.max(1);
+        calculated_max.clamp(min_rows, max_rows)
+    }
+
+    /// Estimate the size of a JSON value in bytes when serialized
+    fn estimate_value_size(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Null => 4,    // "NULL"
+            serde_json::Value::Bool(_) => 5, // "true" or "false"
+            serde_json::Value::Number(n) => {
+                if n.is_i64() || n.is_u64() {
+                    20 // Max digits for 64-bit integer
+                } else {
+                    30 // Float with decimals
+                }
+            }
+            serde_json::Value::String(s) => s.len() + 2,
+            serde_json::Value::Array(arr) => {
+                arr.iter().map(Self::estimate_value_size).sum::<usize>() + arr.len() * 2
+            }
+            serde_json::Value::Object(obj) => {
+                obj.values().map(Self::estimate_value_size).sum::<usize>() + obj.len() * 4
+            }
+        }
+    }
+
+    /// Calculate maximum safe batch size for INSERT operations
+    fn calculate_batch_size(&self, num_columns: usize, batch: &common::InsertBatch<'_>) -> usize {
+        if num_columns == 0 {
+            return 1000; // Fallback default
+        }
+
+        // Estimate bytes per row based on actual data in batch if available
+        let estimated_bytes_per_row = if !batch.rows.is_empty() {
+            let sample_size = std::cmp::min(batch.rows.len(), 10);
+            let total_estimated: usize = batch
+                .rows
+                .iter()
+                .take(sample_size)
+                .map(|row| {
+                    row.iter()
+                        .map(|val| Self::estimate_value_size(val))
+                        .sum::<usize>()
+                })
+                .sum();
+            (total_estimated / sample_size).max(50)
+        } else {
+            num_columns * 100
+        };
+
+        // SQL overhead: column names, placeholders, parentheses
+        let column_overhead: usize = batch
+            .columns
+            .iter()
+            .map(|col| col.len() + 3) // `col` + ", "
+            .sum();
+        let row_overhead = num_columns * 3; // Placeholders "?, " per value
+        let statement_overhead = row_overhead + column_overhead / num_columns.max(1);
+        let fixed_overhead = 100; // INSERT INTO, VALUES, etc.
+
+        self.calculate_generic_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            10,
+            50000,
+        )
+    }
+
+    /// Calculate maximum safe batch size for UPDATE operations
+    ///
+    /// UPDATE executes multiple simple statements, so we estimate per-statement overhead
+    fn calculate_update_batch_size(&self, batch: &common::UpdateBatch<'_>) -> usize {
+        if batch.update_columns.is_empty() || batch.key_columns.is_empty() {
+            return 100; // Conservative fallback
+        }
+
+        // Estimate bytes per row for UPDATE
+        let estimated_bytes_per_row = if !batch.rows.is_empty() {
+            let sample_size = std::cmp::min(batch.rows.len(), 5);
+            let total_estimated: usize = batch
+                .rows
+                .iter()
+                .take(sample_size)
+                .map(|(key_vals, update_vals)| {
+                    let key_size: usize =
+                        key_vals.iter().map(|v| Self::estimate_value_size(v)).sum();
+                    let update_size: usize = update_vals
+                        .iter()
+                        .map(|v| Self::estimate_value_size(v))
+                        .sum();
+                    key_size + update_size
+                })
+                .sum();
+            (total_estimated / sample_size).max(100)
+        } else {
+            (batch.key_columns.len() + batch.update_columns.len()) * 100
+        };
+
+        // Per-statement overhead for simple UPDATE
+        let statement_overhead = batch.update_columns.len() * 20 + batch.key_columns.len() * 20;
+        let fixed_overhead = 200; // UPDATE, SET, WHERE keywords per statement
+
+        self.calculate_generic_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            10,
+            1000,
+        )
+    }
+
+    /// Calculate maximum safe batch size for DELETE operations
+    ///
+    /// DELETE uses WHERE IN which is more efficient than UPDATE
+    fn calculate_delete_batch_size(&self, batch: &common::DeleteBatch<'_>) -> usize {
+        if batch.key_columns.is_empty() {
+            return 100; // Conservative fallback
+        }
+
+        // Estimate bytes per row for DELETE with WHERE IN
+        let estimated_bytes_per_row = if !batch.rows.is_empty() {
+            let sample_size = std::cmp::min(batch.rows.len(), 10);
+            let total_estimated: usize = batch
+                .rows
+                .iter()
+                .take(sample_size)
+                .map(|key_vals| {
+                    key_vals
+                        .iter()
+                        .map(|v| Self::estimate_value_size(v))
+                        .sum::<usize>()
+                })
+                .sum();
+            (total_estimated / sample_size).max(50)
+        } else {
+            batch.key_columns.len() * 100
+        };
+
+        // WHERE IN clause overhead
+        let statement_overhead = batch.key_columns.len() * 20;
+        let fixed_overhead = 150; // DELETE FROM, WHERE keywords
+
+        self.calculate_generic_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            10,
+            5000,
+        )
     }
 
     /// Rollback the active streaming transaction (for graceful shutdown)
@@ -357,8 +548,10 @@ impl MySQLDestination {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to begin MySQL transaction: {}", e)))?;
 
-        // Process all events in this batch
-        let mut current_batch: Option<common::InsertBatch<'_>> = None;
+        // Process all events in this batch - maintain separate batches for INSERT, UPDATE, DELETE
+        let mut insert_batch: Option<common::InsertBatch<'_>> = None;
+        let mut update_batch: Option<common::UpdateBatch<'_>> = None;
+        let mut delete_batch: Option<common::DeleteBatch<'_>> = None;
 
         for event in &transaction.events {
             match &event.event_type {
@@ -368,25 +561,36 @@ impl MySQLDestination {
                     data,
                     ..
                 } => {
+                    // Flush other batches before processing INSERT
+                    if let Some(batch) = update_batch.take() {
+                        execute_batch_update(&mut db_tx, &batch, &self.schema_mappings).await?;
+                    }
+                    if let Some(batch) = delete_batch.take() {
+                        execute_batch_delete(&mut *db_tx, &batch, &self.schema_mappings).await?;
+                    }
+
                     let dest_schema = common::map_schema(&self.schema_mappings, schema);
                     let mut columns: Vec<String> = data.keys().cloned().collect();
                     columns.sort();
 
-                    let can_add = current_batch
+                    let can_add = insert_batch
                         .as_ref()
                         .map(|b| b.can_add(Some(&dest_schema), table, &columns))
                         .unwrap_or(false);
 
                     if can_add {
-                        let batch = current_batch.as_mut().unwrap();
+                        let batch = insert_batch.as_mut().unwrap();
                         batch.add_row(data);
 
-                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                        // Calculate dynamic batch size based on current batch characteristics
+                        let max_batch_size = self.calculate_batch_size(columns.len(), batch);
+
+                        if batch.len() >= max_batch_size {
                             execute_batch_insert(&mut *db_tx, batch, &self.schema_mappings).await?;
-                            current_batch = None;
+                            insert_batch = None;
                         }
                     } else {
-                        if let Some(batch) = current_batch.take() {
+                        if let Some(batch) = insert_batch.take() {
                             execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings)
                                 .await?;
                         }
@@ -397,13 +601,184 @@ impl MySQLDestination {
                             columns,
                         );
                         new_batch.add_row(data);
-                        current_batch = Some(new_batch);
+                        insert_batch = Some(new_batch);
+                    }
+                }
+                EventType::Update {
+                    schema,
+                    table,
+                    old_data,
+                    new_data,
+                    replica_identity,
+                    key_columns,
+                    ..
+                } => {
+                    // Flush other batches before processing UPDATE
+                    if let Some(batch) = insert_batch.take() {
+                        execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
+                    }
+                    if let Some(batch) = delete_batch.take() {
+                        execute_batch_delete(&mut *db_tx, &batch, &self.schema_mappings).await?;
+                    }
+
+                    let dest_schema = common::map_schema(&self.schema_mappings, schema);
+
+                    // Determine key columns for WHERE clause
+                    let where_conditions = build_where_clause_for_update(
+                        old_data,
+                        new_data,
+                        replica_identity,
+                        key_columns,
+                        schema,
+                        table,
+                    )?;
+
+                    let key_cols: Vec<String> = where_conditions
+                        .bind_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, _)| {
+                            where_conditions
+                                .sql
+                                .split(" AND ")
+                                .nth(idx)
+                                .and_then(|cond| cond.split(" = ").next())
+                                .map(|s| s.trim_matches('`').to_string())
+                        })
+                        .collect();
+
+                    // Collect key values
+                    let key_values: Vec<&serde_json::Value> = where_conditions.bind_values;
+
+                    // Get update columns (all columns in new_data)
+                    let mut update_columns: Vec<String> = new_data.keys().cloned().collect();
+                    update_columns.sort();
+
+                    let can_add = update_batch
+                        .as_ref()
+                        .map(|b| {
+                            b.can_add(
+                                Some(&dest_schema),
+                                table,
+                                &update_columns,
+                                &key_cols,
+                                replica_identity,
+                            )
+                        })
+                        .unwrap_or(false);
+
+                    if can_add {
+                        let batch = update_batch.as_mut().unwrap();
+                        batch.add_row(new_data, key_values);
+
+                        let max_batch_size = self.calculate_update_batch_size(batch);
+
+                        if batch.len() >= max_batch_size {
+                            execute_batch_update(&mut db_tx, batch, &self.schema_mappings).await?;
+                            update_batch = None;
+                        }
+                    } else {
+                        if let Some(batch) = update_batch.take() {
+                            execute_batch_update(&mut db_tx, &batch, &self.schema_mappings).await?;
+                        }
+
+                        let mut new_batch = common::UpdateBatch::new_with_schema(
+                            dest_schema,
+                            table.clone(),
+                            update_columns,
+                            key_cols,
+                            replica_identity.clone(),
+                        );
+                        new_batch.add_row(new_data, key_values);
+                        update_batch = Some(new_batch);
+                    }
+                }
+                EventType::Delete {
+                    schema,
+                    table,
+                    old_data,
+                    replica_identity,
+                    key_columns,
+                    ..
+                } => {
+                    // Flush other batches before processing DELETE
+                    if let Some(batch) = insert_batch.take() {
+                        execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
+                    }
+                    if let Some(batch) = update_batch.take() {
+                        execute_batch_update(&mut db_tx, &batch, &self.schema_mappings).await?;
+                    }
+
+                    let dest_schema = common::map_schema(&self.schema_mappings, schema);
+
+                    // Determine key columns for WHERE clause
+                    let where_conditions = build_where_clause_for_delete(
+                        old_data,
+                        replica_identity,
+                        key_columns,
+                        schema,
+                        table,
+                    )?;
+
+                    let key_cols: Vec<String> = where_conditions
+                        .bind_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, _)| {
+                            where_conditions
+                                .sql
+                                .split(" AND ")
+                                .nth(idx)
+                                .and_then(|cond| cond.split(" = ").next())
+                                .map(|s| s.trim_matches('`').to_string())
+                        })
+                        .collect();
+
+                    let key_values: Vec<&serde_json::Value> = where_conditions.bind_values;
+
+                    let can_add = delete_batch
+                        .as_ref()
+                        .map(|b| b.can_add(Some(&dest_schema), table, &key_cols, replica_identity))
+                        .unwrap_or(false);
+
+                    if can_add {
+                        let batch = delete_batch.as_mut().unwrap();
+                        batch.add_row(key_values);
+
+                        let max_batch_size = self.calculate_delete_batch_size(batch);
+
+                        if batch.len() >= max_batch_size {
+                            execute_batch_delete(&mut *db_tx, batch, &self.schema_mappings).await?;
+                            delete_batch = None;
+                        }
+                    } else {
+                        if let Some(batch) = delete_batch.take() {
+                            execute_batch_delete(&mut *db_tx, &batch, &self.schema_mappings)
+                                .await?;
+                        }
+
+                        let mut new_batch = common::DeleteBatch::new_with_schema(
+                            dest_schema,
+                            table.clone(),
+                            key_cols,
+                            replica_identity.clone(),
+                        );
+                        new_batch.add_row(key_values);
+                        delete_batch = Some(new_batch);
                     }
                 }
                 EventType::Truncate(tables) => {
-                    if let Some(batch) = current_batch.take() {
+                    // Flush all pending batches before TRUNCATE
+                    if let Some(batch) = insert_batch.take() {
                         execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
                     }
+                    if let Some(batch) = update_batch.take() {
+                        execute_batch_update(&mut db_tx, &batch, &self.schema_mappings).await?;
+                    }
+                    if let Some(batch) = delete_batch.take() {
+                        execute_batch_delete(&mut *db_tx, &batch, &self.schema_mappings).await?;
+                    }
+
                     for table_full_name in tables {
                         let mut parts = table_full_name.splitn(2, '.');
                         let sql = match (parts.next(), parts.next()) {
@@ -417,17 +792,21 @@ impl MySQLDestination {
                     }
                 }
                 _ => {
-                    if let Some(batch) = current_batch.take() {
-                        execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
-                    }
-                    process_single_event(&mut *db_tx, event, &self.schema_mappings).await?;
+                    // For other event types (BEGIN, COMMIT, RELATION, etc.), skip
+                    debug!("Skipping non-DML event: {:?}", event.event_type);
                 }
             }
         }
 
-        // Flush any remaining batch
-        if let Some(batch) = current_batch.take() {
+        // Flush any remaining batches
+        if let Some(batch) = insert_batch.take() {
             execute_batch_insert(&mut *db_tx, &batch, &self.schema_mappings).await?;
+        }
+        if let Some(batch) = update_batch.take() {
+            execute_batch_update(&mut db_tx, &batch, &self.schema_mappings).await?;
+        }
+        if let Some(batch) = delete_batch.take() {
+            execute_batch_delete(&mut *db_tx, &batch, &self.schema_mappings).await?;
         }
 
         // Commit the transaction
@@ -457,6 +836,22 @@ impl Default for MySQLDestination {
 impl DestinationHandler for MySQLDestination {
     async fn connect(&mut self, connection_string: &str) -> Result<()> {
         let pool = MySqlPool::connect(connection_string).await?;
+
+        // Query max_allowed_packet to calculate optimal batch sizes
+        let row: (String, String) = sqlx::query_as("SHOW VARIABLES LIKE 'max_allowed_packet'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to query max_allowed_packet: {}", e)))?;
+
+        // Parse the string value to u64
+        self.max_allowed_packet = row.1.parse::<u64>().unwrap_or(67108864); // Default to 64MB if parse fails
+
+        info!(
+            "MySQL max_allowed_packet: {} bytes ({:.2} MB)",
+            self.max_allowed_packet,
+            self.max_allowed_packet as f64 / 1_048_576.0
+        );
+
         self.pool = Some(pool);
         Ok(())
     }

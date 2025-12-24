@@ -88,6 +88,7 @@ impl DestinationFactory {
             #[cfg(feature = "sqlite")]
             DestinationType::SQLite => Ok(Box::new(SQLiteDestination::new())),
 
+            #[allow(unreachable_patterns)]
             _ => Err(CdcError::unsupported(format!(
                 "Destination type {:?} is not supported or not enabled",
                 destination_type

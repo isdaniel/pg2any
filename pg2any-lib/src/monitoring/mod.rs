@@ -10,6 +10,10 @@
 // Metrics abstraction layer - always available
 pub mod metrics_abstraction;
 
+// jemalloc memory statistics and profiling - available when metrics feature is enabled
+#[cfg(feature = "metrics")]
+pub mod jemalloc_stats;
+
 // Real metrics implementation - only available when metrics feature is enabled
 #[cfg(feature = "metrics")]
 pub mod metrics;

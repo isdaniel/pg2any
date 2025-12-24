@@ -489,9 +489,4 @@ impl Transaction {
     pub fn set_final_batch(&mut self, is_final: bool) {
         self.is_final_batch = is_final;
     }
-
-    /// Take all events from this transaction, leaving it empty
-    pub fn take_events(&mut self) -> Vec<ChangeEvent> {
-        std::mem::take(&mut self.events)
-    }
 }

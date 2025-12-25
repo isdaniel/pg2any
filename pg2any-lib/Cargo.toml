@@ -13,6 +13,8 @@ keywords = ["postgresql", "cdc", "replication", "database", "streaming"]
 categories = ["database", "asynchronous"]
 
 [dependencies]
+pg_walstream = { workspace = true }
+# Core replication library with libpq connection support
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -22,7 +24,6 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-libpq-sys = { workspace = true }
 lazy_static = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

@@ -65,14 +65,9 @@ pub mod error;
 pub mod types;
 
 // Low-level PostgreSQL replication using libpq-sys
-pub mod buffer;
 pub mod pg_replication;
-pub mod retry;
 
-// Unified replication protocol implementation
-pub mod logical_stream;
 pub mod lsn_tracker;
-pub mod replication_protocol;
 
 // High-level client interface
 pub mod client;
@@ -90,11 +85,55 @@ pub use config::{Config, ConfigBuilder};
 pub use env::load_config_from_env;
 pub use error::CdcError;
 pub use lsn_tracker::{create_lsn_tracker_with_load_async, LsnTracker};
-
-/// Result type for CDC operations
+pub use pg_replication::{PgReplicationConnection, ReplicationConnectionRetry, RetryConfig};
 pub type CdcResult<T> = Result<T, CdcError>;
 
 pub mod destinations;
+
+// Re-export core types from pg_walstream for convenience
+pub use pg_walstream::{
+    // Type aliases and utilities
+    format_lsn,
+    format_postgres_timestamp,
+    // Protocol types
+    message_types,
+    parse_lsn,
+    postgres_timestamp_to_chrono,
+    system_time_to_postgres_timestamp,
+    // Buffer types
+    BufferReader,
+    BufferWriter,
+    // Cancellation token
+    CancellationToken,
+    ColumnData,
+    ColumnInfo,
+    KeepaliveMessage,
+    LogicalReplicationMessage,
+    LogicalReplicationParser,
+    // Stream types
+    LogicalReplicationStream,
+    // PostgreSQL-specific types
+    Lsn,
+    MessageType,
+    Oid,
+    RelationInfo,
+    ReplicaIdentity,
+    ReplicationState,
+    ReplicationStreamConfig,
+    StreamingReplicationMessage,
+    TimestampTz,
+    TupleData,
+    XLogRecPtr,
+    Xid,
+    INVALID_XLOG_REC_PTR,
+    PG_EPOCH_OFFSET_SECS,
+};
+
+// Re-export PgResult from pg_replication (pg2any-lib's version with libpq)
+pub use pg_replication::PgResult;
+
+// Re-export SharedLsnFeedback from lsn_tracker (pg2any-lib's version with log_status method)
+pub use lsn_tracker::SharedLsnFeedback;
 
 // Re-export implementations
 #[cfg(feature = "mysql")]
@@ -107,17 +146,13 @@ pub use crate::destinations::SqlServerDestination;
 pub use crate::destinations::SQLiteDestination;
 
 pub use crate::destinations::{DestinationFactory, DestinationHandler};
-pub use crate::lsn_tracker::SharedLsnFeedback;
-pub use crate::replication_protocol::{
-    ColumnData, ColumnInfo, LogicalReplicationMessage, LogicalReplicationParser, RelationInfo,
-    ReplicationState, TupleData,
-};
 pub use crate::types::{DestinationType, Transaction};
 
 // Conditionally export metrics server functionality
 #[cfg(feature = "metrics")]
 pub use crate::monitoring::{
-    create_metrics_server, create_metrics_server_with_config, MetricsServer, MetricsServerConfig,
+    create_metrics_server, create_metrics_server_with_config, init_real_metrics, MetricsServer,
+    MetricsServerConfig,
 };
 
 // Always export metrics abstraction layer
@@ -125,7 +160,3 @@ pub use crate::monitoring::{
     gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
     ProcessingTimerTrait,
 };
-
-// Conditionally export real metrics functionality when feature is enabled
-#[cfg(feature = "metrics")]
-pub use crate::monitoring::init_real_metrics;

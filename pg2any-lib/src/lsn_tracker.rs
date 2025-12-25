@@ -2,8 +2,8 @@
 //!
 //! This module provides two types of LSN tracking:
 //!
-//! 1. **SharedLsnFeedback**: Thread-safe tracking of LSN positions for replication feedback
-//!    to PostgreSQL (write_lsn, flush_lsn, replay_lsn)
+//! 1. **SharedLsnFeedback**: Re-exported from `pg_walstream` - Thread-safe tracking
+//!    of LSN positions for replication feedback to PostgreSQL (write_lsn, flush_lsn, replay_lsn)
 //!
 //! 2. **LsnTracker**: Thread-safe tracker for the last committed LSN with file persistence
 //!    for graceful shutdown and restart recovery
@@ -25,7 +25,6 @@
 //! - Tracks a "dirty" flag to skip unnecessary writes
 //! - Ensures graceful shutdown with final persistence
 
-use crate::pg_replication::XLogRecPtr;
 use crate::types::Lsn;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,150 +34,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Thread-safe tracker for LSN positions used in replication feedback
-///
-/// This tracker is designed to be shared between the producer (which sends feedback
-/// to PostgreSQL) and the consumer (which commits transactions to the destination).
-#[derive(Debug)]
-pub struct SharedLsnFeedback {
-    /// Last flushed LSN - data written to destination before commit
-    flushed_lsn: AtomicU64,
-    /// Last applied/replayed LSN - data committed to destination
-    applied_lsn: AtomicU64,
-}
-
-impl SharedLsnFeedback {
-    /// Create a new shared LSN feedback tracker
-    pub fn new() -> Self {
-        Self {
-            flushed_lsn: AtomicU64::new(0),
-            applied_lsn: AtomicU64::new(0),
-        }
-    }
-
-    /// Create a new shared LSN feedback tracker wrapped in Arc for sharing
-    pub fn new_shared() -> Arc<Self> {
-        Arc::new(Self::new())
-    }
-
-    /// Update the flushed LSN if the new value is greater
-    ///
-    /// This should be called when data has been written/flushed to the destination
-    /// database, but not yet committed (e.g., during batch writes).
-    #[inline(always)]
-    pub fn update_flushed_lsn(&self, lsn: XLogRecPtr) {
-        if lsn == 0 {
-            return;
-        }
-
-        loop {
-            let current = self.flushed_lsn.load(Ordering::Acquire);
-            if lsn <= current {
-                return;
-            }
-            match self.flushed_lsn.compare_exchange_weak(
-                current,
-                lsn,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    debug!(
-                        "SharedLsnFeedback: Updated flushed LSN from {} to {}",
-                        current, lsn
-                    );
-                    return;
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
-    /// Update the applied/replayed LSN if the new value is greater
-    ///
-    /// This should be called when a transaction has been successfully committed
-    /// to the destination database. This is the most important LSN as PostgreSQL
-    /// uses it to determine which WAL can be recycled.
-    #[inline(always)]
-    pub fn update_applied_lsn(&self, lsn: XLogRecPtr) {
-        if lsn == 0 {
-            return;
-        }
-        loop {
-            let current = self.applied_lsn.load(Ordering::Acquire);
-            if lsn <= current {
-                break;
-            }
-            match self.applied_lsn.compare_exchange_weak(
-                current,
-                lsn,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    debug!(
-                        "SharedLsnFeedback: Updated applied LSN from {} to {}",
-                        current, lsn
-                    );
-                    break;
-                }
-                Err(_) => continue,
-            }
-        }
-
-        // Applied data is implicitly flushed, update flushed as well
-        self.update_flushed_lsn(lsn);
-    }
-
-    /// Get the current flushed LSN
-    #[inline(always)]
-    pub fn get_flushed_lsn(&self) -> XLogRecPtr {
-        self.flushed_lsn.load(Ordering::Acquire)
-    }
-
-    /// Get the current applied LSN
-    #[inline(always)]
-    pub fn get_applied_lsn(&self) -> XLogRecPtr {
-        self.applied_lsn.load(Ordering::Acquire)
-    }
-
-    /// Get both LSN values atomically for feedback
-    ///
-    /// Returns (flushed_lsn, applied_lsn)
-    #[inline(always)]
-    pub fn get_feedback_lsn(&self) -> (XLogRecPtr, XLogRecPtr) {
-        let flushed = self.flushed_lsn.load(Ordering::Acquire);
-        let applied = self.applied_lsn.load(Ordering::Acquire);
-        (flushed, applied)
-    }
-
-    /// Log current LSN state (for debugging)
-    pub fn log_state(&self, prefix: &str) {
-        let flushed = self.get_flushed_lsn();
-        let applied = self.get_applied_lsn();
-        info!(
-            "{}: flushed_lsn={}, applied_lsn={}",
-            prefix,
-            crate::pg_replication::format_lsn(flushed),
-            crate::pg_replication::format_lsn(applied)
-        );
-    }
-}
-
-impl Default for SharedLsnFeedback {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clone for SharedLsnFeedback {
-    fn clone(&self) -> Self {
-        Self {
-            flushed_lsn: AtomicU64::new(self.flushed_lsn.load(Ordering::Acquire)),
-            applied_lsn: AtomicU64::new(self.applied_lsn.load(Ordering::Acquire)),
-        }
-    }
-}
+// Re-export SharedLsnFeedback from pg_walstream to avoid duplication
+pub use pg_walstream::SharedLsnFeedback;
 
 /// Thread-safe tracker for the last committed LSN with file persistence
 ///

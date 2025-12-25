@@ -3,6 +3,10 @@ use thiserror::Error;
 /// Comprehensive error types for CDC operations
 #[derive(Error, Debug)]
 pub enum CdcError {
+    /// Replication error from pg_walstream library
+    #[error("Replication error: {0}")]
+    Replication(#[from] pg_walstream::ReplicationError),
+
     /// SQL Server connection errors  
     #[cfg(feature = "sqlserver")]
     #[error("SQL Server connection error: {0}")]

@@ -2,9 +2,9 @@
 //!
 //! These tests verify the basic functionality of the libpq-sys integration
 
-use pg2any_lib::buffer::{BufferReader, BufferWriter};
 use pg2any_lib::pg_replication::{format_lsn, parse_lsn};
 use pg2any_lib::{ColumnData, ColumnInfo, TupleData};
+use pg_walstream::buffer::{BufferReader, BufferWriter};
 
 #[test]
 fn test_buffer_operations() {
@@ -75,8 +75,8 @@ fn test_replication_data_structures() {
 
 #[test]
 fn test_message_parsing() {
-    use pg2any_lib::replication_protocol::message_types;
     use pg2any_lib::LogicalReplicationParser;
+    use pg_walstream::protocol::message_types;
 
     let mut parser = LogicalReplicationParser::with_protocol_version(1);
 

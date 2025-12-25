@@ -1432,7 +1432,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lazy_static",
- "libpq-sys",
+ "pg_walstream",
  "prometheus",
  "serde",
  "serde_json",
@@ -1440,6 +1440,23 @@ dependencies = [
  "thiserror 2.0.17",
  "tiberius",
  "tikv-jemalloc-ctl",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "pg_walstream"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cdb9b0d779e8def3e556baf0c43b0e73a20ea074fa2e19ac9c331cd7ef360fb"
+dependencies = [
+ "bytes",
+ "chrono",
+ "libpq-sys",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-util",
  "tracing",

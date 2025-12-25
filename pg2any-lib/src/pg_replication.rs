@@ -1,563 +1,22 @@
-//! Low-level PostgreSQL connection using libpq-sys
+//! High-level PostgreSQL replication wrappers
 //!
-//! This module provides safe wrappers around libpq functions for logical replication.
+//! This module provides application-specific wrappers around the low-level
+//! pg_walstream connection layer, integrating with pg2any's error
+//! handling, configuration, and CDC event types.
 
-use crate::buffer::BufferWriter;
 use crate::config::Config;
-use crate::error::{CdcError, Result};
-use crate::logical_stream::{LogicalReplicationStream, ReplicationStreamConfig};
+use crate::error::Result;
 use crate::types::{ChangeEvent, Lsn};
-use chrono::{DateTime, Utc};
-use libpq_sys::*;
-use std::ffi::{CStr, CString};
-use std::os::unix::io::RawFd;
-use std::ptr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::unix::AsyncFd;
+use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
-// PostgreSQL constants
-const PG_EPOCH_OFFSET_SECS: i64 = 946_684_800; // Seconds from 1970-01-01 to 2000-01-01
-pub const INVALID_XLOG_REC_PTR: u64 = 0;
-
-// Type aliases matching PostgreSQL types
-pub type XLogRecPtr = u64;
-pub type Xid = u32;
-pub type Oid = u32;
-pub type TimestampTz = i64;
-
-/// Safe wrapper around PostgreSQL connection for replication
-pub struct PgReplicationConnection {
-    conn: *mut PGconn,
-    is_replication_conn: bool,
-    async_fd: Option<AsyncFd<RawFd>>,
-}
-
-impl PgReplicationConnection {
-    /// Create a new PostgreSQL connection for logical replication
-    pub fn connect(conninfo: &str) -> Result<Self> {
-        // Ensure libpq is properly initialized
-        unsafe {
-            let library_version = PQlibVersion();
-            debug!("Using libpq version: {}", library_version);
-        }
-
-        let c_conninfo = CString::new(conninfo)
-            .map_err(|e| CdcError::connection(format!("Invalid connection string: {}", e)))?;
-
-        let conn = unsafe { PQconnectdb(c_conninfo.as_ptr()) };
-
-        if conn.is_null() {
-            return Err(CdcError::transient_connection(
-                "Failed to allocate PostgreSQL connection object".to_string(),
-            ));
-        }
-
-        let status = unsafe { PQstatus(conn) };
-        if status != ConnStatusType::CONNECTION_OK {
-            let error_msg = unsafe {
-                let error_ptr = PQerrorMessage(conn);
-                if error_ptr.is_null() {
-                    "Unknown connection error".to_string()
-                } else {
-                    CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-                }
-            };
-            unsafe { PQfinish(conn) };
-
-            // Categorize the connection error
-            let error_msg_lower = error_msg.to_lowercase();
-            if error_msg_lower.contains("authentication failed")
-                || error_msg_lower.contains("password authentication failed")
-                || error_msg_lower.contains("role does not exist")
-            {
-                return Err(CdcError::authentication(format!(
-                    "PostgreSQL authentication failed: {}",
-                    error_msg
-                )));
-            } else if error_msg_lower.contains("database does not exist")
-                || error_msg_lower.contains("invalid connection string")
-                || error_msg_lower.contains("unsupported")
-            {
-                return Err(CdcError::permanent_connection(format!(
-                    "PostgreSQL connection failed (permanent): {}",
-                    error_msg
-                )));
-            } else {
-                return Err(CdcError::transient_connection(format!(
-                    "PostgreSQL connection failed (transient): {}",
-                    error_msg
-                )));
-            }
-        }
-
-        // Check server version - logical replication requires PostgreSQL 14+
-        let server_version = unsafe { PQserverVersion(conn) };
-        if server_version < 140000 {
-            unsafe { PQfinish(conn) };
-            return Err(CdcError::permanent_connection(format!(
-                "PostgreSQL version {} is not supported. Logical replication requires PostgreSQL 14+",
-                server_version
-            )));
-        }
-
-        debug!("Connected to PostgreSQL server version: {}", server_version);
-
-        Ok(Self {
-            conn,
-            is_replication_conn: false,
-            async_fd: None,
-        })
-    }
-
-    /// Execute a replication command (like IDENTIFY_SYSTEM)
-    pub fn exec(&self, query: &str) -> Result<PgResult> {
-        let c_query = CString::new(query)
-            .map_err(|e| CdcError::protocol(format!("Invalid query string: {}", e)))?;
-
-        let result = unsafe { PQexec(self.conn, c_query.as_ptr()) };
-
-        if result.is_null() {
-            return Err(CdcError::protocol(
-                "Query execution failed - null result".to_string(),
-            ));
-        }
-
-        let pg_result = PgResult::new(result);
-        // Check for errors
-        let status = pg_result.status();
-        info!(
-            "query : {} pg_result.status() : {:?}",
-            query,
-            pg_result.status()
-        );
-        if !matches!(
-            status,
-            ExecStatusType::PGRES_TUPLES_OK
-                | ExecStatusType::PGRES_COMMAND_OK
-                | ExecStatusType::PGRES_COPY_BOTH
-        ) {
-            let error_msg = pg_result
-                .error_message()
-                .unwrap_or_else(|| "Unknown error".to_string());
-            return Err(CdcError::protocol(format!(
-                "Query execution failed: {}",
-                error_msg
-            )));
-        }
-
-        Ok(pg_result)
-    }
-
-    /// Send IDENTIFY_SYSTEM command
-    pub fn identify_system(&self) -> Result<PgResult> {
-        debug!("Sending IDENTIFY_SYSTEM command");
-        let result = self.exec("IDENTIFY_SYSTEM")?;
-
-        if result.ntuples() > 0 {
-            if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
-                result.get_value(0, 0),
-                result.get_value(0, 1),
-                result.get_value(0, 2),
-            ) {
-                debug!(
-                    "System identification: systemid={}, timeline={}, xlogpos={}",
-                    systemid, timeline, xlogpos
-                );
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Create a replication slot
-    pub fn create_replication_slot(
-        &self,
-        slot_name: &str,
-        output_plugin: &str,
-    ) -> Result<PgResult> {
-        let create_slot_sql = format!(
-            "CREATE_REPLICATION_SLOT \"{}\" LOGICAL {} NOEXPORT_SNAPSHOT;",
-            slot_name, output_plugin
-        );
-
-        let result = self.exec(&create_slot_sql)?;
-
-        if result.ntuples() > 0 {
-            if let Some(slot_name_result) = result.get_value(0, 0) {
-                debug!("Replication slot created: {}", slot_name_result);
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Start logical replication
-    pub fn start_replication(
-        &mut self,
-        slot_name: &str,
-        start_lsn: XLogRecPtr,
-        options: &[(&str, &str)],
-    ) -> Result<()> {
-        let mut options_str = String::new();
-        for (i, (key, value)) in options.iter().enumerate() {
-            if i > 0 {
-                options_str.push_str(", ");
-            }
-            options_str.push_str(&format!("\"{}\" '{}'", key, value));
-        }
-
-        let start_replication_sql = if start_lsn == INVALID_XLOG_REC_PTR {
-            format!(
-                "START_REPLICATION SLOT \"{}\" LOGICAL 0/0 ({})",
-                slot_name, options_str
-            )
-        } else {
-            format!(
-                "START_REPLICATION SLOT \"{}\" LOGICAL {} ({})",
-                slot_name,
-                format_lsn(start_lsn),
-                options_str
-            )
-        };
-
-        debug!("Starting replication: {}", start_replication_sql);
-        let _result = self.exec(&start_replication_sql)?;
-
-        self.is_replication_conn = true;
-
-        // Initialize async socket for non-blocking operations
-        self.initialize_async_socket()?;
-
-        debug!("Replication started successfully");
-        Ok(())
-    }
-
-    /// Send feedback to the server (standby status update)
-    pub fn send_standby_status_update(
-        &self,
-        received_lsn: XLogRecPtr,
-        flushed_lsn: XLogRecPtr,
-        applied_lsn: XLogRecPtr,
-        reply_requested: bool,
-    ) -> Result<()> {
-        if !self.is_replication_conn {
-            return Err(CdcError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
-
-        let timestamp = system_time_to_postgres_timestamp(SystemTime::now());
-
-        // Build the standby status update message using BufferWriter
-        let mut buffer = BufferWriter::with_capacity(34); // 1 + 8 + 8 + 8 + 8 + 1
-
-        buffer.write_u8(b'r')?; // Message type
-        buffer.write_u64(received_lsn)?;
-        buffer.write_u64(flushed_lsn)?;
-        buffer.write_u64(applied_lsn)?;
-        buffer.write_i64(timestamp)?;
-        buffer.write_u8(if reply_requested { 1 } else { 0 })?;
-
-        let reply_data = buffer.freeze();
-
-        let result = unsafe {
-            PQputCopyData(
-                self.conn,
-                reply_data.as_ptr() as *const std::os::raw::c_char,
-                reply_data.len() as i32,
-            )
-        };
-
-        if result != 1 {
-            let error_msg = self.last_error_message();
-            return Err(CdcError::protocol(format!(
-                "Failed to send standby status update: {}",
-                error_msg
-            )));
-        }
-
-        // Flush the connection
-        let flush_result = unsafe { PQflush(self.conn) };
-        if flush_result != 0 {
-            let error_msg = self.last_error_message();
-            return Err(CdcError::protocol(format!(
-                "Failed to flush connection: {}",
-                error_msg
-            )));
-        }
-
-        info!(
-            "Sent standby status update: received={}, flushed={}, applied={}, reply_requested={}",
-            format_lsn(received_lsn),
-            format_lsn(flushed_lsn),
-            format_lsn(applied_lsn),
-            reply_requested
-        );
-
-        Ok(())
-    }
-
-    /// Initialize async socket for non-blocking operations
-    fn initialize_async_socket(&mut self) -> Result<()> {
-        let sock: RawFd = unsafe { PQsocket(self.conn) };
-        if sock < 0 {
-            return Err(CdcError::protocol("Invalid PostgreSQL socket".to_string()));
-        }
-
-        let async_fd = AsyncFd::new(sock)
-            .map_err(|e| CdcError::protocol(format!("Failed to create AsyncFd: {}", e)))?;
-
-        self.async_fd = Some(async_fd);
-        Ok(())
-    }
-
-    /// Get copy data from replication stream (async non-blocking version)
-    ///
-    /// # Arguments
-    /// * `cancellation_token` - Optional cancellation token to abort the operation
-    ///
-    /// # Returns
-    /// * `Ok(Some(data))` - Successfully received data
-    /// * `Ok(None)` - No data available currently
-    /// * `Err(CdcError::Cancelled(_))` - Operation was cancelled
-    /// * `Err(_)` - Other errors occurred
-    pub async fn get_copy_data_async(
-        &mut self,
-        cancellation_token: &CancellationToken,
-    ) -> Result<Option<Vec<u8>>> {
-        if !self.is_replication_conn {
-            return Err(CdcError::protocol(
-                "Connection is not in replication mode".to_string(),
-            ));
-        }
-
-        let async_fd = self
-            .async_fd
-            .as_ref()
-            .ok_or_else(|| CdcError::protocol("AsyncFd not initialized".to_string()))?;
-
-        // First, try to read any buffered data without blocking
-        if let Some(data) = self.try_read_buffered_data()? {
-            return Ok(Some(data));
-        }
-
-        // If no buffered data, wait for either socket readability or cancellation
-        tokio::select! {
-            biased;
-
-            _ = cancellation_token.cancelled() => {
-                info!("Cancellation detected in get_copy_data_async");
-                if let Some(data) = self.try_read_buffered_data()? {
-                    info!("Found buffered data after cancellation, returning it");
-                    return Ok(Some(data));
-                }
-                return Ok(None);
-            }
-
-            // Wait for socket to become readable
-            guard_result = async_fd.readable() => {
-                let mut guard = guard_result.map_err(|e| {
-                    CdcError::protocol(format!("Failed to wait for socket readability: {}", e))
-                })?;
-
-                // Socket is readable - consume input from the OS socket. This is the ONLY place we call PQconsumeInput, avoiding busy-loops
-                let consumed = unsafe { PQconsumeInput(self.conn) };
-                if consumed == 0 {
-                    return Err(CdcError::protocol(self.last_error_message()));
-                }
-
-                // Check if we have complete data now
-                if let Some(data) = self.try_read_buffered_data()? {
-                    return Ok(Some(data));
-                }
-
-                guard.clear_ready();
-                Ok(None)
-            }
-        }
-    }
-
-    /// Try to read copy data from libpq's internal buffer without consuming OS socket
-    /// This should only be called after PQconsumeInput has been called
-    fn try_read_buffered_data(&self) -> Result<Option<Vec<u8>>> {
-        // Check if data is ready without blocking. PQisBusy returns 0 if a complete message is available
-        if unsafe { PQisBusy(self.conn) } != 0 {
-            return Ok(None); // Buffer not complete, wait for next socket readable event
-        }
-
-        let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
-        let result = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
-
-        match result {
-            len if len > 0 => {
-                if buffer.is_null() {
-                    return Err(CdcError::buffer(
-                        "Received null buffer from PQgetCopyData".to_string(),
-                    ));
-                }
-
-                let data = unsafe {
-                    std::slice::from_raw_parts(buffer as *const u8, len as usize).to_vec()
-                };
-
-                unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
-                Ok(Some(data))
-            }
-            0 | -2 => Ok(None), // No complete data available, continue waiting
-            -1 => {
-                // COPY finished or channel closed
-                debug!("COPY finished or channel closed");
-                Ok(None)
-            }
-            _ => Err(CdcError::protocol(format!(
-                "Unexpected PQgetCopyData result: {}",
-                result
-            ))),
-        }
-    }
-
-    /// Get the last error message from the connection
-    fn last_error_message(&self) -> String {
-        unsafe {
-            let error_ptr = PQerrorMessage(self.conn);
-            if error_ptr.is_null() {
-                "Unknown error".to_string()
-            } else {
-                CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
-            }
-        }
-    }
-
-    /// Check if the connection is still alive
-    pub fn is_alive(&self) -> bool {
-        if self.conn.is_null() {
-            return false;
-        }
-
-        unsafe { PQstatus(self.conn) == ConnStatusType::CONNECTION_OK }
-    }
-
-    /// Get the server version
-    pub fn server_version(&self) -> i32 {
-        unsafe { PQserverVersion(self.conn) }
-    }
-
-    fn close_replication_connection(&mut self) {
-        if !self.conn.is_null() {
-            info!("Closing PostgreSQL replication connection");
-
-            // If we're in replication mode, try to end the copy gracefully
-            if self.is_replication_conn {
-                debug!("Ending COPY mode before closing connection");
-                unsafe {
-                    // Try to end the copy operation gracefully, This is important to properly close the replication stream
-                    let result = PQputCopyEnd(self.conn, ptr::null());
-                    if result != 1 {
-                        warn!(
-                            "Failed to end COPY mode gracefully: {}",
-                            self.last_error_message()
-                        );
-                    } else {
-                        debug!("COPY mode ended gracefully");
-                    }
-                }
-                self.is_replication_conn = false;
-            }
-
-            // Close the connection
-            unsafe {
-                PQfinish(self.conn);
-            }
-
-            // Clear the connection pointer and reset state
-            self.conn = std::ptr::null_mut();
-            self.async_fd = None;
-
-            info!("PostgreSQL replication connection closed and cleaned up");
-        } else {
-            info!("Connection already closed or was never initialized");
-        }
-    }
-}
-
-impl Drop for PgReplicationConnection {
-    fn drop(&mut self) {
-        self.close_replication_connection();
-    }
-}
-
-// Make the connection Send by ensuring exclusive access
-unsafe impl Send for PgReplicationConnection {}
-
-/// Safe wrapper for PostgreSQL result
-pub struct PgResult {
-    result: *mut PGresult,
-}
-
-impl PgResult {
-    fn new(result: *mut PGresult) -> Self {
-        Self { result }
-    }
-
-    /// Get the execution status
-    pub fn status(&self) -> ExecStatusType {
-        unsafe { PQresultStatus(self.result) }
-    }
-
-    /// Check if the result is OK
-    pub fn is_ok(&self) -> bool {
-        matches!(
-            self.status(),
-            ExecStatusType::PGRES_TUPLES_OK | ExecStatusType::PGRES_COMMAND_OK
-        )
-    }
-
-    /// Get number of tuples (rows)
-    pub fn ntuples(&self) -> i32 {
-        unsafe { PQntuples(self.result) }
-    }
-
-    /// Get number of fields (columns)
-    pub fn nfields(&self) -> i32 {
-        unsafe { PQnfields(self.result) }
-    }
-
-    /// Get a field value as string
-    pub fn get_value(&self, row: i32, col: i32) -> Option<String> {
-        if row >= self.ntuples() || col >= self.nfields() {
-            return None;
-        }
-
-        let value_ptr = unsafe { PQgetvalue(self.result, row, col) };
-        if value_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(CStr::from_ptr(value_ptr).to_string_lossy().into_owned()) }
-        }
-    }
-
-    /// Get error message if any
-    pub fn error_message(&self) -> Option<String> {
-        let error_ptr = unsafe { PQresultErrorMessage(self.result) };
-        if error_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(CStr::from_ptr(error_ptr).to_string_lossy().into_owned()) }
-        }
-    }
-}
-
-impl Drop for PgResult {
-    fn drop(&mut self) {
-        if !self.result.is_null() {
-            unsafe {
-                PQclear(self.result);
-            }
-        }
-    }
-}
+use tracing::{debug, info};
+
+// Re-export connection types from pg_walstream
+pub use pg_walstream::{
+    format_lsn, format_postgres_timestamp, parse_lsn, postgres_timestamp_to_chrono,
+    system_time_to_postgres_timestamp, Oid, PgReplicationConnection, PgResult,
+    ReplicationConnectionRetry, RetryConfig, TimestampTz, XLogRecPtr, Xid, INVALID_XLOG_REC_PTR,
+};
 
 pub struct ReplicationStream {
     logical_stream: LogicalReplicationStream,
@@ -567,7 +26,9 @@ impl ReplicationStream {
     pub async fn new(config: &Config) -> Result<Self> {
         let stream_config = ReplicationStreamConfig::from(config);
         let logical_stream =
-            LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
+            LogicalReplicationStream::new(&config.source_connection_string, stream_config)
+                .await
+                .map_err(|e| crate::error::CdcError::Replication(e))?;
 
         Ok(Self { logical_stream })
     }
@@ -582,12 +43,12 @@ impl ReplicationStream {
     pub async fn start(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting PostgreSQL logical replication stream");
 
-        // Initialize the logical stream
-        self.logical_stream.initialize().await?;
-
         // Start replication from the specified LSN
         let start_xlog = start_lsn.map(|lsn| lsn.0);
-        self.logical_stream.start(start_xlog).await?;
+        self.logical_stream
+            .start(start_xlog)
+            .await
+            .map_err(|e| crate::error::CdcError::Replication(e))?;
 
         info!("Logical replication stream started successfully");
         Ok(())
@@ -612,7 +73,8 @@ impl ReplicationStream {
         let event = self
             .logical_stream
             .next_event_with_retry(cancellation_token)
-            .await?;
+            .await
+            .map_err(|e| crate::error::CdcError::Replication(e))?;
 
         if let Some(ref event) = event {
             debug!("Received single change event: {:?}", event);
@@ -630,7 +92,9 @@ impl ReplicationStream {
     }
 
     pub async fn stop(&mut self) -> Result<()> {
-        self.logical_stream.send_feedback()?;
+        self.logical_stream
+            .send_feedback()
+            .map_err(|e| crate::error::CdcError::Replication(e))?;
 
         // Note: LSN persistence is now handled by the consumer's LsnTracker
         // which tracks the actually committed LSN to the destination.
@@ -640,13 +104,16 @@ impl ReplicationStream {
             self.current_lsn()
         );
 
-        self.logical_stream.stop().await?;
+        self.logical_stream
+            .stop()
+            .await
+            .map_err(|e| crate::error::CdcError::Replication(e))?;
         Ok(())
     }
 
     #[inline]
     pub fn current_lsn(&self) -> Lsn {
-        Lsn::from(self.logical_stream.state.last_applied_lsn)
+        Lsn::from(self.logical_stream.state.last_received_lsn)
     }
 }
 
@@ -661,124 +128,5 @@ impl ReplicationManager {
 
     pub async fn create_stream_async(&self) -> Result<ReplicationStream> {
         ReplicationStream::new(&self.config).await
-    }
-}
-
-/// Convert SystemTime to PostgreSQL timestamp format (microseconds since 2000-01-01)
-pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
-    let duration_since_unix = time
-        .duration_since(UNIX_EPOCH)
-        .expect("SystemTime is before Unix epoch");
-
-    let unix_secs = duration_since_unix.as_secs() as i64;
-    let unix_micros = unix_secs * 1_000_000 + (duration_since_unix.subsec_micros() as i64);
-
-    // Convert from Unix epoch to PostgreSQL epoch
-    unix_micros - PG_EPOCH_OFFSET_SECS * 1_000_000
-}
-
-/// Convert PostgreSQL timestamp to formatted string
-pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
-    let unix_micros = timestamp + PG_EPOCH_OFFSET_SECS * 1_000_000;
-    let unix_secs = unix_micros / 1_000_000;
-
-    match SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs as u64)) {
-        Some(_) => {
-            // Simple formatting without external dependencies
-            format!("timestamp={}", unix_secs)
-        }
-        None => "invalid timestamp".to_string(),
-    }
-}
-
-/// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
-pub fn postgres_timestamp_to_chrono(ts: i64) -> DateTime<Utc> {
-    // Convert back to Unix epoch microseconds
-    let unix_micros = ts + PG_EPOCH_OFFSET_SECS * 1_000_000;
-
-    let secs = unix_micros / 1_000_000;
-    let micros = (unix_micros % 1_000_000) as u32;
-
-    // Construct chrono DateTime<Utc>
-    chrono::TimeZone::timestamp_opt(&Utc, secs, micros * 1000)
-        .single()
-        .expect("Invalid timestamp conversion")
-}
-
-/// Parse LSN from string format (e.g., "0/12345678")
-pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
-    let parts: Vec<&str> = lsn_str.split('/').collect();
-    if parts.len() != 2 {
-        return Err(CdcError::protocol(format!(
-            "Invalid LSN format: {}. Expected format: high/low",
-            lsn_str
-        )));
-    }
-
-    let high = u64::from_str_radix(parts[0], 16)
-        .map_err(|e| CdcError::protocol(format!("Invalid LSN high part: {}", e)))?;
-    let low = u64::from_str_radix(parts[1], 16)
-        .map_err(|e| CdcError::protocol(format!("Invalid LSN low part: {}", e)))?;
-
-    Ok((high << 32) | low)
-}
-
-/// Format LSN as string (e.g., "0/12345678")
-pub fn format_lsn(lsn: XLogRecPtr) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFFFFFF)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::{TimeZone, Utc};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn test_lsn_parsing() {
-        assert_eq!(parse_lsn("0/12345678").unwrap(), 0x12345678);
-        assert_eq!(parse_lsn("1/12345678").unwrap(), 0x100000000 + 0x12345678);
-        assert!(parse_lsn("invalid").is_err());
-    }
-
-    #[test]
-    fn test_lsn_formatting() {
-        assert_eq!(format_lsn(0x12345678), "0/12345678");
-        assert_eq!(format_lsn(0x100000000 + 0x12345678), "1/12345678");
-    }
-
-    #[test]
-    fn test_postgres_epoch() {
-        let ts = 0; // PostgreSQL epoch (2000-01-01 UTC)
-        let dt = postgres_timestamp_to_chrono(ts);
-        assert_eq!(dt, Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap());
-    }
-
-    #[test]
-    fn test_unix_epoch() {
-        // Unix epoch is 1970-01-01 00:00:00 UTC
-        let unix_epoch = UNIX_EPOCH;
-        let pg_ts = system_time_to_postgres_timestamp(unix_epoch);
-
-        // Convert back
-        let dt = postgres_timestamp_to_chrono(pg_ts);
-        assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
-    }
-
-    #[test]
-    fn test_round_trip_now() {
-        let now = SystemTime::now();
-        let pg_ts = system_time_to_postgres_timestamp(now);
-        let dt = postgres_timestamp_to_chrono(pg_ts);
-
-        // Convert SystemTime to chrono for comparison
-        let duration = now.duration_since(UNIX_EPOCH).unwrap();
-        let unix_secs = duration.as_secs() as i64;
-        let unix_nanos = duration.subsec_nanos();
-        let chrono_now = Utc.timestamp_opt(unix_secs, unix_nanos).unwrap();
-
-        // Allow slight difference due to truncation to microseconds
-        let diff = (dt.timestamp_micros() - chrono_now.timestamp_micros()).abs();
-        assert!(diff < 2, "Round trip difference too large: {}", diff);
     }
 }

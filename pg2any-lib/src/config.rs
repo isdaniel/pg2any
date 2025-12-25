@@ -1,3 +1,5 @@
+use pg_walstream::RetryConfig;
+
 use crate::error::{CdcError, Result};
 use crate::types::DestinationType;
 use std::collections::HashMap;
@@ -483,5 +485,21 @@ impl TableMapping {
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
+    }
+}
+
+/// Convert from CDC config to replication stream config
+impl From<&Config> for pg_walstream::ReplicationStreamConfig {
+    fn from(config: &Config) -> Self {
+        pg_walstream::ReplicationStreamConfig::new(
+            config.replication_slot_name.clone(),
+            config.publication_name.clone(),
+            config.protocol_version,
+            config.streaming,
+            config.heartbeat_interval,
+            config.connection_timeout,
+            Duration::from_secs(30), // Health check interval
+            RetryConfig::default(),
+        )
     }
 }

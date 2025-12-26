@@ -4,13 +4,9 @@ use crate::{
     types::{EventType, Transaction},
 };
 use async_trait::async_trait;
-use sqlx::{Executor, MySql, MySqlPool};
+use sqlx::{MySql, MySqlPool};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
-
-/// Type alias for MySQL's open transaction
-/// Uses generic OpenTransaction with MySQL-specific connection type
-type OpenTransaction = common::OpenTransaction<sqlx::pool::PoolConnection<MySql>>;
+use tracing::{debug, info};
 
 // ============================================================================
 // SQL Building Utilities (Free Functions)
@@ -309,8 +305,6 @@ pub struct MySQLDestination {
     pool: Option<MySqlPool>,
     /// Schema mappings: maps source schema to destination database
     schema_mappings: HashMap<String, String>,
-    /// Active open transaction state (kept for compatibility with rollback_streaming_transaction)
-    active_tx: Option<OpenTransaction>,
     /// MySQL max_allowed_packet value in bytes (default 64MB, max 1GB), Used to calculate safe batch sizes dynamically
     max_allowed_packet: u64,
 }
@@ -321,78 +315,19 @@ impl MySQLDestination {
         Self {
             pool: None,
             schema_mappings: HashMap::new(),
-            active_tx: None,
             max_allowed_packet: 67108864, // Default 64MB
         }
     }
 
-    /// Generic batch size calculator
-    ///
-    /// Calculates the maximum safe batch size based on:
-    /// - Estimated bytes per row (data values)
-    /// - Statement-specific overhead (SQL keywords, syntax)
-    /// - MySQL max_allowed_packet limit with 75% safety margin
-    /// - Min/max bounds for different operation types
-    fn calculate_generic_batch_size(
-        &self,
-        estimated_bytes_per_row: usize,
-        statement_overhead: usize,
-        fixed_overhead: usize,
-        min_rows: usize,
-        max_rows: usize,
-    ) -> usize {
-        let total_bytes_per_row = estimated_bytes_per_row + statement_overhead;
-        let safe_packet_size = (self.max_allowed_packet as f64 * 0.75) as u64;
-        let calculated_max =
-            (safe_packet_size as usize).saturating_sub(fixed_overhead) / total_bytes_per_row.max(1);
-        calculated_max.clamp(min_rows, max_rows)
-    }
-
-    /// Estimate the size of a JSON value in bytes when serialized
-    fn estimate_value_size(value: &serde_json::Value) -> usize {
-        match value {
-            serde_json::Value::Null => 4,    // "NULL"
-            serde_json::Value::Bool(_) => 5, // "true" or "false"
-            serde_json::Value::Number(n) => {
-                if n.is_i64() || n.is_u64() {
-                    20 // Max digits for 64-bit integer
-                } else {
-                    30 // Float with decimals
-                }
-            }
-            serde_json::Value::String(s) => s.len() + 2,
-            serde_json::Value::Array(arr) => {
-                arr.iter().map(Self::estimate_value_size).sum::<usize>() + arr.len() * 2
-            }
-            serde_json::Value::Object(obj) => {
-                obj.values().map(Self::estimate_value_size).sum::<usize>() + obj.len() * 4
-            }
-        }
-    }
-
-    /// Calculate maximum safe batch size for INSERT operations
-    fn calculate_batch_size(&self, num_columns: usize, batch: &common::InsertBatch<'_>) -> usize {
+    /// Calculate maximum safe batch size for INSERT operations using common utilities
+    fn calculate_insert_batch_size(&self, batch: &common::InsertBatch<'_>) -> usize {
+        let num_columns = batch.columns.len();
         if num_columns == 0 {
             return 1000; // Fallback default
         }
 
-        // Estimate bytes per row based on actual data in batch if available
-        let estimated_bytes_per_row = if !batch.rows.is_empty() {
-            let sample_size = std::cmp::min(batch.rows.len(), 10);
-            let total_estimated: usize = batch
-                .rows
-                .iter()
-                .take(sample_size)
-                .map(|row| {
-                    row.iter()
-                        .map(|val| Self::estimate_value_size(val))
-                        .sum::<usize>()
-                })
-                .sum();
-            (total_estimated / sample_size).max(50)
-        } else {
-            num_columns * 100
-        };
+        // Estimate bytes per row based on actual data
+        let estimated_bytes_per_row = common::estimate_insert_batch_row_size(batch, 10);
 
         // SQL overhead: column names, placeholders, parentheses
         let column_overhead: usize = batch
@@ -404,115 +339,63 @@ impl MySQLDestination {
         let statement_overhead = row_overhead + column_overhead / num_columns.max(1);
         let fixed_overhead = 100; // INSERT INTO, VALUES, etc.
 
-        self.calculate_generic_batch_size(
+        common::calculate_batch_size(
             estimated_bytes_per_row,
             statement_overhead,
             fixed_overhead,
+            self.max_allowed_packet,
+            0.75, // 75% safety margin
             10,
             50000,
         )
     }
 
-    /// Calculate maximum safe batch size for UPDATE operations
-    ///
-    /// UPDATE executes multiple simple statements, so we estimate per-statement overhead
+    /// Calculate maximum safe batch size for UPDATE operations using common utilities
     fn calculate_update_batch_size(&self, batch: &common::UpdateBatch<'_>) -> usize {
         if batch.update_columns.is_empty() || batch.key_columns.is_empty() {
             return 100; // Conservative fallback
         }
 
-        // Estimate bytes per row for UPDATE
-        let estimated_bytes_per_row = if !batch.rows.is_empty() {
-            let sample_size = std::cmp::min(batch.rows.len(), 5);
-            let total_estimated: usize = batch
-                .rows
-                .iter()
-                .take(sample_size)
-                .map(|(key_vals, update_vals)| {
-                    let key_size: usize =
-                        key_vals.iter().map(|v| Self::estimate_value_size(v)).sum();
-                    let update_size: usize = update_vals
-                        .iter()
-                        .map(|v| Self::estimate_value_size(v))
-                        .sum();
-                    key_size + update_size
-                })
-                .sum();
-            (total_estimated / sample_size).max(100)
-        } else {
-            (batch.key_columns.len() + batch.update_columns.len()) * 100
-        };
+        // Estimate bytes per row based on actual data
+        let estimated_bytes_per_row = common::estimate_update_batch_row_size(batch, 5);
 
         // Per-statement overhead for simple UPDATE
         let statement_overhead = batch.update_columns.len() * 20 + batch.key_columns.len() * 20;
         let fixed_overhead = 200; // UPDATE, SET, WHERE keywords per statement
 
-        self.calculate_generic_batch_size(
+        common::calculate_batch_size(
             estimated_bytes_per_row,
             statement_overhead,
             fixed_overhead,
+            self.max_allowed_packet,
+            0.75, // 75% safety margin
             10,
             1000,
         )
     }
 
-    /// Calculate maximum safe batch size for DELETE operations
-    ///
-    /// DELETE uses WHERE IN which is more efficient than UPDATE
+    /// Calculate maximum safe batch size for DELETE operations using common utilities
     fn calculate_delete_batch_size(&self, batch: &common::DeleteBatch<'_>) -> usize {
         if batch.key_columns.is_empty() {
             return 100; // Conservative fallback
         }
 
-        // Estimate bytes per row for DELETE with WHERE IN
-        let estimated_bytes_per_row = if !batch.rows.is_empty() {
-            let sample_size = std::cmp::min(batch.rows.len(), 10);
-            let total_estimated: usize = batch
-                .rows
-                .iter()
-                .take(sample_size)
-                .map(|key_vals| {
-                    key_vals
-                        .iter()
-                        .map(|v| Self::estimate_value_size(v))
-                        .sum::<usize>()
-                })
-                .sum();
-            (total_estimated / sample_size).max(50)
-        } else {
-            batch.key_columns.len() * 100
-        };
+        // Estimate bytes per row based on actual data
+        let estimated_bytes_per_row = common::estimate_delete_batch_row_size(batch, 10);
 
         // WHERE IN clause overhead
         let statement_overhead = batch.key_columns.len() * 20;
         let fixed_overhead = 150; // DELETE FROM, WHERE keywords
 
-        self.calculate_generic_batch_size(
+        common::calculate_batch_size(
             estimated_bytes_per_row,
             statement_overhead,
             fixed_overhead,
+            self.max_allowed_packet,
+            0.75, // 75% safety margin
             10,
             5000,
         )
-    }
-
-    /// Rollback the active streaming transaction (for graceful shutdown)
-    async fn rollback_active_transaction(&mut self) -> Result<()> {
-        if let Some(mut active) = self.active_tx.take() {
-            warn!(
-                "MySQL: Rolling back streaming transaction {} ({} events processed)",
-                active.state.transaction_id, active.state.events_processed
-            );
-
-            if let Err(e) = active.handle.execute("ROLLBACK").await {
-                warn!(
-                    "MySQL: Failed to rollback streaming transaction {}: {}",
-                    active.state.transaction_id, e
-                );
-            }
-        }
-
-        Ok(())
     }
 
     /// Process a transaction batch
@@ -583,7 +466,7 @@ impl MySQLDestination {
                         batch.add_row(data);
 
                         // Calculate dynamic batch size based on current batch characteristics
-                        let max_batch_size = self.calculate_batch_size(columns.len(), batch);
+                        let max_batch_size = self.calculate_insert_batch_size(batch);
 
                         if batch.len() >= max_batch_size {
                             execute_batch_insert(&mut *db_tx, batch, &self.schema_mappings).await?;
@@ -871,24 +754,55 @@ impl DestinationHandler for MySQLDestination {
         self.process_transaction_batch(transaction).await
     }
 
-    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
-        self.active_tx.as_ref().map(|tx| tx.state.transaction_id)
-    }
+    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
 
-    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
-        self.rollback_active_transaction().await
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
+
+        // Begin a transaction
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| CdcError::generic(format!("MySQL BEGIN transaction failed: {}", e)))?;
+
+        // Execute all commands in the transaction
+        for (idx, sql) in commands.iter().enumerate() {
+            if let Err(e) = sqlx::query(sql).execute(&mut *tx).await {
+                // Rollback on error
+                if let Err(rollback_err) = tx.rollback().await {
+                    tracing::error!(
+                        "MySQL ROLLBACK failed after execution error: {}",
+                        rollback_err
+                    );
+                }
+                return Err(CdcError::generic(format!(
+                    "MySQL execute_sql_batch failed at command {}/{}: {}",
+                    idx + 1,
+                    commands.len(),
+                    e
+                )));
+            }
+        }
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {}", e)))?;
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        if self.active_tx.is_some() {
-            warn!("MySQL: Closing with active transaction - rolling back");
-            self.rollback_active_transaction().await?;
-        }
-
         if let Some(pool) = &self.pool {
             pool.close().await;
         }
         self.pool = None;
+        info!("MySQL connection closed successfully");
         Ok(())
     }
 }

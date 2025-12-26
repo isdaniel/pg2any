@@ -10,26 +10,11 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info};
 
-/// Maximum number of rows per batch INSERT statement for SQL Server
-const MAX_BATCH_INSERT_SIZE: usize = 1000;
-
-/// SQL Server-specific transaction handle (just a flag since connection is stored separately)
-pub struct SqlServerTransactionHandle {
-    /// Indicates if we have an active transaction (SQL Server keeps the connection, not a separate transaction object)
-    pub has_open_transaction: bool,
-}
-
-/// Type alias for SQL Server's open transaction
-/// Uses generic OpenTransaction with SQL Server-specific handle
-type OpenTransaction = common::OpenTransaction<SqlServerTransactionHandle>;
-
 /// SQL Server destination implementation
 pub struct SqlServerDestination {
     client: Option<Client<Compat<TcpStream>>>,
     /// Schema mappings: maps source schema to destination schema
     schema_mappings: HashMap<String, String>,
-    /// Active transaction state (if any) - used for both streaming and normal transactions
-    active_tx: Option<OpenTransaction>,
 }
 
 impl SqlServerDestination {
@@ -38,8 +23,35 @@ impl SqlServerDestination {
         Self {
             client: None,
             schema_mappings: HashMap::new(),
-            active_tx: None,
         }
+    }
+
+    /// Calculate maximum safe batch size for INSERT operations
+    ///
+    /// SQL Server has no strict packet size limit like MySQL, but we still want reasonable batches
+    fn calculate_insert_batch_size(batch: &common::InsertBatch<'_>) -> usize {
+        let num_columns = batch.columns.len();
+        if num_columns == 0 {
+            return 1000; // Fallback default
+        }
+
+        // Estimate bytes per row based on actual data
+        let estimated_bytes_per_row = common::estimate_insert_batch_row_size(batch, 10);
+
+        // SQL overhead
+        let statement_overhead = num_columns * 20; // Column names and values
+        let fixed_overhead = 200;
+
+        // No packet size limit for SQL Server (0 means unlimited)
+        common::calculate_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            0, // No packet size limit
+            0.75,
+            10,
+            10000, // Higher max for SQL Server
+        )
     }
 
     /// Helper function to escape SQL string values for SQL Server
@@ -93,8 +105,9 @@ impl SqlServerDestination {
                         let batch = current_batch.as_mut().unwrap();
                         batch.add_row(data);
 
-                        // Execute if batch is full
-                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                        // Execute if batch is full - use dynamic calculation
+                        let max_batch_size = Self::calculate_insert_batch_size(batch);
+                        if batch.len() >= max_batch_size {
                             Self::execute_batch_insert_static(client, batch).await?;
                             current_batch = None;
                         }
@@ -381,33 +394,6 @@ impl SqlServerDestination {
         Ok(formatted_conditions.join(" AND "))
     }
 
-    /// Rollback the active streaming transaction (for graceful shutdown)
-    async fn rollback_active_transaction(&mut self) -> Result<()> {
-        if let Some(active) = self.active_tx.take() {
-            if !active.handle.has_open_transaction {
-                return Ok(());
-            }
-
-            tracing::warn!(
-                "SQL Server: Rolling back streaming transaction {} ({} events processed)",
-                active.state.transaction_id,
-                active.state.events_processed
-            );
-
-            if let Some(client) = self.client.as_mut() {
-                if let Err(e) = client.simple_query("ROLLBACK TRANSACTION").await {
-                    tracing::warn!(
-                        "SQL Server: Failed to rollback streaming transaction {}: {}",
-                        active.state.transaction_id,
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Process a transaction batch
     ///
     /// Each batch is processed and committed immediately in its own transaction.
@@ -519,23 +505,61 @@ impl DestinationHandler for SqlServerDestination {
         self.process_transaction_batch(transaction).await
     }
 
-    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
-        self.active_tx
-            .as_ref()
-            .filter(|tx| tx.handle.has_open_transaction)
-            .map(|tx| tx.state.transaction_id)
-    }
+    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
 
-    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
-        self.rollback_active_transaction().await
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| CdcError::generic("SQL Server client not initialized"))?;
+
+        // Begin a transaction
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("SQL Server BEGIN TRANSACTION failed: {}", e))
+            })?;
+
+        // Execute all commands in the transaction
+        let mut execution_result = Ok(());
+        for (idx, sql) in commands.iter().enumerate() {
+            if let Err(e) = client.simple_query(sql).await {
+                execution_result = Err(CdcError::generic(format!(
+                    "SQL Server execute_sql_batch failed at command {}/{}: {}",
+                    idx + 1,
+                    commands.len(),
+                    e
+                )));
+                break;
+            }
+        }
+
+        // If any command failed, rollback
+        if execution_result.is_err() {
+            if let Err(rollback_err) = client.simple_query("ROLLBACK TRANSACTION").await {
+                tracing::error!(
+                    "SQL Server ROLLBACK failed after execution error: {}",
+                    rollback_err
+                );
+            }
+            return execution_result;
+        }
+
+        // Commit the transaction
+        client
+            .simple_query("COMMIT TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("SQL Server COMMIT TRANSACTION failed: {}", e))
+            })?;
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        if self.active_tx.is_some() {
-            tracing::warn!("SQL Server: Closing with active transaction - rolling back");
-            self.rollback_active_transaction().await?;
-        }
-
         if let Some(client) = self.client.take() {
             let _ = client.close().await;
         }

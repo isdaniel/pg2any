@@ -10,19 +10,9 @@ use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info};
 
-/// Maximum number of rows per batch INSERT statement for SQLite
-/// SQLite has a limit on the number of variables per statement (SQLITE_MAX_VARIABLE_NUMBER, default 999)
-const MAX_BATCH_INSERT_SIZE: usize = 500;
-
-/// Maximum number of rows per batch UPDATE statement for SQLite
-const MAX_BATCH_UPDATE_SIZE: usize = 200;
-
-/// Maximum number of rows per batch DELETE statement for SQLite
-const MAX_BATCH_DELETE_SIZE: usize = 500;
-
-/// Type alias for SQLite's open transaction
-/// Uses generic OpenTransaction with SQLite-specific transaction type
-type OpenTransaction = common::OpenTransaction<sqlx::Transaction<'static, sqlx::Sqlite>>;
+// SQLite has SQLITE_MAX_VARIABLE_NUMBER (default 999)
+// We need to account for this when batching to avoid exceeding the limit
+const SQLITE_MAX_VARIABLES: usize = 999;
 
 // ============================================================================
 // SQL Building Utilities (Free Functions)
@@ -242,8 +232,6 @@ where
 pub struct SQLiteDestination {
     pool: Option<SqlitePool>,
     database_path: Option<String>,
-    /// Active transaction state (kept for compatibility with rollback_streaming_transaction)
-    active_tx: Option<OpenTransaction>,
 }
 
 impl SQLiteDestination {
@@ -252,32 +240,102 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
-            active_tx: None,
         }
     }
 
-    /// Rollback the active streaming transaction (for graceful shutdown)
-    async fn rollback_active_transaction(&mut self) -> Result<()> {
-        if let Some(active) = self.active_tx.take() {
-            let tx_id = active.state.transaction_id;
-            let events_processed = active.state.events_processed;
-
-            tracing::warn!(
-                "SQLite: Rolling back streaming transaction {} ({} events processed)",
-                tx_id,
-                events_processed
-            );
-
-            if let Err(e) = active.handle.rollback().await {
-                tracing::warn!(
-                    "SQLite: Failed to rollback streaming transaction {}: {}",
-                    tx_id,
-                    e
-                );
-            }
+    /// Calculate maximum safe batch size for INSERT operations
+    ///
+    /// SQLite has SQLITE_MAX_VARIABLE_NUMBER (default 999) limit on placeholders
+    /// We must ensure rows * columns doesn't exceed this limit
+    fn calculate_insert_batch_size(&self, batch: &common::InsertBatch<'_>) -> usize {
+        let num_columns = batch.columns.len();
+        if num_columns == 0 {
+            return 500; // Fallback default
         }
 
-        Ok(())
+        // SQLite variable limit constraint
+        let max_rows_by_variables = SQLITE_MAX_VARIABLES / num_columns.max(1);
+
+        // Estimate bytes per row based on actual data
+        let estimated_bytes_per_row = common::estimate_insert_batch_row_size(batch, 10);
+
+        // SQL overhead
+        let statement_overhead = num_columns * 3; // Placeholders "?, "
+        let fixed_overhead = 100;
+
+        // No packet size limit for SQLite (0 means unlimited)
+        let calculated = common::calculate_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            0, // No packet size limit
+            0.75,
+            10,
+            5000,
+        );
+
+        // Return the minimum of calculated size and variable limit
+        calculated.min(max_rows_by_variables).max(10)
+    }
+
+    /// Calculate maximum safe batch size for UPDATE operations
+    fn calculate_update_batch_size(&self, batch: &common::UpdateBatch<'_>) -> usize {
+        if batch.update_columns.is_empty() || batch.key_columns.is_empty() {
+            return 200; // Conservative fallback
+        }
+
+        // SQLite variable limit: each UPDATE uses update_columns + key_columns variables
+        let variables_per_row = batch.update_columns.len() + batch.key_columns.len();
+        let max_rows_by_variables = SQLITE_MAX_VARIABLES / variables_per_row.max(1);
+
+        // Estimate bytes per row
+        let estimated_bytes_per_row = common::estimate_update_batch_row_size(batch, 5);
+
+        // Per-statement overhead
+        let statement_overhead = variables_per_row * 20;
+        let fixed_overhead = 200;
+
+        let calculated = common::calculate_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            0, // No packet size limit
+            0.75,
+            10,
+            1000,
+        );
+
+        calculated.min(max_rows_by_variables).max(10)
+    }
+
+    /// Calculate maximum safe batch size for DELETE operations
+    fn calculate_delete_batch_size(&self, batch: &common::DeleteBatch<'_>) -> usize {
+        if batch.key_columns.is_empty() {
+            return 500; // Conservative fallback
+        }
+
+        // SQLite variable limit for WHERE IN clause
+        let variables_per_row = batch.key_columns.len();
+        let max_rows_by_variables = SQLITE_MAX_VARIABLES / variables_per_row.max(1);
+
+        // Estimate bytes per row
+        let estimated_bytes_per_row = common::estimate_delete_batch_row_size(batch, 10);
+
+        // WHERE IN overhead
+        let statement_overhead = variables_per_row * 20;
+        let fixed_overhead = 150;
+
+        let calculated = common::calculate_batch_size(
+            estimated_bytes_per_row,
+            statement_overhead,
+            fixed_overhead,
+            0, // No packet size limit
+            0.75,
+            10,
+            5000,
+        );
+
+        calculated.min(max_rows_by_variables).max(10)
     }
 
     /// Process a transaction batch
@@ -333,7 +391,8 @@ impl SQLiteDestination {
                         let batch = insert_batch.as_mut().unwrap();
                         batch.add_row(data);
 
-                        if batch.len() >= MAX_BATCH_INSERT_SIZE {
+                        let max_batch_size = self.calculate_insert_batch_size(batch);
+                        if batch.len() >= max_batch_size {
                             execute_batch_insert(&mut *db_tx, &batch).await?;
                             insert_batch = None;
                         }
@@ -412,7 +471,8 @@ impl SQLiteDestination {
 
                         batch.add_row(new_data, key_values);
 
-                        if batch.len() >= MAX_BATCH_UPDATE_SIZE {
+                        let max_batch_size = self.calculate_update_batch_size(batch);
+                        if batch.len() >= max_batch_size {
                             execute_batch_update(&mut db_tx, &batch).await?;
                             update_batch = None;
                         }
@@ -492,7 +552,8 @@ impl SQLiteDestination {
 
                         batch.add_row(key_values);
 
-                        if batch.len() >= MAX_BATCH_DELETE_SIZE {
+                        let max_batch_size = self.calculate_delete_batch_size(batch);
+                        if batch.len() >= max_batch_size {
                             execute_batch_delete(&mut *db_tx, &batch).await?;
                             delete_batch = None;
                         }
@@ -648,20 +709,50 @@ impl DestinationHandler for SQLiteDestination {
         self.process_transaction_batch(transaction).await
     }
 
-    fn get_active_streaming_transaction_id(&self) -> Option<u32> {
-        self.active_tx.as_ref().map(|tx| tx.state.transaction_id)
-    }
+    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
 
-    async fn rollback_streaming_transaction(&mut self) -> Result<()> {
-        self.rollback_active_transaction().await
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("SQLite pool not initialized"))?;
+
+        // Begin a transaction
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| CdcError::generic(format!("SQLite BEGIN transaction failed: {}", e)))?;
+
+        // Execute all commands in the transaction
+        for (idx, sql) in commands.iter().enumerate() {
+            if let Err(e) = sqlx::query(sql).execute(&mut *tx).await {
+                // Rollback on error
+                if let Err(rollback_err) = tx.rollback().await {
+                    tracing::error!(
+                        "SQLite ROLLBACK failed after execution error: {}",
+                        rollback_err
+                    );
+                }
+                return Err(CdcError::generic(format!(
+                    "SQLite execute_sql_batch failed at command {}/{}: {}",
+                    idx + 1,
+                    commands.len(),
+                    e
+                )));
+            }
+        }
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| CdcError::generic(format!("SQLite COMMIT transaction failed: {}", e)))?;
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        if self.active_tx.is_some() {
-            tracing::warn!("SQLite: Closing with active transaction - rolling back");
-            self.rollback_active_transaction().await?;
-        }
-
         if let Some(pool) = &self.pool {
             pool.close().await;
         }

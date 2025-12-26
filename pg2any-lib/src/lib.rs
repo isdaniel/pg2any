@@ -75,6 +75,9 @@ pub mod client;
 // Streaming transaction management for protocol v2+
 mod transaction_manager;
 
+// Transaction file persistence
+pub mod transaction_file_manager;
+
 // Monitoring and metrics
 pub mod monitoring;
 

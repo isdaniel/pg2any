@@ -210,16 +210,11 @@ pg2any/                          # Workspace root
 │   │   ├── app.rs               # High-level CDC application orchestration
 │   │   ├── client.rs            # Main CDC client implementation
 │   │   ├── config.rs            # Configuration management and validation
-│   │   ├── connection.rs        # PostgreSQL connection handling
 │   │   ├── env.rs               # Environment variable loading
 │   │   ├── error.rs             # Comprehensive error types
-│   │   ├── logical_stream.rs    # Logical replication stream management
-│   │   ├── pg_replication.rs    # Low-level PostgreSQL replication
-│   │   ├── replication_protocol.rs # Message parsing and protocol handling
-│   │   ├── lsn_tracker.rs       # LSN tracking (SharedLsnFeedback & LsnTracker)
+│   │   ├── pg_replication.rs    # PostgreSQL replication integration (uses pg_walstream)
+│   │   ├── lsn_tracker.rs       # LSN tracking and persistence
 │   │   ├── transaction_manager.rs # Streaming transaction management
-│   │   ├── buffer.rs            # Binary protocol buffer operations
-│   │   ├── retry.rs             # Retry logic and backoff strategies
 │   │   ├── types.rs             # Core data types and enums
 │   │   ├── destinations/        # Database destination implementations
 │   │   │   ├── mod.rs           # Destination trait and factory pattern
@@ -657,10 +652,15 @@ When you run the application, you'll see structured logging output like this:
 - **prometheus** (0.13): Metrics collection and Prometheus integration
 - **tokio-util** (0.7.16): Utilities for async operations and cancellation
 
+### PostgreSQL Logical Replication
+- **pg_walstream** : Low-level PostgreSQL logical replication protocol implementation
+  - Handles WAL stream parsing, protocol messages, and replication connection management
+  - Provides buffer operations, retry logic, and connection handling
+  - Extracted from pg2any-lib for reusability in other projects
+
 ### Database Clients
-- **sqlx** (0.8.6): MySQL async client with runtime-tokio-rustls
+- **sqlx** (0.8.6): MySQL and SQLite async client with runtime-tokio-rustls
 - **tiberius** (0.12): Native SQL Server TDS protocol implementation
-- **libpq-sys** (0.8): Low-level PostgreSQL C library bindings
 
 ### Serialization & Data
 - **serde** (1.0.219): Serialization framework with derive support

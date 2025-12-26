@@ -91,36 +91,6 @@ impl TransactionManager {
         );
     }
 
-    /// Handle COMMIT event - returns final transaction with all remaining events
-    pub(crate) fn handle_commit(
-        &mut self,
-        transaction_id: u32,
-        lsn: Option<Lsn>,
-    ) -> Option<Transaction> {
-        if let Some(state) = self.active_transactions.remove(&transaction_id) {
-            debug!(
-                "COMMIT: Finalizing transaction {} with {} events",
-                transaction_id,
-                state.pending_events.len()
-            );
-
-            let mut tx = Transaction::new(transaction_id, state.commit_timestamp);
-            tx.events = state.pending_events;
-            tx.is_final_batch = true;
-
-            if let Some(l) = lsn {
-                tx.set_commit_lsn(l);
-            } else if let Some(l) = state.last_lsn {
-                tx.set_commit_lsn(l);
-            }
-
-            Some(tx)
-        } else {
-            warn!("COMMIT for unknown transaction {}", transaction_id);
-            None
-        }
-    }
-
     /// Handle StreamStart event - opens a new stream segment
     pub(crate) fn handle_stream_start(
         &mut self,
@@ -234,27 +204,6 @@ impl TransactionManager {
         }
     }
 
-    /// Add an event to a transaction (normal or streaming)
-    pub(crate) fn add_event(&mut self, transaction_id: u32, event: ChangeEvent) {
-        if let Some(state) = self.active_transactions.get_mut(&transaction_id) {
-            if event.lsn.is_some() {
-                state.last_lsn = event.lsn;
-            }
-            state.pending_events.push(event);
-        } else {
-            warn!("Event for unknown transaction {}", transaction_id);
-        }
-    }
-
-    /// Check if a transaction has reached batch size
-    pub(crate) fn should_send_batch(&self, transaction_id: u32) -> bool {
-        if let Some(state) = self.active_transactions.get(&transaction_id) {
-            state.pending_events.len() >= self.batch_size
-        } else {
-            false
-        }
-    }
-
     /// Take a batch of events from a transaction and commit it
     /// Updates LSN for graceful shutdown recovery
     pub(crate) fn take_batch(&mut self, transaction_id: u32) -> Option<Transaction> {
@@ -282,27 +231,6 @@ impl TransactionManager {
         } else {
             None
         }
-    }
-
-    /// Get event count for a transaction
-    pub(crate) fn event_count(&self, transaction_id: u32) -> usize {
-        self.active_transactions
-            .get(&transaction_id)
-            .map(|s| s.pending_events.len())
-            .unwrap_or(0)
-    }
-
-    /// Check if there are any active transactions
-    pub(crate) fn has_active_transactions(&self) -> bool {
-        !self.active_transactions.is_empty()
-    }
-
-    /// Clear all active transactions (for shutdown)
-    /// Returns the count of cleared transactions
-    pub(crate) fn clear(&mut self) -> usize {
-        let count = self.active_transactions.len();
-        self.active_transactions.clear();
-        count
     }
 }
 

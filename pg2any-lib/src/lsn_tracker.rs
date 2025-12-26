@@ -8,14 +8,53 @@
 //! 2. **LsnTracker**: Thread-safe tracker for the last committed LSN with file persistence
 //!    for graceful shutdown and restart recovery
 //!
-//! The PostgreSQL replication protocol expects three different LSN values:
-//! - `write_lsn`: Data received from the stream
-//! - `flush_lsn`: Data written to destination (before commit)  
-//! - `replay_lsn`: Data committed to destination
+//! ## PostgreSQL Replication Protocol LSN Semantics
 //!
-//! Since the producer reads from PostgreSQL and the consumer writes to the destination,
-//! we need a thread-safe way to share the committed LSN from consumer back to producer
-//! for accurate feedback to PostgreSQL.
+//! The PostgreSQL replication protocol expects three different LSN values as defined
+//! in [pg_stat_replication](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW):
+//!
+//! - `write_lsn`: Last WAL location written to disk by standby server  
+//!   - Automatically updated by pg_walstream when WAL data is received
+//!   
+//! - `flush_lsn`: Last WAL location **flushed to disk** by standby server
+//!   - Updated when transaction files are committed (moved to sql_pending_tx/)
+//!   - Represents durable persistence of WAL data
+//!   
+//! - `replay_lsn`: Last WAL location **replayed into the database** on standby
+//!   - Updated when transactions are successfully committed to destination database
+//!   - Represents actual application of changes
+//!
+//! ## pg2any LSN Tracking Implementation
+//!
+//! ### File-Based Workflow (Current Implementation)
+//! - **Producer**: Updates `flush_lsn` when transaction file is moved to sql_pending_tx/
+//!   - This happens in `client.rs` after `commit_transaction()` or streaming commit
+//!   - Represents that WAL data has been durably persisted to disk
+//! - **Consumer**: Updates `replay_lsn` (via `update_applied_lsn`) when transaction SQL is executed and committed
+//!   - This happens in `client.rs` after successful `execute_sql_batch()` and `delete_pending_transaction()`
+//!   - Represents that changes have been applied to the destination database
+//!
+//! ## Monitoring Replication Progress
+//!
+//! You can monitor the replication progress using:
+//! ```sql
+//! SELECT
+//!     application_name,
+//!     state,
+//!     sent_lsn,
+//!     write_lsn,
+//!     flush_lsn,
+//!     replay_lsn,
+//!     pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes
+//! FROM pg_stat_replication
+//! WHERE application_name = 'pg2any';
+//! ```
+//!
+//! Expected behavior:
+//! - `flush_lsn` advances when transaction files are committed to disk
+//! - `replay_lsn` advances when SQL is executed on destination
+//! - `flush_lsn` >= `replay_lsn` (data must be flushed before replayed)
+//! - Lag should be minimal in steady state
 //!
 //! ## Optimization Strategy
 //!

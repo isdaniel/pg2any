@@ -22,7 +22,7 @@
             "program": "${cargo:program}", // tells lldb to run the built binary
             "args": [],
             "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env",
+            "envFile": "${workspaceFolder}/env/.env_local",
             "env": {
                 "RUST_LOG": "info" 
             }

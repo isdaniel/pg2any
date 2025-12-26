@@ -83,6 +83,11 @@ pub struct Config {
     /// but may increase memory usage. Default: 1000
     pub batch_size: usize,
 
+    /// Base path for transaction files (default: current directory)
+    /// Contains sql_received_tx/ and sql_pending_tx/ subdirectories
+    /// Transaction file persistence is always enabled for data safety
+    pub transaction_file_base_path: String,
+
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
 }
@@ -182,6 +187,7 @@ impl Default for Config {
             table_mappings: HashMap::new(),
             schema_mappings: HashMap::new(),
             batch_size: 1000,
+            transaction_file_base_path: ".".to_string(),
             extra_options: HashMap::new(),
         }
     }
@@ -356,6 +362,13 @@ impl ConfigBuilder {
     /// Set all schema mappings at once
     pub fn schema_mappings(mut self, mappings: HashMap<String, String>) -> Self {
         self.config.schema_mappings = mappings;
+        self
+    }
+
+    /// Set the base path for transaction files
+    /// Transaction file persistence is always enabled for data safety
+    pub fn transaction_file_base_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.config.transaction_file_base_path = path.into();
         self
     }
 

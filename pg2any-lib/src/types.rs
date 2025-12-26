@@ -120,3 +120,18 @@ impl Transaction {
         self.is_final_batch = is_final;
     }
 }
+
+/// Transaction processing context for the CDC client
+///
+/// This enum tracks the current transaction state during replication streaming.
+/// It helps distinguish between normal transactions (BEGIN...COMMIT) and
+/// streaming transactions (StreamStart...StreamCommit) for proper event handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionContext {
+    /// No active transaction
+    None,
+    /// Normal transaction (BEGIN...COMMIT)
+    Normal(u32), // transaction_id
+    /// Streaming transaction (StreamStart...StreamCommit)
+    Streaming(u32), // transaction_id
+}

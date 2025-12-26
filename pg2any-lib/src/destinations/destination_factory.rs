@@ -23,9 +23,9 @@ use super::sqlite::SQLiteDestination;
 /// ## File-Based Transaction Processing
 ///
 /// The current architecture uses file-based transaction processing:
-/// - Transactions are written to files in sql_received_tx/ as events arrive
-/// - Completed transactions are moved to sql_pending_tx/ on COMMIT/StreamCommit
-/// - Consumer reads files and executes SQL via `execute_sql_batch()` in atomic transactions
+/// - Transactions are written to files in sql_data_tx/ as events arrive
+/// - Metadata for completed transactions are stored in sql_pending_tx/ on COMMIT/StreamCommit
+/// - Consumer reads metadata and executes SQL via `execute_sql_batch()` in atomic transactions
 /// - No database transactions are kept open between batches
 #[async_trait]
 pub trait DestinationHandler: Send + Sync {
@@ -35,20 +35,6 @@ pub trait DestinationHandler: Send + Sync {
     /// Set schema mappings for translating source schemas to destination schemas/databases
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
-
-    /// Process a transaction batch
-    ///
-    /// In the file-based architecture, this method processes batches read from transaction files.
-    /// Each batch is executed atomically in its own database transaction and committed immediately.
-    /// The distinction between streaming and normal transactions is no longer relevant at this level.
-    ///
-    /// # Arguments
-    /// * `transaction` - Transaction batch to process
-    ///
-    /// # Returns
-    /// * `Ok(())` - Transaction batch was successfully processed and committed
-    /// * `Err(...)` - Processing failed
-    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()>;
 
     /// Execute a batch of SQL commands within a single transaction
     ///

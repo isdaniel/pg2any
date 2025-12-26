@@ -393,78 +393,6 @@ impl SqlServerDestination {
 
         Ok(formatted_conditions.join(" AND "))
     }
-
-    /// Process a transaction batch
-    ///
-    /// Each batch is processed and committed immediately in its own transaction.
-    /// This applies to both intermediate batches (batch_size reached) and
-    /// final batches (Commit/StreamCommit received).
-    async fn process_transaction_batch(&mut self, transaction: &Transaction) -> Result<()> {
-        let tx_id = transaction.transaction_id;
-
-        // Skip empty batches
-        if transaction.is_empty() {
-            debug!("Skipping empty batch for transaction {}", tx_id);
-            return Ok(());
-        }
-
-        let tx_start = std::time::Instant::now();
-
-        debug!(
-            "SQL Server: Processing transaction {} ({} events)",
-            tx_id,
-            transaction.event_count()
-        );
-
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| CdcError::generic("SQL Server connection not established"))?;
-
-        // Begin a new transaction for this batch
-        client
-            .simple_query("BEGIN TRANSACTION")
-            .await
-            .map_err(|e| {
-                CdcError::generic(format!("Failed to begin SQL Server transaction: {}", e))
-            })?;
-
-        let schema_mappings = self.schema_mappings.clone();
-
-        let result = Self::process_events_with_batching_static(
-            client,
-            &transaction.events,
-            &schema_mappings,
-        )
-        .await;
-
-        if let Err(e) = result {
-            tracing::warn!(
-                "SQL Server: Error processing batch, rolling back transaction {}: {}",
-                tx_id,
-                e
-            );
-            let _ = client.simple_query("ROLLBACK TRANSACTION").await;
-            return Err(e);
-        }
-
-        // Commit the transaction
-        client
-            .simple_query("COMMIT TRANSACTION")
-            .await
-            .map_err(|e| {
-                CdcError::generic(format!("Failed to commit SQL Server transaction: {}", e))
-            })?;
-
-        info!(
-            "SQL Server: Committed batch for transaction {} ({} events) in {:?}",
-            tx_id,
-            transaction.event_count(),
-            tx_start.elapsed()
-        );
-
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -498,11 +426,6 @@ impl DestinationHandler for SqlServerDestination {
                 self.schema_mappings
             );
         }
-    }
-
-    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
-        // Unified transaction processing handles both normal and streaming transactions
-        self.process_transaction_batch(transaction).await
     }
 
     async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {

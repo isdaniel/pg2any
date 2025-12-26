@@ -5,30 +5,36 @@
 //!
 //! ## Architecture
 //!
-//! - **sql_received_tx/**: Stores events for in-progress transactions (not yet committed)
+//! - **sql_data_tx/**: Stores actual SQL data (append-only, never moved)
 //!   - File naming: `{txid}_{timestamp}.sql`
 //!   - Events are appended as SQL commands as they arrive
-//!   - Files remain here until COMMIT or ABORT
+//!   - Files are NOT moved or deleted until transaction is fully executed
 //!
-//! - **sql_pending_tx/**: Stores committed transactions ready for execution
-//!   - Files are moved here from sql_received_tx on COMMIT/StreamCommit
-//!   - Consumer executes these files in commit timestamp order
-//!   - Files are deleted after successful execution
+//! - **sql_received_tx/**: Stores metadata for in-progress transactions
+//!   - File naming: `{txid}_{timestamp}.meta`
+//!   - Contains JSON metadata: transaction_id, timestamp, data_file_path
+//!   - Small files (~100 bytes) for fast operations
+//!
+//! - **sql_pending_tx/**: Stores metadata for committed transactions ready for execution
+//!   - File naming: `{txid}_{timestamp}.meta`
+//!   - Contains JSON metadata: transaction_id, timestamp, commit_lsn, data_file_path
+//!   - Metadata moved here from sql_received_tx on COMMIT/StreamCommit
+//!   - Consumer reads these to find which data files to execute
 //!
 //! ## Transaction Flow
 //!
-//! 1. BEGIN: Create new file in sql_received_tx/
-//! 2. DML Events: Append SQL commands to the file
-//! 3. COMMIT: Move file to sql_pending_tx/
-//! 4. Consumer: Execute SQL from sql_pending_tx/ in order
-//! 5. Success: Delete file and update LSN
-//! 6. ABORT: Delete file from sql_received_tx/
+//! 1. BEGIN: Create data file in sql_data_tx/ and metadata in sql_received_tx/
+//! 2. DML Events: Append SQL commands to the data file
+//! 3. COMMIT: Move metadata from sql_received_tx/ to sql_pending_tx/ (data stays in sql_data_tx/)
+//! 4. Consumer: Read metadata from sql_pending_tx/, execute SQL from sql_data_tx/
+//! 5. Success: Delete metadata from sql_pending_tx/ and data file from sql_data_tx/
+//! 6. ABORT: Delete metadata from sql_received_tx/ and data file from sql_data_tx/
 //!
 //! ## Recovery
 //!
 //! On startup:
-//! - Files in sql_received_tx/ are incomplete transactions (can be cleaned up)
-//! - Files in sql_pending_tx/ are committed but not yet executed (must be processed)
+//! - Metadata in sql_received_tx/ are incomplete transactions (can be cleaned up with data files)
+//! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
 use crate::error::{CdcError, Result};
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
@@ -42,14 +48,17 @@ use tracing::{debug, info, warn};
 
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
+const DATA_TX_DIR: &str = "sql_data_tx";
 
-/// Transaction file metadata stored alongside SQL commands
+/// Transaction file metadata stored in sql_received_tx/ and sql_pending_tx/
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionFileMetadata {
     pub transaction_id: u32,
     pub commit_timestamp: DateTime<Utc>,
     pub commit_lsn: Option<Lsn>,
     pub destination_type: DestinationType,
+    /// Path to the SQL data file in sql_data_tx/
+    pub data_file_path: PathBuf,
 }
 
 /// A committed transaction file ready for execution
@@ -77,14 +86,17 @@ impl TransactionFileManager {
         // Create directories if they don't exist
         let received_tx_dir = base_path.join(RECEIVED_TX_DIR);
         let pending_tx_dir = base_path.join(PENDING_TX_DIR);
+        let data_tx_dir = base_path.join(DATA_TX_DIR);
 
         fs::create_dir_all(&received_tx_dir).await?;
         fs::create_dir_all(&pending_tx_dir).await?;
+        fs::create_dir_all(&data_tx_dir).await?;
 
         info!(
             "Transaction file manager initialized at {:?} for {:?}",
             base_path, destination_type
         );
+        info!("Three-directory structure: sql_data_tx/ (data), sql_received_tx/ (in-progress metadata), sql_pending_tx/ (committed metadata)");
 
         Ok(Self {
             base_path,
@@ -103,39 +115,57 @@ impl TransactionFileManager {
         &self.destination_type
     }
 
-    /// Get the file path for a received transaction
+    /// Get the file path for a received transaction metadata
     fn get_received_tx_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
-        let filename = format!("{}_{}.sql", tx_id, timestamp.timestamp_millis());
+        let filename = format!("{}_{}.meta", tx_id, timestamp.timestamp_millis());
         self.base_path.join(RECEIVED_TX_DIR).join(filename)
     }
 
-    /// Get the file path for a pending transaction
+    /// Get the file path for a pending transaction metadata
     fn get_pending_tx_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
-        let filename = format!("{}_{}.sql", tx_id, timestamp.timestamp_millis());
+        let filename = format!("{}_{}.meta", tx_id, timestamp.timestamp_millis());
         self.base_path.join(PENDING_TX_DIR).join(filename)
     }
 
-    /// Create a new transaction file in sql_received_tx
+    /// Get the file path for the SQL data file
+    fn get_data_file_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
+        let filename = format!("{}_{}.sql", tx_id, timestamp.timestamp_millis());
+        self.base_path.join(DATA_TX_DIR).join(filename)
+    }
+
+    /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
     pub async fn begin_transaction(&self, tx_id: u32, timestamp: DateTime<Utc>) -> Result<PathBuf> {
-        let file_path = self.get_received_tx_path(tx_id, timestamp);
+        let data_file_path = self.get_data_file_path(tx_id, timestamp);
+        let metadata_path = self.get_received_tx_path(tx_id, timestamp);
 
-        // Create the file with initial metadata comment
-        let mut file = File::create(&file_path).await?;
+        // Create the SQL data file in sql_data_tx/
+        let mut data_file = File::create(&data_file_path).await?;
+        data_file.write_all(b"-- BEGIN TRANSACTION\n").await?;
+        data_file.flush().await?;
 
+        debug!("Created data file: {:?}", data_file_path);
+
+        // Create metadata file in sql_received_tx/
         let metadata = TransactionFileMetadata {
             transaction_id: tx_id,
             commit_timestamp: timestamp,
             commit_lsn: None,
             destination_type: self.destination_type.clone(),
+            data_file_path: data_file_path.clone(),
         };
 
-        let metadata_json = serde_json::to_string(&metadata)?;
-        file.write_all(format!("-- METADATA: {}\n", metadata_json).as_bytes())
-            .await?;
-        file.write_all(b"-- BEGIN TRANSACTION\n").await?;
+        let metadata_json = serde_json::to_string_pretty(&metadata)?;
+        let mut metadata_file = File::create(&metadata_path).await?;
+        metadata_file.write_all(metadata_json.as_bytes()).await?;
+        metadata_file.flush().await?;
 
-        debug!("Created transaction file: {:?}", file_path);
-        Ok(file_path)
+        info!(
+            "Started transaction {}: data={:?}, metadata={:?}",
+            tx_id, data_file_path, metadata_path
+        );
+
+        // Return the data file path for appending events
+        Ok(data_file_path)
     }
 
     /// Append a change event to a running transaction file
@@ -150,108 +180,132 @@ impl TransactionFileManager {
         Ok(())
     }
 
-    /// Move a transaction file from sql_received_tx to sql_pending_tx (on commit)
+    /// Move metadata from sql_received_tx to sql_pending_tx
     pub async fn commit_transaction(
         &self,
         tx_id: u32,
         timestamp: DateTime<Utc>,
         commit_lsn: Option<Lsn>,
     ) -> Result<PathBuf> {
-        let received_path = self.get_received_tx_path(tx_id, timestamp);
-        let pending_path = self.get_pending_tx_path(tx_id, timestamp);
+        let received_metadata_path = self.get_received_tx_path(tx_id, timestamp);
+        let pending_metadata_path = self.get_pending_tx_path(tx_id, timestamp);
 
-        // Open source file for streaming read
-        let source_file = File::open(&received_path).await.map_err(|e| {
+        // Read existing metadata from sql_received_tx/
+        let metadata_content = fs::read_to_string(&received_metadata_path)
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to read metadata from {:?}: {}",
+                    received_metadata_path, e
+                ))
+            })?;
+
+        let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
+            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {}", e)))?;
+
+        // Update commit LSN
+        metadata.commit_lsn = commit_lsn;
+
+        // Write updated metadata to sql_pending_tx/
+        let updated_json = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {}", e)))?;
+
+        let mut pending_file = File::create(&pending_metadata_path).await.map_err(|e| {
             CdcError::generic(format!(
-                "Failed to open received file {:?}: {}",
-                received_path, e
+                "Failed to create pending metadata {:?}: {}",
+                pending_metadata_path, e
             ))
         })?;
-        let reader = BufReader::with_capacity(8192, source_file);
-        let mut lines = reader.lines();
 
-        // Create destination file for streaming write
-        let mut dest_file = File::create(&pending_path).await.map_err(|e| {
-            CdcError::generic(format!(
-                "Failed to create pending file {:?}: {}",
-                pending_path, e
-            ))
-        })?;
-
-        let mut metadata_updated = false;
-
-        // Stream line-by-line, updating metadata as we go
-        while let Some(line) = lines
-            .next_line()
+        pending_file
+            .write_all(updated_json.as_bytes())
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to read from received file: {}", e)))?
-        {
-            if !metadata_updated && line.starts_with("-- METADATA:") {
-                // Parse existing metadata and update with commit LSN
-                let json_str = line.trim_start_matches("-- METADATA:").trim();
-                let mut metadata: TransactionFileMetadata = serde_json::from_str(json_str)
-                    .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {}", e)))?;
-                metadata.commit_lsn = commit_lsn;
+            .map_err(|e| CdcError::generic(format!("Failed to write metadata: {}", e)))?;
 
-                // Write updated metadata line
-                let updated_json = serde_json::to_string(&metadata).map_err(|e| {
-                    CdcError::generic(format!("Failed to serialize metadata: {}", e))
-                })?;
-                dest_file
-                    .write_all(format!("-- METADATA: {}\n", updated_json).as_bytes())
-                    .await
-                    .map_err(|e| CdcError::generic(format!("Failed to write metadata: {}", e)))?;
-                metadata_updated = true;
-            } else {
-                // Copy line as-is
-                dest_file
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| CdcError::generic(format!("Failed to write line: {}", e)))?;
-                dest_file
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|e| CdcError::generic(format!("Failed to write newline: {}", e)))?;
-            }
-        }
-
-        // Add COMMIT marker
-        dest_file
-            .write_all(b"-- COMMIT TRANSACTION\n")
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to write COMMIT marker: {}", e)))?;
-
-        // Ensure all data is written to disk
-        dest_file
+        pending_file
             .flush()
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to flush pending file: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {}", e)))?;
 
-        // Remove source file only after successful write
-        fs::remove_file(&received_path).await.map_err(|e| {
-            CdcError::generic(format!(
-                "Failed to remove received file {:?}: {}",
-                received_path, e
-            ))
-        })?;
+        // Append COMMIT marker to data file
+        let data_file_path = &metadata.data_file_path;
+        if data_file_path.exists() {
+            let mut data_file = fs::OpenOptions::new()
+                .append(true)
+                .open(data_file_path)
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to open data file {:?}: {}",
+                        data_file_path, e
+                    ))
+                })?;
+            data_file
+                .write_all(b"-- COMMIT TRANSACTION\n")
+                .await
+                .map_err(|e| CdcError::generic(format!("Failed to write COMMIT marker: {}", e)))?;
+            data_file
+                .flush()
+                .await
+                .map_err(|e| CdcError::generic(format!("Failed to flush data file: {}", e)))?;
+        }
+
+        // Remove metadata from sql_received_tx/ only after successful write
+        fs::remove_file(&received_metadata_path)
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to remove received metadata {:?}: {}",
+                    received_metadata_path, e
+                ))
+            })?;
 
         info!(
-            "Committed transaction {} to pending queue (LSN: {:?}) using streaming I/O",
+            "Committed transaction {}: moved metadata to sql_pending_tx/ (LSN: {:?}), data stays in sql_data_tx/",
             tx_id, commit_lsn
         );
 
-        Ok(pending_path)
+        Ok(pending_metadata_path)
     }
 
-    /// Delete a transaction file (on abort)
+    /// Delete transaction files (metadata and data) on abort
     pub async fn abort_transaction(&self, tx_id: u32, timestamp: DateTime<Utc>) -> Result<()> {
-        let received_path = self.get_received_tx_path(tx_id, timestamp);
+        let received_metadata_path = self.get_received_tx_path(tx_id, timestamp);
+        let data_file_path = self.get_data_file_path(tx_id, timestamp);
 
-        if received_path.exists() {
-            fs::remove_file(&received_path).await?;
-            info!("Aborted transaction {}, deleted file", tx_id);
+        // Read metadata to get data file path (in case it's different)
+        let actual_data_path = if received_metadata_path.exists() {
+            if let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await {
+                if let Ok(metadata) =
+                    serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
+                {
+                    metadata.data_file_path
+                } else {
+                    data_file_path.clone()
+                }
+            } else {
+                data_file_path.clone()
+            }
+        } else {
+            data_file_path
+        };
+
+        // Delete metadata file
+        if received_metadata_path.exists() {
+            fs::remove_file(&received_metadata_path).await?;
+            debug!("Deleted metadata file: {:?}", received_metadata_path);
         }
 
+        // Delete data file
+        if actual_data_path.exists() {
+            fs::remove_file(&actual_data_path).await?;
+            debug!("Deleted data file: {:?}", actual_data_path);
+        }
+
+        info!(
+            "Aborted transaction {}, deleted metadata and data files",
+            tx_id
+        );
         Ok(())
     }
 
@@ -264,7 +318,8 @@ impl TransactionFileManager {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) == Some("sql") {
+            // Read .meta files from sql_pending_tx/
+            if path.extension().and_then(|s| s.to_str()) == Some("meta") {
                 if let Ok(metadata) = self.read_metadata(&path).await {
                     files.push(PendingTransactionFile {
                         file_path: path,
@@ -280,55 +335,59 @@ impl TransactionFileManager {
         Ok(files)
     }
 
-    /// Read metadata from a transaction file
+    /// Read metadata from a transaction metadata file (.meta)
     async fn read_metadata(&self, file_path: &Path) -> Result<TransactionFileMetadata> {
-        let file = File::open(file_path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        if let Some(line) = lines.next_line().await? {
-            if line.starts_with("-- METADATA:") {
-                let json_str = line.trim_start_matches("-- METADATA:").trim();
-                let metadata: TransactionFileMetadata = serde_json::from_str(json_str)?;
-                return Ok(metadata);
-            }
-        }
-
-        Err(CdcError::Generic(
-            "Transaction file missing metadata".to_string(),
-        ))
+        let metadata_content = fs::read_to_string(file_path).await?;
+        let metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)?;
+        Ok(metadata)
     }
 
-    /// Read SQL commands from a transaction file (excluding metadata comments)
+    /// Read SQL commands from a transaction data file (excluding comments)
+    ///
+    /// This method reads SQL commands from the data file referenced by a pending transaction.
+    /// The file_path parameter should be the path to the metadata file (.meta) in sql_pending_tx/.
+    /// This method will read the metadata to find the actual data file path in sql_data_tx/.
     ///
     /// This method uses buffered streaming I/O to efficiently handle large transaction files
     /// (100MB+) without loading the entire file into memory. SQL statements are properly
     /// parsed by splitting on semicolons while respecting string literals and comments.
-    ///
-    /// This fixes the issue where SQL statements containing embedded newlines in string
-    /// literals would be incorrectly split when reading line-by-line.
     ///
     /// Performance characteristics:
     /// - Memory: O(1) - only buffers 64KB at a time
     /// - Time: O(n) where n is file size in bytes
     /// - Can handle files of any size without truncation
     /// - Properly handles multi-line SQL statements
-    pub async fn read_sql_commands(&self, file_path: &Path) -> Result<Vec<String>> {
-        let file = File::open(file_path).await.map_err(|e| {
-            CdcError::generic(format!("Failed to open file {:?}: {}", file_path, e))
+    pub async fn read_sql_commands(&self, metadata_file_path: &Path) -> Result<Vec<String>> {
+        // Read metadata to get the data file path
+        let metadata = self.read_metadata(metadata_file_path).await?;
+        let data_file_path = &metadata.data_file_path;
+
+        debug!(
+            "Reading SQL commands from data file: {:?} (referenced by metadata: {:?})",
+            data_file_path, metadata_file_path
+        );
+
+        let file = File::open(data_file_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to open data file {:?}: {}",
+                data_file_path, e
+            ))
         })?;
 
         let reader = BufReader::with_capacity(65536, file); // 64KB buffer for optimal I/O
         let mut lines = reader.lines();
         let mut file_content = String::with_capacity(65536);
 
-        // Read the entire file content, filtering out metadata and comment lines
+        // Read the entire file content, filtering out comment lines
         while let Some(line) = lines.next_line().await.map_err(|e| {
-            CdcError::generic(format!("Failed to read line from {:?}: {}", file_path, e))
+            CdcError::generic(format!(
+                "Failed to read line from {:?}: {}",
+                data_file_path, e
+            ))
         })? {
             let trimmed = line.trim();
 
-            // Skip metadata and transaction markers (comments starting with --)
+            // Skip transaction markers (comments starting with --)
             if trimmed.starts_with("--") {
                 continue;
             }
@@ -349,7 +408,7 @@ impl TransactionFileManager {
         debug!(
             "Read {} SQL commands from {:?} using statement-based parsing",
             commands.len(),
-            file_path
+            data_file_path
         );
 
         // Log first and last few commands for debugging
@@ -476,31 +535,66 @@ impl TransactionFileManager {
         Ok(statements)
     }
 
-    /// Delete a pending transaction file after successful execution
-    pub async fn delete_pending_transaction(&self, file_path: &Path) -> Result<()> {
-        fs::remove_file(file_path).await?;
-        debug!("Deleted executed transaction file: {:?}", file_path);
+    /// Delete a pending transaction (metadata and data files) after successful execution
+    pub async fn delete_pending_transaction(&self, metadata_file_path: &Path) -> Result<()> {
+        // Read metadata to get data file path
+        let metadata = self.read_metadata(metadata_file_path).await?;
+        let data_file_path = &metadata.data_file_path;
+
+        // Delete data file from sql_data_tx/
+        if data_file_path.exists() {
+            fs::remove_file(data_file_path).await?;
+            debug!("Deleted data file: {:?}", data_file_path);
+        }
+
+        // Delete metadata file from sql_pending_tx/
+        fs::remove_file(metadata_file_path).await?;
+        debug!("Deleted metadata file: {:?}", metadata_file_path);
+
+        info!(
+            "Deleted executed transaction files: metadata={:?}, data={:?}",
+            metadata_file_path, data_file_path
+        );
         Ok(())
     }
 
-    /// Clean up incomplete transactions from sql_received_tx directory
+    /// Clean up incomplete transactions from sql_received_tx and sql_data_tx directories
     pub async fn cleanup_received_transactions(&self) -> Result<()> {
         let received_dir = self.base_path.join(RECEIVED_TX_DIR);
         let mut entries = fs::read_dir(&received_dir).await?;
         let mut count = 0;
 
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
+            let metadata_path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) == Some("sql") {
-                fs::remove_file(&path).await?;
+            // Process .meta files from sql_received_tx/
+            if metadata_path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                // Read metadata to get data file path
+                if let Ok(metadata) = self.read_metadata(&metadata_path).await {
+                    let data_file_path = &metadata.data_file_path;
+
+                    // Delete data file if it exists
+                    if data_file_path.exists() {
+                        if let Err(e) = fs::remove_file(data_file_path).await {
+                            warn!(
+                                "Failed to delete incomplete data file {:?}: {}",
+                                data_file_path, e
+                            );
+                        } else {
+                            debug!("Deleted incomplete data file: {:?}", data_file_path);
+                        }
+                    }
+                }
+
+                // Delete metadata file
+                fs::remove_file(&metadata_path).await?;
                 count += 1;
             }
         }
 
         if count > 0 {
             warn!(
-                "Cleaned up {} incomplete transactions from sql_received_tx",
+                "Cleaned up {} incomplete transaction(s) from sql_received_tx and sql_data_tx",
                 count
             );
         }

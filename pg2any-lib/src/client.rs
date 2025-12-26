@@ -400,22 +400,44 @@ impl CdcClient {
                                             }
 
                                             // Notify consumer with transaction details for immediate processing
-                                            let notification = PendingTransactionFile {
-                                                file_path: pending_path.clone(),
-                                                metadata: TransactionFileMetadata {
-                                                    transaction_id: tx_id,
-                                                    commit_timestamp: timestamp,
-                                                    commit_lsn: event.lsn,
-                                                    destination_type: transaction_file_manager
-                                                        .destination_type()
-                                                        .clone(),
+
+                                            match tokio::fs::read_to_string(&pending_path).await {
+                                                Ok(content) => match serde_json::from_str::<
+                                                    TransactionFileMetadata,
+                                                >(
+                                                    &content
+                                                ) {
+                                                    Ok(metadata) => {
+                                                        let notification = PendingTransactionFile {
+                                                            file_path: pending_path.clone(),
+                                                            metadata,
+                                                        };
+                                                        if let Err(e) =
+                                                            commit_notifier.send(notification).await
+                                                        {
+                                                            warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
+                                                        } else {
+                                                            debug!("Sent commit notification for transaction {} with file {:?}", tx_id, pending_path);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to parse metadata from {:?}: {}", pending_path, e);
+                                                        metrics_collector.record_error(
+                                                            "metadata_parse_failed",
+                                                            "producer",
+                                                        );
+                                                    }
                                                 },
-                                            };
-                                            if let Err(e) = commit_notifier.send(notification).await
-                                            {
-                                                warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
-                                            } else {
-                                                debug!("Sent commit notification for transaction {} with file {:?}", tx_id, pending_path);
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to read metadata from {:?}: {}",
+                                                        pending_path, e
+                                                    );
+                                                    metrics_collector.record_error(
+                                                        "metadata_read_failed",
+                                                        "producer",
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -516,21 +538,44 @@ impl CdcClient {
                                         }
 
                                         // Notify consumer with transaction details for immediate processing
-                                        let notification = PendingTransactionFile {
-                                            file_path: pending_path.clone(),
-                                            metadata: TransactionFileMetadata {
-                                                transaction_id: *transaction_id,
-                                                commit_timestamp: timestamp,
-                                                commit_lsn: event.lsn,
-                                                destination_type: transaction_file_manager
-                                                    .destination_type()
-                                                    .clone(),
-                                            },
-                                        };
-                                        if let Err(e) = commit_notifier.send(notification).await {
-                                            warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
-                                        } else {
-                                            debug!("Sent commit notification for streaming transaction {} with file {:?}", transaction_id, pending_path);
+                                        // Read metadata from the pending file to get complete information including data_file_path
+                                        match tokio::fs::read_to_string(&pending_path).await {
+                                            Ok(content) => {
+                                                match serde_json::from_str::<TransactionFileMetadata>(
+                                                    &content,
+                                                ) {
+                                                    Ok(metadata) => {
+                                                        let notification = PendingTransactionFile {
+                                                            file_path: pending_path.clone(),
+                                                            metadata,
+                                                        };
+                                                        if let Err(e) =
+                                                            commit_notifier.send(notification).await
+                                                        {
+                                                            warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
+                                                        } else {
+                                                            debug!("Sent commit notification for streaming transaction {} with file {:?}", transaction_id, pending_path);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to parse metadata from {:?}: {}", pending_path, e);
+                                                        metrics_collector.record_error(
+                                                            "metadata_parse_failed",
+                                                            "producer",
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to read metadata from {:?}: {}",
+                                                    pending_path, e
+                                                );
+                                                metrics_collector.record_error(
+                                                    "metadata_read_failed",
+                                                    "producer",
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -1232,20 +1277,6 @@ mod tests {
 
         fn set_schema_mappings(&mut self, _mappings: std::collections::HashMap<String, String>) {
             // Mock implementation - no-op
-        }
-
-        async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()> {
-            if self.processing_delay > Duration::ZERO {
-                sleep(self.processing_delay).await;
-            }
-
-            if self.should_fail {
-                return Err(CdcError::generic("Mock error"));
-            }
-
-            let mut transactions = self.transactions_processed.lock().unwrap();
-            transactions.push(ProcessedTransactionInfo::from(transaction));
-            Ok(())
         }
 
         async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {

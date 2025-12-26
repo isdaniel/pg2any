@@ -16,7 +16,7 @@ fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
 /// Test that destination handlers have consistent interfaces
 #[tokio::test]
 async fn test_destination_handler_interface() {
-    let events = vec![
+    let _events = vec![
         create_test_event(),
         create_update_event(),
         create_delete_event(),
@@ -26,14 +26,16 @@ async fn test_destination_handler_interface() {
     {
         let mut destination = DestinationFactory::create(&DestinationType::MySQL).unwrap();
 
-        // Test single event processing interface
-        for event in &events {
-            let event_result = destination
-                .process_transaction(&wrap_in_transaction(event.clone()))
-                .await;
-            // Should fail due to no connection, but not panic
-            assert!(event_result.is_err());
-        }
+        // Test execute_sql_batch interface with empty batch (should succeed)
+        let empty_batch_result = destination.execute_sql_batch(&[]).await;
+        assert!(empty_batch_result.is_ok());
+
+        // Test execute_sql_batch with SQL that will fail due to no connection
+        let sql_batch_result = destination
+            .execute_sql_batch(&["INSERT INTO test (id) VALUES (1);".to_string()])
+            .await;
+        // Should fail due to no connection, but not panic
+        assert!(sql_batch_result.is_err());
 
         // Test close method
         let close_result = destination.close().await;
@@ -44,14 +46,16 @@ async fn test_destination_handler_interface() {
     {
         let mut destination = DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
-        // Test single event processing interface
-        for event in &events {
-            let event_result = destination
-                .process_transaction(&wrap_in_transaction(event.clone()))
-                .await;
-            // Should fail due to no connection, but not panic
-            assert!(event_result.is_err());
-        }
+        // Test execute_sql_batch interface with empty batch (should succeed)
+        let empty_batch_result = destination.execute_sql_batch(&[]).await;
+        assert!(empty_batch_result.is_ok());
+
+        // Test execute_sql_batch with SQL that will fail due to no connection
+        let sql_batch_result = destination
+            .execute_sql_batch(&["INSERT INTO test (id) VALUES (1);".to_string()])
+            .await;
+        // Should fail due to no connection, but not panic
+        assert!(sql_batch_result.is_err());
 
         // Test close method
         let close_result = destination.close().await;

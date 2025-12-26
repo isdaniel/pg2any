@@ -1,28 +1,38 @@
 /// Common utilities and traits for destination implementations
+///
+/// This module provides shared functionality for all destination implementations:
+///
+/// ## Batch Management
+/// - `InsertBatch`, `UpdateBatch`, `DeleteBatch`: Data structures for batching DML operations
+/// - Dynamic batch size calculation based on actual data size and database constraints
+/// - Database-specific limits handling (MySQL max_allowed_packet, SQLite variable limits)
+///
+/// ## Batch Size Calculation
+/// The refactored batch size system uses actual data sampling instead of hardcoded constants:
+/// - `estimate_value_size()`: Estimates bytes for JSON values
+/// - `estimate_*_batch_row_size()`: Samples batch data to estimate average row size
+/// - `calculate_batch_size()`: Generic calculator respecting packet limits and constraints
+/// - `analyze_transaction_batch_requirements()`: Analyzes transaction characteristics
+///
+/// This approach provides:
+/// - **Adaptive sizing**: Batch sizes adjust based on actual data size
+/// - **Safety**: Respects database-specific limits (MySQL packet size, SQLite variables)
+/// - **Performance**: Optimizes throughput while preventing errors
+/// - **Consistency**: All destinations use the same calculation logic
+///
+/// ## WHERE Clause Building
+/// - Replica identity-aware WHERE clause generation
+/// - Supports FULL, DEFAULT, INDEX, and NOTHING replica identities
+/// - Handles key column resolution and old_data availability
+///
+/// ## Schema Mapping
+/// - Maps source schemas to destination databases/schemas
+/// - Essential for cross-database replication
 use crate::{
     error::{CdcError, Result},
     types::ReplicaIdentity,
 };
 use std::collections::HashMap;
-
-/// Generic open transaction wrapper that holds database-specific transaction state
-/// The generic parameter T allows each destination to use its own connection/transaction type
-pub struct OpenTransaction<T> {
-    /// PostgreSQL transaction ID and event count tracking
-    pub state: TransactionState,
-    /// Database-specific transaction handle (connection, transaction object, or flag)
-    pub handle: T,
-}
-
-impl<T> OpenTransaction<T> {
-    /// Create a new open transaction with the given transaction ID and handle
-    pub fn new(transaction_id: u32, handle: T) -> Self {
-        Self {
-            state: TransactionState::new(transaction_id),
-            handle,
-        }
-    }
-}
 
 /// Helper struct for building WHERE clauses with proper parameter binding
 /// Uses references to avoid unnecessary cloning of JSON values
@@ -245,29 +255,201 @@ impl<'a> DeleteBatch<'a> {
     }
 }
 
-/// Transaction state tracking for streaming transactions
-pub struct TransactionState {
-    /// PostgreSQL transaction ID
-    pub transaction_id: u32,
-    /// Number of events processed so far
-    pub events_processed: usize,
-}
-
-impl TransactionState {
-    pub fn new(transaction_id: u32) -> Self {
-        Self {
-            transaction_id,
-            events_processed: 0,
-        }
-    }
-}
-
 /// Map a source schema to destination schema using provided mappings
 pub fn map_schema(schema_mappings: &HashMap<String, String>, source_schema: &str) -> String {
     schema_mappings
         .get(source_schema)
         .cloned()
         .unwrap_or_else(|| source_schema.to_string())
+}
+
+/// Estimate the size of a JSON value in bytes when serialized to SQL
+///
+/// This provides a reasonable approximation for calculating batch sizes
+/// based on actual data size rather than arbitrary constants.
+pub fn estimate_value_size(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,    // "NULL"
+        serde_json::Value::Bool(_) => 5, // "true" or "false"
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                20 // Max digits for 64-bit integer
+            } else {
+                30 // Float with decimals
+            }
+        }
+        serde_json::Value::String(s) => s.len() + 2, // String content + quotes
+        serde_json::Value::Array(arr) => {
+            arr.iter().map(estimate_value_size).sum::<usize>() + arr.len() * 2
+        }
+        serde_json::Value::Object(obj) => {
+            obj.values().map(estimate_value_size).sum::<usize>() + obj.len() * 4
+        }
+    }
+}
+
+/// Generic batch size calculator
+///
+/// Calculates the maximum safe batch size based on:
+/// - Estimated bytes per row (data values)
+/// - Statement-specific overhead (SQL keywords, syntax)
+/// - Maximum packet/statement size limit with safety margin
+/// - Min/max bounds for different operation types
+///
+/// # Arguments
+/// * `estimated_bytes_per_row` - Estimated size of data per row
+/// * `statement_overhead` - Per-statement SQL syntax overhead
+/// * `fixed_overhead` - Fixed SQL statement overhead (INSERT INTO, etc.)
+/// * `max_packet_size` - Maximum packet size (0 = unlimited)
+/// * `safety_margin` - Safety margin percentage (e.g., 0.75 = 75%)
+/// * `min_rows` - Minimum batch size to return
+/// * `max_rows` - Maximum batch size to return
+pub fn calculate_batch_size(
+    estimated_bytes_per_row: usize,
+    statement_overhead: usize,
+    fixed_overhead: usize,
+    max_packet_size: u64,
+    safety_margin: f64,
+    min_rows: usize,
+    max_rows: usize,
+) -> usize {
+    let total_bytes_per_row = estimated_bytes_per_row + statement_overhead;
+
+    if max_packet_size == 0 {
+        // No packet size limit
+        return max_rows;
+    }
+
+    let safe_packet_size = (max_packet_size as f64 * safety_margin) as u64;
+    let calculated_max =
+        (safe_packet_size as usize).saturating_sub(fixed_overhead) / total_bytes_per_row.max(1);
+    calculated_max.clamp(min_rows, max_rows)
+}
+
+/// Estimate average row size from InsertBatch data
+///
+/// Samples the first N rows to estimate average data size per row
+pub fn estimate_insert_batch_row_size(batch: &InsertBatch<'_>, sample_size: usize) -> usize {
+    if batch.rows.is_empty() {
+        return batch.columns.len() * 100; // Fallback estimate
+    }
+
+    let sample_count = sample_size.min(batch.rows.len());
+    let total_estimated: usize = batch
+        .rows
+        .iter()
+        .take(sample_count)
+        .map(|row| {
+            row.iter()
+                .map(|val| estimate_value_size(val))
+                .sum::<usize>()
+        })
+        .sum();
+
+    (total_estimated / sample_count).max(50)
+}
+
+/// Estimate average row size from UpdateBatch data
+///
+/// Samples the first N rows to estimate average data size per row
+pub fn estimate_update_batch_row_size(batch: &UpdateBatch<'_>, sample_size: usize) -> usize {
+    if batch.rows.is_empty() {
+        return (batch.key_columns.len() + batch.update_columns.len()) * 100; // Fallback
+    }
+
+    let sample_count = sample_size.min(batch.rows.len());
+    let total_estimated: usize = batch
+        .rows
+        .iter()
+        .take(sample_count)
+        .map(|(key_vals, update_vals)| {
+            let key_size: usize = key_vals.iter().map(|v| estimate_value_size(v)).sum();
+            let update_size: usize = update_vals.iter().map(|v| estimate_value_size(v)).sum();
+            key_size + update_size
+        })
+        .sum();
+
+    (total_estimated / sample_count).max(100)
+}
+
+/// Estimate average row size from DeleteBatch data
+///
+/// Samples the first N rows to estimate average key size per row
+pub fn estimate_delete_batch_row_size(batch: &DeleteBatch<'_>, sample_size: usize) -> usize {
+    if batch.rows.is_empty() {
+        return batch.key_columns.len() * 100; // Fallback
+    }
+
+    let sample_count = sample_size.min(batch.rows.len());
+    let total_estimated: usize = batch
+        .rows
+        .iter()
+        .take(sample_count)
+        .map(|key_vals| {
+            key_vals
+                .iter()
+                .map(|v| estimate_value_size(v))
+                .sum::<usize>()
+        })
+        .sum();
+
+    (total_estimated / sample_count).max(50)
+}
+
+/// Analyze a Transaction and estimate batch sizes for its events
+///
+/// This function provides insights into the transaction's data characteristics
+/// to help determine optimal batch sizes for processing.
+///
+/// Returns a tuple: (insert_count, update_count, delete_count, avg_data_size)
+pub fn analyze_transaction_batch_requirements(
+    transaction: &crate::types::Transaction,
+) -> (usize, usize, usize, usize) {
+    use crate::types::EventType;
+
+    let mut insert_count = 0;
+    let mut update_count = 0;
+    let mut delete_count = 0;
+    let mut total_data_size = 0;
+    let mut data_events = 0;
+
+    for event in &transaction.events {
+        match &event.event_type {
+            EventType::Insert { data, .. } => {
+                insert_count += 1;
+                let size: usize = data.values().map(|v| estimate_value_size(v)).sum();
+                total_data_size += size;
+                data_events += 1;
+            }
+            EventType::Update {
+                new_data, old_data, ..
+            } => {
+                update_count += 1;
+                let new_size: usize = new_data.values().map(|v| estimate_value_size(v)).sum();
+                let old_size: usize = old_data
+                    .as_ref()
+                    .map(|d| d.values().map(|v| estimate_value_size(v)).sum())
+                    .unwrap_or(0);
+                total_data_size += new_size + old_size;
+                data_events += 1;
+            }
+            EventType::Delete { old_data, .. } => {
+                delete_count += 1;
+                let size: usize = old_data.values().map(|v| estimate_value_size(v)).sum();
+                total_data_size += size;
+                data_events += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let avg_data_size = if data_events > 0 {
+        total_data_size / data_events
+    } else {
+        0
+    };
+
+    (insert_count, update_count, delete_count, avg_data_size)
 }
 
 /// Build WHERE clause conditions for UPDATE operations based on replica identity

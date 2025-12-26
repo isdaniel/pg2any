@@ -72,12 +72,7 @@ impl CdcApp {
     /// Returns `CdcError` if the CDC client cannot be created or initialized.
     pub async fn new(config: CdcAppConfig) -> CdcResult<Self> {
         info!("Initializing CDC client");
-        let mut client = CdcClient::new(config.cdc_config.clone()).await?;
-
-        info!("Performing CDC client initialization");
-        client.init().await?;
-
-        info!("CDC client initialized successfully");
+        let client = CdcClient::new(config.cdc_config.clone()).await?;
 
         Ok(Self { client, config })
     }
@@ -137,7 +132,6 @@ impl CdcApp {
         self.client.set_lsn_tracker(lsn_tracker);
 
         info!("Starting CDC replication stream");
-        info!("This will continuously monitor PostgreSQL changes");
 
         #[cfg(feature = "metrics")]
         {
@@ -148,7 +142,6 @@ impl CdcApp {
             }
         }
 
-        info!("Starting CDC replication (metrics disabled)");
         self.run_with_optional_server(start_lsn, None).await
     }
 
@@ -197,26 +190,6 @@ impl CdcApp {
                 Ok(())
             }
         }
-    }
-
-    /// Get metrics in Prometheus text format
-    pub fn get_metrics(&self) -> CdcResult<String> {
-        self.client.get_metrics()
-    }
-
-    /// Initialize build information in metrics  
-    pub fn init_build_info(&self, version: &str) {
-        self.client.init_build_info(version);
-    }
-
-    /// Get access to the underlying client (for advanced use cases)
-    pub fn client(&self) -> &CdcClient {
-        &self.client
-    }
-
-    /// Get mutable access to the underlying client (for advanced use cases)
-    pub fn client_mut(&mut self) -> &mut CdcClient {
-        &mut self.client
     }
 }
 

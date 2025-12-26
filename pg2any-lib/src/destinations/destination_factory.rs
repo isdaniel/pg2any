@@ -1,6 +1,6 @@
 use crate::{
     error::{CdcError, Result},
-    types::{DestinationType, Transaction},
+    types::DestinationType,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -20,14 +20,13 @@ use super::sqlite::SQLiteDestination;
 /// Each worker has its own destination handler with its own connection.
 /// Workers process complete transactions atomically to ensure data consistency.
 ///
-/// ## Streaming Transaction Support
+/// ## File-Based Transaction Processing
 ///
-/// For streaming transactions (protocol v2+), the handler supports keeping a database
-/// transaction open across multiple batches from the same PostgreSQL transaction:
-///
-/// - `process_transaction()` - Unified method that handles both normal and streaming transactions
-/// - `rollback_streaming_transaction()` - Rollback an open streaming transaction
-/// - `get_active_streaming_transaction_id()` - Check if there's an open streaming transaction
+/// The current architecture uses file-based transaction processing:
+/// - Transactions are written to files in sql_data_tx/ as events arrive
+/// - Metadata for completed transactions are stored in sql_pending_tx/ on COMMIT/StreamCommit
+/// - Consumer reads metadata and executes SQL via `execute_sql_batch()` in atomic transactions
+/// - No database transactions are kept open between batches
 #[async_trait]
 pub trait DestinationHandler: Send + Sync {
     /// Initialize the destination connection
@@ -37,36 +36,18 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
-    /// Process a transaction (both normal and streaming)
+    /// Execute a batch of SQL commands within a single transaction
     ///
-    /// This unified method handles all transaction types:
-    /// - **Normal transactions** (is_streaming=false): BEGIN → process → COMMIT atomically
-    /// - **Streaming transactions** (is_streaming=true): Process in batches, commit on final batch
-    ///
-    /// For streaming transactions:
-    /// - Opens a DB transaction on first batch (is_final_batch=false)
-    /// - Processes intermediate batches without committing
-    /// - Commits DB transaction on final batch (is_final_batch=true)
+    /// This is the primary method used by the consumer to execute transaction files.
+    /// All commands are executed atomically - if any command fails, the entire batch is rolled back.
     ///
     /// # Arguments
-    /// * `transaction` - Transaction or batch with flags indicating type and finality
+    /// * `commands` - Vector of SQL commands to execute in a single transaction
     ///
     /// # Returns
-    /// * `Ok(())` - Transaction/batch was successfully processed
-    /// * `Err(...)` - Processing failed (streaming transactions should be rolled back)
-    async fn process_transaction(&mut self, transaction: &Transaction) -> Result<()>;
-
-    /// Check if there's an active streaming transaction
-    ///
-    /// Returns the transaction_id of the active streaming transaction, if any.
-    /// This is used to ensure proper cleanup during shutdown.
-    fn get_active_streaming_transaction_id(&self) -> Option<u32>;
-
-    /// Rollback an active streaming transaction
-    ///
-    /// This is called when a StreamAbort is received or during error recovery/shutdown.
-    /// Default implementation does nothing (for handlers that don't maintain open transactions).
-    async fn rollback_streaming_transaction(&mut self) -> Result<()>;
+    /// * `Ok(())` - All SQL commands were successfully executed and committed
+    /// * `Err(...)` - Execution failed, transaction was rolled back
+    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()>;
 
     /// Close the connection
     async fn close(&mut self) -> Result<()>;

@@ -204,81 +204,6 @@ transaction_files/
 
 ### Workflow Diagrams
 
-#### Complete System Workflow
-
-```mermaid
-graph TB
-    Start([Start pg2any]) --> LoadConfig[Load Configuration]
-    LoadConfig --> LoadLSN[Load LSN Metadata<br/>from .metadata file]
-    LoadLSN --> CheckRecovery{Recovery<br/>Needed?}
-    
-    CheckRecovery -->|Yes| CleanupIncomplete[Cleanup sql_received_tx/]
-    CheckRecovery -->|No| StartTasks[Start Producer & Consumer]
-    CleanupIncomplete --> ProcessPending[Process sql_pending_tx/]
-    ProcessPending --> StartTasks
-    
-    StartTasks --> Producer[Producer Task]
-    StartTasks --> Consumer[Consumer Task]
-    
-    Producer --> ReadWAL[Read PostgreSQL WAL Stream]
-    ReadWAL --> ProcessEvent{Event Type}
-    
-    ProcessEvent -->|BEGIN| CreateFiles[Create .sql in sql_data_tx/<br/>Create .meta in sql_received_tx/]
-    ProcessEvent -->|INSERT/UPDATE/DELETE| AppendSQL[Append SQL to .sql file<br/>Buffer: 64KB]
-    ProcessEvent -->|COMMIT| FlushBuffer[Flush Buffer]
-    ProcessEvent -->|Heartbeat| SendFeedback[Send LSN Feedback]
-    
-    CreateFiles --> ReadWAL
-    AppendSQL --> CheckBuffer{Buffer Full?}
-    CheckBuffer -->|Yes| FlushToDisk[Flush to Disk]
-    CheckBuffer -->|No| ReadWAL
-    FlushToDisk --> ReadWAL
-    
-    FlushBuffer --> MoveMeta[Move .meta to sql_pending_tx/]
-    MoveMeta --> NotifyConsumer[Notify Consumer via Channel]
-    NotifyConsumer --> ReadWAL
-    SendFeedback --> ReadWAL
-    
-    Consumer --> WaitNotification[Wait for Notification]
-    WaitNotification --> ListPending[List Files in sql_pending_tx/]
-    ListPending --> CheckFiles{Files<br/>Available?}
-    
-    CheckFiles -->|No| WaitNotification
-    CheckFiles -->|Yes| ReadMeta[Read .meta File]
-    ReadMeta --> GetDataPath[Get Data File Path]
-    GetDataPath --> CheckResume{Resume<br/>Position?}
-    
-    CheckResume -->|Yes| ReadFromIndex[Read SQL from Index]
-    CheckResume -->|No| ReadAllSQL[Read All SQL Commands]
-    
-    ReadFromIndex --> ExecuteBatch[Execute SQL Batch]
-    ReadAllSQL --> ExecuteBatch
-    
-    ExecuteBatch --> CheckSuccess{Execution<br/>Success?}
-    
-    CheckSuccess -->|Yes| UpdatePosition[Update Consumer Position<br/>in LSN Metadata]
-    CheckSuccess -->|No| LogError[Log Error]
-    
-    UpdatePosition --> CheckComplete{All Commands<br/>Executed?}
-    CheckComplete -->|No| ExecuteBatch
-    CheckComplete -->|Yes| DeleteFiles[Delete .meta and .sql Files]
-    
-    DeleteFiles --> UpdateLSN[Update flush_lsn<br/>in LSN Metadata]
-    UpdateLSN --> ClearPosition[Clear Consumer Position]
-    ClearPosition --> ListPending
-    
-    LogError --> Retry{Retry?}
-    Retry -->|Yes| ExecuteBatch
-    Retry -->|No| HandleError[Handle Error]
-    HandleError --> ListPending
-    
-    Producer -.->|Graceful Shutdown| FlushAll[Flush All Buffers]
-    Consumer -.->|Graceful Shutdown| PersistLSN[Persist LSN Metadata]
-    
-    FlushAll --> Shutdown([Shutdown])
-    PersistLSN --> Shutdown
-```
-
 #### Transaction Processing Detail Flow
 
 ```mermaid
@@ -395,52 +320,6 @@ graph TB
     style Crash fill:#ff6b6b
     style NormalOperation fill:#51cf66
     style ResumeFromIndex fill:#ffd43b
-```
-
-#### LSN Metadata Persistence Flow
-
-```mermaid
-graph LR
-    subgraph Producer Updates
-        P1[Transaction Committed] --> P2[Update write_lsn]
-        P2 --> P3[Send to LSN Feedback]
-    end
-    
-    subgraph Consumer Updates
-        C1[SQL Batch Executed] --> C2[Update consumer_state]
-        C2 --> C3[Set current_file_path]
-        C3 --> C4[Set last_executed_command_index]
-        C4 --> C5[Mark as dirty]
-    end
-    
-    subgraph Transaction Complete
-        T1[All Commands Done] --> T2[Update flush_lsn]
-        T2 --> T3[Clear consumer_state]
-        T3 --> T4[Mark as dirty]
-    end
-    
-    subgraph Background Persistence
-        BG1{Check Interval<br/>1 second} --> BG2{Is Dirty?}
-        BG2 -->|Yes| BG3[Serialize to JSON]
-        BG2 -->|No| BG1
-        BG3 --> BG4[Write to .tmp file]
-        BG4 --> BG5[fsync]
-        BG5 --> BG6[Atomic rename to .metadata]
-        BG6 --> BG7[Clear dirty flag]
-        BG7 --> BG1
-    end
-    
-    subgraph Shutdown
-        S1[Shutdown Signal] --> S2[Stop Background Task]
-        S2 --> S3[Force Flush Buffers]
-        S3 --> S4[Final Persist]
-        S4 --> S5[fsync]
-        S5 --> S6([Exit])
-    end
-    
-    P3 --> BG1
-    C5 --> BG1
-    T4 --> BG1
 ```
 
 ## Project Structure

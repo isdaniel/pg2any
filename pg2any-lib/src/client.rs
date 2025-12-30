@@ -4,12 +4,12 @@ use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::transaction_file_manager::{
-    PendingTransactionFile, TransactionFileManager, TransactionFileMetadata,
+use crate::transaction_manager::{
+    PendingTransactionFile, TransactionFileMetadata, TransactionManager,
 };
-use crate::transaction_manager::{TransactionContext, TransactionManager};
-use crate::types::{EventType, Lsn};
+use crate::types::{EventType, Lsn, TransactionContext};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 /// - Writes transaction files to sql_received_tx/ directory
 /// - Moves completed transactions to sql_pending_tx/ on COMMIT
 /// - Handles LSN tracking and heartbeats
-/// - Sends feedback to PostgreSQL with proper write/flush/replay LSN values
+/// - Sends feedback to PostgreSQL
 ///
 /// ## Consumer (Destination Writer)
 /// - Receives notifications via mpsc channel when transactions are committed
@@ -35,15 +35,14 @@ use tracing::{debug, error, info, warn};
 /// - Processes complete transactions atomically
 /// - Deletes transaction files after successful execution
 /// - Transaction consistency: all events in a transaction succeed or fail together
-/// - Updates shared LSN feedback after successful commits
+/// - Updates flush_lsn after successful commits
 ///
 /// ## LSN Tracking
 ///
-/// The client uses a shared `SharedLsnFeedback` to communicate committed LSN
-/// from the consumer back to the producer for accurate feedback to PostgreSQL:
-/// - write_lsn: Updated by producer when data is received
-/// - flush_lsn: Updated when transaction file is moved to sql_pending_tx/
-/// - replay_lsn: Updated by consumer when transaction is committed to destination
+/// The client uses simplified LSN tracking with a single flush_lsn value:
+/// - flush_lsn: Updated by consumer when transaction is committed to destination
+/// - This LSN serves as the start_lsn for recovery on restart
+/// - Persisted to disk periodically for graceful shutdown support
 pub struct CdcClient {
     config: Config,
     replication_manager: Option<ReplicationManager>,
@@ -57,7 +56,7 @@ pub struct CdcClient {
     /// Shared LSN feedback for replication protocol (write/flush/replay separation)
     shared_lsn_feedback: Arc<SharedLsnFeedback>,
     /// Transaction file manager for file-based workflow
-    transaction_file_manager: Option<Arc<TransactionFileManager>>,
+    transaction_file_manager: Option<Arc<TransactionManager>>,
 }
 
 impl CdcClient {
@@ -78,13 +77,12 @@ impl CdcClient {
             "Transaction file persistence enabled at: {}",
             config.transaction_file_base_path
         );
-        let mut manager = TransactionFileManager::new(
+        let mut manager = TransactionManager::new(
             &config.transaction_file_base_path,
             config.destination_type.clone(),
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
-        let transaction_file_manager = Some(Arc::new(manager));
 
         Ok(Self {
             config,
@@ -96,7 +94,7 @@ impl CdcClient {
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker: None,
             shared_lsn_feedback,
-            transaction_file_manager,
+            transaction_file_manager: Some(Arc::new(manager)),
         })
     }
 
@@ -126,12 +124,12 @@ impl CdcClient {
 
             // Process pending transaction files from previous run (recovery)
             if let Some(ref file_mgr) = self.transaction_file_manager {
-                info!("Transaction file persistence enabled - checking for pending files");
+                info!("Transaction file persistence - checking for pending files");
                 if let Err(e) = Self::process_pending_transaction_files(
                     file_mgr,
                     handler,
+                    &self.cancellation_token,
                     &self.lsn_tracker,
-                    &self.shared_lsn_feedback,
                     &self.metrics_collector,
                     self.config.batch_size,
                 )
@@ -154,8 +152,10 @@ impl CdcClient {
     pub async fn start_replication_from_lsn(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting CDC replication");
 
+        info!("Performing CDC client initialization (including recovery)");
         // Ensure we're initialized
         self.init().await?;
+        info!("CDC client initialized successfully");
 
         // Create replication stream using async method
         let replication_manager = self
@@ -173,7 +173,7 @@ impl CdcClient {
         // Start the replication stream
         replication_stream.start(start_lsn).await?;
 
-        // Start file-based workflow (always enabled)
+        // Start file-based workflow
         self.start_file_based_workflow(replication_stream, start_lsn)
             .await?;
 
@@ -184,7 +184,6 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Start file-based workflow (new primary mode)
     async fn start_file_based_workflow(
         &mut self,
         replication_stream: ReplicationStream,
@@ -204,21 +203,34 @@ impl CdcClient {
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
-            let batch_size = self.config.batch_size;
             let file_mgr = transaction_file_manager.clone();
             let lsn_feedback = self.shared_lsn_feedback.clone();
+            let lsn_tracker = self.lsn_tracker.clone();
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
                 token,
                 start_lsn,
                 metrics,
-                batch_size,
                 file_mgr,
                 lsn_feedback,
+                lsn_tracker,
                 tx_commit_notifier,
             ))
         };
+
+        // Process any pending transactions from previous run before starting consumer
+        info!("Checking for pending transaction files from previous run...");
+        let pending_count = transaction_file_manager
+            .list_pending_transactions()
+            .await?
+            .len();
+        if pending_count > 0 {
+            info!(
+                "Found {} pending transaction files to process before starting consumer",
+                pending_count
+            );
+        }
 
         // Start consumer (reads from files only)
         let dest_type = &self.config.destination_type;
@@ -288,6 +300,100 @@ impl CdcClient {
         });
     }
 
+    /// Helper function to handle transaction commit logic (shared between Commit and StreamCommit)
+    ///
+    /// This function encapsulates the common logic for committing a transaction:
+    /// 1. Move transaction file from sql_received_tx/ to sql_pending_tx/
+    /// 2. Update flush_lsn for PostgreSQL feedback
+    /// 3. Update lsn_tracker for persistence
+    /// 4. Read metadata from pending file
+    /// 5. Notify consumer via mpsc channel
+    /// 6. Handle errors with metrics recording
+    ///
+    /// # Arguments
+    /// * `transaction_id` - Transaction ID being committed
+    /// * `timestamp` - Commit timestamp
+    /// * `event_lsn` - LSN of the commit event
+    /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
+    /// * `transaction_file_manager` - File manager for moving transaction files
+    /// * `shared_lsn_feedback` - Shared LSN feedback for PostgreSQL protocol
+    /// * `lsn_tracker` - Optional LSN tracker for persistence
+    /// * `commit_notifier` - Channel sender for notifying consumer
+    /// * `metrics_collector` - Metrics collector for error recording
+    async fn handle_transaction_commit(
+        transaction_id: u32,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        event_lsn: Option<Lsn>,
+        transaction_type: &str,
+        transaction_file_manager: &Arc<TransactionManager>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        lsn_tracker: &Option<Arc<LsnTracker>>,
+        commit_notifier: &mpsc::Sender<PendingTransactionFile>,
+        metrics_collector: &Arc<MetricsCollector>,
+    ) -> Result<()> {
+        match transaction_file_manager
+            .commit_transaction(transaction_id, timestamp, event_lsn)
+            .await
+        {
+            Ok(pending_path) => {
+                info!(
+                    "Committed {} transaction file to: {:?}",
+                    transaction_type, pending_path
+                );
+
+                // Update flush_lsn - transaction file is now durably persisted to disk
+                if let Some(lsn) = event_lsn {
+                    shared_lsn_feedback.update_flushed_lsn(lsn.0);
+                    debug!(
+                        "Updated flush LSN to {} for {} transaction {} (file persisted to sql_pending_tx/)",
+                        lsn, transaction_type, transaction_id
+                    );
+
+                    if let Some(ref tracker) = lsn_tracker {
+                        tracker.update_if_greater(lsn.0);
+                    }
+                }
+
+                // Notify consumer with transaction details for immediate processing
+                match tokio::fs::read_to_string(&pending_path).await {
+                    Ok(content) => {
+                        match serde_json::from_str::<TransactionFileMetadata>(&content) {
+                            Ok(metadata) => {
+                                let notification = PendingTransactionFile {
+                                    file_path: pending_path.clone(),
+                                    metadata,
+                                };
+                                if let Err(e) = commit_notifier.send(notification).await {
+                                    warn!(
+                                    "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
+                                    e
+                                );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse metadata from {:?}: {}", pending_path, e);
+                                metrics_collector.record_error("metadata_parse_failed", "producer");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read metadata from {:?}: {}", pending_path, e);
+                        metrics_collector.record_error("metadata_read_failed", "producer");
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "Failed to commit {} transaction file for tx {}: {}",
+                    transaction_type, transaction_id, e
+                );
+                metrics_collector.record_error("transaction_file_commit_failed", "producer");
+                Err(e)
+            }
+        }
+    }
+
     /// File-based producer task: reads events from PostgreSQL replication stream and writes to transaction files
     ///
     /// This producer collects events between BEGIN and COMMIT, writing them to transaction files.
@@ -299,23 +405,29 @@ impl CdcClient {
     ///
     /// - Normal transactions (BEGIN...COMMIT): Single transaction file
     /// - Streaming transactions (StreamStart...StreamCommit): Large transactions in one file
+    ///
+    /// ## LSN Tracking
+    ///
+    /// The producer updates shared_lsn_feedback with flush_lsn when transaction files are moved to sql_pending_tx/
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
-        _batch_size: usize,
-        transaction_file_manager: Arc<TransactionFileManager>,
+        transaction_file_manager: Arc<TransactionManager>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
+        lsn_tracker: Option<Arc<LsnTracker>>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
     ) -> Result<()> {
-        info!("Starting file-based replication producer");
+        info!(
+            "Starting replication producer, last time start_lsn: {}",
+            start_lsn
+        );
 
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // Unified transaction manager for both normal and streaming transactions
-        let mut tx_manager = TransactionManager::new(_batch_size);
+        // Track current transaction context
         let mut current_context = TransactionContext::None;
 
         // Track active transaction files: tx_id -> (file_path, timestamp)
@@ -333,7 +445,7 @@ impl CdcClient {
                             continue;
                         }
 
-                        // Record current LSN
+                        // Record current LSN for metrics
                         metrics_collector.record_received_lsn(current_lsn.0);
                     }
                     metrics_collector.record_event(&event);
@@ -352,7 +464,6 @@ impl CdcClient {
                                 "Starting transaction {} commit_timestamp: {}",
                                 transaction_id, commit_timestamp
                             );
-                            tx_manager.handle_begin(*transaction_id, *commit_timestamp, event.lsn);
                             current_context = TransactionContext::Normal(*transaction_id);
 
                             // Create transaction file
@@ -381,75 +492,26 @@ impl CdcClient {
                             if let TransactionContext::Normal(tx_id) = current_context {
                                 info!("Producer: Committing normal transaction {}", tx_id);
 
-                                // Move transaction file to pending
+                                // Move transaction file to pending and notify consumer
                                 if let Some((_, timestamp)) = active_tx_files.remove(&tx_id) {
-                                    match transaction_file_manager
-                                        .commit_transaction(tx_id, timestamp, event.lsn)
-                                        .await
+                                    // Use helper function to handle commit logic
+                                    if let Err(e) = Self::handle_transaction_commit(
+                                        tx_id,
+                                        timestamp,
+                                        event.lsn,
+                                        "normal",
+                                        &transaction_file_manager,
+                                        &shared_lsn_feedback,
+                                        &lsn_tracker,
+                                        &commit_notifier,
+                                        &metrics_collector,
+                                    )
+                                    .await
                                     {
-                                        Ok(pending_path) => {
-                                            info!(
-                                                "Committed transaction file to: {:?}",
-                                                pending_path
-                                            );
-
-                                            // Update flush_lsn - transaction file is now durably persisted to disk
-                                            if let Some(lsn) = event.lsn {
-                                                shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                                                debug!("Updated flush LSN to {} for transaction {} (file persisted to sql_pending_tx/)", lsn, tx_id);
-                                            }
-
-                                            // Notify consumer with transaction details for immediate processing
-
-                                            match tokio::fs::read_to_string(&pending_path).await {
-                                                Ok(content) => match serde_json::from_str::<
-                                                    TransactionFileMetadata,
-                                                >(
-                                                    &content
-                                                ) {
-                                                    Ok(metadata) => {
-                                                        let notification = PendingTransactionFile {
-                                                            file_path: pending_path.clone(),
-                                                            metadata,
-                                                        };
-                                                        if let Err(e) =
-                                                            commit_notifier.send(notification).await
-                                                        {
-                                                            warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
-                                                        } else {
-                                                            debug!("Sent commit notification for transaction {} with file {:?}", tx_id, pending_path);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Failed to parse metadata from {:?}: {}", pending_path, e);
-                                                        metrics_collector.record_error(
-                                                            "metadata_parse_failed",
-                                                            "producer",
-                                                        );
-                                                    }
-                                                },
-                                                Err(e) => {
-                                                    error!(
-                                                        "Failed to read metadata from {:?}: {}",
-                                                        pending_path, e
-                                                    );
-                                                    metrics_collector.record_error(
-                                                        "metadata_read_failed",
-                                                        "producer",
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Failed to commit transaction file for tx {}: {}",
-                                                tx_id, e
-                                            );
-                                            metrics_collector.record_error(
-                                                "transaction_file_commit_failed",
-                                                "producer",
-                                            );
-                                        }
+                                        error!(
+                                            "Failed to handle normal transaction commit for tx {}: {}",
+                                            tx_id, e
+                                        );
                                     }
                                 }
 
@@ -466,11 +528,6 @@ impl CdcClient {
                             debug!(
                                 "StreamStart: transaction_id={}, first_segment={}",
                                 transaction_id, first_segment
-                            );
-                            tx_manager.handle_stream_start(
-                                *transaction_id,
-                                *first_segment,
-                                event.lsn,
                             );
                             current_context = TransactionContext::Streaming(*transaction_id);
 
@@ -501,90 +558,38 @@ impl CdcClient {
                         }
 
                         EventType::StreamStop => {
-                            // Just mark the stream stop, don't send batches
+                            // StreamStop marks the end of a segment in streaming transactions
                             if let TransactionContext::Streaming(xid) = current_context {
-                                tx_manager.handle_stream_stop(xid, event.lsn);
                                 debug!("Producer: StreamStop for transaction {}", xid);
                             }
                         }
 
                         EventType::StreamCommit {
                             transaction_id,
-                            commit_timestamp,
+                            commit_timestamp: _,
                         } => {
                             info!("Producer: StreamCommit for transaction {}", transaction_id);
-                            tx_manager.handle_stream_commit(
-                                *transaction_id,
-                                *commit_timestamp,
-                                event.lsn,
-                            );
 
-                            // Move streaming transaction file to pending
+                            // Move streaming transaction file to pending and notify consumer
                             if let Some((_, timestamp)) = active_tx_files.remove(transaction_id) {
-                                match transaction_file_manager
-                                    .commit_transaction(*transaction_id, timestamp, event.lsn)
-                                    .await
+                                // Use helper function to handle commit logic
+                                if let Err(e) = Self::handle_transaction_commit(
+                                    *transaction_id,
+                                    timestamp,
+                                    event.lsn,
+                                    "streaming",
+                                    &transaction_file_manager,
+                                    &shared_lsn_feedback,
+                                    &lsn_tracker,
+                                    &commit_notifier,
+                                    &metrics_collector,
+                                )
+                                .await
                                 {
-                                    Ok(pending_path) => {
-                                        info!(
-                                            "Committed streaming transaction file to: {:?}",
-                                            pending_path
-                                        );
-
-                                        // Update flush_lsn - streaming transaction file is now durably persisted to disk
-                                        if let Some(lsn) = event.lsn {
-                                            shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                                            debug!("Updated flush LSN to {} for streaming transaction {} (file persisted to sql_pending_tx/)", lsn, transaction_id);
-                                        }
-
-                                        // Notify consumer with transaction details for immediate processing
-                                        // Read metadata from the pending file to get complete information including data_file_path
-                                        match tokio::fs::read_to_string(&pending_path).await {
-                                            Ok(content) => {
-                                                match serde_json::from_str::<TransactionFileMetadata>(
-                                                    &content,
-                                                ) {
-                                                    Ok(metadata) => {
-                                                        let notification = PendingTransactionFile {
-                                                            file_path: pending_path.clone(),
-                                                            metadata,
-                                                        };
-                                                        if let Err(e) =
-                                                            commit_notifier.send(notification).await
-                                                        {
-                                                            warn!("Failed to send commit notification to consumer: {}. Consumer may have stopped.", e);
-                                                        } else {
-                                                            debug!("Sent commit notification for streaming transaction {} with file {:?}", transaction_id, pending_path);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Failed to parse metadata from {:?}: {}", pending_path, e);
-                                                        metrics_collector.record_error(
-                                                            "metadata_parse_failed",
-                                                            "producer",
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to read metadata from {:?}: {}",
-                                                    pending_path, e
-                                                );
-                                                metrics_collector.record_error(
-                                                    "metadata_read_failed",
-                                                    "producer",
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to commit streaming transaction file for tx {}: {}", transaction_id, e);
-                                        metrics_collector.record_error(
-                                            "transaction_file_commit_failed",
-                                            "producer",
-                                        );
-                                    }
+                                    error!(
+                                        "Failed to handle streaming transaction commit for tx {}: {}",
+                                        transaction_id, e
+                                    );
                                 }
                             }
 
@@ -597,7 +602,6 @@ impl CdcClient {
 
                         EventType::StreamAbort { transaction_id } => {
                             debug!("StreamAbort: transaction_id={}", transaction_id);
-                            tx_manager.handle_stream_abort(*transaction_id);
 
                             // Delete transaction file
                             if let Some((_, timestamp)) = active_tx_files.remove(transaction_id) {
@@ -684,6 +688,13 @@ impl CdcClient {
 
         info!("File-based producer shutting down");
 
+        if let Err(e) = transaction_file_manager.flush_all_buffers().await {
+            error!("Failed to flush buffers during shutdown: {}", e);
+            metrics_collector.record_error("buffer_flush_failed", "producer");
+        } else {
+            info!("Successfully flushed all buffers");
+        }
+
         // If there's an incomplete transaction, log a warning
         match current_context {
             TransactionContext::Normal(tx_id) => {
@@ -716,12 +727,15 @@ impl CdcClient {
     ///
     /// This function processes all committed transaction files from sql_pending_tx/
     /// in commit timestamp order before starting normal replication processing.
+    ///
+    /// This method now respects cancellation token for graceful shutdown during recovery.
+    ///
     async fn process_pending_transaction_files(
-        file_mgr: &TransactionFileManager,
+        file_mgr: &TransactionManager,
         destination: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
         lsn_tracker: &Option<Arc<LsnTracker>>,
-        shared_feedback: &Arc<SharedLsnFeedback>,
-        metrics: &Arc<MetricsCollector>,
+        metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
     ) -> Result<()> {
         info!("Checking for pending transaction files from previous run...");
@@ -739,78 +753,44 @@ impl CdcClient {
             total_count
         );
 
-        for pending_tx in pending_txs {
+        for (idx, pending_tx) in pending_txs.iter().enumerate() {
+            // Check for cancellation before processing each file
+            if cancellation_token.is_cancelled() {
+                info!(
+                    "Cancellation detected during recovery, processed {} of {} files",
+                    idx, total_count
+                );
+                return Err(CdcError::cancelled("Recovery cancelled by shutdown signal"));
+            }
+
             info!(
-                "Processing pending transaction file: {} (tx_id: {}, lsn: {:?})",
+                "Processing pending transaction file {} of {}: {} (tx_id: {}, lsn: {:?})",
+                idx + 1,
+                total_count,
                 pending_tx.file_path.display(),
                 pending_tx.metadata.transaction_id,
                 pending_tx.metadata.commit_lsn
             );
 
-            // Read SQL commands from file
-            let commands = file_mgr.read_sql_commands(&pending_tx.file_path).await?;
-            let command_count = commands.len();
-
-            info!(
-                "Executing {} SQL command(s) from file in batches of {}",
-                command_count, batch_size
-            );
-
-            // Execute commands in batches within transactions for better performance
-            for (batch_idx, chunk) in commands.chunks(batch_size).enumerate() {
-                debug!(
-                    "Executing batch {}/{} with {} commands (tx_id: {})",
-                    batch_idx + 1,
-                    (command_count + batch_size - 1) / batch_size,
-                    chunk.len(),
-                    pending_tx.metadata.transaction_id
-                );
-
-                if let Err(e) = destination.execute_sql_batch(chunk).await {
-                    error!(
-                        "Failed to execute SQL batch {} from file {}: {}",
-                        batch_idx + 1,
-                        pending_tx.file_path.display(),
-                        e
-                    );
-                    metrics.record_error("transaction_file_execution_failed", "consumer");
-                    return Err(e);
-                }
-            }
-
-            info!(
-                "Successfully executed all {} commands from file",
-                command_count
-            );
-
-            // Update LSN tracking
-            if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-                if let Some(tracker) = lsn_tracker {
-                    tracker.update_if_greater(commit_lsn.0);
-                    // Persist to disk
-                    if let Err(e) = tracker.persist_async().await {
-                        error!("Failed to persist LSN after processing file: {}", e);
-                    }
-                }
-                shared_feedback.update_applied_lsn(commit_lsn.0);
-            }
-
-            // Delete the file after successful processing
-            if let Err(e) = file_mgr
-                .delete_pending_transaction(&pending_tx.file_path)
-                .await
+            // Call the core processing logic directly
+            if let Err(e) = Self::process_transaction_file(
+                pending_tx,
+                file_mgr,
+                destination,
+                cancellation_token,
+                lsn_tracker,
+                metrics_collector,
+                batch_size,
+            )
+            .await
             {
                 error!(
-                    "Failed to delete processed transaction file {}: {}",
+                    "Failed to process pending transaction file {}: {}",
                     pending_tx.file_path.display(),
                     e
                 );
-                // Don't fail - file will be reprocessed on next restart (idempotent)
-            } else {
-                info!(
-                    "Deleted processed transaction file: {}",
-                    pending_tx.file_path.display()
-                );
+                metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+                return Err(e);
             }
         }
 
@@ -829,7 +809,7 @@ impl CdcClient {
     /// without needing to scan the directory.
     ///
     /// LSN tracking: After each successful transaction file execution,
-    /// the LSN is updated and persisted to ensure graceful shutdown doesn't lose data.
+    /// the flush_lsn is updated and persisted to ensure graceful shutdown doesn't lose data.
     ///
     /// # Arguments
     /// * `transaction_file_manager` - File manager for reading pending transaction files
@@ -842,7 +822,7 @@ impl CdcClient {
     /// * `batch_size` - Batch size for SQL log truncation control
     /// * `mut commit_receiver` - Channel receiver for transaction commit notifications with file details
     async fn run_consumer_loop(
-        transaction_file_manager: Arc<TransactionFileManager>,
+        transaction_file_manager: Arc<TransactionManager>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
@@ -871,15 +851,9 @@ impl CdcClient {
                         &mut destination_handler,
                         &metrics_collector,
                         &lsn_tracker,
-                        &shared_lsn_feedback,
                         batch_size,
+                        &cancellation_token,
                     ).await;
-
-                    // Final persist of LSN on shutdown
-                    if let Some(ref tracker) = lsn_tracker {
-                        info!("Consumer: Final LSN persistence on shutdown");
-                        tracker.shutdown_async().await;
-                    }
 
                     // Log final LSN state
                     shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
@@ -907,9 +881,9 @@ impl CdcClient {
                                 &notification,
                                 &transaction_file_manager,
                                 &mut destination_handler,
-                                &metrics_collector,
+                                &cancellation_token,
                                 &lsn_tracker,
-                                &shared_lsn_feedback,
+                                &metrics_collector,
                                 batch_size,
                             ).await {
                                 error!(
@@ -930,8 +904,8 @@ impl CdcClient {
                                 &mut destination_handler,
                                 &metrics_collector,
                                 &lsn_tracker,
-                                &shared_lsn_feedback,
                                 batch_size,
+                                &cancellation_token,
                             ).await;
 
                             break;
@@ -954,99 +928,189 @@ impl CdcClient {
 
     /// Drain any remaining transaction files from sql_pending_tx/ during shutdown
     async fn drain_remaining_files(
-        transaction_file_manager: &TransactionFileManager,
+        transaction_file_manager: &TransactionManager,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         lsn_tracker: &Option<Arc<LsnTracker>>,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         batch_size: usize,
+        cancellation_token: &CancellationToken,
     ) {
-        let mut count = 0;
-
         // Get all pending files
         match transaction_file_manager.list_pending_transactions().await {
             Ok(pending_files) => {
+                info!(
+                    "Consumer: Draining {} remaining transaction files during shutdown",
+                    pending_files.len()
+                );
                 for pending_tx in pending_files {
+                    // Check for cancellation before processing each file during drain
+                    if cancellation_token.is_cancelled() {
+                        break;
+                    }
+
                     debug!(
-                        "Consumer: Processing remaining file {:?} during shutdown",
-                        pending_tx.file_path
+                        "Consumer: Processing remaining file {:?} during shutdown (tx_id: {})",
+                        pending_tx.file_path, pending_tx.metadata.transaction_id
                     );
 
-                    if let Err(e) = Self::process_transaction_file(
+                    match Self::process_transaction_file(
                         &pending_tx,
                         transaction_file_manager,
                         destination_handler,
-                        metrics_collector,
+                        cancellation_token,
                         lsn_tracker,
-                        shared_lsn_feedback,
+                        metrics_collector,
                         batch_size,
                     )
                     .await
                     {
-                        error!(
-                            "Failed to process remaining file {:?}: {}",
-                            pending_tx.file_path, e
-                        );
-                    } else {
-                        count += 1;
-                    }
+                        Ok(()) => {}
+                        Err(e) => {
+                            error!(
+                                "Failed to process remaining file {:?}: {}",
+                                pending_tx.file_path, e
+                            );
+                        }
+                    };
                 }
             }
             Err(e) => {
                 error!("Failed to list remaining files during shutdown: {}", e);
             }
         }
-
-        info!(
-            "Consumer processed {} remaining transaction files during graceful shutdown",
-            count
-        );
     }
 
     /// Process a single transaction file
-    ///
     /// Reads SQL commands from the file, executes them via the destination handler in batches,
     /// updates LSN tracking, and deletes the file upon success.
+    /// This method supports resumable processing: it tracks the position after each batch
+    /// and can resume from where it left off if interrupted.
+    ///
+    /// Checks cancellation token between batches to support graceful shutdown.
     async fn process_transaction_file(
-        pending_tx: &crate::transaction_file_manager::PendingTransactionFile,
-        file_manager: &TransactionFileManager,
+        pending_tx: &PendingTransactionFile,
+        file_manager: &TransactionManager,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        metrics_collector: &Arc<MetricsCollector>,
+        cancellation_token: &CancellationToken,
         lsn_tracker: &Option<Arc<LsnTracker>>,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
     ) -> Result<()> {
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
+        let file_path_str = pending_tx.file_path.to_string_lossy().to_string();
+
+        // Check if we're resuming from a saved position for THIS specific file
+        let start_index = if let Some(ref tracker) = lsn_tracker {
+            if let Some((saved_file_path, saved_start_index)) = tracker.get_resume_position() {
+                // Only use the saved index if it's for the current file
+                if saved_file_path == file_path_str {
+                    saved_start_index
+                } else {
+                    info!(
+                        "Saved position is for different file ('{}' vs '{}'). Starting from index 0",
+                        saved_file_path, file_path_str
+                    );
+                    0
+                }
+            } else {
+                info!("No saved consumer position found, starting from index 0");
+                0
+            }
+        } else {
+            info!("No LSN tracker available, starting from index 0");
+            0
+        };
 
         info!(
-            "Processing transaction file: {} (tx_id: {}, lsn: {:?})",
+            "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
             pending_tx.file_path.display(),
             tx_id,
-            pending_tx.metadata.commit_lsn
+            pending_tx.metadata.commit_lsn,
+            start_index
         );
 
-        // Read SQL commands from file
+        // Read SQL commands from file starting from the saved position
         let commands = file_manager
-            .read_sql_commands(&pending_tx.file_path)
+            .read_sql_commands_from_index(&pending_tx.file_path, start_index)
             .await?;
         let command_count = commands.len();
+        let total_commands = start_index + command_count;
+
+        if command_count == 0 {
+            info!(
+                "All commands already executed for transaction file: {} (tx_id: {})",
+                pending_tx.file_path.display(),
+                tx_id
+            );
+
+            // Clear position and delete file
+            if let Some(ref tracker) = lsn_tracker {
+                tracker.clear_consumer_position();
+            }
+
+            // Update LSN and delete file
+            Self::finalize_transaction_file(
+                pending_tx,
+                file_manager,
+                lsn_tracker,
+                metrics_collector,
+                total_commands,
+            )
+            .await?;
+
+            return Ok(());
+        }
 
         info!(
-            "Executing {} SQL command(s) from file in batches of {}",
-            command_count, batch_size
+            "Executing {} remaining SQL command(s) from file in batches of {} (total: {}, skipped: {})",
+            command_count, batch_size, total_commands, start_index
         );
 
         // Execute commands in batches within transactions for better performance
         let mut batch_count = 0;
+        let mut current_command_index = start_index;
+
         for (batch_idx, chunk) in commands.chunks(batch_size).enumerate() {
-            let batch_start_time = std::time::Instant::now();
+            // Check for cancellation before processing each batch
+            if cancellation_token.is_cancelled() {
+                info!(
+                    "Cancellation detected during transaction file processing at batch {}/{}, saving position",
+                    batch_idx,
+                    (command_count + batch_size - 1) / batch_size
+                );
+
+                // Save current position before returning
+                if let Some(ref tracker) = lsn_tracker {
+                    if current_command_index > 0 {
+                        tracker.update_consumer_position(
+                            file_path_str.clone(),
+                            current_command_index - 1,
+                        );
+                        debug!(
+                            "Saved consumer position on cancellation: file={}, last_executed_index={}",
+                            file_path_str, current_command_index - 1
+                        );
+                    }
+                }
+
+                warn!(
+                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                    tx_id
+                );
+
+                return Ok(());
+            }
+
+            let batch_start_time = Instant::now();
             debug!(
-                "Executing batch {}/{} with {} commands (tx_id: {})",
+                "Executing batch {}/{} with {} commands (tx_id: {}, global indices: {}-{})",
                 batch_idx + 1,
                 (command_count + batch_size - 1) / batch_size,
                 chunk.len(),
-                tx_id
+                tx_id,
+                current_command_index,
+                current_command_index + chunk.len() - 1
             );
 
             // Execute the batch in a single transaction
@@ -1058,7 +1122,38 @@ impl CdcClient {
                     e
                 );
                 metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+
+                // Save current position before returning error
+                if let Some(ref tracker) = lsn_tracker {
+                    // Save position as the last successfully completed command
+                    // current_command_index - 1 is the last successful command
+                    if current_command_index > 0 {
+                        tracker.update_consumer_position(
+                            file_path_str.clone(),
+                            current_command_index - 1,
+                        );
+                        info!(
+                            "Saved consumer position after batch failure: command_index={}",
+                            current_command_index - 1
+                        );
+                    }
+                }
+
                 return Err(e);
+            }
+
+            // Update current position after successful batch
+            current_command_index += chunk.len();
+
+            // Save position after each batch for resumability
+            if let Some(ref tracker) = lsn_tracker {
+                // Save the index of the last successfully executed command (0-indexed)
+                tracker.update_consumer_position(file_path_str.clone(), current_command_index - 1);
+                debug!(
+                    "Updated consumer position: file={}, last_executed_index={}",
+                    file_path_str,
+                    current_command_index - 1
+                );
             }
 
             let batch_duration = batch_start_time.elapsed();
@@ -1074,35 +1169,77 @@ impl CdcClient {
 
         let duration = start_time.elapsed();
         info!(
-            "Successfully executed all {} commands in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
+            "Successfully executed all {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
             command_count,
+            total_commands,
             batch_count,
             duration,
             tx_id,
             duration / batch_count.max(1) as u32
         );
 
-        // Update LSN tracking
-        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
-            debug!(
-                "Updated applied LSN to {} for transaction {}",
-                commit_lsn, tx_id
-            );
+        // Clear consumer position since file is fully processed
+        if let Some(ref tracker) = lsn_tracker {
+            tracker.clear_consumer_position();
+            debug!("Cleared consumer position after full file completion");
+        }
 
-            if let Some(tracker) = lsn_tracker {
+        // Finalize: update LSN, record metrics, delete file
+        Self::finalize_transaction_file(
+            pending_tx,
+            file_manager,
+            lsn_tracker,
+            metrics_collector,
+            total_commands,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Core logic for finalizing transaction file processing
+    async fn finalize_transaction_file(
+        pending_tx: &PendingTransactionFile,
+        file_manager: &TransactionManager,
+        lsn_tracker: &Option<Arc<LsnTracker>>,
+        metrics_collector: &Arc<MetricsCollector>,
+        total_commands: usize,
+    ) -> Result<()> {
+        let tx_id = pending_tx.metadata.transaction_id;
+
+        // Update LSN tracking (replay_lsn only, pending_file_count will be updated after deletion)
+        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
+            // Note: We don't have shared_lsn_feedback here, which is only used by the consumer loop
+            // For recovery processing, we only update the lsn_tracker
+            debug!("Transaction {} commit LSN: {}", tx_id, commit_lsn);
+
+            if let Some(ref tracker) = lsn_tracker {
+                // Update flush LSN (last committed to destination)
                 tracker.commit_lsn(commit_lsn.0);
-                debug!(
-                    "Persisted commit LSN {} for transaction {}",
-                    commit_lsn, tx_id
-                );
             }
         }
 
-        // Record metrics (file-based metrics are simpler)
+        // Record metrics - create a transaction object for metrics recording
+        let destination_type_str = pending_tx.metadata.destination_type.to_string();
+
+        // Create a transaction object for metrics (events are already executed, so we use empty vec)
+        // The event_count is derived from the number of SQL commands executed
+        let mut transaction = crate::types::Transaction::new(
+            pending_tx.metadata.transaction_id,
+            pending_tx.metadata.commit_timestamp,
+        );
+        transaction.commit_lsn = pending_tx.metadata.commit_lsn;
+
+        // Record transaction processed metrics
+        metrics_collector.record_transaction_processed(&transaction, &destination_type_str);
+
+        // Since file-based processing always processes complete transactions,
+        // we also record this as a full transaction
+        metrics_collector.record_full_transaction_processed(&transaction, &destination_type_str);
+
         debug!(
-            "Successfully processed transaction file with {} commands",
-            command_count
+            "Successfully processed transaction file with {} commands and recorded metrics",
+            total_commands
         );
 
         // Delete the file after successful processing
@@ -1115,12 +1252,22 @@ impl CdcClient {
                 pending_tx.file_path.display(),
                 e
             );
-            // Don't fail - file will be reprocessed on next restart (idempotent)
-        } else {
-            debug!(
-                "Deleted processed transaction file: {}",
-                pending_tx.file_path.display()
-            );
+        }
+
+        if pending_tx.metadata.commit_lsn.is_some() {
+            if let Some(ref tracker) = lsn_tracker {
+                let pending_count = file_manager.list_pending_transactions().await?.len();
+                tracker.update_consumer_state(
+                    tx_id,
+                    pending_tx.metadata.commit_timestamp,
+                    pending_count,
+                );
+
+                debug!(
+                    "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
+                    tx_id, pending_count
+                );
+            }
         }
 
         Ok(())
@@ -1138,8 +1285,34 @@ impl CdcClient {
 
         // Shutdown LSN tracker to persist final state
         if let Some(ref tracker) = self.lsn_tracker {
-            info!("Shutting down LSN tracker");
+            info!("Shutting down LSN tracker and persisting final state");
+
+            // Log state before shutdown
+            let pre_shutdown_metadata = tracker.get_metadata();
+            info!(
+                "Pre-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}",
+                pg_walstream::format_lsn(pre_shutdown_metadata.lsn_tracking.flush_lsn),
+                pre_shutdown_metadata.consumer_state.pending_file_count,
+                pre_shutdown_metadata.consumer_state.current_file_path
+            );
+
+            // Shutdown LSN tracker (includes final persist)
             tracker.shutdown_async().await;
+
+            if let Err(e) = tracker.persist_async().await {
+                warn!("Final forced persistence failed: {}", e);
+            } else {
+                info!("Final LSN persistence completed successfully");
+            }
+
+            // Log final state after persist
+            let post_shutdown_metadata = tracker.get_metadata();
+            info!(
+                "Post-shutdown state (persisted) - flush_lsn={}, pending_files={}, current_file={:?}",
+                pg_walstream::format_lsn(post_shutdown_metadata.lsn_tracking.flush_lsn),
+                post_shutdown_metadata.consumer_state.pending_file_count,
+                post_shutdown_metadata.consumer_state.current_file_path
+            );
         }
 
         // Close destination connection
@@ -1264,9 +1437,7 @@ mod tests {
 
     // Mock destination handler for testing
     pub struct MockDestinationHandler {
-        pub transactions_processed: std::sync::Arc<std::sync::Mutex<Vec<ProcessedTransactionInfo>>>,
         pub should_fail: bool,
-        pub processing_delay: Duration,
     }
 
     #[async_trait::async_trait]

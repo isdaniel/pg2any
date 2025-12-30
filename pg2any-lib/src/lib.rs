@@ -72,11 +72,8 @@ pub mod lsn_tracker;
 // High-level client interface
 pub mod client;
 
-// Streaming transaction management for protocol v2+
-mod transaction_manager;
-
 // Transaction file persistence
-pub mod transaction_file_manager;
+mod transaction_manager;
 
 // Monitoring and metrics
 pub mod monitoring;
@@ -93,7 +90,6 @@ pub type CdcResult<T> = Result<T, CdcError>;
 
 pub mod destinations;
 
-// Re-export core types from pg_walstream for convenience
 pub use pg_walstream::{
     // Type aliases and utilities
     format_lsn,

@@ -1,6 +1,6 @@
 use crate::{
     error::{CdcError, Result},
-    types::{DestinationType, Transaction},
+    types::DestinationType,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;

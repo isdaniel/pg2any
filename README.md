@@ -15,12 +15,13 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 
 ### What's Implemented
 
-- **Production-Ready Architecture**: Async/await with Tokio, structured error handling, graceful shutdown
+- **Production-Ready Architecture**: File-based producer-consumer with crash recovery
 - **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
 - **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
-- **Transaction Consistency**: Transaction-level atomicity with BEGIN/COMMIT boundary handling and LSN persistence
-- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations with shared utilities
+- **Crash Recovery**: Automatic recovery from incomplete transactions on restart
+- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations
 - **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
+- **LSN Metadata Tracking**: Enhanced LSN tracking with consumer position and resume capability
 - **Configuration Management**: Environment variables and builder pattern with validation
 - **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - **Development Tooling**: Makefile automation, formatting, linting, and quality checks
@@ -31,17 +32,18 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Async Runtime**: High-performance async/await with Tokio and proper cancellation
 - **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
 - **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
-- **Transaction-Level Processing**: Complete transactions processed atomically from BEGIN to COMMIT
-- **Streaming Transaction Support**: Handles large transactions with mid-stream batching
+- **Transaction Atomicity**: Complete transactions processed atomically with rollback on failure
+- **Streaming Transaction Support**: Handles large transactions with mid-stream batching and buffered I/O
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
-- **Transaction Safety**: ACID compliance with full transaction atomicity and ordering
+- **LSN Metadata Tracking**: Enhanced tracking with consumer position for fine-grained resume capability
+- **Resumable Processing**: Can restart from exact position within large transaction files
 - **Configuration**: Environment variables, builder pattern, and validation
-- **Error Handling**: Comprehensive error types with `thiserror` and proper propagation
+- **Error Handling**: Comprehensive error types with thiserror and proper propagation
 - **Real-time Streaming**: Live change capture for all DML operations
 - **Production Ready**: Structured logging, graceful shutdown, and resource management
-- **Monitoring & Metrics**: Comprehensive Prometheus metrics, and health monitoring
+- **Monitoring & Metrics**: Comprehensive Prometheus metrics and health monitoring
 - **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
-- **Memory Profiling**: jemalloc allocator with heap profiling support for memory leak detection and performance optimization
+- **Memory Profiling**: jemalloc allocator with heap profiling support
 - **Development Tools**: Docker environment, Makefile automation, extensive testing
 
 ### PostgreSQL Setup
@@ -124,46 +126,321 @@ pub fn init_logging() {
 
 ## Architecture
 
-### Data Flow Architecture
+### File-Based Transaction Processing Architecture
+
+pg2any uses a **file-based producer-consumer pattern** for reliable, crash-safe transaction processing:
 
 ```
-                                          ┌──────────────────────────────────┐
-                                          │  PostgreSQL Logical Replication  │
-                                          │         (WAL Stream)             │
-                                          └────────────┬─────────────────────┘
-                                                       │
-                                                       ▼
-                                          ┌────────────────────────┐
-                                          │   Protocol Parser     │
-                                          │  (Message Decoding)   │
-                                          └──────────┬─────────────┘
-                                                     │
-                                                     ▼
-                                          ┌──────────────────────┐
-                                          │   Transaction        │
-                                          │   Assembler          │
-                                          └──────────┬───────────┘
-                                                     │
-                                                     ▼
-                                          ┌──────────────────────┐
-                                          │   Transaction        │
-                                          │   Channel (Bounded)  │
-                                          └──────────┬───────────┘
-                                                     │
-                                                     ▼
-                                          ┌──────────────────────┐
-                                          │   Consumer Task      │
-                                          │  (Single Thread)     │
-                                          └──────────┬───────────┘
-                                                     │
-                                                     ▼
-                                          ┌──────────────────────┐
-                                          │  Target Database     │
-                                          │ (MySQL/SQLServer/    │
-                                          │      SQLite)         │
-                                          └──────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PostgreSQL Logical Replication                       │
+│                           (WAL Stream)                                  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+                    ┌────────────────────────┐
+                    │   Producer Task        │
+                    │  (Replication Reader)  │
+                    │                        │
+                    │  - BEGIN: Create files │
+                    │  - Events: Append SQL  │
+                    │  - COMMIT: Move files  │
+                    └────────┬───────────────┘
+                             │
+                             ▼
+        ┌────────────────────────────────────────────┐
+        │      File System (Transaction Store)       │
+        ├────────────────────────────────────────────┤
+        │  sql_data_tx/       SQL data files (.sql)  │
+        │  sql_received_tx/   In-progress (.meta)    │
+        │  sql_pending_tx/    Ready to execute       │
+        └────────┬───────────────────────────────────┘
+                 │
+                 ▼ Notification via channel
+        ┌────────────────────────┐
+        │   Consumer Task        │
+        │  (SQL Executor)        │
+        │                        │
+        │  - Read pending files  │
+        │  - Execute SQL batches │
+        │  - Delete on success   │
+        │  - Update LSN          │
+        └────────┬───────────────┘
+                 │
+                 ▼
+        ┌────────────────────────┐
+        │  Target Database       │
+        │  (MySQL/SqlServer/     │
+        │   SQLite)              │
+        └────────────────────────┘
 
-Key: Single producer-single consumer with transaction-level atomicity and ordering
+Key Features:
+- Crash-safe: Transactions persisted to disk before execution
+- Resumable: Can restart from last committed LSN
+- Ordered: Transactions executed in commit order
+- Atomic: All events in a transaction succeed or fail together
+```
+
+### Transaction File Structure
+
+pg2any uses a three-directory structure for reliable transaction processing:
+
+```
+transaction_files/
+├── sql_data_tx/          # Actual SQL statements (never moved)
+│   └── {txid}_{timestamp}.sql
+├── sql_received_tx/      # In-progress transaction metadata
+│   └── {txid}_{timestamp}.meta
+└── sql_pending_tx/       # Committed, ready for execution
+    └── {txid}_{timestamp}.meta
+```
+
+**Transaction Lifecycle:**
+1. **BEGIN**: Create `.sql` file in `sql_data_tx/` and `.meta` in `sql_received_tx/`
+2. **Events**: Append SQL commands to `.sql` file (buffered writes)
+3. **COMMIT**: Move `.meta` from `sql_received_tx/` to `sql_pending_tx/`
+4. **Execution**: Consumer reads pending `.meta`, executes SQL from `.sql`
+5. **Success**: Delete both `.meta` and `.sql` files
+6. **Recovery**: Cleanup incomplete transactions from `sql_received_tx/`
+
+### Workflow Diagrams
+
+#### Complete System Workflow
+
+```mermaid
+graph TB
+    Start([Start pg2any]) --> LoadConfig[Load Configuration]
+    LoadConfig --> LoadLSN[Load LSN Metadata<br/>from .metadata file]
+    LoadLSN --> CheckRecovery{Recovery<br/>Needed?}
+    
+    CheckRecovery -->|Yes| CleanupIncomplete[Cleanup sql_received_tx/]
+    CheckRecovery -->|No| StartTasks[Start Producer & Consumer]
+    CleanupIncomplete --> ProcessPending[Process sql_pending_tx/]
+    ProcessPending --> StartTasks
+    
+    StartTasks --> Producer[Producer Task]
+    StartTasks --> Consumer[Consumer Task]
+    
+    Producer --> ReadWAL[Read PostgreSQL WAL Stream]
+    ReadWAL --> ProcessEvent{Event Type}
+    
+    ProcessEvent -->|BEGIN| CreateFiles[Create .sql in sql_data_tx/<br/>Create .meta in sql_received_tx/]
+    ProcessEvent -->|INSERT/UPDATE/DELETE| AppendSQL[Append SQL to .sql file<br/>Buffer: 64KB]
+    ProcessEvent -->|COMMIT| FlushBuffer[Flush Buffer]
+    ProcessEvent -->|Heartbeat| SendFeedback[Send LSN Feedback]
+    
+    CreateFiles --> ReadWAL
+    AppendSQL --> CheckBuffer{Buffer Full?}
+    CheckBuffer -->|Yes| FlushToDisk[Flush to Disk]
+    CheckBuffer -->|No| ReadWAL
+    FlushToDisk --> ReadWAL
+    
+    FlushBuffer --> MoveMeta[Move .meta to sql_pending_tx/]
+    MoveMeta --> NotifyConsumer[Notify Consumer via Channel]
+    NotifyConsumer --> ReadWAL
+    SendFeedback --> ReadWAL
+    
+    Consumer --> WaitNotification[Wait for Notification]
+    WaitNotification --> ListPending[List Files in sql_pending_tx/]
+    ListPending --> CheckFiles{Files<br/>Available?}
+    
+    CheckFiles -->|No| WaitNotification
+    CheckFiles -->|Yes| ReadMeta[Read .meta File]
+    ReadMeta --> GetDataPath[Get Data File Path]
+    GetDataPath --> CheckResume{Resume<br/>Position?}
+    
+    CheckResume -->|Yes| ReadFromIndex[Read SQL from Index]
+    CheckResume -->|No| ReadAllSQL[Read All SQL Commands]
+    
+    ReadFromIndex --> ExecuteBatch[Execute SQL Batch]
+    ReadAllSQL --> ExecuteBatch
+    
+    ExecuteBatch --> CheckSuccess{Execution<br/>Success?}
+    
+    CheckSuccess -->|Yes| UpdatePosition[Update Consumer Position<br/>in LSN Metadata]
+    CheckSuccess -->|No| LogError[Log Error]
+    
+    UpdatePosition --> CheckComplete{All Commands<br/>Executed?}
+    CheckComplete -->|No| ExecuteBatch
+    CheckComplete -->|Yes| DeleteFiles[Delete .meta and .sql Files]
+    
+    DeleteFiles --> UpdateLSN[Update flush_lsn<br/>in LSN Metadata]
+    UpdateLSN --> ClearPosition[Clear Consumer Position]
+    ClearPosition --> ListPending
+    
+    LogError --> Retry{Retry?}
+    Retry -->|Yes| ExecuteBatch
+    Retry -->|No| HandleError[Handle Error]
+    HandleError --> ListPending
+    
+    Producer -.->|Graceful Shutdown| FlushAll[Flush All Buffers]
+    Consumer -.->|Graceful Shutdown| PersistLSN[Persist LSN Metadata]
+    
+    FlushAll --> Shutdown([Shutdown])
+    PersistLSN --> Shutdown
+```
+
+#### Transaction Processing Detail Flow
+
+```mermaid
+sequenceDiagram
+    participant PG as PostgreSQL WAL
+    participant Producer as Producer Task
+    participant FS as File System
+    participant Channel as Notification Channel
+    participant Consumer as Consumer Task
+    participant Dest as Destination DB
+    participant LSN as LSN Tracker
+
+    Note over PG,LSN: Transaction Processing Flow
+    
+    PG->>Producer: BEGIN (tx_id: 12345)
+    Producer->>FS: Create 12345.sql in sql_data_tx/
+    Producer->>FS: Create 12345.meta in sql_received_tx/
+    
+    PG->>Producer: INSERT event
+    Producer->>Producer: Generate SQL
+    Producer->>FS: Append to buffer (64KB)
+    
+    PG->>Producer: UPDATE event
+    Producer->>Producer: Generate SQL
+    Producer->>FS: Append to buffer
+    
+    PG->>Producer: DELETE event
+    Producer->>Producer: Generate SQL
+    Producer->>FS: Append to buffer
+    
+    Note over Producer,FS: Buffer reaches 64KB
+    Producer->>FS: Flush buffer to 12345.sql
+    
+    PG->>Producer: More events...
+    Producer->>FS: Append to buffer
+    
+    PG->>Producer: COMMIT (LSN: 0/1A2B3C4D)
+    Producer->>FS: Flush remaining buffer
+    Producer->>FS: Move 12345.meta to sql_pending_tx/
+    Producer->>Channel: Send notification
+    Producer->>PG: Send LSN feedback (write_lsn)
+    
+    Channel->>Consumer: Transaction ready
+    Consumer->>FS: Read 12345.meta from sql_pending_tx/
+    Consumer->>FS: Get data path from metadata
+    Consumer->>FS: Read SQL commands from 12345.sql
+    
+    loop For each SQL batch (100 commands)
+        Consumer->>Dest: BEGIN TRANSACTION
+        Consumer->>Dest: Execute SQL batch
+        Consumer->>Dest: COMMIT TRANSACTION
+        Consumer->>LSN: Update consumer position (index: 99)
+        Consumer->>LSN: Persist metadata
+    end
+    
+    Consumer->>FS: Delete 12345.meta from sql_pending_tx/
+    Consumer->>FS: Delete 12345.sql from sql_data_tx/
+    Consumer->>LSN: Update flush_lsn (0/1A2B3C4D)
+    Consumer->>LSN: Clear consumer position
+    Consumer->>LSN: Persist metadata
+    Consumer->>PG: Send LSN feedback (flush_lsn, replay_lsn)
+```
+
+#### Crash Recovery Workflow
+
+```mermaid
+graph TB
+    Crash([System Crash]) --> Restart[Restart pg2any]
+    Restart --> LoadMeta[Load LSN Metadata]
+    LoadMeta --> CheckMeta{Metadata<br/>Exists?}
+    
+    CheckMeta -->|No| StartFresh[Start from Latest]
+    CheckMeta -->|Yes| ParseMeta[Parse JSON Metadata]
+    
+    ParseMeta --> GetLSN[Extract flush_lsn]
+    ParseMeta --> GetPosition[Extract consumer_state]
+    
+    GetPosition --> CheckPosition{current_file_path<br/>exists?}
+    
+    CheckPosition -->|No| CleanReceived[Cleanup sql_received_tx/]
+    CheckPosition -->|Yes| ResumePosition[Resume from<br/>last_executed_command_index + 1]
+    
+    CleanReceived --> ScanReceived[Scan sql_received_tx/<br/>for .meta files]
+    ScanReceived --> ForEachReceived{For Each<br/>.meta}
+    
+    ForEachReceived -->|More files| ReadReceivedMeta[Read .meta]
+    ForEachReceived -->|Done| ProcessPending[Process sql_pending_tx/]
+    
+    ReadReceivedMeta --> GetDataFile[Get data_file_path]
+    GetDataFile --> DeleteIncomplete[Delete .meta and .sql]
+    DeleteIncomplete --> ForEachReceived
+    
+    ProcessPending --> ScanPending[Scan sql_pending_tx/<br/>for .meta files]
+    ScanPending --> SortByTimestamp[Sort by commit_timestamp]
+    SortByTimestamp --> ForEachPending{For Each<br/>.meta}
+    
+    ForEachPending -->|More files| CheckResumeFile{Is current_file_path?}
+    ForEachPending -->|Done| SetStartLSN[Set start_lsn = flush_lsn]
+    
+    CheckResumeFile -->|Yes| ResumeFromIndex[Read SQL from<br/>last_executed_command_index + 1]
+    CheckResumeFile -->|No| ReadAllCommands[Read All SQL Commands]
+    
+    ResumeFromIndex --> ExecuteRecovery[Execute Remaining Commands]
+    ReadAllCommands --> ExecuteRecovery
+    
+    ExecuteRecovery --> UpdateRecoveryLSN[Update LSN Metadata]
+    UpdateRecoveryLSN --> DeleteRecoveryFiles[Delete .meta and .sql]
+    DeleteRecoveryFiles --> ForEachPending
+    
+    SetStartLSN --> StartReplication[Start Replication from flush_lsn]
+    StartFresh --> StartReplication
+    StartReplication --> NormalOperation([Normal Operation])
+    
+    style Crash fill:#ff6b6b
+    style NormalOperation fill:#51cf66
+    style ResumeFromIndex fill:#ffd43b
+```
+
+#### LSN Metadata Persistence Flow
+
+```mermaid
+graph LR
+    subgraph Producer Updates
+        P1[Transaction Committed] --> P2[Update write_lsn]
+        P2 --> P3[Send to LSN Feedback]
+    end
+    
+    subgraph Consumer Updates
+        C1[SQL Batch Executed] --> C2[Update consumer_state]
+        C2 --> C3[Set current_file_path]
+        C3 --> C4[Set last_executed_command_index]
+        C4 --> C5[Mark as dirty]
+    end
+    
+    subgraph Transaction Complete
+        T1[All Commands Done] --> T2[Update flush_lsn]
+        T2 --> T3[Clear consumer_state]
+        T3 --> T4[Mark as dirty]
+    end
+    
+    subgraph Background Persistence
+        BG1{Check Interval<br/>1 second} --> BG2{Is Dirty?}
+        BG2 -->|Yes| BG3[Serialize to JSON]
+        BG2 -->|No| BG1
+        BG3 --> BG4[Write to .tmp file]
+        BG4 --> BG5[fsync]
+        BG5 --> BG6[Atomic rename to .metadata]
+        BG6 --> BG7[Clear dirty flag]
+        BG7 --> BG1
+    end
+    
+    subgraph Shutdown
+        S1[Shutdown Signal] --> S2[Stop Background Task]
+        S2 --> S3[Force Flush Buffers]
+        S3 --> S4[Final Persist]
+        S4 --> S5[fsync]
+        S5 --> S6([Exit])
+    end
+    
+    P3 --> BG1
+    C5 --> BG1
+    T4 --> BG1
 ```
 
 ## Project Structure
@@ -208,18 +485,17 @@ pg2any/                          # Workspace root
 │   ├── src/
 │   │   ├── lib.rs               # Public API exports and documentation
 │   │   ├── app.rs               # High-level CDC application orchestration
-│   │   ├── client.rs            # Main CDC client implementation
+│   │   ├── client.rs            # Main CDC client with file-based producer-consumer
 │   │   ├── config.rs            # Configuration management and validation
 │   │   ├── env.rs               # Environment variable loading
 │   │   ├── error.rs             # Comprehensive error types
 │   │   ├── pg_replication.rs    # PostgreSQL replication integration (uses pg_walstream)
-│   │   ├── lsn_tracker.rs       # LSN tracking and persistence
-│   │   ├── transaction_manager.rs # Streaming transaction management
+│   │   ├── lsn_tracker.rs       # LSN tracking with metadata persistence (.metadata files)
+│   │   ├── transaction_manager.rs # File-based transaction persistence (sql_data_tx/, sql_received_tx/, sql_pending_tx/)
 │   │   ├── types.rs             # Core data types and enums
 │   │   ├── destinations/        # Database destination implementations
 │   │   │   ├── mod.rs           # Destination trait and factory pattern
 │   │   │   ├── destination_factory.rs # Factory for creating destinations
-│   │   │   ├── common.rs        # Common transaction handling utilities
 │   │   │   ├── mysql.rs         # MySQL destination with SQLx
 │   │   │   ├── sqlserver.rs     # SQL Server destination with Tiberius
 │   │   │   └── sqlite.rs        # SQLite destination with SQLx
@@ -228,13 +504,14 @@ pg2any/                          # Workspace root
 │   │       ├── metrics.rs       # Core metrics definitions
 │   │       ├── metrics_abstraction.rs # Metrics abstraction layer
 │   │       └── metrics_server.rs # HTTP metrics server
-│   └── tests/                   # Comprehensive test suite (10 test files, 100+ tests)
+│   └── tests/                   # Comprehensive test suite 
 │       ├── integration_tests.rs       # End-to-end CDC testing
 │       ├── destination_integration_tests.rs # Database destination testing
 │       ├── event_type_refactor_tests.rs    # Event type handling tests
 │       ├── mysql_edge_cases_tests.rs       # MySQL-specific edge cases
 │       ├── mysql_error_handling_simple_tests.rs # Error handling tests
 │       ├── mysql_where_clause_fix_tests.rs # WHERE clause generation tests
+│       ├── position_tracking_tests.rs      # Consumer position resume tests
 │       ├── replica_identity_tests.rs       # Replica identity handling
 │       ├── sqlite_comprehensive_tests.rs   # SQLite comprehensive testing
 │       ├── sqlite_destination_tests.rs     # SQLite destination tests
@@ -292,7 +569,8 @@ pg2any supports comprehensive configuration through environment variables or the
 | **Performance** | | | | | |
 | | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `500` | `3000`, `6000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
 | **System** | | | | | |
-| | `CDC_LAST_LSN_FILE` | LSN persistence file | `./pg2any_last_lsn` | `/data/lsn_state` | |
+| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores comprehensive CDC metadata including LSN tracking and consumer position |
+| | `CDC_TRANSACTION_FILE_BASE_PATH` | Base directory for transaction file storage | `./` | `/data/transactions` | Contains sql_data_tx/, sql_received_tx/, sql_pending_tx/ subdirectories |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
 
 ### Key Configuration Approach
@@ -627,22 +905,28 @@ cargo test --features metrics
 When you run the application, you'll see structured logging output like this:
 
 ```
-2025-08-15T10:30:00.123Z INFO  pg2any: Starting PostgreSQL CDC Application
-2025-08-15T10:30:00.124Z INFO  pg2any: Loading configuration from environment variables
-2025-08-15T10:30:00.125Z INFO  pg2any: Configuration loaded successfully
-2025-08-15T10:30:00.126Z INFO  pg2any: Initializing CDC client
-2025-08-15T10:30:00.127Z INFO  pg2any: Performing CDC client initialization
-2025-08-15T10:30:00.128Z INFO  pg2any: CDC client initialized successfully
-2025-08-15T10:30:00.129Z INFO  pg2any: Starting CDC replication pipeline
-2025-08-15T10:30:00.130Z DEBUG pg2any_lib::logical_stream: Creating logical replication stream
-2025-08-15T10:30:00.131Z DEBUG pg2any_lib::pg_replication: Connected to PostgreSQL server version: 150000
-2025-08-15T10:30:00.132Z INFO  pg2any_lib::client: Processing BEGIN transaction (LSN: 0/1A2B3C4D)
-2025-08-15T10:30:00.133Z INFO  pg2any_lib::client: Processing INSERT event on table 'users'
-2025-08-15T10:30:00.134Z INFO  pg2any_lib::client: Processing COMMIT transaction (LSN: 0/1A2B3C5E)
-2025-08-15T10:30:00.135Z INFO  pg2any: CDC replication running! Real-time change streaming active
+2025-12-30T10:30:00.123Z INFO  pg2any: Starting PostgreSQL CDC Application
+2025-12-30T10:30:00.124Z INFO  pg2any: Loading configuration from environment variables
+2025-12-30T10:30:00.125Z INFO  pg2any: Configuration loaded successfully
+2025-12-30T10:30:00.126Z INFO  pg2any: Initializing CDC client
+2025-12-30T10:30:00.127Z INFO  pg2any: Transaction file persistence enabled at: ./
+2025-12-30T10:30:00.128Z INFO  pg2any: Three-directory structure: sql_data_tx/ (data), sql_received_tx/ (in-progress metadata), sql_pending_tx/ (committed metadata)
+2025-12-30T10:30:00.129Z INFO  pg2any: Created directory for LSN metadata: "./pg2any_last_lsn.metadata"
+2025-12-30T10:30:00.130Z INFO  pg2any: Loaded CDC metadata from ./pg2any_last_lsn.metadata (flush_lsn: 0/1A2B3C4D)
+2025-12-30T10:30:00.131Z INFO  pg2any: Starting CDC replication pipeline
+2025-12-30T10:30:00.132Z INFO  pg2any_lib::client: Started producer task (PostgreSQL reader)
+2025-12-30T10:30:00.133Z INFO  pg2any_lib::client: Started consumer task (SQL executor)
+2025-12-30T10:30:00.134Z INFO  pg2any_lib::client: Processing BEGIN transaction 12345
+2025-12-30T10:30:00.135Z INFO  pg2any_lib::client: Created data file: ./sql_data_tx/12345_1735556400000.sql
+2025-12-30T10:30:00.136Z INFO  pg2any_lib::client: Processing INSERT event on table 'users'
+2025-12-30T10:30:00.137Z INFO  pg2any_lib::client: Flushed 4096 bytes to ./sql_data_tx/12345_1735556400000.sql
+2025-12-30T10:30:00.138Z INFO  pg2any_lib::client: Committed transaction 12345: moved metadata to sql_pending_tx/
+2025-12-30T10:30:00.139Z INFO  pg2any_lib::client: Consumer: Executing transaction 12345 (50 SQL commands)
+2025-12-30T10:30:00.140Z INFO  pg2any_lib::client: Successfully executed transaction 12345, deleted files
+2025-12-30T10:30:00.141Z INFO  pg2any: CDC replication running! Real-time change streaming active
 ```
 
-**Note**: This shows the production-ready application with real PostgreSQL logical replication, integrated metrics collection, LSN tracking, and comprehensive monitoring capabilities.
+**Note**: This shows the production-ready file-based architecture with crash-safe transaction persistence, comprehensive LSN metadata tracking, buffered I/O, and automatic recovery capabilities.
 
 ## Dependencies
 

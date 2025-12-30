@@ -1,17 +1,9 @@
-use chrono::Utc;
 use pg2any_lib::{
     destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationFactory},
     types::{ChangeEvent, EventType, ReplicaIdentity},
-    DestinationType, Transaction,
+    DestinationType,
 };
 use std::collections::HashMap;
-
-/// Helper function to wrap a single event in a transaction for testing
-fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
-    let mut tx = Transaction::new(1, Utc::now());
-    tx.add_event(event);
-    tx
-}
 
 /// Test that destination handlers have consistent interfaces
 #[tokio::test]

@@ -165,11 +165,6 @@ impl CdcClient {
 
         let mut replication_stream = replication_manager.create_stream_async().await?;
 
-        // Set the shared LSN feedback on the replication stream
-        // This enables proper write/flush/replay LSN tracking for PostgreSQL feedback
-        replication_stream.set_shared_lsn_feedback(self.shared_lsn_feedback.clone());
-        info!("Shared LSN feedback configured for replication stream");
-
         // Start the replication stream
         replication_stream.start(start_lsn).await?;
 
@@ -345,9 +340,9 @@ impl CdcClient {
                 if let Some(lsn) = event_lsn {
                     shared_lsn_feedback.update_flushed_lsn(lsn.0);
                     debug!(
-                        "Updated flush LSN to {} for {} transaction {} (file persisted to sql_pending_tx/)",
+                    "Updated flush LSN to {} for {} transaction {} (file persisted to sql_pending_tx/)",
                         lsn, transaction_type, transaction_id
-                    );
+                );
 
                     if let Some(ref tracker) = lsn_tracker {
                         tracker.update_if_greater(lsn.0);
@@ -439,15 +434,14 @@ impl CdcClient {
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
                 Ok(Some(event)) => {
-                    if let Some(current_lsn) = event.lsn {
-                        if current_lsn <= start_lsn {
-                            debug!("Skipping event with LSN {} <= {}", current_lsn, start_lsn);
-                            continue;
-                        }
-
-                        // Record current LSN for metrics
-                        metrics_collector.record_received_lsn(current_lsn.0);
+                    if event.lsn <= start_lsn {
+                        debug!("Skipping event with LSN {} <= {}", event.lsn, start_lsn);
+                        continue;
                     }
+
+                    // Record current LSN for metrics
+                    metrics_collector.record_received_lsn(event.lsn.0);
+
                     metrics_collector.record_event(&event);
 
                     // Handle transaction boundaries
@@ -498,7 +492,7 @@ impl CdcClient {
                                     if let Err(e) = Self::handle_transaction_commit(
                                         tx_id,
                                         timestamp,
-                                        event.lsn,
+                                        Some(event.lsn),
                                         "normal",
                                         &transaction_file_manager,
                                         &shared_lsn_feedback,
@@ -576,7 +570,7 @@ impl CdcClient {
                                 if let Err(e) = Self::handle_transaction_commit(
                                     *transaction_id,
                                     timestamp,
-                                    event.lsn,
+                                    Some(event.lsn),
                                     "streaming",
                                     &transaction_file_manager,
                                     &shared_lsn_feedback,
@@ -1264,9 +1258,9 @@ impl CdcClient {
                 );
 
                 debug!(
-                    "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
-                    tx_id, pending_count
-                );
+                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
+                tx_id, pending_count
+            );
             }
         }
 

@@ -33,13 +33,6 @@ impl ReplicationStream {
         Ok(Self { logical_stream })
     }
 
-    pub fn set_shared_lsn_feedback(
-        &mut self,
-        feedback: std::sync::Arc<crate::lsn_tracker::SharedLsnFeedback>,
-    ) {
-        self.logical_stream.set_shared_lsn_feedback(feedback);
-    }
-
     pub async fn start(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
         info!("Starting PostgreSQL logical replication stream");
 
@@ -79,9 +72,7 @@ impl ReplicationStream {
         if let Some(ref event) = event {
             debug!("Received single change event: {:?}", event);
             // Update last received LSN
-            if let Some(lsn) = event.lsn {
-                self.logical_stream.state.update_lsn(lsn.0);
-            }
+            self.logical_stream.state.update_lsn(event.lsn.value());
         }
 
         Ok(event)

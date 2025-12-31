@@ -71,8 +71,7 @@ impl DestinationFactory {
 
             #[allow(unreachable_patterns)]
             _ => Err(CdcError::unsupported(format!(
-                "Destination type {:?} is not supported or not enabled",
-                destination_type
+                "Destination type {destination_type:?} is not supported or not enabled"
             ))),
         }
     }

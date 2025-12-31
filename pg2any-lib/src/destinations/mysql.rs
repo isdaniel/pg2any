@@ -43,7 +43,7 @@ impl DestinationHandler for MySQLDestination {
         let row: (String, String) = sqlx::query_as("SHOW VARIABLES LIKE 'max_allowed_packet'")
             .fetch_one(&pool)
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to query max_allowed_packet: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to query max_allowed_packet: {e}")))?;
 
         // Parse the string value to u64
         self.max_allowed_packet = row.1.parse::<u64>().unwrap_or(67108864); // Default to 64MB if parse fails
@@ -82,7 +82,7 @@ impl DestinationHandler for MySQLDestination {
         let mut tx = pool
             .begin()
             .await
-            .map_err(|e| CdcError::generic(format!("MySQL BEGIN transaction failed: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("MySQL BEGIN transaction failed: {e}")))?;
 
         // Execute all commands in the transaction
         for (idx, sql) in commands.iter().enumerate() {
@@ -106,7 +106,7 @@ impl DestinationHandler for MySQLDestination {
         // Commit the transaction
         tx.commit()
             .await
-            .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {e}")))?;
 
         Ok(())
     }

@@ -1,5 +1,6 @@
 use chrono::Utc;
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
+use pg_walstream::Lsn;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -9,7 +10,13 @@ fn test_new_event_type_insert() {
     data.insert("id".to_string(), json!(1));
     data.insert("name".to_string(), json!("test"));
 
-    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data.clone());
+    let event = ChangeEvent::insert(
+        "public".to_string(),
+        "users".to_string(),
+        123,
+        data.clone(),
+        Lsn::from(100),
+    );
 
     match event.event_type {
         EventType::Insert {
@@ -45,6 +52,7 @@ fn test_new_event_type_update() {
         new_data.clone(),
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     );
 
     match event.event_type {
@@ -82,6 +90,7 @@ fn test_new_event_type_delete() {
         old_data.clone(),
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(200),
     );
 
     match event.event_type {
@@ -108,7 +117,7 @@ fn test_new_event_type_delete() {
 fn test_new_event_type_begin_commit() {
     let timestamp = Utc::now();
 
-    let begin_event = ChangeEvent::begin(12345, timestamp);
+    let begin_event = ChangeEvent::begin(12345, timestamp, Lsn::from(0));
     match begin_event.event_type {
         EventType::Begin {
             transaction_id,
@@ -120,7 +129,7 @@ fn test_new_event_type_begin_commit() {
         _ => panic!("Expected Begin variant"),
     }
 
-    let commit_event = ChangeEvent::commit(12345, timestamp);
+    let commit_event = ChangeEvent::commit(12345, timestamp, Lsn::from(0));
     match commit_event.event_type {
         EventType::Commit { commit_timestamp } => {
             assert_eq!(commit_timestamp, timestamp);
@@ -133,7 +142,7 @@ fn test_new_event_type_begin_commit() {
 fn test_new_event_type_truncate() {
     let tables = vec!["public.users".to_string(), "public.orders".to_string()];
 
-    let event = ChangeEvent::truncate(tables.clone());
+    let event = ChangeEvent::truncate(tables.clone(), Lsn::from(400));
     match event.event_type {
         EventType::Truncate(event_tables) => {
             assert_eq!(event_tables, tables);
@@ -148,7 +157,13 @@ fn test_event_serialization() {
     data.insert("id".to_string(), json!(1));
     data.insert("name".to_string(), json!("test"));
 
-    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "public".to_string(),
+        "users".to_string(),
+        123,
+        data,
+        Lsn::from(100),
+    );
 
     // Test that the event can be serialized and deserialized
     let serialized = serde_json::to_string(&event).expect("Failed to serialize event");

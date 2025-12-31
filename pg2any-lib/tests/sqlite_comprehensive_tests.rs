@@ -4,6 +4,7 @@ use pg2any_lib::{
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
     Transaction,
 };
+use pg_walstream::Lsn;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -224,6 +225,7 @@ async fn test_sqlite_empty_string_handling() {
         "comprehensive_test".to_string(),
         123,
         data,
+        Lsn::from(100),
     );
     let result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -272,6 +274,7 @@ async fn test_sqlite_null_value_handling() {
         "comprehensive_test".to_string(),
         123,
         data,
+        Lsn::from(100),
     );
     let result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -329,6 +332,7 @@ async fn test_sqlite_unicode_and_special_characters() {
         "comprehensive_test".to_string(),
         123,
         data,
+        Lsn::from(100),
     );
     let result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -387,6 +391,7 @@ async fn test_sqlite_large_data_handling() {
         "comprehensive_test".to_string(),
         123,
         data,
+        Lsn::from(100),
     );
     let result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -442,6 +447,7 @@ async fn test_sqlite_numeric_precision() {
             "comprehensive_test".to_string(),
             123,
             data,
+            Lsn::from(100),
         );
         let result = destination
             .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -509,6 +515,7 @@ async fn test_sqlite_constraint_violations() {
         "comprehensive_test".to_string(),
         123,
         data1,
+        Lsn::from(100),
     );
     let result1 = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event1)))
@@ -525,6 +532,7 @@ async fn test_sqlite_constraint_violations() {
         "comprehensive_test".to_string(),
         124,
         data2,
+        Lsn::from(100),
     );
     let result2 = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event2)))
@@ -562,6 +570,7 @@ async fn test_sqlite_missing_key_columns_error() {
         "comprehensive_test".to_string(),
         123,
         data.clone(),
+        Lsn::from(100),
     );
     let result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -577,6 +586,7 @@ async fn test_sqlite_missing_key_columns_error() {
         data,
         ReplicaIdentity::Default,
         vec![], // Empty key columns
+        Lsn::from(300),
     );
 
     let result = destination
@@ -628,6 +638,7 @@ async fn test_sqlite_bulk_operations_performance() {
             "users".to_string(),
             123 + i as u32,
             data,
+            Lsn::from(100),
         );
         let result = destination
             .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -674,6 +685,7 @@ async fn test_sqlite_bulk_operations_performance() {
             new_data,
             ReplicaIdentity::Default,
             vec!["id".to_string()],
+            Lsn::from(300),
         );
 
         let result = destination
@@ -747,6 +759,7 @@ async fn test_sqlite_concurrent_operations() {
                 "users".to_string(),
                 record_id as u32,
                 data,
+                Lsn::from(100),
             );
             let result = destination
                 .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
@@ -802,8 +815,8 @@ async fn test_sqlite_transaction_events() {
     create_users_table(&pool).await.unwrap();
 
     // Test transaction BEGIN/COMMIT events
-    let begin_event = ChangeEvent::begin(100, Utc::now());
-    let commit_event = ChangeEvent::commit(110, Utc::now());
+    let begin_event = ChangeEvent::begin(100, Utc::now(), Lsn::from(0));
+    let commit_event = ChangeEvent::commit(110, Utc::now(), Lsn::from(0));
 
     // These should not fail (even though SQLite handles transactions automatically)
     let begin_result = destination
@@ -819,7 +832,13 @@ async fn test_sqlite_transaction_events() {
     data.insert("name".to_string(), json!("Transaction Test"));
     data.insert("email".to_string(), json!("txn@example.com"));
 
-    let insert_event = ChangeEvent::insert("main".to_string(), "users".to_string(), 105, data);
+    let insert_event = ChangeEvent::insert(
+        "main".to_string(),
+        "users".to_string(),
+        105,
+        data,
+        Lsn::from(100),
+    );
     let insert_result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
             insert_event,
@@ -857,10 +876,10 @@ async fn test_sqlite_metadata_events() {
 
     // Test various metadata events that should be safely ignored
     let metadata_events = vec![
-        ChangeEvent::relation(),
-        ChangeEvent::type_event(),
-        ChangeEvent::origin(),
-        ChangeEvent::message(),
+        ChangeEvent::relation(Lsn::from(0)),
+        ChangeEvent::type_event(Lsn::from(0)),
+        ChangeEvent::origin(Lsn::from(0)),
+        ChangeEvent::message(Lsn::from(0)),
     ];
 
     for event in metadata_events {
@@ -899,7 +918,13 @@ async fn test_sqlite_connection_recovery() {
     let mut values = HashMap::new();
     values.insert("id".to_string(), json!(1));
     values.insert("name".to_string(), json!("Alice"));
-    let event = ChangeEvent::insert("public".to_string(), "users".to_string(), 1, values);
+    let event = ChangeEvent::insert(
+        "public".to_string(),
+        "users".to_string(),
+        1,
+        values,
+        Lsn::from(100),
+    );
     let transaction = wrap_in_transaction(event);
     let process_result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&transaction))
@@ -918,7 +943,13 @@ async fn test_sqlite_connection_recovery() {
     let mut values2 = HashMap::new();
     values2.insert("id".to_string(), json!(2));
     values2.insert("name".to_string(), json!("Bob"));
-    let event2 = ChangeEvent::insert("public".to_string(), "users".to_string(), 2, values2);
+    let event2 = ChangeEvent::insert(
+        "public".to_string(),
+        "users".to_string(),
+        2,
+        values2,
+        Lsn::from(100),
+    );
     let transaction2 = wrap_in_transaction(event2);
     let process_result2 = destination
         .execute_sql_batch(&transaction_to_sql_commands(&transaction2))
@@ -1018,6 +1049,7 @@ async fn test_sqlite_complete_crud_cycle() {
         "users".to_string(),
         1,
         create_data.clone(),
+        Lsn::from(100),
     );
     let create_result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
@@ -1061,6 +1093,7 @@ async fn test_sqlite_complete_crud_cycle() {
         update_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     );
 
     let update_result = destination
@@ -1095,6 +1128,7 @@ async fn test_sqlite_complete_crud_cycle() {
         delete_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(200),
     );
 
     let delete_result = destination
@@ -1139,7 +1173,13 @@ async fn test_sqlite_destination_factory_integration() {
     data.insert("id".to_string(), json!(1));
     data.insert("name".to_string(), json!("Factory Test"));
 
-    let event = ChangeEvent::insert("main".to_string(), "users".to_string(), 1, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "users".to_string(),
+        1,
+        data,
+        Lsn::from(100),
+    );
     let process_result = destination
         .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
         .await;

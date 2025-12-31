@@ -27,20 +27,19 @@ impl SqlServerDestination {
 #[async_trait]
 impl DestinationHandler for SqlServerDestination {
     async fn connect(&mut self, connection_string: &str) -> Result<()> {
-        let config = Config::from_ado_string(connection_string).map_err(|e| {
-            CdcError::generic(format!("Invalid SQL Server connection string: {}", e))
-        })?;
+        let config = Config::from_ado_string(connection_string)
+            .map_err(|e| CdcError::generic(format!("Invalid SQL Server connection string: {e}")))?;
 
         let tcp = TcpStream::connect(config.get_addr())
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to connect to SQL Server: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to connect to SQL Server: {e}")))?;
         tcp.set_nodelay(true)
-            .map_err(|e| CdcError::generic(format!("Failed to set TCP_NODELAY: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to set TCP_NODELAY: {e}")))?;
 
         let client = Client::connect(config, tcp.compat_write())
             .await
             .map_err(|e| {
-                CdcError::generic(format!("Failed to establish SQL Server connection: {}", e))
+                CdcError::generic(format!("Failed to establish SQL Server connection: {e}"))
             })?;
 
         self.client = Some(client);
@@ -71,9 +70,7 @@ impl DestinationHandler for SqlServerDestination {
         client
             .simple_query("BEGIN TRANSACTION")
             .await
-            .map_err(|e| {
-                CdcError::generic(format!("SQL Server BEGIN TRANSACTION failed: {}", e))
-            })?;
+            .map_err(|e| CdcError::generic(format!("SQL Server BEGIN TRANSACTION failed: {e}")))?;
 
         // Execute all commands in the transaction
         let mut execution_result = Ok(());
@@ -104,9 +101,7 @@ impl DestinationHandler for SqlServerDestination {
         client
             .simple_query("COMMIT TRANSACTION")
             .await
-            .map_err(|e| {
-                CdcError::generic(format!("SQL Server COMMIT TRANSACTION failed: {}", e))
-            })?;
+            .map_err(|e| CdcError::generic(format!("SQL Server COMMIT TRANSACTION failed: {e}")))?;
 
         Ok(())
     }

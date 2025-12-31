@@ -817,8 +817,13 @@ When you run the application, you'll see structured logging output like this:
 
 ### PostgreSQL Logical Replication
 - **pg_walstream** : Low-level PostgreSQL logical replication protocol implementation
+  - GitHub: [isdaniel/pg-walstream](https://github.com/isdaniel/pg-walstream)
+  - Crates.io: [pg_walstream](https://crates.io/crates/pg_walstream)
   - Handles WAL stream parsing, protocol messages, and replication connection management
-  - Provides buffer operations, retry logic, and connection handling
+  - Provides buffer operations, retry logic, and thread-safe LSN tracking
+  - Supports PostgreSQL logical replication protocol versions 1-4
+  - Zero-copy operations with efficient buffer management using `bytes` crate
+  - Built-in connection management with exponential backoff retry logic
   - Extracted from pg2any-lib for reusability in other projects
 
 ### Database Clients

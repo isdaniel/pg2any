@@ -2,6 +2,7 @@
 /// These tests verify the critical bug fix where UPDATE/DELETE operations
 /// now correctly use old_data when available, falling back to new_data when needed
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
+use pg_walstream::Lsn;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -40,6 +41,7 @@ fn test_update_uses_old_data_for_where_clause() {
         new_data.clone(),
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     );
 
     // Test data source selection logic (mirrors the fixed MySQL destination code)
@@ -85,6 +87,7 @@ fn test_update_fallback_to_new_data_when_old_data_none() {
         new_data.clone(),
         ReplicaIdentity::Nothing,
         vec![], // No key columns
+        Lsn::from(300),
     );
 
     // Test data source selection fallback
@@ -131,6 +134,7 @@ fn test_delete_always_uses_old_data() {
         old_data.clone(),
         ReplicaIdentity::Full,
         vec!["id".to_string(), "email".to_string()],
+        Lsn::from(200),
     );
 
     // For DELETE, old_data should always be available
@@ -188,6 +192,7 @@ fn test_composite_key_data_source_selection() {
         new_data.clone(),
         ReplicaIdentity::Default,
         vec!["tenant_id".to_string(), "user_id".to_string()], // Composite key
+        Lsn::from(300),
     );
 
     // Test data source selection with composite key
@@ -243,6 +248,7 @@ fn test_replica_identity_full_uses_all_columns() {
         new_data.clone(),
         ReplicaIdentity::Full,
         vec!["id".to_string(), "name".to_string(), "age".to_string()],
+        Lsn::from(300),
     );
 
     match &event.event_type {
@@ -288,6 +294,7 @@ fn test_json_null_values_in_replica_identity() {
         new_data.clone(),
         ReplicaIdentity::Full,
         vec!["id".to_string(), "optional_field".to_string()],
+        Lsn::from(300),
     );
 
     match &event.event_type {
@@ -319,6 +326,7 @@ fn test_key_columns_availability() {
         data.clone(),
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     );
 
     let key_columns = event_default.get_key_columns().unwrap();
@@ -334,6 +342,7 @@ fn test_key_columns_availability() {
         data.clone(),
         ReplicaIdentity::Full,
         vec!["id".to_string(), "name".to_string()],
+        Lsn::from(300),
     );
 
     let key_columns_full = event_full.get_key_columns().unwrap();
@@ -350,6 +359,7 @@ fn test_key_columns_availability() {
         data,
         ReplicaIdentity::Nothing,
         vec![], // No key columns
+        Lsn::from(300),
     );
 
     let key_columns_nothing = event_nothing.get_key_columns().unwrap();

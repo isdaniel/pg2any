@@ -9,7 +9,8 @@ use pg2any_lib::monitoring::{
     gather_metrics, init_metrics, MetricsCollector, MetricsCollectorTrait, ProcessingTimer,
     ProcessingTimerTrait,
 };
-use pg2any_lib::types::{ChangeEvent, Lsn, ReplicaIdentity};
+use pg2any_lib::types::{ChangeEvent, ReplicaIdentity};
+use pg_walstream::Lsn;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -25,7 +26,13 @@ fn create_test_insert_event() -> ChangeEvent {
         serde_json::Value::String("test".to_string()),
     );
 
-    ChangeEvent::insert("public".to_string(), "users".to_string(), 12345, data)
+    ChangeEvent::insert(
+        "public".to_string(),
+        "users".to_string(),
+        12345,
+        data,
+        Lsn::from(100),
+    )
 }
 
 fn create_test_update_event() -> ChangeEvent {
@@ -57,6 +64,7 @@ fn create_test_update_event() -> ChangeEvent {
         new_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     )
 }
 
@@ -78,11 +86,15 @@ fn create_test_delete_event() -> ChangeEvent {
         old_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(200),
     )
 }
 
 fn create_test_truncate_event() -> ChangeEvent {
-    ChangeEvent::truncate(vec!["users".to_string(), "orders".to_string()])
+    ChangeEvent::truncate(
+        vec!["users".to_string(), "orders".to_string()],
+        Lsn::from(400),
+    )
 }
 
 #[cfg(test)]
@@ -279,7 +291,7 @@ mod tests {
 
         // Create event with LSN
         let mut event = create_test_insert_event();
-        event.lsn = Some(Lsn(54321));
+        event.lsn = Lsn::from(54321);
 
         // Record event with LSN
         collector.record_event(&event);

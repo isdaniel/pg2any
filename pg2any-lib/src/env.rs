@@ -169,16 +169,14 @@ fn parse_schema_mapping_env(key: &str) -> Result<HashMap<String, String>, CdcErr
                 let parts: Vec<&str> = pair.splitn(2, ':').collect();
                 if parts.len() != 2 {
                     return Err(CdcError::config(format!(
-                        "Invalid schema mapping format '{}'. Expected 'source:dest' format.",
-                        pair
+                        "Invalid schema mapping format '{pair}'. Expected 'source:dest' format."
                     )));
                 }
                 let source = parts[0].trim();
                 let dest = parts[1].trim();
                 if source.is_empty() || dest.is_empty() {
                     return Err(CdcError::config(format!(
-                        "Invalid schema mapping '{}'. Both source and destination must be non-empty.",
-                        pair
+                        "Invalid schema mapping '{pair}'. Both source and destination must be non-empty."
                     )));
                 }
                 mappings.insert(source.to_string(), dest.to_string());
@@ -193,10 +191,7 @@ fn parse_schema_mapping_env(key: &str) -> Result<HashMap<String, String>, CdcErr
 fn parse_bool_env(key: &str, default: bool) -> Result<bool, CdcError> {
     match std::env::var(key) {
         Ok(value) => value.parse::<bool>().map_err(|e| {
-            CdcError::config(format!(
-                "Invalid boolean value for {}: {} ({})",
-                key, value, e
-            ))
+            CdcError::config(format!("Invalid boolean value for {key}: {value} ({e})"))
         }),
         Err(_) => Ok(default),
     }
@@ -205,9 +200,9 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool, CdcError> {
 /// Parse a u32 environment variable with a default value
 fn parse_u32_env(key: &str, default: u32) -> Result<u32, CdcError> {
     match std::env::var(key) {
-        Ok(value) => value.parse::<u32>().map_err(|e| {
-            CdcError::config(format!("Invalid u32 value for {}: {} ({})", key, value, e))
-        }),
+        Ok(value) => value
+            .parse::<u32>()
+            .map_err(|e| CdcError::config(format!("Invalid u32 value for {key}: {value} ({e})"))),
         Err(_) => Ok(default),
     }
 }
@@ -215,9 +210,9 @@ fn parse_u32_env(key: &str, default: u32) -> Result<u32, CdcError> {
 /// Parse a u64 environment variable with a default value
 fn parse_u64_env(key: &str, default: u64) -> Result<u64, CdcError> {
     match std::env::var(key) {
-        Ok(value) => value.parse::<u64>().map_err(|e| {
-            CdcError::config(format!("Invalid u64 value for {}: {} ({})", key, value, e))
-        }),
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|e| CdcError::config(format!("Invalid u64 value for {key}: {value} ({e})"))),
         Err(_) => Ok(default),
     }
 }
@@ -225,12 +220,9 @@ fn parse_u64_env(key: &str, default: u64) -> Result<u64, CdcError> {
 /// Parse a usize environment variable with a default value
 fn parse_usize_env(key: &str, default: usize) -> Result<usize, CdcError> {
     match std::env::var(key) {
-        Ok(value) => value.parse::<usize>().map_err(|e| {
-            CdcError::config(format!(
-                "Invalid usize value for {}: {} ({})",
-                key, value, e
-            ))
-        }),
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|e| CdcError::config(format!("Invalid usize value for {key}: {value} ({e})"))),
         Err(_) => Ok(default),
     }
 }

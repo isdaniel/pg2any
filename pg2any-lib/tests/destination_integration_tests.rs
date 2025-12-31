@@ -3,6 +3,7 @@ use pg2any_lib::{
     types::{ChangeEvent, EventType, ReplicaIdentity},
     DestinationType,
 };
+use pg_walstream::Lsn;
 use std::collections::HashMap;
 
 /// Test that destination handlers have consistent interfaces
@@ -112,7 +113,13 @@ fn create_test_event() -> ChangeEvent {
     );
     data.insert("active".to_string(), serde_json::Value::Bool(true));
 
-    ChangeEvent::insert("public".to_string(), "test_table".to_string(), 456, data)
+    ChangeEvent::insert(
+        "public".to_string(),
+        "test_table".to_string(),
+        456,
+        data,
+        Lsn::from(100),
+    )
 }
 
 fn create_update_event() -> ChangeEvent {
@@ -144,6 +151,7 @@ fn create_update_event() -> ChangeEvent {
         new_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     )
 }
 
@@ -165,6 +173,7 @@ fn create_delete_event() -> ChangeEvent {
         old_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(200),
     )
 }
 
@@ -187,6 +196,7 @@ fn create_update_event_without_old_data() -> ChangeEvent {
         new_data,
         ReplicaIdentity::Nothing,
         vec!["id".to_string()], // fallback key columns
+        Lsn::from(300),
     )
 }
 

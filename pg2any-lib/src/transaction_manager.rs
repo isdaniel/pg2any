@@ -311,13 +311,12 @@ impl TransactionManager {
             .await
             .map_err(|e| {
                 CdcError::generic(format!(
-                    "Failed to read metadata from {:?}: {}",
-                    received_metadata_path, e
+                    "Failed to read metadata from {received_metadata_path:?}: {e}"
                 ))
             })?;
 
         let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
-            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
 
         let data_file_path = metadata.data_file_path.clone();
 
@@ -340,24 +339,23 @@ impl TransactionManager {
 
         // Write updated metadata to sql_pending_tx/
         let updated_json = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut pending_file = File::create(&pending_metadata_path).await.map_err(|e| {
             CdcError::generic(format!(
-                "Failed to create pending metadata {:?}: {}",
-                pending_metadata_path, e
+                "Failed to create pending metadata {pending_metadata_path:?}: {e}"
             ))
         })?;
 
         pending_file
             .write_all(updated_json.as_bytes())
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to write metadata: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to write metadata: {e}")))?;
 
         pending_file
             .flush()
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {e}")))?;
 
         // Append COMMIT marker to data file
         if data_file_path.exists() {
@@ -366,19 +364,16 @@ impl TransactionManager {
                 .open(&data_file_path)
                 .await
                 .map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to open data file {:?}: {}",
-                        data_file_path, e
-                    ))
+                    CdcError::generic(format!("Failed to open data file {data_file_path:?}: {e}"))
                 })?;
             data_file
                 .write_all(b"-- COMMIT TRANSACTION\n")
                 .await
-                .map_err(|e| CdcError::generic(format!("Failed to write COMMIT marker: {}", e)))?;
+                .map_err(|e| CdcError::generic(format!("Failed to write COMMIT marker: {e}")))?;
             data_file
                 .flush()
                 .await
-                .map_err(|e| CdcError::generic(format!("Failed to flush data file: {}", e)))?;
+                .map_err(|e| CdcError::generic(format!("Failed to flush data file: {e}")))?;
         }
 
         // Remove metadata from sql_received_tx/ only after successful write
@@ -386,8 +381,7 @@ impl TransactionManager {
             .await
             .map_err(|e| {
                 CdcError::generic(format!(
-                    "Failed to remove received metadata {:?}: {}",
-                    received_metadata_path, e
+                    "Failed to remove received metadata {received_metadata_path:?}: {e}"
                 ))
             })?;
 
@@ -518,10 +512,7 @@ impl TransactionManager {
         );
 
         let file = File::open(data_file_path).await.map_err(|e| {
-            CdcError::generic(format!(
-                "Failed to open data file {:?}: {}",
-                data_file_path, e
-            ))
+            CdcError::generic(format!("Failed to open data file {data_file_path:?}: {e}"))
         })?;
 
         let reader = BufReader::with_capacity(65536, file); // 64KB buffer for optimal I/O
@@ -530,10 +521,7 @@ impl TransactionManager {
 
         // Read the entire file content, filtering out comment lines
         while let Some(line) = lines.next_line().await.map_err(|e| {
-            CdcError::generic(format!(
-                "Failed to read line from {:?}: {}",
-                data_file_path, e
-            ))
+            CdcError::generic(format!("Failed to read line from {data_file_path:?}: {e}"))
         })? {
             let trimmed = line.trim();
 
@@ -773,7 +761,7 @@ impl TransactionManager {
                     table,
                     columns
                         .iter()
-                        .map(|c| format!("`{}`", c))
+                        .map(|c| format!("`{c}`"))
                         .collect::<Vec<_>>()
                         .join(", "),
                     values.join(", ")
@@ -786,7 +774,7 @@ impl TransactionManager {
                     table,
                     columns
                         .iter()
-                        .map(|c| format!("[{}]", c))
+                        .map(|c| format!("[{c}]"))
                         .collect::<Vec<_>>()
                         .join(", "),
                     values.join(", ")
@@ -798,7 +786,7 @@ impl TransactionManager {
                     table,
                     columns
                         .iter()
-                        .map(|c| format!("\"{}\"", c))
+                        .map(|c| format!("\"{c}\""))
                         .collect::<Vec<_>>()
                         .join(", "),
                     values.join(", ")
@@ -825,9 +813,9 @@ impl TransactionManager {
             .iter()
             .map(|(col, val)| {
                 let formatted_col = match self.destination_type {
-                    DestinationType::MySQL => format!("`{}`", col),
-                    DestinationType::SqlServer => format!("[{}]", col),
-                    DestinationType::SQLite => format!("\"{}\"", col),
+                    DestinationType::MySQL => format!("`{col}`"),
+                    DestinationType::SqlServer => format!("[{col}]"),
+                    DestinationType::SQLite => format!("\"{col}\""),
                 };
                 format!("{} = {}", formatted_col, self.format_value(val))
             })
@@ -889,19 +877,13 @@ impl TransactionManager {
 
         let sql = match self.destination_type {
             DestinationType::MySQL => {
-                format!(
-                    "DELETE FROM `{}`.`{}` WHERE {};",
-                    schema, table, where_clause
-                )
+                format!("DELETE FROM `{schema}`.`{table}` WHERE {where_clause};")
             }
             DestinationType::SqlServer => {
-                format!(
-                    "DELETE FROM [{}].[{}] WHERE {};",
-                    schema, table, where_clause
-                )
+                format!("DELETE FROM [{schema}].[{table}] WHERE {where_clause};")
             }
             DestinationType::SQLite => {
-                format!("DELETE FROM \"{}\" WHERE {};", table, where_clause)
+                format!("DELETE FROM \"{table}\" WHERE {where_clause};")
             }
         };
 
@@ -924,14 +906,14 @@ impl TransactionManager {
 
             let sql = match self.destination_type {
                 DestinationType::MySQL => {
-                    format!("TRUNCATE TABLE `{}`.`{}`;", schema, table)
+                    format!("TRUNCATE TABLE `{schema}`.`{table}`;")
                 }
                 DestinationType::SqlServer => {
-                    format!("TRUNCATE TABLE [{}].[{}];", schema, table)
+                    format!("TRUNCATE TABLE [{schema}].[{table}];")
                 }
                 DestinationType::SQLite => {
                     // SQLite doesn't have TRUNCATE, use DELETE
-                    format!("DELETE FROM \"{}\";", table)
+                    format!("DELETE FROM \"{table}\";")
                 }
             };
             sqls.push(sql);
@@ -949,19 +931,19 @@ impl TransactionManager {
         new_data: &HashMap<String, serde_json::Value>,
     ) -> Result<String> {
         let conditions: Vec<String> = match replica_identity {
-            ReplicaIdentity::Default { .. } | ReplicaIdentity::Index { .. } => {
+            ReplicaIdentity::Default | ReplicaIdentity::Index => {
                 // Use key columns
                 let data = old_data.as_ref().unwrap_or(new_data);
                 key_columns
                     .iter()
                     .map(|col| {
                         let val = data.get(col).ok_or_else(|| {
-                            CdcError::Generic(format!("Key column {} not found", col))
+                            CdcError::Generic(format!("Key column {col} not found"))
                         })?;
                         let formatted_col = match self.destination_type {
-                            DestinationType::MySQL => format!("`{}`", col),
-                            DestinationType::SqlServer => format!("[{}]", col),
-                            DestinationType::SQLite => format!("\"{}\"", col),
+                            DestinationType::MySQL => format!("`{col}`"),
+                            DestinationType::SqlServer => format!("[{col}]"),
+                            DestinationType::SQLite => format!("\"{col}\""),
                         };
                         Ok(format!("{} = {}", formatted_col, self.format_value(val)))
                     })
@@ -975,12 +957,12 @@ impl TransactionManager {
                 data.iter()
                     .map(|(col, val)| {
                         let formatted_col = match self.destination_type {
-                            DestinationType::MySQL => format!("`{}`", col),
-                            DestinationType::SqlServer => format!("[{}]", col),
-                            DestinationType::SQLite => format!("\"{}\"", col),
+                            DestinationType::MySQL => format!("`{col}`"),
+                            DestinationType::SqlServer => format!("[{col}]"),
+                            DestinationType::SQLite => format!("\"{col}\""),
                         };
                         if val.is_null() {
-                            format!("{} IS NULL", formatted_col)
+                            format!("{formatted_col} IS NULL")
                         } else {
                             format!("{} = {}", formatted_col, self.format_value(val))
                         }
@@ -1012,12 +994,12 @@ impl TransactionManager {
             serde_json::Value::String(s) => {
                 // Escape single quotes by doubling them (SQL standard)
                 let escaped = s.replace('\'', "''");
-                format!("'{}'", escaped)
+                format!("'{escaped}'")
             }
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                 // For complex types, serialize as JSON string
                 let json_str = value.to_string().replace('\'', "''");
-                format!("'{}'", json_str)
+                format!("'{json_str}'")
             }
         }
     }

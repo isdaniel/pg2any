@@ -1,4 +1,5 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
+use pg_walstream::Lsn;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -20,6 +21,7 @@ async fn test_replica_identity_default_with_primary_key() {
         new_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()], // Primary key column
+        Lsn::from(300),
     );
 
     // Test the WHERE clause generation directly
@@ -60,6 +62,7 @@ async fn test_replica_identity_full() {
         new_data,
         ReplicaIdentity::Full,
         vec!["id".to_string(), "name".to_string(), "email".to_string()], // All columns
+        Lsn::from(300),
     );
 
     // Test the key columns for FULL replica identity
@@ -97,6 +100,7 @@ async fn test_replica_identity_index() {
         new_data,
         ReplicaIdentity::Index,
         vec!["id".to_string(), "email".to_string()], // Index columns
+        Lsn::from(300),
     );
 
     // Test the key columns for INDEX replica identity
@@ -123,6 +127,7 @@ async fn test_replica_identity_nothing() {
         new_data,
         ReplicaIdentity::Nothing,
         vec![], // No key columns
+        Lsn::from(300),
     );
 
     // Test that NOTHING replica identity has no key columns
@@ -146,6 +151,7 @@ async fn test_delete_with_replica_identity_default() {
         old_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()], // Primary key
+        Lsn::from(200),
     );
 
     // Test DELETE event structure
@@ -176,6 +182,7 @@ async fn test_delete_with_replica_identity_full() {
         old_data,
         ReplicaIdentity::Full,
         vec!["id".to_string(), "name".to_string(), "email".to_string()], // All columns
+        Lsn::from(200),
     );
 
     // Test DELETE with FULL replica identity

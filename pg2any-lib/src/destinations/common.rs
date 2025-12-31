@@ -417,7 +417,7 @@ pub fn analyze_transaction_batch_requirements(
         match &event.event_type {
             EventType::Insert { data, .. } => {
                 insert_count += 1;
-                let size: usize = data.values().map(|v| estimate_value_size(v)).sum();
+                let size: usize = data.values().map(estimate_value_size).sum();
                 total_data_size += size;
                 data_events += 1;
             }
@@ -425,17 +425,17 @@ pub fn analyze_transaction_batch_requirements(
                 new_data, old_data, ..
             } => {
                 update_count += 1;
-                let new_size: usize = new_data.values().map(|v| estimate_value_size(v)).sum();
+                let new_size: usize = new_data.values().map(estimate_value_size).sum();
                 let old_size: usize = old_data
                     .as_ref()
-                    .map(|d| d.values().map(|v| estimate_value_size(v)).sum())
+                    .map(|d| d.values().map(estimate_value_size).sum())
                     .unwrap_or(0);
                 total_data_size += new_size + old_size;
                 data_events += 1;
             }
             EventType::Delete { old_data, .. } => {
                 delete_count += 1;
-                let size: usize = old_data.values().map(|v| estimate_value_size(v)).sum();
+                let size: usize = old_data.values().map(estimate_value_size).sum();
                 total_data_size += size;
                 data_events += 1;
             }
@@ -473,8 +473,7 @@ pub fn build_where_conditions_for_update<'a>(
                 Ok(conditions)
             } else {
                 Err(CdcError::generic(format!(
-                    "UPDATE with FULL replica identity requires old_data but none provided for table {}.{}",
-                    schema, table
+                    "UPDATE with FULL replica identity requires old_data but none provided for table {schema}.{table}"
                 )))
             }
         }
@@ -482,8 +481,7 @@ pub fn build_where_conditions_for_update<'a>(
         ReplicaIdentity::Default | ReplicaIdentity::Index => {
             if key_columns.is_empty() {
                 return Err(CdcError::generic(format!(
-                    "UPDATE requires key columns for table {}.{} with DEFAULT/INDEX replica identity",
-                    schema, table
+                    "UPDATE requires key columns for table {schema}.{table} with DEFAULT/INDEX replica identity"
                 )));
             }
 
@@ -499,8 +497,7 @@ pub fn build_where_conditions_for_update<'a>(
                     conditions.push((key_column.as_str(), value));
                 } else {
                     return Err(CdcError::generic(format!(
-                        "Key column '{}' not found in data for UPDATE on table {}.{}",
-                        key_column, schema, table
+                        "Key column '{key_column}' not found in data for UPDATE on table {schema}.{table}"
                     )));
                 }
             }
@@ -511,8 +508,7 @@ pub fn build_where_conditions_for_update<'a>(
             // For UPDATE with NOTHING, try to use key columns if available
             if key_columns.is_empty() {
                 return Err(CdcError::generic(format!(
-                    "Cannot UPDATE with NOTHING replica identity and no key columns for table {}.{}",
-                    schema, table
+                    "Cannot UPDATE with NOTHING replica identity and no key columns for table {schema}.{table}"
                 )));
             }
 
@@ -522,8 +518,7 @@ pub fn build_where_conditions_for_update<'a>(
                     conditions.push((key_column.as_str(), value));
                 } else {
                     return Err(CdcError::generic(format!(
-                        "Key column '{}' not found in new_data for UPDATE with NOTHING replica identity on table {}.{}",
-                        key_column, schema, table
+                        "Key column '{key_column}' not found in new_data for UPDATE with NOTHING replica identity on table {schema}.{table}"
                     )));
                 }
             }
@@ -553,8 +548,7 @@ pub fn build_where_conditions_for_delete<'a>(
         ReplicaIdentity::Default | ReplicaIdentity::Index => {
             if key_columns.is_empty() {
                 return Err(CdcError::generic(format!(
-                    "DELETE requires key columns for table {}.{} with DEFAULT/INDEX replica identity",
-                    schema, table
+                    "DELETE requires key columns for table {schema}.{table} with DEFAULT/INDEX replica identity"
                 )));
             }
 
@@ -564,8 +558,7 @@ pub fn build_where_conditions_for_delete<'a>(
                     conditions.push((key_column.as_str(), value));
                 } else {
                     return Err(CdcError::generic(format!(
-                        "Key column '{}' not found in old_data for DELETE on table {}.{}",
-                        key_column, schema, table
+                        "Key column '{key_column}' not found in old_data for DELETE on table {schema}.{table}"
                     )));
                 }
             }
@@ -573,8 +566,7 @@ pub fn build_where_conditions_for_delete<'a>(
         }
 
         ReplicaIdentity::Nothing => Err(CdcError::generic(format!(
-            "Cannot DELETE with NOTHING replica identity for table {}.{}",
-            schema, table
+            "Cannot DELETE with NOTHING replica identity for table {schema}.{table}"
         ))),
     }
 }

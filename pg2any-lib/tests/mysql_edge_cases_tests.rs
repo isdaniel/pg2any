@@ -1,6 +1,7 @@
 /// Integration tests for MySQL destination error handling and edge cases
 /// These tests verify error conditions and edge cases in the WHERE clause generation
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
+use pg_walstream::Lsn;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -24,6 +25,7 @@ mod mysql_error_scenarios {
             incomplete_data,
             ReplicaIdentity::Default,
             vec!["id".to_string()], // "id" not in data
+            Lsn::from(300),
         );
 
         // This event structure should trigger an error in MySQL destination
@@ -50,6 +52,7 @@ mod mysql_error_scenarios {
             HashMap::new(),       // Empty new_data
             ReplicaIdentity::Default,
             vec!["id".to_string()],
+            Lsn::from(300),
         );
 
         match &event.event_type {
@@ -77,6 +80,7 @@ mod mysql_error_scenarios {
             HashMap::new(), // Empty new_data
             ReplicaIdentity::Nothing,
             vec!["id".to_string()],
+            Lsn::from(300),
         );
 
         match &event.event_type {
@@ -107,6 +111,7 @@ mod mysql_error_scenarios {
             data,
             ReplicaIdentity::Nothing,
             vec![], // No key columns
+            Lsn::from(300),
         );
 
         let key_columns = event.get_key_columns().unwrap();
@@ -134,6 +139,7 @@ mod mysql_error_scenarios {
             incomplete_data,
             ReplicaIdentity::Default,
             vec!["tenant_id".to_string(), "user_id".to_string()], // Composite key
+            Lsn::from(300),
         );
 
         match &event.event_type {
@@ -173,6 +179,7 @@ mod data_source_selection_tests {
             new_data.clone(),
             ReplicaIdentity::Default,
             vec!["id".to_string()],
+            Lsn::from(300),
         );
 
         // Simulate the fixed data source selection logic
@@ -217,6 +224,7 @@ mod data_source_selection_tests {
             new_data.clone(),
             ReplicaIdentity::Nothing,
             vec![],
+            Lsn::from(300),
         );
 
         match &event.event_type {
@@ -274,6 +282,7 @@ mod complex_data_tests {
             new_data,
             ReplicaIdentity::Default,
             vec!["id".to_string()],
+            Lsn::from(300),
         );
 
         // Verify complex JSON data is handled correctly
@@ -318,6 +327,7 @@ mod complex_data_tests {
                 "bool_key".to_string(),
                 "null_key".to_string(),
             ],
+            Lsn::from(300),
         );
 
         match &event.event_type {
@@ -373,6 +383,7 @@ mod schema_table_tests {
                 data,
                 ReplicaIdentity::Default,
                 vec!["id".to_string()],
+                Lsn::from(300),
             );
 
             // Verify schema and table names are preserved correctly

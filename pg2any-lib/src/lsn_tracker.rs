@@ -649,8 +649,8 @@ impl LsnTracker {
         let flush_lsn = metadata.get_lsn();
 
         // Serialize metadata to JSON
-        let json_content = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json_content =
+            serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
 
         // Write to temp file first for atomic write
         let temp_path = format!("{}.tmp", self.lsn_file_path);
@@ -680,8 +680,8 @@ impl LsnTracker {
         let flush_lsn = metadata.get_lsn();
 
         // Serialize metadata to JSON
-        let json_content = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json_content =
+            serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
 
         // Write to temp file first for atomic write
         let temp_path = format!("{}.tmp", self.lsn_file_path);

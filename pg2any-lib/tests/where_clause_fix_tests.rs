@@ -1,4 +1,5 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
+use pg_walstream::Lsn;
 use std::collections::HashMap;
 
 /// Test to demonstrate the fix for UPDATE WHERE clause issue
@@ -42,6 +43,7 @@ fn test_update_where_clause_uses_old_data() {
         new_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(300),
     );
 
     // Test that the event structure correctly supports proper WHERE clause generation
@@ -123,6 +125,7 @@ fn test_delete_where_clause_uses_old_data() {
         old_data,
         ReplicaIdentity::Default,
         vec!["id".to_string()],
+        Lsn::from(200),
     );
 
     // Verify DELETE event structure
@@ -160,6 +163,7 @@ fn test_update_fallback_when_no_old_data() {
         new_data,
         ReplicaIdentity::Nothing,
         vec!["id".to_string()], // fallback key columns
+        Lsn::from(300),
     );
 
     // Verify the fallback scenario

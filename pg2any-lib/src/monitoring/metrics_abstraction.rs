@@ -197,10 +197,9 @@ mod real_metrics {
                 .with_label_values(&[event_type, table_name])
                 .inc();
 
-            // Update LSN if available
-            if let Some(lsn) = event.lsn {
-                LAST_PROCESSED_LSN.set(lsn.0 as f64);
-            }
+            // Update LSN
+            // In pg-walstream 0.1.0, event.lsn is Lsn (not Option)
+            LAST_PROCESSED_LSN.set(event.lsn.value() as f64);
 
             // Track events for rate calculation
             self.events_in_window.fetch_add(1, Ordering::Relaxed);
@@ -294,8 +293,8 @@ mod real_metrics {
             let mut buffer = Vec::new();
             encoder
                 .encode(&metric_families, &mut buffer)
-                .map_err(|e| crate::CdcError::generic(&e.to_string()))?;
-            String::from_utf8(buffer).map_err(|e| crate::CdcError::generic(&e.to_string()))
+                .map_err(|e| crate::CdcError::generic(e.to_string()))?;
+            String::from_utf8(buffer).map_err(|e| crate::CdcError::generic(e.to_string()))
         }
 
         fn init_build_info(&self, version: &str) {
@@ -461,7 +460,7 @@ mod noop_metrics {
 /// Initialize the global metrics registry (only when metrics feature is enabled)
 #[cfg(feature = "metrics")]
 pub fn init_metrics() -> CdcResult<()> {
-    crate::monitoring::metrics::init_metrics().map_err(|e| crate::CdcError::generic(&e.to_string()))
+    crate::monitoring::metrics::init_metrics().map_err(|e| crate::CdcError::generic(e.to_string()))
 }
 
 /// No-op metrics initialization when metrics feature is disabled
@@ -476,7 +475,7 @@ pub fn init_metrics() -> CdcResult<()> {
 #[cfg(feature = "metrics")]
 pub fn gather_metrics() -> CdcResult<String> {
     crate::monitoring::metrics::gather_metrics()
-        .map_err(|e| crate::CdcError::generic(&e.to_string()))
+        .map_err(|e| crate::CdcError::generic(e.to_string()))
 }
 
 /// Return a message indicating metrics are disabled

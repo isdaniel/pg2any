@@ -187,100 +187,95 @@ lazy_static! {
 pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
     REGISTRY
         .register(Box::new(EVENTS_PROCESSED_TOTAL.clone()))
-        .map_err(|e| format!("Failed to register EVENTS_PROCESSED_TOTAL: {}", e))?;
+        .map_err(|e| format!("Failed to register EVENTS_PROCESSED_TOTAL: {e}"))?;
 
     REGISTRY
         .register(Box::new(EVENTS_BY_TYPE.clone()))
-        .map_err(|e| format!("Failed to register EVENTS_BY_TYPE: {}", e))?;
+        .map_err(|e| format!("Failed to register EVENTS_BY_TYPE: {e}"))?;
 
     REGISTRY
         .register(Box::new(EVENTS_RATE.clone()))
-        .map_err(|e| format!("Failed to register EVENTS_RATE: {}", e))?;
+        .map_err(|e| format!("Failed to register EVENTS_RATE: {e}"))?;
 
     REGISTRY
         .register(Box::new(CONSUMER_QUEUE_SIZE.clone()))
-        .map_err(|e| format!("Failed to register CONSUMER_QUEUE_SIZE: {}", e))?;
+        .map_err(|e| format!("Failed to register CONSUMER_QUEUE_SIZE: {e}"))?;
 
     REGISTRY
         .register(Box::new(LAST_PROCESSED_LSN.clone()))
-        .map_err(|e| format!("Failed to register LAST_PROCESSED_LSN: {}", e))?;
+        .map_err(|e| format!("Failed to register LAST_PROCESSED_LSN: {e}"))?;
 
     REGISTRY
         .register(Box::new(CURRENT_RECEIVED_LSN.clone()))
-        .map_err(|e| format!("Failed to register CURRENT_RECEIVED_LSN: {}", e))?;
+        .map_err(|e| format!("Failed to register CURRENT_RECEIVED_LSN: {e}"))?;
 
     REGISTRY
         .register(Box::new(ERRORS_TOTAL.clone()))
-        .map_err(|e| format!("Failed to register ERRORS_TOTAL: {}", e))?;
+        .map_err(|e| format!("Failed to register ERRORS_TOTAL: {e}"))?;
 
     REGISTRY
         .register(Box::new(SOURCE_CONNECTION_STATUS.clone()))
-        .map_err(|e| format!("Failed to register SOURCE_CONNECTION_STATUS: {}", e))?;
+        .map_err(|e| format!("Failed to register SOURCE_CONNECTION_STATUS: {e}"))?;
 
     REGISTRY
         .register(Box::new(DESTINATION_CONNECTION_STATUS.clone()))
-        .map_err(|e| format!("Failed to register DESTINATION_CONNECTION_STATUS: {}", e))?;
+        .map_err(|e| format!("Failed to register DESTINATION_CONNECTION_STATUS: {e}"))?;
 
     REGISTRY
         .register(Box::new(EVENT_PROCESSING_DURATION.clone()))
-        .map_err(|e| format!("Failed to register EVENT_PROCESSING_DURATION: {}", e))?;
+        .map_err(|e| format!("Failed to register EVENT_PROCESSING_DURATION: {e}"))?;
 
     REGISTRY
         .register(Box::new(ACTIVE_CONNECTIONS.clone()))
-        .map_err(|e| format!("Failed to register ACTIVE_CONNECTIONS: {}", e))?;
+        .map_err(|e| format!("Failed to register ACTIVE_CONNECTIONS: {e}"))?;
 
     REGISTRY
         .register(Box::new(UPTIME_SECONDS.clone()))
-        .map_err(|e| format!("Failed to register UPTIME_SECONDS: {}", e))?;
+        .map_err(|e| format!("Failed to register UPTIME_SECONDS: {e}"))?;
 
     REGISTRY
         .register(Box::new(BUILD_INFO.clone()))
-        .map_err(|e| format!("Failed to register BUILD_INFO: {}", e))?;
+        .map_err(|e| format!("Failed to register BUILD_INFO: {e}"))?;
 
     REGISTRY
         .register(Box::new(TRANSACTIONS_PROCESSED_TOTAL.clone()))
-        .map_err(|e| format!("Failed to register TRANSACTIONS_PROCESSED_TOTAL: {}", e))?;
+        .map_err(|e| format!("Failed to register TRANSACTIONS_PROCESSED_TOTAL: {e}"))?;
 
     REGISTRY
         .register(Box::new(FULL_TRANSACTIONS_PROCESSED_TOTAL.clone()))
-        .map_err(|e| {
-            format!(
-                "Failed to register FULL_TRANSACTIONS_PROCESSED_TOTAL: {}",
-                e
-            )
-        })?;
+        .map_err(|e| format!("Failed to register FULL_TRANSACTIONS_PROCESSED_TOTAL: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_ALLOCATED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_ALLOCATED_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_ALLOCATED_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_RESIDENT_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_RESIDENT_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_RESIDENT_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_ACTIVE_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_ACTIVE_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_ACTIVE_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_MAPPED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_MAPPED_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_MAPPED_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_METADATA_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_METADATA_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_METADATA_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_RETAINED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_RETAINED_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_RETAINED_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_FRAGMENTATION_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_FRAGMENTATION_BYTES: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_FRAGMENTATION_BYTES: {e}"))?;
 
     REGISTRY
         .register(Box::new(MEMORY_UTILIZATION_PERCENT.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_UTILIZATION_PERCENT: {}", e))?;
+        .map_err(|e| format!("Failed to register MEMORY_UTILIZATION_PERCENT: {e}"))?;
 
     debug!("All metrics registered successfully");
     Ok(())

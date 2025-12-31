@@ -109,7 +109,6 @@ pub use pg_walstream::{
     KeepaliveMessage,
     LogicalReplicationMessage,
     LogicalReplicationParser,
-    // Stream types
     LogicalReplicationStream,
     // PostgreSQL-specific types
     Lsn,

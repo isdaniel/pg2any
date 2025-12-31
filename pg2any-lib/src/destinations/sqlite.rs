@@ -62,19 +62,17 @@ impl DestinationHandler for SQLiteDestination {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     CdcError::generic(format!(
-                        "Failed to create directory for SQLite database: {}",
-                        e
+                        "Failed to create directory for SQLite database: {e}"
                     ))
                 })?;
             }
         }
 
         // Create connection options
-        let mut options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path))
-            .map_err(|e| {
+        let mut options =
+            SqliteConnectOptions::from_str(&format!("sqlite://{db_path}")).map_err(|e| {
                 CdcError::generic(format!(
-                    "Failed to parse SQLite connection string '{}': {}",
-                    db_path, e
+                    "Failed to parse SQLite connection string '{db_path}': {e}"
                 ))
             })?;
 
@@ -87,8 +85,7 @@ impl DestinationHandler for SQLiteDestination {
         // Create connection pool
         let pool = SqlitePool::connect_with(options).await.map_err(|e| {
             CdcError::generic(format!(
-                "Failed to connect to SQLite database '{}': {}",
-                db_path, e
+                "Failed to connect to SQLite database '{db_path}': {e}"
             ))
         })?;
 
@@ -116,7 +113,7 @@ impl DestinationHandler for SQLiteDestination {
         let mut tx = pool
             .begin()
             .await
-            .map_err(|e| CdcError::generic(format!("SQLite BEGIN transaction failed: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("SQLite BEGIN transaction failed: {e}")))?;
 
         // Execute all commands in the transaction
         for (idx, sql) in commands.iter().enumerate() {
@@ -140,7 +137,7 @@ impl DestinationHandler for SQLiteDestination {
         // Commit the transaction
         tx.commit()
             .await
-            .map_err(|e| CdcError::generic(format!("SQLite COMMIT transaction failed: {}", e)))?;
+            .map_err(|e| CdcError::generic(format!("SQLite COMMIT transaction failed: {e}")))?;
 
         Ok(())
     }

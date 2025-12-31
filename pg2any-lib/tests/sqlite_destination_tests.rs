@@ -4,6 +4,7 @@ use pg2any_lib::{
     types::{ChangeEvent, DestinationType, EventType, ReplicaIdentity},
     Transaction,
 };
+use pg_walstream::Lsn;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -327,7 +328,13 @@ async fn test_sqlite_destination_process_insert_event() {
 
     // Create INSERT event
     let data = create_test_data();
-    let event = ChangeEvent::insert("main".to_string(), "users".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "users".to_string(),
+        123,
+        data,
+        Lsn::from(100),
+    );
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
@@ -381,6 +388,7 @@ async fn test_sqlite_destination_process_update_event() {
         new_data,
         ReplicaIdentity::Default,
         key_columns,
+        Lsn::from(300),
     );
 
     // Process the event using execute_sql_batch
@@ -443,6 +451,7 @@ async fn test_sqlite_destination_process_delete_event() {
         old_data,
         ReplicaIdentity::Default,
         key_columns,
+        Lsn::from(200),
     );
 
     // Process the event using execute_sql_batch
@@ -505,7 +514,7 @@ async fn test_sqlite_destination_process_truncate_event() {
     // Create TRUNCATE event
     let event = ChangeEvent {
         event_type: EventType::Truncate(vec!["main.users".to_string()]),
-        lsn: None,
+        lsn: Lsn::from(400),
         metadata: None,
     };
 
@@ -580,6 +589,7 @@ async fn test_sqlite_destination_replica_identity_full() {
         new_data,
         ReplicaIdentity::Full,
         vec![], // No key columns needed for FULL
+        Lsn::from(300),
     );
 
     // Process the event using execute_sql_batch
@@ -620,6 +630,7 @@ async fn test_sqlite_destination_replica_identity_nothing_error() {
         old_data,
         ReplicaIdentity::Nothing,
         vec![],
+        Lsn::from(200),
     );
 
     // Process the event - with SQL workflow, invalid events are skipped (generate no SQL)
@@ -669,7 +680,13 @@ async fn test_sqlite_destination_complex_data_types() {
     );
     data.insert("null_value".to_string(), json!(null));
 
-    let event = ChangeEvent::insert("main".to_string(), "complex_data".to_string(), 123, data);
+    let event = ChangeEvent::insert(
+        "main".to_string(),
+        "complex_data".to_string(),
+        123,
+        data,
+        Lsn::from(100),
+    );
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);

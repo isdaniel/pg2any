@@ -165,8 +165,7 @@ cleanup_test_data() {
         -p "$POSTGRES_PORT" \
         -U "$POSTGRES_USER" \
         -d "$POSTGRES_DB" \
-        -c "TRUNCATE TABLE public.t1;" \
-        2>&1 || true
+        -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
     
     # Clean MySQL
     mysql \

@@ -53,14 +53,14 @@ jobs:
     - name: Verify PostgreSQL is ready
       run: |
         echo "Verifying PostgreSQL connection..."
-        docker exec chaos_test_postgres pg_isready -U postgres
-        docker exec chaos_test_postgres psql -U postgres -c "SELECT version();"
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
     
     - name: Verify MySQL is ready
       run: |
         echo "Verifying MySQL connection..."
-        docker exec chaos_test_mysql mysqladmin ping -h localhost -u root -ptest.123
-        docker exec chaos_test_mysql mysql -u root -ptest.123 -e "SELECT VERSION();"
+        docker exec cdc_mysql mysqladmin ping -h localhost -u root -ptest.123
+        docker exec cdc_mysql mysql -u root -ptest.123 -e "SELECT VERSION();"
     
     - name: Verify CDC application is running
       run: |
@@ -119,7 +119,7 @@ jobs:
         echo "=========================================="
         echo "MySQL Logs (Last 100 lines)"
         echo "=========================================="
-        docker logs chaos_test_mysql --tail 100
+        docker logs cdc_mysql --tail 100
     
     - name: Show container status on failure
       if: failure()

@@ -97,7 +97,6 @@ chaos-test-setup:
 	@chmod +x tests/chaos/scripts/*.sh
 	@docker-compose -f docker-compose.chaos-test.yml up --build -d
 	@echo "Waiting for services to be healthy..."
-	@sleep 20
 	@docker-compose -f docker-compose.chaos-test.yml ps
 
 chaos-test:

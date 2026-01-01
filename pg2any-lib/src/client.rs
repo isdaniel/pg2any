@@ -433,7 +433,7 @@ impl CdcClient {
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
-                Ok(Some(event)) => {
+                Ok(event) => {
                     if event.lsn <= start_lsn {
                         debug!("Skipping event with LSN {} <= {}", event.lsn, start_lsn);
                         continue;
@@ -663,13 +663,6 @@ impl CdcClient {
                         _ => {
                             debug!("Skipping metadata event: {:?}", event.event_type);
                         }
-                    }
-                }
-                Ok(None) => {
-                    // No event available
-                    if cancellation_token.is_cancelled() {
-                        info!("Producer received cancellation signal");
-                        break;
                     }
                 }
                 Err(e) => {

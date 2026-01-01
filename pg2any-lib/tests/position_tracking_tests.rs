@@ -25,7 +25,7 @@ mod position_tracking_tests {
     async fn test_update_consumer_position() {
         let lsn_file = get_test_file_path("update_position");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Update position
         tracker.update_consumer_position(
@@ -52,7 +52,7 @@ mod position_tracking_tests {
     async fn test_get_resume_position() {
         let lsn_file = get_test_file_path("resume_position");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Update position to command 499 (0-indexed)
         tracker.update_consumer_position("/path/to/file.meta".to_string(), 499);
@@ -73,7 +73,7 @@ mod position_tracking_tests {
     async fn test_clear_consumer_position() {
         let lsn_file = get_test_file_path("clear_position");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Set position
         tracker.update_consumer_position("/path/to/file.meta".to_string(), 499);
@@ -99,7 +99,7 @@ mod position_tracking_tests {
 
         // First session: save position
         {
-            let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+            let tracker = LsnTracker::new(Some(&lsn_file));
             tracker.update_consumer_position("/path/to/transaction_123.meta".to_string(), 2499);
             tracker.commit_lsn(123456789);
 
@@ -108,8 +108,7 @@ mod position_tracking_tests {
 
         // Second session: load position
         {
-            let (tracker, lsn) =
-                LsnTracker::new_with_load_and_interval(Some(&lsn_file), 1000).await;
+            let (tracker, lsn) = LsnTracker::new_with_load(Some(&lsn_file)).await;
 
             // Verify LSN was restored
             assert!(lsn.is_some());
@@ -133,7 +132,7 @@ mod position_tracking_tests {
     async fn test_position_at_file_boundary() {
         let lsn_file = get_test_file_path("boundary");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Simulate processing all commands (last_executed = total - 1)
         tracker.update_consumer_position(
@@ -175,7 +174,7 @@ mod position_tracking_tests {
         fs::write(&metadata_file, json).await.unwrap();
 
         // Load with new tracker
-        let (tracker, lsn) = LsnTracker::new_with_load_and_interval(Some(&lsn_file), 1000).await;
+        let (tracker, lsn) = LsnTracker::new_with_load(Some(&lsn_file)).await;
 
         // Verify LSN was loaded
         assert!(lsn.is_some());
@@ -193,7 +192,7 @@ mod position_tracking_tests {
     async fn test_position_update_sequence() {
         let lsn_file = get_test_file_path("sequence");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Simulate processing batches of 100 commands
         let file_path = "/path/to/file.meta".to_string();
@@ -228,7 +227,7 @@ mod position_tracking_tests {
     async fn test_multiple_files_with_position() {
         let lsn_file = get_test_file_path("multiple_files");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // Process file 1 completely
         tracker.update_consumer_position("/path/to/file1.meta".to_string(), 999);
@@ -253,7 +252,7 @@ mod position_tracking_tests {
     async fn test_position_with_single_command_file() {
         let lsn_file = get_test_file_path("single_command");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 100);
+        let tracker = LsnTracker::new(Some(&lsn_file));
 
         // File with single command
         tracker.update_consumer_position("/path/to/single.meta".to_string(), 0);
@@ -271,7 +270,7 @@ mod position_tracking_tests {
     async fn test_position_dirty_flag() {
         let lsn_file = get_test_file_path("dirty_flag");
 
-        let tracker = LsnTracker::new_with_interval(Some(&lsn_file), 10000); // Long interval
+        let tracker = LsnTracker::new(Some(&lsn_file)); // Long interval
 
         // Initially not dirty
         assert!(!tracker.is_dirty());

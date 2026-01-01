@@ -60,7 +60,7 @@ impl ReplicationStream {
     pub async fn next_event(
         &mut self,
         cancellation_token: &CancellationToken,
-    ) -> Result<Option<ChangeEvent>> {
+    ) -> Result<ChangeEvent> {
         debug!("Fetching next single change event with retry support and cancellation");
 
         let event = self
@@ -69,11 +69,7 @@ impl ReplicationStream {
             .await
             .map_err(|e| crate::error::CdcError::Replication(e))?;
 
-        if let Some(ref event) = event {
-            debug!("Received single change event: {:?}", event);
-            // Update last received LSN
-            self.logical_stream.state.update_lsn(event.lsn.value());
-        }
+        self.logical_stream.state.update_lsn(event.lsn.value());
 
         Ok(event)
     }

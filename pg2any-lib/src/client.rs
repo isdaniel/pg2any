@@ -433,7 +433,7 @@ impl CdcClient {
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
-                Ok(Some(event)) => {
+                Ok(event) => {
                     if event.lsn <= start_lsn {
                         debug!("Skipping event with LSN {} <= {}", event.lsn, start_lsn);
                         continue;
@@ -663,13 +663,6 @@ impl CdcClient {
                         _ => {
                             debug!("Skipping metadata event: {:?}", event.event_type);
                         }
-                    }
-                }
-                Ok(None) => {
-                    // No event available
-                    if cancellation_token.is_cancelled() {
-                        info!("Producer received cancellation signal");
-                        break;
                     }
                 }
                 Err(e) => {
@@ -1074,17 +1067,26 @@ impl CdcClient {
                     (command_count + batch_size - 1) / batch_size
                 );
 
-                // Save current position before returning
+                // Save current position with immediate atomic persistence before returning
                 if let Some(ref tracker) = lsn_tracker {
                     if current_command_index > 0 {
-                        tracker.update_consumer_position(
-                            file_path_str.clone(),
-                            current_command_index - 1,
-                        );
-                        debug!(
-                            "Saved consumer position on cancellation: file={}, last_executed_index={}",
-                            file_path_str, current_command_index - 1
-                        );
+                        let last_executed_index = current_command_index - 1;
+
+                        // CRITICAL: Atomic update + persist for graceful shutdown
+                        if let Err(e) = tracker
+                            .update_consumer_position_and_persist_immediately(
+                                file_path_str.clone(),
+                                last_executed_index,
+                            )
+                            .await
+                        {
+                            error!("Failed to persist consumer position on cancellation: {}", e);
+                        } else {
+                            info!(
+                                "Persisted consumer position on cancellation: last_executed_index={}",
+                                last_executed_index
+                            );
+                        }
                     }
                 }
 
@@ -1117,19 +1119,30 @@ impl CdcClient {
                 );
                 metrics_collector.record_error("transaction_file_execution_failed", "consumer");
 
-                // Save current position before returning error
+                // Save current position before returning error with atomic persistence
                 if let Some(ref tracker) = lsn_tracker {
                     // Save position as the last successfully completed command
                     // current_command_index - 1 is the last successful command
                     if current_command_index > 0 {
-                        tracker.update_consumer_position(
-                            file_path_str.clone(),
-                            current_command_index - 1,
-                        );
-                        info!(
-                            "Saved consumer position after batch failure: command_index={}",
-                            current_command_index - 1
-                        );
+                        let last_executed_index = current_command_index - 1;
+
+                        if let Err(persist_err) = tracker
+                            .update_consumer_position_and_persist_immediately(
+                                file_path_str.clone(),
+                                last_executed_index,
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to atomically persist consumer position on batch error: {}",
+                                persist_err
+                            );
+                        } else {
+                            info!(
+                                "Consumer position on batch failure: index={}",
+                                last_executed_index
+                            );
+                        }
                     }
                 }
 
@@ -1142,12 +1155,21 @@ impl CdcClient {
             // Save position after each batch for resumability
             if let Some(ref tracker) = lsn_tracker {
                 // Save the index of the last successfully executed command (0-indexed)
-                tracker.update_consumer_position(file_path_str.clone(), current_command_index - 1);
-                debug!(
-                    "Updated consumer position: file={}, last_executed_index={}",
-                    file_path_str,
-                    current_command_index - 1
-                );
+                let last_executed_index = current_command_index - 1;
+
+                if let Err(e) = tracker
+                    .update_consumer_position_and_persist_immediately(
+                        file_path_str.clone(),
+                        last_executed_index,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to persist consumer position after batch {}: {}",
+                        batch_idx + 1,
+                        e
+                    );
+                }
             }
 
             let batch_duration = batch_start_time.elapsed();
@@ -1172,10 +1194,17 @@ impl CdcClient {
             duration / batch_count.max(1) as u32
         );
 
-        // Clear consumer position since file is fully processed
+        // Clear consumer position since file is fully processed and persist immediately
         if let Some(ref tracker) = lsn_tracker {
-            tracker.clear_consumer_position();
-            debug!("Cleared consumer position after full file completion");
+            if let Err(e) = tracker
+                .clear_consumer_position_and_persist_immediately()
+                .await
+            {
+                warn!(
+                    "Failed to atomically clear and persist consumer position: {}",
+                    e
+                );
+            }
         }
 
         // Finalize: update LSN, record metrics, delete file
@@ -1277,6 +1306,11 @@ impl CdcClient {
         // Wait for both tasks to complete gracefully
         self.wait_for_tasks_completion().await?;
 
+        // Close destination connection
+        if let Some(ref mut handler) = self.destination_handler {
+            handler.close().await?;
+        }
+
         // Shutdown LSN tracker to persist final state
         if let Some(ref tracker) = self.lsn_tracker {
             info!("Shutting down LSN tracker and persisting final state");
@@ -1284,34 +1318,25 @@ impl CdcClient {
             // Log state before shutdown
             let pre_shutdown_metadata = tracker.get_metadata();
             info!(
-                "Pre-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}",
+                "Pre-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}, last_executed_index={:?}",
                 pg_walstream::format_lsn(pre_shutdown_metadata.lsn_tracking.flush_lsn),
                 pre_shutdown_metadata.consumer_state.pending_file_count,
-                pre_shutdown_metadata.consumer_state.current_file_path
+                pre_shutdown_metadata.consumer_state.current_file_path,
+                pre_shutdown_metadata.consumer_state.last_executed_command_index
             );
 
-            // Shutdown LSN tracker (includes final persist)
+            // Shutdown LSN tracker, which includes a final state persistence.
             tracker.shutdown_async().await;
 
-            if let Err(e) = tracker.persist_async().await {
-                warn!("Final forced persistence failed: {}", e);
-            } else {
-                info!("Final LSN persistence completed successfully");
-            }
-
-            // Log final state after persist
+            // Log final state after shutdown
             let post_shutdown_metadata = tracker.get_metadata();
             info!(
-                "Post-shutdown state (persisted) - flush_lsn={}, pending_files={}, current_file={:?}",
+                "Post-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}, last_executed_index={:?}",
                 pg_walstream::format_lsn(post_shutdown_metadata.lsn_tracking.flush_lsn),
                 post_shutdown_metadata.consumer_state.pending_file_count,
-                post_shutdown_metadata.consumer_state.current_file_path
+                post_shutdown_metadata.consumer_state.current_file_path,
+                post_shutdown_metadata.consumer_state.last_executed_command_index
             );
-        }
-
-        // Close destination connection
-        if let Some(ref mut handler) = self.destination_handler {
-            handler.close().await?;
         }
 
         info!("CDC replication stopped gracefully");

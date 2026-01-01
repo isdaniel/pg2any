@@ -1,0 +1,164 @@
+name: CDC Chaos Integration Test
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  chaos-integration-test:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+      fail-fast: false 
+    
+    runs-on: ${{ matrix.os }}
+    
+    timeout-minutes: 360  
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Compose
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+    
+    - name: Verify test structure
+      run: |
+        echo "Verifying chaos test structure..."
+        ls -la tests/chaos/
+        ls -la tests/chaos/scripts/
+        ls -la tests/chaos/scenarios/
+    
+    - name: Start Docker Compose services
+      run: |
+        echo "Starting all services with docker-compose..."
+        docker-compose -f docker-compose.chaos-test.yml up --build -d
+      working-directory: .
+    
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for services to become healthy..."
+        timeout 120 bash -c 'until docker ps | grep -q "healthy"; do sleep 5; done' || true
+        docker-compose -f docker-compose.chaos-test.yml ps
+        sleep 15
+      working-directory: .
+    
+    - name: Verify PostgreSQL is ready
+      run: |
+        echo "Verifying PostgreSQL connection..."
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
+    
+    - name: Verify MySQL is ready
+      run: |
+        echo "Verifying MySQL connection..."
+        docker exec cdc_mysql mysqladmin ping -h localhost -u root -ptest.123
+        docker exec cdc_mysql mysql -u root -ptest.123 -e "SELECT VERSION();"
+    
+    - name: Verify CDC application is running
+      run: |
+        echo "Verifying CDC application..."
+        docker ps -a | grep cdc_application
+        docker logs cdc_application | tail -n 50
+    
+    - name: Make scripts executable
+      run: |
+        chmod +x tests/chaos/scripts/*.sh
+        ls -la tests/chaos/scripts/
+    
+    - name: Run chaos integration tests
+      run: |
+        echo "=========================================="
+        echo "Starting CDC Chaos Integration Tests"
+        echo "=========================================="
+        echo "OS: ${{ matrix.os }}"
+        echo "Test will run with chaos (random container restarts)"
+        echo ""
+        
+        cd tests/chaos/scripts
+        ./run_chaos_tests.sh
+      env:
+        CDC_POSTGRES_HOST: 127.0.0.1
+        CDC_POSTGRES_PORT: 5432
+        CDC_POSTGRES_USER: postgres
+        CDC_POSTGRES_PASSWORD: test.123
+        CDC_POSTGRES_DB: postgres
+        CDC_MYSQL_HOST: 127.0.0.1
+        CDC_MYSQL_PORT: 3306
+        CDC_MYSQL_USER: root
+        CDC_MYSQL_PASSWORD: test.123
+        CDC_MYSQL_DB: cdc_db
+        CDC_CONTAINER_NAME: cdc_application
+    
+    - name: Show CDC application logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "CDC Application Logs (Last 200 lines)"
+        echo "=========================================="
+        docker logs cdc_application --tail 200
+    
+    - name: Show PostgreSQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "PostgreSQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs chaos_test_postgres --tail 100
+    
+    - name: Show MySQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "MySQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_mysql --tail 100
+    
+    - name: Show container status on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Docker Container Status"
+        echo "=========================================="
+        docker-compose -f docker-compose.chaos-test.yml ps
+        docker ps -a
+    
+    - name: Stop and remove containers
+      if: always()
+      run: |
+        echo "Cleaning up Docker containers..."
+        docker-compose -f docker-compose.chaos-test.yml down -v
+        docker volume rm chaos_test_lsn_data 2>/dev/null || true
+        docker network rm chaos_test_network 2>/dev/null || true
+        docker system prune -f
+      working-directory: .
+    
+    - name: Show disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df
+
+  notify:
+    needs: chaos-integration-test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Test result summary
+      run: |
+        echo "=========================================="
+        echo "Chaos Integration Test Summary"
+        echo "=========================================="
+        echo "Job status: ${{ needs.chaos-integration-test.result }}"
+        if [ "${{ needs.chaos-integration-test.result }}" = "success" ]; then
+          echo "✓ All chaos integration tests passed!"
+        else
+          echo "✗ Some chaos integration tests failed."
+        fi

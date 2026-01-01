@@ -21,3 +21,5 @@ target
 #.idea/
 
 pg2any_last_lsn
+.github/instructions/*
+tests/chaos/scripts/chaos_script.log

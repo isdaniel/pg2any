@@ -84,7 +84,7 @@ pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
 pub use env::load_config_from_env;
 pub use error::CdcError;
-pub use lsn_tracker::{create_lsn_tracker_with_load_async, LsnTracker};
+pub use lsn_tracker::{create_lsn_tracker_with_load, LsnTracker};
 pub use pg_replication::{PgReplicationConnection, ReplicationConnectionRetry, RetryConfig};
 pub type CdcResult<T> = Result<T, CdcError>;
 

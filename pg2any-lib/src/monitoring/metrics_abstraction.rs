@@ -289,7 +289,7 @@ mod real_metrics {
         fn get_metrics(&self) -> CdcResult<String> {
             use prometheus::Encoder;
             let encoder = prometheus::TextEncoder::new();
-            let metric_families = REGISTRY.gather();
+            let metric_families = prometheus::default_registry().gather();
             let mut buffer = Vec::new();
             encoder
                 .encode(&metric_families, &mut buffer)

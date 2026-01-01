@@ -1,7 +1,7 @@
 # PostgreSQL CDC Makefile
 # Provides convenient commands for development and deployment
 
-.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean
+.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean chaos-test chaos-test-setup chaos-test-clean
 
 # Default target
 help:
@@ -28,6 +28,11 @@ help:
 	@echo "  mysql          Connect to MySQL"
 	@echo "  test-data      Insert test data"
 	@echo "  show-data      Show data in both databases"
+	@echo ""
+	@echo "Chaos Testing:"
+	@echo "  chaos-test-setup   Set up and start services for chaos testing"
+	@echo "  chaos-test         Run chaos integration tests"
+	@echo "  chaos-test-clean   Clean up after chaos testing"
 	@echo ""
 
 # Development commands
@@ -85,3 +90,30 @@ mysql:
 
 clean:
 	cargo clean
+
+# Chaos Testing commands
+chaos-test-setup:
+	@echo "Setting up chaos testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test.yml up --build -d
+	@echo "Waiting for services to be healthy..."
+	@docker-compose -f docker-compose.chaos-test.yml ps
+
+chaos-test:
+	@echo "Running chaos integration tests..."
+	@echo "This will randomly restart the CDC application to test graceful shutdown"
+	@cd tests/chaos/scripts && ./run_chaos_tests.sh
+
+chaos-test-clean:
+	@echo "Cleaning up chaos testing environment..."
+	@docker-compose -f docker-compose.chaos-test.yml down -v
+	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+chaos-test-full: chaos-test-setup chaos-test chaos-test-clean
+	@echo "Full chaos test cycle complete!"
+
+chaos-test-logs:
+	@echo "Showing CDC application logs..."
+	@docker logs -f cdc_application

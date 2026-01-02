@@ -327,12 +327,10 @@ impl LsnTracker {
         info!("Shutting down LSN tracker");
 
         // Force an immediate persist to ensure final state is written
-        if self.dirty.load(Ordering::Acquire) {
-            if let Err(e) = self.persist_async().await {
-                warn!("Failed to persist on shutdown: {}", e);
-            } else {
-                info!("Final state persisted on shutdown");
-            }
+        if let Err(e) = self.persist_async().await {
+            warn!("Failed to persist on shutdown: {}", e);
+        } else {
+            info!("Final state persisted on shutdown");
         }
 
         info!("LSN tracker stopped gracefully");

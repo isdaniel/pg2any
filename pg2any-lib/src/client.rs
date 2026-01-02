@@ -1325,13 +1325,7 @@ impl CdcClient {
                 pre_shutdown_metadata.consumer_state.last_executed_command_index
             );
 
-            if let Err(e) = tracker.persist_async().await {
-                error!("Pre-shutdown persistence failed: {}", e);
-            } else {
-                info!("Pre-shutdown persistence completed successfully");
-            }
-
-            // Shutdown LSN tracker background task (this also does a final persist internally)
+            // Shutdown LSN tracker, which includes a final state persistence.
             tracker.shutdown_async().await;
 
             // Log final state after shutdown

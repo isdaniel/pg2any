@@ -4,5 +4,5 @@ BEGIN;
         RANDOM() * 1000000,
             md5(random()::text || clock_timestamp()::text)::uuid,
             md5(random()::text || clock_timestamp()::text)::uuid
-    FROM generate_series(1,5000000) i;
+    FROM generate_series(1,1500000) i;
 COMMIT;

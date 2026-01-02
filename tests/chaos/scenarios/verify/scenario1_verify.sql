@@ -1,7 +1,7 @@
 -- Scenario 1: Verification - Check if 100 records were replicated
 SELECT 
     CASE 
-        WHEN COUNT(*) >= 100 THEN 'PASS'
+        WHEN COUNT(*) = 100 THEN 'PASS'
         ELSE 'FAIL'
     END AS test_result,
     COUNT(*) AS actual_count,

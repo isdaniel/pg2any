@@ -40,12 +40,9 @@ BEGIN
     END LOOP;
 END $$;
 
-SELECT pg_sleep(1);
 
 -- Delete some records
 DELETE FROM public.t1 WHERE val < 100000;
-
-SELECT pg_sleep(1);
 
 -- Final insert
 DO $$

@@ -2,7 +2,7 @@
 -- Verify that some records were deleted (count should be less than 80)
 SELECT 
     CASE 
-        WHEN COUNT(*) < 80 AND COUNT(*) >= 0 THEN 'PASS'
+        WHEN COUNT(*) = 50000 THEN 'PASS'
         ELSE 'FAIL'
     END AS test_result,
     COUNT(*) AS remaining_count

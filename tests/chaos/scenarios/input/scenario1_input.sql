@@ -13,10 +13,5 @@ BEGIN
             md5(random()::text || clock_timestamp()::text)::uuid,
             md5(random()::text || clock_timestamp()::text)::uuid
         );
-        
-        -- Small delay to simulate real-world traffic
-        IF i % 10 = 0 THEN
-            PERFORM pg_sleep(0.1);
-        END IF;
     END LOOP;
 END $$;

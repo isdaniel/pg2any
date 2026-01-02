@@ -2,7 +2,7 @@
 -- Count records where val >= 10000 (updated records)
 SELECT 
     CASE 
-        WHEN COUNT(*) > 0 THEN 'PASS'
+        WHEN COUNT(*) = 50 THEN 'PASS'
         ELSE 'FAIL'
     END AS test_result,
     COUNT(*) AS updated_count

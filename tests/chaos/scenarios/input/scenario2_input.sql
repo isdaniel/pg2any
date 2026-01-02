@@ -16,10 +16,6 @@ BEGIN
     END LOOP;
 END $$;
 
--- Wait a moment for replication
-SELECT pg_sleep(2);
-
 -- Update records with a specific pattern
 UPDATE public.t1 
-SET val = val + 10000
-WHERE val < 500000;
+SET val = val + 10000;

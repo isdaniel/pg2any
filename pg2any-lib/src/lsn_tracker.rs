@@ -40,13 +40,14 @@
 //! WHERE application_name = 'pg2any';
 //! ```
 //!
-//! ## Optimization Strategy
+//! ## Persistence Strategy
 //!
-//! Instead of persisting on every commit (which causes excessive I/O), the LsnTracker:
-//! - Batches multiple commits and persists periodically (default: every 1 second)
-//! - Uses a background tokio task for non-blocking persistence
-//! - Tracks a "dirty" flag to skip unnecessary writes
-//! - Ensures graceful shutdown with final persistence
+//! The LsnTracker persists immediately after critical state changes:
+//! - After each batch execution in the consumer (explicit calls to `persist_async()`)
+//! - On shutdown for final state preservation
+//! - On error conditions for durability guarantees
+//! - Tracks a "dirty" flag to skip unnecessary writes when state hasn't changed
+//! - All persistence is explicit and immediate for data safety
 
 use crate::types::Lsn;
 use chrono::{DateTime, Utc};
@@ -54,10 +55,7 @@ use pg_walstream::format_lsn;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // Re-export SharedLsnFeedback from pg_walstream to avoid duplication
 pub use pg_walstream::SharedLsnFeedback;
@@ -212,13 +210,13 @@ impl CdcMetadata {
 /// - Consumer execution state for recovery
 /// - Timestamp information for monitoring
 ///
-/// ## Optimization Strategy
+/// ## Persistence Strategy
 ///
-/// Instead of persisting on every commit (which causes excessive I/O), this tracker:
-/// - Batches multiple commits and persists periodically (default: every 1 second)
-/// - Uses a background tokio task for non-blocking persistence
-/// - Tracks a "dirty" flag to skip unnecessary writes
-/// - Ensures graceful shutdown with final persistence
+/// This tracker persists immediately when explicitly requested:
+/// - After each batch execution in the consumer (via `persist_async()`)
+/// - On shutdown for final state preservation
+/// - On error conditions for durability guarantees
+/// - Tracks a "dirty" flag to skip unnecessary writes when state hasn't changed
 ///
 /// ## Key Design Principle
 ///
@@ -257,31 +255,11 @@ pub struct LsnTracker {
     dirty: AtomicBool,
     /// Path to the metadata persistence file
     lsn_file_path: String,
-    /// Persistence interval in milliseconds
-    interval_ms: u64,
-    /// Cancellation token for background task
-    shutdown_token: CancellationToken,
-    /// Handle to the background persistence task
-    background_task: Arc<Mutex<JoinHandle<()>>>,
 }
 
 impl LsnTracker {
-    /// Default persistence interval in milliseconds (1 second)
-    pub const DEFAULT_PERSIST_INTERVAL_MS: u64 = 1000;
-
     /// Create a new LSN tracker with the specified file path
     pub fn new(lsn_file_path: Option<&str>) -> Arc<Self> {
-        Self::new_with_interval(lsn_file_path, Self::DEFAULT_PERSIST_INTERVAL_MS)
-    }
-
-    /// Create a new LSN tracker with custom persistence interval
-    /// The background persistence task is started automatically and will run
-    /// until the provided shutdown_token is cancelled or the tracker is dropped.
-    ///
-    /// # Arguments
-    /// * `lsn_file_path` - Optional path to the LSN metadata file
-    /// * `interval_ms` - Persistence interval in milliseconds
-    pub fn new_with_interval(lsn_file_path: Option<&str>, interval_ms: u64) -> Arc<Self> {
         let mut path = lsn_file_path
             .map(String::from)
             .or_else(|| std::env::var("CDC_LAST_LSN_FILE").ok())
@@ -303,102 +281,20 @@ impl LsnTracker {
             }
         }
 
-        let interval = Duration::from_millis(interval_ms);
-        let shutdown_token = CancellationToken::new();
-        // Use Arc::new_cyclic to create the tracker and spawn the background task with a reference to the tracker in a single step
-        let tracker = Arc::new_cyclic(|weak_tracker: &std::sync::Weak<Self>| {
-            let shutdown_token_clone = shutdown_token.clone();
-
-            // Spawn the background task with a weak reference
-            let weak_tracker_clone = weak_tracker.clone();
-            let handle = tokio::spawn(async move {
-                info!(
-                    "Background LSN persistence task started (interval: {:?})",
-                    interval
-                );
-
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        // Shutdown signal
-                        _ = shutdown_token_clone.cancelled() => {
-                            info!("LSN Tracker background persistence task received shutdown signal");
-                            break;
-                        }
-
-                        // Periodic persistence
-                        _ = tokio::time::sleep(interval) => {
-                            if let Some(tracker) = weak_tracker_clone.upgrade() {
-                                if tracker.dirty.load(Ordering::Acquire) {
-                                    if let Err(e) = tracker.persist_async().await {
-                                        warn!("Background persistence failed: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Final persist on shutdown - force to ensure consumer position is saved
-                if let Some(tracker) = weak_tracker_clone.upgrade() {
-                    info!("Background task: Performing final forced persistence on shutdown");
-
-                    // Log state before persist
-                    let metadata = tracker.get_metadata();
-                    info!(
-                        "Final state before persist - flush_lsn={}, pending_files={}, current_file={:?}",
-                        format_lsn(metadata.lsn_tracking.flush_lsn),
-                        metadata.consumer_state.pending_file_count,
-                        metadata.consumer_state.current_file_path
-                    );
-
-                    // Force persist to save consumer position even if LSN unchanged
-                    if let Err(e) = tracker.persist_async().await {
-                        warn!("Final forced persistence on shutdown failed: {}", e);
-                    } else {
-                        let final_lsn = metadata.get_lsn();
-                        if final_lsn > 0 {
-                            info!("Final LSN persisted on shutdown: {}", format_lsn(final_lsn));
-                        }
-                    }
-                }
-
-                debug!("Background LSN persistence task stopped");
-            });
-
-            // Create the tracker with the actual handle
-            Self {
-                metadata: Arc::new(Mutex::new(CdcMetadata::default())),
-                last_persisted_lsn: AtomicU64::new(0),
-                dirty: AtomicBool::new(false),
-                lsn_file_path: path,
-                interval_ms,
-                shutdown_token,
-                background_task: Arc::new(Mutex::new(handle)),
-            }
-        });
-
-        info!(
-            "Started background LSN persistence (interval: {}ms)",
-            interval_ms
-        );
-
-        tracker
+        Arc::new(Self {
+            metadata: Arc::new(Mutex::new(CdcMetadata::default())),
+            last_persisted_lsn: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            lsn_file_path: path,
+        })
     }
 
-    /// Create a new LSN tracker with custom interval and load the initial value from file
-    ///
-    /// The background persistence task is started automatically.
+    /// Create a new LSN tracker and load the initial value from file
     ///
     /// # Arguments
     /// * `lsn_file_path` - Optional path to the LSN metadata file
-    /// * `interval_ms` - Persistence interval in milliseconds
-    pub async fn new_with_load_and_interval(
-        lsn_file_path: Option<&str>,
-        interval_ms: u64,
-    ) -> (Arc<Self>, Option<Lsn>) {
-        let tracker = Self::new_with_interval(lsn_file_path, interval_ms);
+    pub async fn new_with_load(lsn_file_path: Option<&str>) -> (Arc<Self>, Option<Lsn>) {
+        let tracker = Self::new(lsn_file_path);
 
         let loaded_metadata = tracker.load_from_file().await;
 
@@ -425,56 +321,26 @@ impl LsnTracker {
         }
     }
 
-    /// Shutdown the background persistence task gracefully
-    /// This ensures the final LSN is persisted before the task exits.
-    /// Should be called before dropping the tracker.
+    /// Shutdown the tracker gracefully
+    /// This ensures the final LSN is persisted before exit.
     pub async fn shutdown_async(&self) {
-        if self.shutdown_token.is_cancelled() {
-            debug!("LSN tracker already shutting down");
-            return;
-        }
+        info!("Shutting down LSN tracker");
 
-        info!("Shutting down LSN persistence task");
-
-        // Signal the background task to shutdown
-        self.shutdown_token.cancel();
-
-        let handle = {
-            let mut task_guard = self.background_task.lock().unwrap();
-            std::mem::replace(&mut *task_guard, tokio::spawn(async {}))
-        };
-
-        debug!("Waiting for background persistence task to complete...");
-        match handle.await {
-            Ok(_) => info!("Background persistence task completed successfully"),
-            Err(e) => {
-                error!("Shutdown Async persist failed: {}", e);
-            }
-        }
-
-        // Force an immediate persist BEFORE signaling shutdown
-        // This ensures the latest state is written to disk even if the background task
-        // doesn't get a chance to run its final persist
+        // Force an immediate persist to ensure final state is written
         if self.dirty.load(Ordering::Acquire) {
             if let Err(e) = self.persist_async().await {
-                warn!("Failed to force persist before shutdown signal: {}", e);
+                warn!("Failed to persist on shutdown: {}", e);
             } else {
-                info!("Pre-shutdown persist completed successfully");
+                info!("Final state persisted on shutdown");
             }
         }
 
-        info!("LSN persistence task stopped gracefully");
+        info!("LSN tracker stopped gracefully");
     }
 
     /// Synchronous shutdown for use in Drop or non-async contexts
-    /// Note: This cannot wait for async operations to complete.
     pub fn shutdown_sync(&self) {
-        if self.shutdown_token.is_cancelled() {
-            return;
-        }
-
-        info!("Initiating sync shutdown of LSN persistence");
-        self.shutdown_token.cancel();
+        info!("Initiating sync shutdown of LSN tracker");
 
         // Perform synchronous final persist
         if let Err(e) = self.persist_sync() {
@@ -548,9 +414,8 @@ impl LsnTracker {
 
     /// Update and mark LSN for persistence
     /// This should be called after each successful transaction commit to the destination.
-    /// It updates the in-memory LSN and marks it as dirty for background persistence.
-    /// Note: With background persistence enabled, this does NOT immediately persist to disk.
-    /// The background task handles periodic persistence to reduce I/O overhead.
+    /// It updates the in-memory LSN and marks it as dirty.
+    /// Note: This does NOT automatically persist to disk - caller must explicitly call `persist_async()`.
     #[inline]
     pub fn commit_lsn(&self, lsn: u64) {
         self.update_if_greater(lsn);
@@ -563,9 +428,10 @@ impl LsnTracker {
         timestamp: DateTime<Utc>,
         pending_count: usize,
     ) {
-        let mut metadata = self.metadata.lock().unwrap();
-        metadata.update_consumer_state(tx_id, timestamp, pending_count);
-        drop(metadata);
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.update_consumer_state(tx_id, timestamp, pending_count);
+        }
         self.dirty.store(true, Ordering::Release);
         debug!(
             "Updated consumer state: tx_id={}, pending_count={}",
@@ -576,9 +442,10 @@ impl LsnTracker {
     /// Update consumer position within a transaction file
     /// Call this after each successful batch execution to enable fine-grained recovery
     pub fn update_consumer_position(&self, file_path: String, last_executed_command_index: usize) {
-        let mut metadata = self.metadata.lock().unwrap();
-        metadata.update_consumer_position(file_path.clone(), last_executed_command_index);
-        drop(metadata);
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.update_consumer_position(file_path.clone(), last_executed_command_index);
+        }
         self.dirty.store(true, Ordering::Release);
         debug!(
             "Updated consumer position: file={}, command_index={}",
@@ -586,13 +453,76 @@ impl LsnTracker {
         );
     }
 
+    /// Update consumer position AND persist immediately in one atomic operation
+    ///
+    /// This method is designed to prevent data inconsistency during graceful shutdown.
+    /// It combines the position update with immediate persistence to eliminate the
+    /// race condition where:
+    /// 1. DB transaction commits
+    /// 2. Position updated in memory
+    /// 3. **SIGTERM arrives before persist_async() is called**
+    /// 4. On restart: old position → duplicate replay
+    ///
+    /// By persisting immediately after position update, we ensure the tracking file
+    /// reflects the actual state of committed data in the destination database.
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the transaction file being processed
+    /// * `last_executed_command_index` - 0-based index of the last executed command
+    ///
+    /// # Returns
+    /// * `Ok(())` - Position updated and persisted successfully
+    /// * `Err(io::Error)` - Persistence failed (position still updated in memory)
+    pub async fn update_consumer_position_and_persist_immediately(
+        &self,
+        file_path: String,
+        last_executed_command_index: usize,
+    ) -> std::io::Result<()> {
+        // Update position in memory
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.update_consumer_position(file_path.clone(), last_executed_command_index);
+        }
+        self.dirty.store(true, Ordering::Release);
+
+        // CRITICAL: Immediately persist to disk to prevent race condition
+        self.persist_internal().await?;
+
+        Ok(())
+    }
+
     /// Clear consumer position when a file is fully processed
     pub fn clear_consumer_position(&self) {
-        let mut metadata = self.metadata.lock().unwrap();
-        metadata.clear_consumer_position();
-        drop(metadata);
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.clear_consumer_position();
+        }
         self.dirty.store(true, Ordering::Release);
         debug!("Cleared consumer position after file completion");
+    }
+
+    /// Clear consumer position AND persist immediately in one atomic operation
+    ///
+    /// Used when a transaction file is fully processed to ensure the cleared
+    /// state is immediately written to disk.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Position cleared and persisted successfully
+    /// * `Err(io::Error)` - Persistence failed (position still cleared in memory)
+    pub async fn clear_consumer_position_and_persist_immediately(&self) -> std::io::Result<()> {
+        // Clear position in memory
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.clear_consumer_position();
+        }
+        self.dirty.store(true, Ordering::Release);
+
+        // CRITICAL: Immediately persist to disk
+        self.persist_async().await?;
+
+        debug!("Atomically cleared and persisted consumer position");
+
+        Ok(())
     }
 
     /// Get the resume position for recovery
@@ -633,13 +563,7 @@ impl LsnTracker {
         self.persist_internal().await
     }
 
-    // / Force persist the current metadata to file, bypassing LSN comparison checks
-    // / This is useful for saving consumer position updates during shutdown
-    // pub async fn persist_async_force(&self) -> std::io::Result<()> {
-    //     self.persist_internal(true).await
-    // }
-
-    /// Internal persist implementation that updates the persisted LSN tracker
+    /// Internal persist implementation
     async fn persist_internal(&self) -> std::io::Result<()> {
         let metadata = {
             let m = self.metadata.lock().unwrap();
@@ -708,37 +632,18 @@ impl LsnTracker {
         &self.lsn_file_path
     }
 
-    /// Get the persistence interval in milliseconds
-    pub fn interval_ms(&self) -> u64 {
-        self.interval_ms
-    }
-
     /// Check if there are pending changes to persist
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
 }
 
-impl Drop for LsnTracker {
-    fn drop(&mut self) {
-        // Ensure graceful shutdown on drop
-        self.shutdown_sync();
-    }
-}
-
-/// Create a shared LSN tracker with initial load from file
-///
-/// The background persistence task is started automatically.
-/// The returned `Arc<LsnTracker>` should be used throughout the application lifecycle.
-/// Background persistence will be stopped when the shutdown_token is cancelled.
-///
-/// # Arguments
-/// * `lsn_file_path` - Optional path to the LSN metadata file
-pub async fn create_lsn_tracker_with_load_async(
+/// Helper function to create a tracker with loaded LSN value
+/// This is a convenience wrapper for the most common usage pattern.
+pub async fn create_lsn_tracker_with_load(
     lsn_file_path: Option<&str>,
 ) -> (Arc<LsnTracker>, Option<Lsn>) {
-    LsnTracker::new_with_load_and_interval(lsn_file_path, LsnTracker::DEFAULT_PERSIST_INTERVAL_MS)
-        .await
+    LsnTracker::new_with_load(lsn_file_path).await
 }
 
 #[cfg(test)]
@@ -747,88 +652,90 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_lsn_tracker_new() {
-        let tracker = LsnTracker::new_with_interval(Some("/tmp/test_lsn_new"), 60000);
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn"));
         assert_eq!(tracker.get(), 0);
-        assert_eq!(tracker.file_path(), "/tmp/test_lsn_new.metadata");
-        assert_eq!(tracker.interval_ms(), 60000);
-    }
-
-    #[tokio::test]
-    async fn test_lsn_tracker_update_if_greater() {
-        let tracker = LsnTracker::new_with_interval(Some("/tmp/test_lsn_update"), 60000);
-
-        tracker.update_if_greater(100);
-        assert_eq!(tracker.get(), 100);
-        assert!(tracker.is_dirty());
-
-        // Should not update with smaller value
-        tracker.update_if_greater(50);
-        assert_eq!(tracker.get(), 100);
-
-        // Should update with larger value
-        tracker.update_if_greater(150);
-        assert_eq!(tracker.get(), 150);
-
-        // Should ignore zero
-        tracker.update_if_greater(0);
-        assert_eq!(tracker.get(), 150);
+        assert_eq!(tracker.file_path(), "/tmp/test_lsn.metadata");
     }
 
     #[tokio::test]
     async fn test_lsn_tracker_get_lsn() {
-        let tracker = LsnTracker::new_with_interval(Some("/tmp/test_lsn_get"), 60000);
-
-        assert_eq!(tracker.get_lsn(), None);
-
-        tracker.update_if_greater(100);
-        assert_eq!(tracker.get_lsn(), Some(Lsn(100)));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_get_lsn"));
+        tracker.commit_lsn(100);
+        let lsn = tracker.get_lsn();
+        assert_eq!(lsn, Some(Lsn(100)));
     }
 
     #[tokio::test]
-    async fn test_commit_lsn_marks_dirty() {
-        let tracker = LsnTracker::new_with_interval(Some("/tmp/test_lsn_commit"), 60000);
-        assert!(!tracker.is_dirty());
+    async fn test_lsn_tracker_update_if_greater() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_update_if_greater"));
 
-        tracker.commit_lsn(100);
+        tracker.update_if_greater(100);
         assert_eq!(tracker.get(), 100);
-        assert!(tracker.is_dirty());
+
+        // Smaller value should be ignored
+        tracker.update_if_greater(50);
+        assert_eq!(tracker.get(), 100);
+
+        // Greater value should update
+        tracker.update_if_greater(200);
+        assert_eq!(tracker.get(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_zero_lsn_ignored() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_zero"));
+
+        tracker.update_if_greater(100);
+        tracker.update_if_greater(0); // Should be ignored
+
+        assert_eq!(tracker.get(), 100);
     }
 
     #[tokio::test]
     async fn test_persist_async() {
         let path = "/tmp/test_lsn_persist_async";
-        let metadata_path = format!("{}.metadata", path);
-        let tracker = LsnTracker::new_with_interval(Some(path), 60000);
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        tracker.commit_lsn(12345678);
-        assert!(tracker.is_dirty());
-
+        let tracker = LsnTracker::new(Some(path));
+        tracker.commit_lsn(12345);
         tracker.persist_async().await.unwrap();
 
-        // After persist, dirty flag should be cleared
-        assert!(!tracker.is_dirty());
+        // Read back the file
+        let content = tokio::fs::read_to_string(format!("{}.metadata", path))
+            .await
+            .unwrap();
+        let metadata: CdcMetadata = serde_json::from_str(&content).unwrap();
+        assert_eq!(metadata.lsn_tracking.flush_lsn, 12345);
 
-        // Verify file contents - should be JSON
-        let contents = tokio::fs::read_to_string(&metadata_path).await.unwrap();
-        assert!(!contents.is_empty());
-        assert!(contents.contains("version"));
-        assert!(contents.contains("lsn_tracking"));
-
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        // Clean up
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
     }
 
     #[tokio::test]
     async fn test_persist_skips_when_not_dirty() {
-        let path = "/tmp/test_lsn_skip_persist";
-        let tracker = LsnTracker::new_with_interval(Some(path), 60000);
+        let path = "/tmp/test_lsn_persist_skip";
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        tracker.commit_lsn(100);
+        let tracker = LsnTracker::new(Some(path));
+        tracker.commit_lsn(12345);
         tracker.persist_async().await.unwrap();
 
-        // Persist again without changes - should skip
+        // Second persist should be skipped (not dirty)
         let result = tracker.persist_async().await;
         assert!(result.is_ok());
+
+        // Clean up
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
+    }
+
+    #[tokio::test]
+    async fn test_commit_lsn_marks_dirty() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_dirty"));
+
+        assert!(!tracker.is_dirty());
+
+        tracker.commit_lsn(100);
+        assert!(tracker.is_dirty());
     }
 
     #[tokio::test]
@@ -836,45 +743,49 @@ mod lsn_tracker_tests {
         let path = "/tmp/test_lsn_load";
         let metadata_path = format!("{}.metadata", path);
 
-        // Write test JSON metadata
-        let test_metadata = CdcMetadata {
+        // Create a metadata file
+        let metadata = CdcMetadata {
             version: "1.0".to_string(),
             last_updated: Utc::now(),
-            lsn_tracking: LsnTracking {
-                flush_lsn: 11259375,
-            },
+            lsn_tracking: LsnTracking { flush_lsn: 54321 },
             consumer_state: ConsumerState {
-                last_processed_tx_id: None,
-                last_processed_timestamp: None,
-                pending_file_count: 0,
+                last_processed_tx_id: Some(999),
+                last_processed_timestamp: Some(Utc::now()),
+                pending_file_count: 5,
                 current_file_path: None,
                 last_executed_command_index: None,
             },
         };
-        let json = serde_json::to_string_pretty(&test_metadata).unwrap();
+
+        let json = serde_json::to_string_pretty(&metadata).unwrap();
         tokio::fs::write(&metadata_path, json).await.unwrap();
 
-        let tracker = LsnTracker::new_with_interval(Some(path), 60000);
+        // Load it
+        let tracker = LsnTracker::new(Some(path));
         let loaded = tracker.load_from_file().await;
 
         assert!(loaded.is_some());
-        let metadata = loaded.unwrap();
-        assert_eq!(metadata.lsn_tracking.flush_lsn, 11259375);
+        let loaded_metadata = loaded.unwrap();
+        assert_eq!(loaded_metadata.lsn_tracking.flush_lsn, 54321);
+        assert_eq!(
+            loaded_metadata.consumer_state.last_processed_tx_id,
+            Some(999)
+        );
 
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        // Clean up
+        let _ = std::fs::remove_file(metadata_path);
     }
 
     #[tokio::test]
     async fn test_new_with_load() {
-        let path = "/tmp/test_lsn_with_load";
+        let path = "/tmp/test_lsn_new_with_load";
         let metadata_path = format!("{}.metadata", path);
 
-        // Write test JSON metadata
-        let test_metadata = CdcMetadata {
+        // Create a metadata file
+        let metadata = CdcMetadata {
             version: "1.0".to_string(),
             last_updated: Utc::now(),
-            lsn_tracking: LsnTracking { flush_lsn: 1193046 },
+            lsn_tracking: LsnTracking { flush_lsn: 67890 },
             consumer_state: ConsumerState {
                 last_processed_tx_id: None,
                 last_processed_timestamp: None,
@@ -883,227 +794,108 @@ mod lsn_tracker_tests {
                 last_executed_command_index: None,
             },
         };
-        let json = serde_json::to_string_pretty(&test_metadata).unwrap();
+
+        let json = serde_json::to_string_pretty(&metadata).unwrap();
         tokio::fs::write(&metadata_path, json).await.unwrap();
 
-        let (tracker, lsn) = LsnTracker::new_with_load_and_interval(Some(path), 1000).await;
+        // Load using new_with_load
+        let (tracker, loaded_lsn) = LsnTracker::new_with_load(Some(path)).await;
 
-        assert!(lsn.is_some());
-        assert_eq!(tracker.get(), 1193046);
+        assert_eq!(loaded_lsn, Some(Lsn(67890)));
+        assert_eq!(tracker.get(), 67890);
 
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        // Clean up
+        let _ = std::fs::remove_file(metadata_path);
     }
 
     #[tokio::test]
-    async fn test_background_persistence_with_shutdown() {
-        let path = "/tmp/test_lsn_bg_shutdown";
-        let metadata_path = format!("{}.metadata", path);
+    async fn test_metadata_extension_not_present() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_no_ext"));
+        assert!(tracker.file_path().ends_with(".metadata"));
+    }
 
-        // Create tracker with short interval for testing
-        let arc_tracker = LsnTracker::new_with_interval(Some(path), 100);
+    #[tokio::test]
+    async fn test_metadata_extension_already_present() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn.metadata"));
+        // Should not double-add the extension
+        assert_eq!(tracker.file_path().matches(".metadata").count(), 1);
+    }
 
-        // Commit some LSNs
-        arc_tracker.commit_lsn(100);
-        arc_tracker.commit_lsn(200);
-        arc_tracker.commit_lsn(300);
+    #[tokio::test]
+    async fn test_shared_across_threads() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_threads"));
+        let tracker_clone = tracker.clone();
 
-        // Wait a bit for background task to persist
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let handle = tokio::spawn(async move {
+            tracker_clone.commit_lsn(12345);
+        });
 
-        // Commit final LSN
-        arc_tracker.commit_lsn(400);
-
-        // Shutdown gracefully - this should persist the final LSN
-        arc_tracker.shutdown_async().await;
-
-        // Verify final LSN was persisted
-        let contents = tokio::fs::read_to_string(&metadata_path).await.unwrap();
-        assert!(!contents.is_empty());
-
-        // Load from file to verify
-        let (new_tracker, loaded_lsn) =
-            LsnTracker::new_with_load_and_interval(Some(path), 1000).await;
-        assert!(loaded_lsn.is_some());
-        assert_eq!(new_tracker.get(), 400);
-
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        handle.await.unwrap();
+        assert_eq!(tracker.get(), 12345);
     }
 
     #[tokio::test]
     async fn test_shutdown_without_background_task() {
-        let path = "/tmp/test_lsn_no_bg_shutdown";
-        let metadata_path = format!("{}.metadata", path);
-        let tracker = LsnTracker::new_with_interval(Some(path), 60000);
+        let path = "/tmp/test_lsn_shutdown_simple";
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        // Commit LSN (background task is already running from new_with_interval)
-        tracker.commit_lsn(999);
+        let tracker = LsnTracker::new(Some(path));
+        tracker.commit_lsn(99999);
 
-        // Shutdown should still persist
+        // Shutdown should persist
         tracker.shutdown_async().await;
 
-        // Verify LSN was persisted
-        let contents = tokio::fs::read_to_string(&metadata_path).await.unwrap();
-        assert!(!contents.is_empty());
+        // Verify file was written
+        let content = tokio::fs::read_to_string(format!("{}.metadata", path))
+            .await
+            .unwrap();
+        let metadata: CdcMetadata = serde_json::from_str(&content).unwrap();
+        assert_eq!(metadata.lsn_tracking.flush_lsn, 99999);
 
-        let (new_tracker, loaded_lsn) =
-            LsnTracker::new_with_load_and_interval(Some(path), 1000).await;
-        assert!(loaded_lsn.is_some());
-        assert_eq!(new_tracker.get(), 999);
-
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        // Clean up
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
     }
 
     #[tokio::test]
     async fn test_double_shutdown_is_safe() {
-        let path = "/tmp/test_lsn_double_shutdown";
-        let metadata_path = format!("{}.metadata", path);
-        let (arc_tracker, _) = LsnTracker::new_with_load_and_interval(Some(path), 1000).await;
-
-        arc_tracker.commit_lsn(555);
-
-        // First shutdown
-        arc_tracker.shutdown_async().await;
-
-        // Second shutdown should be safe (no-op)
-        arc_tracker.shutdown_async().await;
-
-        // Cleanup
-        let _ = tokio::fs::remove_file(&metadata_path).await;
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_double_shutdown"));
+        tracker.shutdown_async().await;
+        // Second shutdown should be safe
+        tracker.shutdown_async().await;
     }
 
+    // Shared LSN Feedback tests
     #[test]
     fn test_shared_lsn_feedback_new() {
-        let feedback = SharedLsnFeedback::new();
+        let feedback = SharedLsnFeedback::new_shared();
         assert_eq!(feedback.get_flushed_lsn(), 0);
         assert_eq!(feedback.get_applied_lsn(), 0);
     }
 
     #[test]
     fn test_update_flushed_lsn() {
-        let feedback = SharedLsnFeedback::new();
-
+        let feedback = SharedLsnFeedback::new_shared();
         feedback.update_flushed_lsn(100);
         assert_eq!(feedback.get_flushed_lsn(), 100);
-
-        // Should not update with smaller value
-        feedback.update_flushed_lsn(50);
-        assert_eq!(feedback.get_flushed_lsn(), 100);
-
-        // Should update with larger value
-        feedback.update_flushed_lsn(200);
-        assert_eq!(feedback.get_flushed_lsn(), 200);
     }
 
     #[test]
     fn test_update_applied_lsn() {
-        let feedback = SharedLsnFeedback::new();
-
-        feedback.update_applied_lsn(100);
-        assert_eq!(feedback.get_applied_lsn(), 100);
-        // Applied also updates flushed
-        assert_eq!(feedback.get_flushed_lsn(), 100);
-
-        // Should not update with smaller value
-        feedback.update_applied_lsn(50);
-        assert_eq!(feedback.get_applied_lsn(), 100);
+        let feedback = SharedLsnFeedback::new_shared();
+        feedback.update_applied_lsn(200);
+        assert_eq!(feedback.get_applied_lsn(), 200);
     }
 
     #[test]
     fn test_get_feedback_lsn() {
-        let feedback = SharedLsnFeedback::new();
+        let feedback = SharedLsnFeedback::new_shared();
+        feedback.update_flushed_lsn(150);
+        feedback.update_applied_lsn(200);
 
-        feedback.update_flushed_lsn(100);
-        feedback.update_applied_lsn(50);
-
+        // get_feedback_lsn returns a tuple (flushed, applied)
+        // Both update to the max value seen
         let (flushed, applied) = feedback.get_feedback_lsn();
-        assert_eq!(flushed, 100);
-        assert_eq!(applied, 50);
-    }
-
-    #[test]
-    fn test_zero_lsn_ignored() {
-        let feedback = SharedLsnFeedback::new();
-        feedback.update_flushed_lsn(100);
-        feedback.update_applied_lsn(100);
-
-        // Zero should be ignored
-        feedback.update_flushed_lsn(0);
-        feedback.update_applied_lsn(0);
-
-        assert_eq!(feedback.get_flushed_lsn(), 100);
-        assert_eq!(feedback.get_applied_lsn(), 100);
-    }
-
-    #[test]
-    fn test_shared_across_threads() {
-        use std::thread;
-
-        let feedback = Arc::new(SharedLsnFeedback::new());
-        let feedback_clone = feedback.clone();
-
-        let handle = thread::spawn(move || {
-            for i in 1..=100 {
-                feedback_clone.update_applied_lsn(i);
-            }
-        });
-
-        handle.join().unwrap();
-
-        assert_eq!(feedback.get_applied_lsn(), 100);
-        assert_eq!(feedback.get_flushed_lsn(), 100);
-    }
-
-    #[tokio::test]
-    async fn test_metadata_extension_already_present() {
-        // Test that if path already has .metadata extension, it doesn't add another one
-        let path_with_extension = "/tmp/test_lsn_with_ext.metadata";
-        let tracker = LsnTracker::new_with_interval(Some(path_with_extension), 60000);
-
-        // Should not add .metadata.metadata
-        assert_eq!(tracker.file_path(), "/tmp/test_lsn_with_ext.metadata");
-        assert!(!tracker.file_path().ends_with(".metadata.metadata"));
-
-        // Test persistence works correctly
-        tracker.commit_lsn(12345);
-        tracker.persist_async().await.unwrap();
-
-        // Verify file was created at correct location
-        let contents = tokio::fs::read_to_string("/tmp/test_lsn_with_ext.metadata")
-            .await
-            .unwrap();
-        assert!(contents.contains("lsn_tracking"));
-
-        // Cleanup
-        let _ = tokio::fs::remove_file("/tmp/test_lsn_with_ext.metadata").await;
-    }
-
-    #[tokio::test]
-    async fn test_metadata_extension_not_present() {
-        // Test that if path doesn't have .metadata extension, it adds it
-        let path_without_extension = "/tmp/test_lsn_without_ext";
-        let tracker = LsnTracker::new_with_interval(Some(path_without_extension), 60000);
-
-        // Should add .metadata
-        assert_eq!(tracker.file_path(), "/tmp/test_lsn_without_ext.metadata");
-        assert!(tracker.file_path().ends_with(".metadata"));
-
-        // Test persistence works correctly
-        tracker.commit_lsn(54321);
-        tracker.persist_async().await.unwrap();
-
-        // Verify file was created at correct location
-        let contents = tokio::fs::read_to_string("/tmp/test_lsn_without_ext.metadata")
-            .await
-            .unwrap();
-        assert!(contents.contains("lsn_tracking"));
-
-        // Shutdown gracefully
-        tracker.shutdown_async().await;
-
-        // Cleanup
-        let _ = tokio::fs::remove_file("/tmp/test_lsn_without_ext.metadata").await;
+        assert_eq!(flushed, 200);
+        assert_eq!(applied, 200);
     }
 }

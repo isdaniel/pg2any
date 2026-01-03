@@ -339,7 +339,9 @@ async fn test_sqlite_destination_process_insert_event() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was inserted
@@ -394,7 +396,9 @@ async fn test_sqlite_destination_process_update_event() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was updated
@@ -457,7 +461,9 @@ async fn test_sqlite_destination_process_delete_event() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was deleted
@@ -521,7 +527,9 @@ async fn test_sqlite_destination_process_truncate_event() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the table was truncated
@@ -595,7 +603,9 @@ async fn test_sqlite_destination_replica_identity_full() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was updated
@@ -636,7 +646,9 @@ async fn test_sqlite_destination_replica_identity_nothing_error() {
     // Process the event - with SQL workflow, invalid events are skipped (generate no SQL)
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     // Empty batch succeeds
     assert!(result.is_ok());
 
@@ -691,7 +703,9 @@ async fn test_sqlite_destination_complex_data_types() {
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
     let commands = transaction_to_sql_commands(&tx);
-    let result = destination.execute_sql_batch(&commands).await;
+    let result = destination
+        .execute_sql_batch_with_hook(&commands, None)
+        .await;
     assert!(result.is_ok());
 
     // Verify the data was inserted

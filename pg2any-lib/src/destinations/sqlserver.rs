@@ -56,7 +56,17 @@ impl DestinationHandler for SqlServerDestination {
         }
     }
 
-    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        commands: &[String],
+        pre_commit_hook: Option<
+            Box<
+                dyn FnOnce() -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                    > + Send,
+            >,
+        >,
+    ) -> Result<()> {
         if commands.is_empty() {
             return Ok(());
         }
@@ -95,6 +105,23 @@ impl DestinationHandler for SqlServerDestination {
                 );
             }
             return execution_result;
+        }
+
+        // Execute pre-commit hook BEFORE transaction COMMIT
+        if let Some(hook) = pre_commit_hook {
+            if let Err(e) = hook().await {
+                // Rollback transaction if hook fails
+                if let Err(rollback_err) = client.simple_query("ROLLBACK TRANSACTION").await {
+                    tracing::error!(
+                        "SQL Server ROLLBACK failed after pre-commit hook error: {}",
+                        rollback_err
+                    );
+                }
+                return Err(CdcError::generic(format!(
+                    "SQL Server pre-commit hook failed, transaction rolled back: {}",
+                    e
+                )));
+            }
         }
 
         // Commit the transaction

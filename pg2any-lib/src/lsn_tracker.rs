@@ -437,8 +437,7 @@ impl LsnTracker {
         );
     }
 
-    /// Update consumer position within a transaction file
-    /// Call this after each successful batch execution to enable fine-grained recovery
+    /// Update consumer position within a transaction file (non-persistent)
     pub fn update_consumer_position(&self, file_path: String, last_executed_command_index: usize) {
         {
             let mut metadata = self.metadata.lock().unwrap();

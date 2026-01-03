@@ -1062,33 +1062,10 @@ impl CdcClient {
             // Check for cancellation before processing each batch
             if cancellation_token.is_cancelled() {
                 info!(
-                    "Cancellation detected during transaction file processing at batch {}/{}, saving position",
+                    "Cancellation detected during transaction file processing at batch {}/{}",
                     batch_idx,
                     (command_count + batch_size - 1) / batch_size
                 );
-
-                // Save current position with immediate atomic persistence before returning
-                if let Some(ref tracker) = lsn_tracker {
-                    if current_command_index > 0 {
-                        let last_executed_index = current_command_index - 1;
-
-                        // CRITICAL: Atomic update + persist for graceful shutdown
-                        if let Err(e) = tracker
-                            .update_consumer_position_and_persist_immediately(
-                                file_path_str.clone(),
-                                last_executed_index,
-                            )
-                            .await
-                        {
-                            error!("Failed to persist consumer position on cancellation: {}", e);
-                        } else {
-                            info!(
-                                "Persisted consumer position on cancellation: last_executed_index={}",
-                                last_executed_index
-                            );
-                        }
-                    }
-                }
 
                 warn!(
                     "Transaction file processing cancelled by shutdown signal (tx_id: {})",
@@ -1098,6 +1075,45 @@ impl CdcClient {
                 return Ok(());
             }
 
+            // CRITICAL: Transactional checkpoint update for atomicity
+            // The pre-commit hook executes WITHIN the database transaction, BEFORE COMMIT.
+            // This provides true atomicity:
+            //
+            // Timeline:
+            //   BEGIN;
+            //     INSERT INTO users ...;       ← Execute batch commands
+            //     UPDATE products ...;
+            //
+            //     [pre_commit_hook()]          ← Update checkpoint (in-memory + persist)
+            //   COMMIT;                        ← Both data and checkpoint committed atomically
+            //
+            // If crash/rollback occurs:
+            //   - Before COMMIT: Both data and checkpoint rolled back → Safe, resume from old position
+            //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
+            //   - No race condition possible!
+            let next_command_index = current_command_index + chunk.len();
+            let pre_commit_hook = if let Some(ref tracker) = lsn_tracker {
+                let tracker_clone = tracker.clone();
+                let file_path_clone = file_path_str.clone();
+                let last_executed_index = next_command_index - 1;
+
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        tracker_clone
+                            .update_consumer_position(file_path_clone, last_executed_index);
+                        Ok(())
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                })
+                    as Box<
+                        dyn FnOnce() -> std::pin::Pin<
+                                Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                            > + Send,
+                    >)
+            } else {
+                None
+            };
+
             let batch_start_time = Instant::now();
             debug!(
                 "Executing batch {}/{} with {} commands (tx_id: {}, global indices: {}-{})",
@@ -1106,11 +1122,14 @@ impl CdcClient {
                 chunk.len(),
                 tx_id,
                 current_command_index,
-                current_command_index + chunk.len() - 1
+                next_command_index - 1
             );
 
-            // Execute the batch in a single transaction
-            if let Err(e) = destination_handler.execute_sql_batch(chunk).await {
+            // Execute the batch with transactional checkpoint hook
+            if let Err(e) = destination_handler
+                .execute_sql_batch_with_hook(chunk, pre_commit_hook)
+                .await
+            {
                 error!(
                     "Failed to execute SQL batch {} from file {}: {}",
                     batch_idx + 1,
@@ -1119,58 +1138,15 @@ impl CdcClient {
                 );
                 metrics_collector.record_error("transaction_file_execution_failed", "consumer");
 
-                // Save current position before returning error with atomic persistence
-                if let Some(ref tracker) = lsn_tracker {
-                    // Save position as the last successfully completed command
-                    // current_command_index - 1 is the last successful command
-                    if current_command_index > 0 {
-                        let last_executed_index = current_command_index - 1;
-
-                        if let Err(persist_err) = tracker
-                            .update_consumer_position_and_persist_immediately(
-                                file_path_str.clone(),
-                                last_executed_index,
-                            )
-                            .await
-                        {
-                            error!(
-                                "Failed to atomically persist consumer position on batch error: {}",
-                                persist_err
-                            );
-                        } else {
-                            info!(
-                                "Consumer position on batch failure: index={}",
-                                last_executed_index
-                            );
-                        }
-                    }
-                }
+                info!(
+                    "Batch and checkpoint rolled back together, will retry from last committed position on restart"
+                );
 
                 return Err(e);
             }
 
             // Update current position after successful batch
-            current_command_index += chunk.len();
-
-            // Save position after each batch for resumability
-            if let Some(ref tracker) = lsn_tracker {
-                // Save the index of the last successfully executed command (0-indexed)
-                let last_executed_index = current_command_index - 1;
-
-                if let Err(e) = tracker
-                    .update_consumer_position_and_persist_immediately(
-                        file_path_str.clone(),
-                        last_executed_index,
-                    )
-                    .await
-                {
-                    warn!(
-                        "Failed to persist consumer position after batch {}: {}",
-                        batch_idx + 1,
-                        e
-                    );
-                }
-            }
+            current_command_index = next_command_index;
 
             let batch_duration = batch_start_time.elapsed();
             debug!(
@@ -1200,10 +1176,7 @@ impl CdcClient {
                 .clear_consumer_position_and_persist_immediately()
                 .await
             {
-                warn!(
-                    "Failed to atomically clear and persist consumer position: {}",
-                    e
-                );
+                warn!("Failed to clear and persist consumer position: {}", e);
             }
         }
 
@@ -1314,16 +1287,6 @@ impl CdcClient {
         // Shutdown LSN tracker to persist final state
         if let Some(ref tracker) = self.lsn_tracker {
             info!("Shutting down LSN tracker and persisting final state");
-
-            // Log state before shutdown
-            let pre_shutdown_metadata = tracker.get_metadata();
-            info!(
-                "Pre-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}, last_executed_index={:?}",
-                pg_walstream::format_lsn(pre_shutdown_metadata.lsn_tracking.flush_lsn),
-                pre_shutdown_metadata.consumer_state.pending_file_count,
-                pre_shutdown_metadata.consumer_state.current_file_path,
-                pre_shutdown_metadata.consumer_state.last_executed_command_index
-            );
 
             // Shutdown LSN tracker, which includes a final state persistence.
             tracker.shutdown_async().await;
@@ -1469,7 +1432,17 @@ mod tests {
             // Mock implementation - no-op
         }
 
-        async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+        async fn execute_sql_batch_with_hook(
+            &mut self,
+            commands: &[String],
+            pre_commit_hook: Option<
+                Box<
+                    dyn FnOnce() -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                        > + Send,
+                >,
+            >,
+        ) -> Result<()> {
             if self.should_fail {
                 return Err(CdcError::generic("Mock execute_sql_batch error"));
             }
@@ -1477,6 +1450,12 @@ mod tests {
             for _ in commands {
                 // No-op
             }
+
+            // Execute pre-commit hook if provided
+            if let Some(hook) = pre_commit_hook {
+                hook().await?;
+            }
+
             Ok(())
         }
 

@@ -1,9 +1,10 @@
 -- Scenario 3: Verification - Check if deletes were replicated
--- Verify that some records were deleted (count should be less than 80)
+-- This scenario verifies that the delete operations from scenario 3 were correctly replicated
 SELECT 
     CASE 
         WHEN COUNT(*) = 50000 THEN 'PASS'
         ELSE 'FAIL'
     END AS test_result,
-    COUNT(*) AS remaining_count
+    COUNT(*) AS actual_count,
+    50000 AS  expected_count
 FROM cdc_db.t1;

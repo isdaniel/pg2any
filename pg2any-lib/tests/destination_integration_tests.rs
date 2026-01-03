@@ -20,12 +20,12 @@ async fn test_destination_handler_interface() {
         let mut destination = DestinationFactory::create(&DestinationType::MySQL).unwrap();
 
         // Test execute_sql_batch interface with empty batch (should succeed)
-        let empty_batch_result = destination.execute_sql_batch(&[]).await;
+        let empty_batch_result = destination.execute_sql_batch_with_hook(&[], None).await;
         assert!(empty_batch_result.is_ok());
 
         // Test execute_sql_batch with SQL that will fail due to no connection
         let sql_batch_result = destination
-            .execute_sql_batch(&["INSERT INTO test (id) VALUES (1);".to_string()])
+            .execute_sql_batch_with_hook(&["INSERT INTO test (id) VALUES (1);".to_string()], None)
             .await;
         // Should fail due to no connection, but not panic
         assert!(sql_batch_result.is_err());
@@ -40,12 +40,12 @@ async fn test_destination_handler_interface() {
         let mut destination = DestinationFactory::create(&DestinationType::SqlServer).unwrap();
 
         // Test execute_sql_batch interface with empty batch (should succeed)
-        let empty_batch_result = destination.execute_sql_batch(&[]).await;
+        let empty_batch_result = destination.execute_sql_batch_with_hook(&[], None).await;
         assert!(empty_batch_result.is_ok());
 
         // Test execute_sql_batch with SQL that will fail due to no connection
         let sql_batch_result = destination
-            .execute_sql_batch(&["INSERT INTO test (id) VALUES (1);".to_string()])
+            .execute_sql_batch_with_hook(&["INSERT INTO test (id) VALUES (1);".to_string()], None)
             .await;
         // Should fail due to no connection, but not panic
         assert!(sql_batch_result.is_err());

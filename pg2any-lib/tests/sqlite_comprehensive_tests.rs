@@ -228,7 +228,10 @@ async fn test_sqlite_empty_string_handling() {
         Lsn::from(100),
     );
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -277,7 +280,10 @@ async fn test_sqlite_null_value_handling() {
         Lsn::from(100),
     );
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -335,7 +341,10 @@ async fn test_sqlite_unicode_and_special_characters() {
         Lsn::from(100),
     );
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -394,7 +403,10 @@ async fn test_sqlite_large_data_handling() {
         Lsn::from(100),
     );
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -450,7 +462,10 @@ async fn test_sqlite_numeric_precision() {
             Lsn::from(100),
         );
         let result = destination
-            .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+            .execute_sql_batch_with_hook(
+                &transaction_to_sql_commands(&wrap_in_transaction(event)),
+                None,
+            )
             .await;
         assert!(result.is_ok(), "Failed to insert value: {:?}", value);
     }
@@ -518,7 +533,10 @@ async fn test_sqlite_constraint_violations() {
         Lsn::from(100),
     );
     let result1 = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event1)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event1)),
+            None,
+        )
         .await;
     assert!(result1.is_ok());
 
@@ -535,7 +553,10 @@ async fn test_sqlite_constraint_violations() {
         Lsn::from(100),
     );
     let result2 = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event2)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event2)),
+            None,
+        )
         .await;
     assert!(
         result2.is_err(),
@@ -573,7 +594,10 @@ async fn test_sqlite_missing_key_columns_error() {
         Lsn::from(100),
     );
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -590,9 +614,10 @@ async fn test_sqlite_missing_key_columns_error() {
     );
 
     let result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            update_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(update_event)),
+            None,
+        )
         .await;
     // With the SQL-based workflow, events with missing key columns are skipped (generate no SQL)
     // so execute_sql_batch succeeds with empty batch
@@ -641,7 +666,10 @@ async fn test_sqlite_bulk_operations_performance() {
             Lsn::from(100),
         );
         let result = destination
-            .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+            .execute_sql_batch_with_hook(
+                &transaction_to_sql_commands(&wrap_in_transaction(event)),
+                None,
+            )
             .await;
         assert!(result.is_ok(), "Failed to insert record {}", i);
     }
@@ -689,7 +717,10 @@ async fn test_sqlite_bulk_operations_performance() {
         );
 
         let result = destination
-            .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+            .execute_sql_batch_with_hook(
+                &transaction_to_sql_commands(&wrap_in_transaction(event)),
+                None,
+            )
             .await;
         assert!(result.is_ok(), "Failed to update record {}", i);
     }
@@ -762,7 +793,10 @@ async fn test_sqlite_concurrent_operations() {
                 Lsn::from(100),
             );
             let result = destination
-                .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+                .execute_sql_batch_with_hook(
+                    &transaction_to_sql_commands(&wrap_in_transaction(event)),
+                    None,
+                )
                 .await;
             assert!(
                 result.is_ok(),
@@ -820,9 +854,10 @@ async fn test_sqlite_transaction_events() {
 
     // These should not fail (even though SQLite handles transactions automatically)
     let begin_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            begin_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(begin_event)),
+            None,
+        )
         .await;
     assert!(begin_result.is_ok());
 
@@ -840,16 +875,18 @@ async fn test_sqlite_transaction_events() {
         Lsn::from(100),
     );
     let insert_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            insert_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(insert_event)),
+            None,
+        )
         .await;
     assert!(insert_result.is_ok());
 
     let commit_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            commit_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(commit_event)),
+            None,
+        )
         .await;
     assert!(commit_result.is_ok());
 
@@ -885,7 +922,9 @@ async fn test_sqlite_metadata_events() {
     for event in metadata_events {
         let tx = wrap_in_transaction(event.clone());
         let commands = transaction_to_sql_commands(&tx);
-        let result = destination.execute_sql_batch(&commands).await;
+        let result = destination
+            .execute_sql_batch_with_hook(&commands, None)
+            .await;
         assert!(
             result.is_ok(),
             "Metadata event should not fail: {:?}",
@@ -927,7 +966,7 @@ async fn test_sqlite_connection_recovery() {
     );
     let transaction = wrap_in_transaction(event);
     let process_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&transaction))
+        .execute_sql_batch_with_hook(&transaction_to_sql_commands(&transaction), None)
         .await;
     assert!(process_result.is_ok());
 
@@ -952,7 +991,7 @@ async fn test_sqlite_connection_recovery() {
     );
     let transaction2 = wrap_in_transaction(event2);
     let process_result2 = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&transaction2))
+        .execute_sql_batch_with_hook(&transaction_to_sql_commands(&transaction2), None)
         .await;
     assert!(process_result2.is_ok());
 
@@ -1052,9 +1091,10 @@ async fn test_sqlite_complete_crud_cycle() {
         Lsn::from(100),
     );
     let create_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            create_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(create_event)),
+            None,
+        )
         .await;
     assert!(create_result.is_ok());
 
@@ -1097,9 +1137,10 @@ async fn test_sqlite_complete_crud_cycle() {
     );
 
     let update_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            update_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(update_event)),
+            None,
+        )
         .await;
     assert!(update_result.is_ok());
 
@@ -1132,9 +1173,10 @@ async fn test_sqlite_complete_crud_cycle() {
     );
 
     let delete_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(
-            delete_event,
-        )))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(delete_event)),
+            None,
+        )
         .await;
     assert!(delete_result.is_ok());
 
@@ -1181,7 +1223,10 @@ async fn test_sqlite_destination_factory_integration() {
         Lsn::from(100),
     );
     let process_result = destination
-        .execute_sql_batch(&transaction_to_sql_commands(&wrap_in_transaction(event)))
+        .execute_sql_batch_with_hook(
+            &transaction_to_sql_commands(&wrap_in_transaction(event)),
+            None,
+        )
         .await;
     assert!(process_result.is_ok());
 

@@ -141,7 +141,7 @@ impl CdcMetadata {
     }
 
     /// Update flush LSN (transaction committed to destination)
-    pub fn update_flush_lsn(&mut self, lsn: u64) {
+    fn update_flush_lsn(&mut self, lsn: u64) {
         if lsn > self.lsn_tracking.flush_lsn {
             self.lsn_tracking.flush_lsn = lsn;
             self.last_updated = Utc::now();
@@ -260,7 +260,7 @@ pub struct LsnTracker {
 impl LsnTracker {
     /// Create a new LSN tracker with the specified file path
     pub fn new(lsn_file_path: Option<&str>) -> Arc<Self> {
-        let mut path = lsn_file_path
+        let mut path: String = lsn_file_path
             .map(String::from)
             .or_else(|| std::env::var("CDC_LAST_LSN_FILE").ok())
             .unwrap_or_else(|| "./pg2any_last_lsn.metadata".to_string());
@@ -437,8 +437,7 @@ impl LsnTracker {
         );
     }
 
-    /// Update consumer position within a transaction file
-    /// Call this after each successful batch execution to enable fine-grained recovery
+    /// Update consumer position within a transaction file (non-persistent)
     pub fn update_consumer_position(&self, file_path: String, last_executed_command_index: usize) {
         {
             let mut metadata = self.metadata.lock().unwrap();
@@ -490,7 +489,7 @@ impl LsnTracker {
     }
 
     /// Clear consumer position when a file is fully processed
-    pub fn clear_consumer_position(&self) {
+    fn clear_consumer_position(&self) {
         {
             let mut metadata = self.metadata.lock().unwrap();
             metadata.clear_consumer_position();
@@ -509,11 +508,7 @@ impl LsnTracker {
     /// * `Err(io::Error)` - Persistence failed (position still cleared in memory)
     pub async fn clear_consumer_position_and_persist_immediately(&self) -> std::io::Result<()> {
         // Clear position in memory
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.clear_consumer_position();
-        }
-        self.dirty.store(true, Ordering::Release);
+        self.clear_consumer_position();
 
         // CRITICAL: Immediately persist to disk
         self.persist_async().await?;
@@ -856,10 +851,14 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_double_shutdown_is_safe() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_double_shutdown"));
+        let path = "/tmp/test_lsn_double_shutdown";
+        let tracker = LsnTracker::new(Some(path));
         tracker.shutdown_async().await;
         // Second shutdown should be safe
         tracker.shutdown_async().await;
+
+        // Clean up
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
     }
 
     // Shared LSN Feedback tests

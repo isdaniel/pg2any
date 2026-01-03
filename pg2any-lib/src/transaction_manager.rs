@@ -51,8 +51,8 @@ const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
 const DATA_TX_DIR: &str = "sql_data_tx";
 
-/// Default buffer size for event accumulation (64KB)
-const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+/// Default buffer size for event accumulation (1MB)
+const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 
 struct BufferedEventWriter {
     /// File path being written to
@@ -210,32 +210,30 @@ impl TransactionManager {
     }
 
     /// Get the file path for a received transaction metadata
-    fn get_received_tx_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
-        let filename = format!("{}_{}.meta", tx_id, timestamp.timestamp_millis());
+    fn get_received_tx_path(&self, tx_id: u32) -> PathBuf {
+        let filename = format!("{}.meta", tx_id);
         self.base_path.join(RECEIVED_TX_DIR).join(filename)
     }
 
     /// Get the file path for a pending transaction metadata
-    fn get_pending_tx_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
-        let filename = format!("{}_{}.meta", tx_id, timestamp.timestamp_millis());
+    fn get_pending_tx_path(&self, tx_id: u32) -> PathBuf {
+        let filename = format!("{}.meta", tx_id);
         self.base_path.join(PENDING_TX_DIR).join(filename)
     }
 
     /// Get the file path for the SQL data file
-    fn get_data_file_path(&self, tx_id: u32, timestamp: DateTime<Utc>) -> PathBuf {
-        let filename = format!("{}_{}.sql", tx_id, timestamp.timestamp_millis());
+    fn get_data_file_path(&self, tx_id: u32) -> PathBuf {
+        let filename = format!("{}.sql", tx_id);
         self.base_path.join(DATA_TX_DIR).join(filename)
     }
 
     /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
     pub async fn begin_transaction(&self, tx_id: u32, timestamp: DateTime<Utc>) -> Result<PathBuf> {
-        let data_file_path = self.get_data_file_path(tx_id, timestamp);
-        let metadata_path = self.get_received_tx_path(tx_id, timestamp);
+        let data_file_path = self.get_data_file_path(tx_id);
+        let metadata_path = self.get_received_tx_path(tx_id);
 
         // Create the SQL data file in sql_data_tx/
-        let mut data_file = File::create(&data_file_path).await?;
-        data_file.write_all(b"-- BEGIN TRANSACTION\n").await?;
-        data_file.flush().await?;
+        File::create(&data_file_path).await?;
 
         debug!("Created data file: {:?}", data_file_path);
 
@@ -300,11 +298,11 @@ impl TransactionManager {
     pub async fn commit_transaction(
         &self,
         tx_id: u32,
-        timestamp: DateTime<Utc>,
+        _timestamp: DateTime<Utc>,
         commit_lsn: Option<Lsn>,
     ) -> Result<PathBuf> {
-        let received_metadata_path = self.get_received_tx_path(tx_id, timestamp);
-        let pending_metadata_path = self.get_pending_tx_path(tx_id, timestamp);
+        let received_metadata_path = self.get_received_tx_path(tx_id);
+        let pending_metadata_path = self.get_pending_tx_path(tx_id);
 
         // Read existing metadata from sql_received_tx/
         let metadata_content = fs::read_to_string(&received_metadata_path)
@@ -357,25 +355,6 @@ impl TransactionManager {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {e}")))?;
 
-        // Append COMMIT marker to data file
-        if data_file_path.exists() {
-            let mut data_file = fs::OpenOptions::new()
-                .append(true)
-                .open(&data_file_path)
-                .await
-                .map_err(|e| {
-                    CdcError::generic(format!("Failed to open data file {data_file_path:?}: {e}"))
-                })?;
-            data_file
-                .write_all(b"-- COMMIT TRANSACTION\n")
-                .await
-                .map_err(|e| CdcError::generic(format!("Failed to write COMMIT marker: {e}")))?;
-            data_file
-                .flush()
-                .await
-                .map_err(|e| CdcError::generic(format!("Failed to flush data file: {e}")))?;
-        }
-
         // Remove metadata from sql_received_tx/ only after successful write
         fs::remove_file(&received_metadata_path)
             .await
@@ -394,9 +373,9 @@ impl TransactionManager {
     }
 
     /// Delete transaction files (metadata and data) on abort
-    pub async fn abort_transaction(&self, tx_id: u32, timestamp: DateTime<Utc>) -> Result<()> {
-        let received_metadata_path = self.get_received_tx_path(tx_id, timestamp);
-        let data_file_path = self.get_data_file_path(tx_id, timestamp);
+    pub async fn abort_transaction(&self, tx_id: u32, _timestamp: DateTime<Utc>) -> Result<()> {
+        let received_metadata_path = self.get_received_tx_path(tx_id);
+        let data_file_path = self.get_data_file_path(tx_id);
 
         // Read metadata to get data file path (in case it's different)
         let actual_data_path = if received_metadata_path.exists() {
@@ -466,6 +445,44 @@ impl TransactionManager {
         Ok(files)
     }
 
+    /// List all incomplete (received but not committed) transactions from sql_received_tx/
+    ///
+    /// Returns a HashMap mapping transaction_id -> (data_file_path, timestamp)
+    /// This is used by the producer to restore its active_tx_files state on restart
+    pub async fn list_received_transactions(
+        &self,
+    ) -> Result<HashMap<u32, (PathBuf, DateTime<Utc>)>> {
+        let received_dir = self.base_path.join(RECEIVED_TX_DIR);
+        let mut entries = fs::read_dir(&received_dir).await?;
+
+        let mut metas = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+
+            if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                let meta = fs::metadata(&path).await?;
+                let time = meta.created().or_else(|_| meta.modified())?;
+                metas.push((path, DateTime::<Utc>::from(time)));
+            }
+        }
+
+        metas.sort_by_key(|(_, t)| *t);
+
+        let mut active_txs = HashMap::new();
+
+        for (path, _file_time) in metas {
+            if let Ok(metadata) = self.read_metadata(&path).await {
+                active_txs.insert(
+                    metadata.transaction_id,
+                    (metadata.data_file_path.clone(), metadata.commit_timestamp),
+                );
+            }
+        }
+
+        Ok(active_txs)
+    }
+
     /// Read metadata from a transaction metadata file (.meta)
     async fn read_metadata(&self, file_path: &Path) -> Result<TransactionFileMetadata> {
         let metadata_content = fs::read_to_string(file_path).await?;
@@ -475,14 +492,14 @@ impl TransactionManager {
 
     /// Read SQL commands starting from a specific command index
     ///
-    /// This method enables resumable processing by allowing you to skip already-executed commands.
-    /// It reads all commands from the file but only returns those from start_index onwards.
+    /// This method uses streaming parsing to efficiently handle large transaction files
+    /// without loading the entire file into memory.
     ///
     /// Performance characteristics:
-    /// - Memory: O(1) - only buffers 64KB at a time
+    /// - Memory: O(k) where k is the size of statements being collected (after start_index)
     /// - Time: O(n) where n is file size in bytes
-    /// - Can handle files of any size without truncation
-    /// - Properly handles multi-line SQL statements
+    /// - Properly handles multi-line SQL statements with quote escaping
+    /// - Can handle files of any size without memory issues
     ///
     /// # Arguments
     /// * `metadata_file_path` - Path to the metadata file in sql_pending_tx/
@@ -517,15 +534,24 @@ impl TransactionManager {
 
         let reader = BufReader::with_capacity(65536, file); // 64KB buffer for optimal I/O
         let mut lines = reader.lines();
-        let mut file_content = String::with_capacity(65536);
 
-        // Read the entire file content, filtering out comment lines
+        // Streaming parser state
+        let mut current_statement = String::with_capacity(512);
+        let mut statement_index = 0;
+        let mut collected_statements = Vec::new();
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_backtick = false;
+        let mut in_bracket = false;
+
+        // Process file line by line
         while let Some(line) = lines.next_line().await.map_err(|e| {
             CdcError::generic(format!("Failed to read line from {data_file_path:?}: {e}"))
         })? {
             let trimmed = line.trim();
 
-            // Skip transaction markers (comments starting with --)
+            // Skip SQL comments (lines starting with --)
+            // This provides defense against any comments in SQL data files
             if trimmed.starts_with("--") {
                 continue;
             }
@@ -535,143 +561,107 @@ impl TransactionManager {
                 continue;
             }
 
-            // Add the line to content (preserve original spacing within statements)
-            file_content.push_str(&line);
-            file_content.push('\n');
-        }
-
-        // Parse SQL statements by splitting on semicolons while respecting string literals
-        let all_commands = self.parse_sql_statements(&file_content)?;
-
-        // Return only commands from start_index onwards
-        let total_commands = all_commands.len();
-        let commands_to_return = if start_index >= total_commands {
-            // All commands already processed, return empty vector
-            debug!(
-                "start_index ({}) >= total_commands ({}), returning empty vector",
-                start_index, total_commands
-            );
-            Vec::new()
-        } else {
-            // Skip already-processed commands
-            let skipped = start_index;
-            let remaining = total_commands - start_index;
-            debug!(
-                "Skipping {} already-processed commands, returning {} remaining commands",
-                skipped, remaining
-            );
-            all_commands[start_index..].to_vec()
-        };
-
-        debug!(
-            "Read {} total SQL commands from {:?}, returning {} commands starting from index {}",
-            total_commands,
-            data_file_path,
-            commands_to_return.len(),
-            start_index
-        );
-
-        Ok(commands_to_return)
-    }
-
-    /// Parse SQL statements from text, properly handling string literals and semicolons
-    ///
-    /// This parser splits SQL text into individual statements by finding semicolons that
-    /// are NOT inside string literals. It handles:
-    /// - Single-quoted strings with escaped quotes ('')
-    /// - Backtick-quoted identifiers (MySQL)
-    /// - Double-quoted identifiers (PostgreSQL/SQLite)
-    /// - Square-bracket identifiers (SQL Server)
-    ///
-    /// Returns a vector of trimmed SQL statements without trailing semicolons.
-    fn parse_sql_statements(&self, content: &str) -> Result<Vec<String>> {
-        let mut statements = Vec::with_capacity(1000);
-        let mut current_statement = String::with_capacity(512);
-        let mut chars = content.chars().peekable();
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_backtick = false;
-        let mut in_bracket = false;
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\'' if !in_double_quote && !in_backtick && !in_bracket => {
-                    current_statement.push(ch);
-                    if in_single_quote {
-                        // Check for escaped quote ('')
-                        if chars.peek() == Some(&'\'') {
-                            current_statement.push(chars.next().unwrap());
+            // Parse the line character by character
+            let mut chars = line.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\'' if !in_double_quote && !in_backtick && !in_bracket => {
+                        current_statement.push(ch);
+                        if in_single_quote {
+                            // Check for escaped quote ('')
+                            if chars.peek() == Some(&'\'') {
+                                current_statement.push(chars.next().unwrap());
+                            } else {
+                                in_single_quote = false;
+                            }
                         } else {
-                            in_single_quote = false;
+                            in_single_quote = true;
                         }
-                    } else {
-                        in_single_quote = true;
                     }
-                }
-                '"' if !in_single_quote && !in_backtick && !in_bracket => {
-                    current_statement.push(ch);
-                    if in_double_quote {
-                        // Check for escaped quote ("")
-                        if chars.peek() == Some(&'"') {
-                            current_statement.push(chars.next().unwrap());
+                    '"' if !in_single_quote && !in_backtick && !in_bracket => {
+                        current_statement.push(ch);
+                        if in_double_quote {
+                            // Check for escaped quote ("")
+                            if chars.peek() == Some(&'"') {
+                                current_statement.push(chars.next().unwrap());
+                            } else {
+                                in_double_quote = false;
+                            }
                         } else {
-                            in_double_quote = false;
+                            in_double_quote = true;
                         }
-                    } else {
-                        in_double_quote = true;
                     }
-                }
-                '`' if !in_single_quote && !in_double_quote && !in_bracket => {
-                    current_statement.push(ch);
-                    if in_backtick {
-                        // Check for escaped backtick (``)
-                        if chars.peek() == Some(&'`') {
-                            current_statement.push(chars.next().unwrap());
+                    '`' if !in_single_quote && !in_double_quote && !in_bracket => {
+                        current_statement.push(ch);
+                        if in_backtick {
+                            // Check for escaped backtick (``)
+                            if chars.peek() == Some(&'`') {
+                                current_statement.push(chars.next().unwrap());
+                            } else {
+                                in_backtick = false;
+                            }
                         } else {
-                            in_backtick = false;
+                            in_backtick = true;
                         }
-                    } else {
-                        in_backtick = true;
                     }
-                }
-                '[' if !in_single_quote && !in_double_quote && !in_backtick => {
-                    current_statement.push(ch);
-                    in_bracket = true;
-                }
-                ']' if in_bracket => {
-                    current_statement.push(ch);
-                    in_bracket = false;
-                }
-                ';' if !in_single_quote && !in_double_quote && !in_backtick && !in_bracket => {
-                    // Found a statement terminator outside of any quotes
-                    let trimmed = current_statement.trim();
-                    if !trimmed.is_empty() {
-                        statements.push(trimmed.to_string());
+                    '[' if !in_single_quote && !in_double_quote && !in_backtick => {
+                        current_statement.push(ch);
+                        in_bracket = true;
                     }
-                    current_statement.clear();
-                }
-                _ => {
-                    current_statement.push(ch);
+                    ']' if in_bracket => {
+                        current_statement.push(ch);
+                        in_bracket = false;
+                    }
+                    ';' if !in_single_quote && !in_double_quote && !in_backtick && !in_bracket => {
+                        // Found a statement terminator outside of any quotes
+                        let trimmed_stmt = current_statement.trim();
+                        if !trimmed_stmt.is_empty() {
+                            // Only collect statements >= start_index
+                            if statement_index >= start_index {
+                                collected_statements.push(trimmed_stmt.to_string());
+                            }
+                            statement_index += 1;
+                        }
+                        current_statement.clear();
+                    }
+                    _ => {
+                        current_statement.push(ch);
+                    }
                 }
             }
+
+            // Add newline to preserve multi-line statements
+            current_statement.push('\n');
         }
 
         // Handle any remaining content (statement without trailing semicolon)
-        let trimmed = current_statement.trim();
-        if !trimmed.is_empty() {
+        let trimmed_stmt = current_statement.trim();
+        if !trimmed_stmt.is_empty() {
             warn!(
                 "SQL statement without trailing semicolon (length: {} chars): {}",
-                trimmed.len(),
-                if trimmed.len() > 100 {
-                    format!("{}...", &trimmed[..100])
+                trimmed_stmt.len(),
+                if trimmed_stmt.len() > 100 {
+                    format!("{}...", &trimmed_stmt[..100])
                 } else {
-                    trimmed.to_string()
+                    trimmed_stmt.to_string()
                 }
             );
-            statements.push(trimmed.to_string());
+            if statement_index >= start_index {
+                collected_statements.push(trimmed_stmt.to_string());
+            }
+            statement_index += 1;
         }
 
-        Ok(statements)
+        let total_statements = statement_index;
+        debug!(
+            "Read {} total SQL statements from {:?}, collected {} statements starting from index {}",
+            total_statements,
+            data_file_path,
+            collected_statements.len(),
+            start_index
+        );
+
+        Ok(collected_statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution

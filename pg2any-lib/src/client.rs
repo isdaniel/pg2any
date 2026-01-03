@@ -74,8 +74,8 @@ impl CdcClient {
     ///
     /// # Returns
     ///
-    /// Returns a tuple of (CdcClient, Option<Lsn>) where the Lsn is the last committed
-    /// LSN loaded from the persistence file, or None if starting fresh.
+    /// Returns a tuple of (`CdcClient`, `Option<Lsn>`) where the `Lsn` is the last committed
+    /// LSN loaded from the persistence file, or `None` if starting fresh.
     pub async fn new(config: Config, lsn_file_path: Option<&str>) -> Result<(Self, Option<Lsn>)> {
         info!("Creating CDC client");
 

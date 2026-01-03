@@ -36,18 +36,46 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
-    /// Execute a batch of SQL commands within a single transaction
+    /// Execute a batch of SQL commands within a single transaction with optional pre-commit hook
     ///
     /// This is the primary method used by the consumer to execute transaction files.
     /// All commands are executed atomically - if any command fails, the entire batch is rolled back.
     ///
+    /// ## Transactional Checkpoint Strategy
+    ///
+    /// The `pre_commit_hook` enables true atomicity between data changes and checkpoint updates:
+    /// ```ignore
+    /// BEGIN;
+    ///   INSERT INTO users ...;  // Your CDC data
+    ///   UPDATE products ...;
+    ///   
+    ///   pre_commit_hook();      // Update checkpoint (in-memory + persist to file)
+    /// COMMIT;                   // Both data AND checkpoint committed atomically
+    /// ```
+    ///
+    /// If transaction fails or crashes:
+    /// - Before COMMIT: Both data and checkpoint rolled back → Safe
+    /// - After COMMIT: Both data and checkpoint committed → Safe
+    /// - No race condition possible!
+    ///
     /// # Arguments
     /// * `commands` - Vector of SQL commands to execute in a single transaction
+    /// * `pre_commit_hook` - Optional boxed async function called BEFORE COMMIT within the transaction
     ///
     /// # Returns
-    /// * `Ok(())` - All SQL commands were successfully executed and committed
-    /// * `Err(...)` - Execution failed, transaction was rolled back
-    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()>;
+    /// * `Ok(())` - All SQL commands and pre-commit hook executed successfully, transaction committed
+    /// * `Err(...)` - Execution or hook failed, entire transaction was rolled back
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        commands: &[String],
+        pre_commit_hook: Option<
+            Box<
+                dyn FnOnce() -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                    > + Send,
+            >,
+        >,
+    ) -> Result<()>;
 
     /// Close the connection
     async fn close(&mut self) -> Result<()>;

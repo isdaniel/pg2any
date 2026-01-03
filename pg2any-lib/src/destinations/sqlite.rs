@@ -99,7 +99,17 @@ impl DestinationHandler for SQLiteDestination {
     // SQLite does not use schema/database namespacing like MySQL, so schema mappings are not needed
     fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
 
-    async fn execute_sql_batch(&mut self, commands: &[String]) -> Result<()> {
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        commands: &[String],
+        pre_commit_hook: Option<
+            Box<
+                dyn FnOnce() -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                    > + Send,
+            >,
+        >,
+    ) -> Result<()> {
         if commands.is_empty() {
             return Ok(());
         }
@@ -129,6 +139,23 @@ impl DestinationHandler for SQLiteDestination {
                     "SQLite execute_sql_batch failed at command {}/{}: {}",
                     idx + 1,
                     commands.len(),
+                    e
+                )));
+            }
+        }
+
+        // Execute pre-commit hook BEFORE transaction COMMIT
+        if let Some(hook) = pre_commit_hook {
+            if let Err(e) = hook().await {
+                // Rollback transaction if hook fails
+                if let Err(rollback_err) = tx.rollback().await {
+                    tracing::error!(
+                        "SQLite ROLLBACK failed after pre-commit hook error: {}",
+                        rollback_err
+                    );
+                }
+                return Err(CdcError::generic(format!(
+                    "SQLite pre-commit hook failed, transaction rolled back: {}",
                     e
                 )));
             }

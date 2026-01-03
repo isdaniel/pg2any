@@ -3,7 +3,7 @@ use crate::{
     types::DestinationType,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 // Import destination implementations
 #[cfg(feature = "mysql")]
@@ -69,11 +69,7 @@ pub trait DestinationHandler: Send + Sync {
         &mut self,
         commands: &[String],
         pre_commit_hook: Option<
-            Box<
-                dyn FnOnce() -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                    > + Send,
-            >,
+            Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>,
         >,
     ) -> Result<()>;
 

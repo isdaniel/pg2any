@@ -466,6 +466,42 @@ impl TransactionManager {
         Ok(files)
     }
 
+    /// List all incomplete (received but not committed) transactions from sql_received_tx/
+    ///
+    /// Returns a HashMap mapping transaction_id -> (data_file_path, timestamp)
+    /// This is used by the producer to restore its active_tx_files state on restart
+    pub async fn list_received_transactions(
+        &self,
+    ) -> Result<HashMap<u32, (PathBuf, DateTime<Utc>)>> {
+        let received_dir = self.base_path.join(RECEIVED_TX_DIR);
+        let mut entries = fs::read_dir(&received_dir).await?;
+        let mut active_txs = HashMap::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+
+            // Read .meta files from sql_received_tx/
+            if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                if let Ok(metadata) = self.read_metadata(&path).await {
+                    active_txs.insert(
+                        metadata.transaction_id,
+                        (metadata.data_file_path.clone(), metadata.commit_timestamp),
+                    );
+                }
+            }
+        }
+
+        if !active_txs.is_empty() {
+            info!(
+                "Recovered {} incomplete transaction(s) from sql_received_tx/: {:?}",
+                active_txs.len(),
+                active_txs.keys().collect::<Vec<_>>()
+            );
+        }
+
+        Ok(active_txs)
+    }
+
     /// Read metadata from a transaction metadata file (.meta)
     async fn read_metadata(&self, file_path: &Path) -> Result<TransactionFileMetadata> {
         let metadata_content = fs::read_to_string(file_path).await?;
@@ -547,19 +583,8 @@ impl TransactionManager {
         let total_commands = all_commands.len();
         let commands_to_return = if start_index >= total_commands {
             // All commands already processed, return empty vector
-            debug!(
-                "start_index ({}) >= total_commands ({}), returning empty vector",
-                start_index, total_commands
-            );
             Vec::new()
         } else {
-            // Skip already-processed commands
-            let skipped = start_index;
-            let remaining = total_commands - start_index;
-            debug!(
-                "Skipping {} already-processed commands, returning {} remaining commands",
-                skipped, remaining
-            );
             all_commands[start_index..].to_vec()
         };
 

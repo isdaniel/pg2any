@@ -96,22 +96,20 @@ impl MetricsServer {
 /// Handle HTTP requests for metrics and health endpoints
 async fn metrics_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     match (req.method(), req.uri().path()) {
-        (&hyper::Method::GET, "/metrics") => {
-            match crate::monitoring::metrics::gather_metrics() {
-                Ok(metrics) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(Full::new(Bytes::from(metrics)))
-                    .unwrap()),
-                Err(err) => {
-                    error!("Failed to collect metrics: {}", err);
-                    Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("Failed to collect metrics")))
-                        .unwrap())
-                }
+        (&hyper::Method::GET, "/metrics") => match crate::monitoring::metrics::gather_metrics() {
+            Ok(metrics) => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .body(Full::new(Bytes::from(metrics)))
+                .unwrap()),
+            Err(err) => {
+                error!("Failed to collect metrics: {}", err);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from("Failed to collect metrics")))
+                    .unwrap())
             }
-        }
+        },
         (&hyper::Method::GET, "/health") => Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")

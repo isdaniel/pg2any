@@ -260,7 +260,7 @@ pub struct LsnTracker {
 impl LsnTracker {
     /// Create a new LSN tracker with the specified file path
     pub fn new(lsn_file_path: Option<&str>) -> Arc<Self> {
-        let mut path = lsn_file_path
+        let mut path: String = lsn_file_path
             .map(String::from)
             .or_else(|| std::env::var("CDC_LAST_LSN_FILE").ok())
             .unwrap_or_else(|| "./pg2any_last_lsn.metadata".to_string());
@@ -855,10 +855,14 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_double_shutdown_is_safe() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_double_shutdown"));
+        let path = "/tmp/test_lsn_double_shutdown";
+        let tracker = LsnTracker::new(Some(path));
         tracker.shutdown_async().await;
         // Second shutdown should be safe
         tracker.shutdown_async().await;
+
+        // Clean up
+        let _ = std::fs::remove_file(format!("{}.metadata", path));
     }
 
     // Shared LSN Feedback tests

@@ -9,10 +9,7 @@ use tracing::info;
 
 #[cfg(feature = "metrics")]
 use crate::MetricsServer;
-use crate::{
-    client::CdcClient, config::Config, lsn_tracker::create_lsn_tracker_with_load, types::Lsn,
-    CdcResult,
-};
+use crate::{client::CdcClient, config::Config, types::Lsn, CdcResult};
 
 /// Configuration for the CDC application
 #[derive(Debug, Clone)]
@@ -54,6 +51,7 @@ impl CdcAppConfig {
 pub struct CdcApp {
     client: CdcClient,
     config: CdcAppConfig,
+    start_lsn: Option<Lsn>,
 }
 
 impl CdcApp {
@@ -70,11 +68,16 @@ impl CdcApp {
     /// # Errors
     ///
     /// Returns `CdcError` if the CDC client cannot be created or initialized.
-    pub async fn new(config: CdcAppConfig) -> CdcResult<Self> {
+    pub async fn new(config: CdcAppConfig, lsn_file_path: Option<&str>) -> CdcResult<Self> {
         info!("Initializing CDC client");
-        let client = CdcClient::new(config.cdc_config.clone()).await?;
 
-        Ok(Self { client, config })
+        // Create CDC client with LSN tracking - lsn_file_path will be determined from environment or default
+        let (client, start_lsn) = CdcClient::new(config.cdc_config.clone(), lsn_file_path).await?;
+        Ok(Self {
+            client,
+            config,
+            start_lsn,
+        })
     }
 
     /// Create a new CDC application instance with just the CDC config (backwards compatible)
@@ -82,6 +85,7 @@ impl CdcApp {
     /// # Arguments
     ///
     /// * `cdc_config` - The CDC configuration to use
+    /// * `lsn_file_path` - Optional path to the LSN persistence file
     ///
     /// # Returns
     ///
@@ -90,9 +94,9 @@ impl CdcApp {
     /// # Errors
     ///
     /// Returns `CdcError` if the CDC client cannot be created or initialized.
-    pub async fn from_config(cdc_config: Config) -> CdcResult<Self> {
+    pub async fn from_config(cdc_config: Config, lsn_file_path: Option<&str>) -> CdcResult<Self> {
         let app_config = CdcAppConfig::new(cdc_config);
-        Self::new(app_config).await
+        Self::new(app_config, lsn_file_path).await
     }
 
     /// Run the CDC application with graceful shutdown handling
@@ -122,14 +126,8 @@ impl CdcApp {
     /// - Shutdown handling fails
     /// - Client stop operation fails
     /// - Metrics server fails to start (when metrics feature is enabled)
-    pub async fn run(&mut self, lsn_file_path: Option<&str>) -> CdcResult<()> {
+    pub async fn run(&mut self) -> CdcResult<()> {
         self.client.init_build_info(&self.config.version);
-
-        // Create LSN tracker and load last known LSN
-        let (lsn_tracker, start_lsn) = create_lsn_tracker_with_load(lsn_file_path).await;
-
-        // Set the LSN tracker on the client for tracking committed LSN
-        self.client.set_lsn_tracker(lsn_tracker);
 
         info!("Starting CDC replication stream");
 
@@ -138,11 +136,13 @@ impl CdcApp {
             if let Some(port) = self.config.metrics_port {
                 info!("Starting metrics server on port {}", port);
                 let server = crate::create_metrics_server(port);
-                return self.run_with_optional_server(start_lsn, Some(server)).await;
+                return self
+                    .run_with_optional_server(self.start_lsn, Some(server))
+                    .await;
             }
         }
 
-        self.run_with_optional_server(start_lsn, None).await
+        self.run_with_optional_server(self.start_lsn, None).await
     }
 
     /// Internal method to run the CDC application with optional metrics server
@@ -230,8 +230,8 @@ pub async fn run_cdc_app(config: Config, lsn_file_path: Option<&str>) -> CdcResu
         metrics_port: None,
         version: "unknown".to_string(),
     };
-    let mut app = CdcApp::new(app_config).await?;
-    app.run(lsn_file_path).await
+    let mut app = CdcApp::new(app_config, lsn_file_path).await?;
+    app.run().await
 }
 
 /// Set up graceful shutdown signal handling

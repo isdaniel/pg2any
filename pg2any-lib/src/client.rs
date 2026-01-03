@@ -52,7 +52,7 @@ pub struct CdcClient {
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     metrics_collector: Arc<MetricsCollector>,
     /// LSN tracker for tracking last committed LSN to destination (for file persistence)
-    lsn_tracker: Option<Arc<LsnTracker>>,
+    lsn_tracker: Arc<LsnTracker>,
     /// Shared LSN feedback for replication protocol (write/flush/replay separation)
     shared_lsn_feedback: Arc<SharedLsnFeedback>,
     /// Transaction file manager for file-based workflow
@@ -60,8 +60,23 @@ pub struct CdcClient {
 }
 
 impl CdcClient {
-    /// Create a new CDC client
-    pub async fn new(config: Config) -> Result<Self> {
+    /// Create a new CDC client with LSN tracking
+    ///
+    /// This method creates a new CDC client and automatically initializes the LSN tracker
+    /// for tracking committed LSN positions. The LSN tracker is loaded from the persistence
+    /// file if it exists, allowing graceful recovery from previous runs.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The CDC configuration
+    /// * `lsn_file_path` - Optional path to the LSN persistence file. If None, uses
+    ///   the default from environment variables or "./pg2any_last_lsn.metadata"
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of (CdcClient, Option<Lsn>) where the Lsn is the last committed
+    /// LSN loaded from the persistence file, or None if starting fresh.
+    pub async fn new(config: Config, lsn_file_path: Option<&str>) -> Result<(Self, Option<Lsn>)> {
         info!("Creating CDC client");
 
         // Create destination handler
@@ -84,7 +99,12 @@ impl CdcClient {
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
 
-        Ok(Self {
+        // Create LSN tracker and load last known LSN
+        info!("Initializing LSN tracker for position tracking");
+        let (lsn_tracker, start_lsn) =
+            crate::lsn_tracker::create_lsn_tracker_with_load(lsn_file_path).await;
+
+        let client = Self {
             config,
             replication_manager: Some(replication_manager),
             destination_handler: Some(destination_handler),
@@ -92,18 +112,12 @@ impl CdcClient {
             producer_handle: None,
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
-            lsn_tracker: None,
+            lsn_tracker,
             shared_lsn_feedback,
             transaction_file_manager: Some(Arc::new(manager)),
-        })
-    }
+        };
 
-    /// Set the LSN tracker for tracking committed LSN
-    ///
-    /// This should be called before starting replication to enable
-    /// LSN persistence after each successful commit to the destination.
-    pub fn set_lsn_tracker(&mut self, tracker: Arc<LsnTracker>) {
-        self.lsn_tracker = Some(tracker);
+        Ok((client, start_lsn))
     }
 
     /// Initialize the CDC client
@@ -312,7 +326,7 @@ impl CdcClient {
     /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
     /// * `transaction_file_manager` - File manager for moving transaction files
     /// * `shared_lsn_feedback` - Shared LSN feedback for PostgreSQL protocol
-    /// * `lsn_tracker` - Optional LSN tracker for persistence
+    /// * `lsn_tracker` - LSN tracker for persistence
     /// * `commit_notifier` - Channel sender for notifying consumer
     /// * `metrics_collector` - Metrics collector for error recording
     async fn handle_transaction_commit(
@@ -322,7 +336,7 @@ impl CdcClient {
         transaction_type: &str,
         transaction_file_manager: &Arc<TransactionManager>,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-        lsn_tracker: &Option<Arc<LsnTracker>>,
+        lsn_tracker: &Arc<LsnTracker>,
         commit_notifier: &mpsc::Sender<PendingTransactionFile>,
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
@@ -344,9 +358,7 @@ impl CdcClient {
                         lsn, transaction_type, transaction_id
                 );
 
-                    if let Some(ref tracker) = lsn_tracker {
-                        tracker.update_if_greater(lsn.0);
-                    }
+                    lsn_tracker.update_if_greater(lsn.0);
                 }
 
                 // Notify consumer with transaction details for immediate processing
@@ -411,7 +423,7 @@ impl CdcClient {
         metrics_collector: Arc<MetricsCollector>,
         transaction_file_manager: Arc<TransactionManager>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
-        lsn_tracker: Option<Arc<LsnTracker>>,
+        lsn_tracker: Arc<LsnTracker>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
     ) -> Result<()> {
         info!(
@@ -721,7 +733,7 @@ impl CdcClient {
         file_mgr: &TransactionManager,
         destination: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
-        lsn_tracker: &Option<Arc<LsnTracker>>,
+        lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
     ) -> Result<()> {
@@ -814,7 +826,7 @@ impl CdcClient {
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
-        lsn_tracker: Option<Arc<LsnTracker>>,
+        lsn_tracker: Arc<LsnTracker>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
         batch_size: usize,
         mut commit_receiver: mpsc::Receiver<PendingTransactionFile>,
@@ -918,7 +930,7 @@ impl CdcClient {
         transaction_file_manager: &TransactionManager,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
-        lsn_tracker: &Option<Arc<LsnTracker>>,
+        lsn_tracker: &Arc<LsnTracker>,
         batch_size: usize,
         cancellation_token: &CancellationToken,
     ) {
@@ -979,7 +991,7 @@ impl CdcClient {
         file_manager: &TransactionManager,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
-        lsn_tracker: &Option<Arc<LsnTracker>>,
+        lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
     ) -> Result<()> {
@@ -988,26 +1000,22 @@ impl CdcClient {
         let file_path_str = pending_tx.file_path.to_string_lossy().to_string();
 
         // Check if we're resuming from a saved position for THIS specific file
-        let start_index = if let Some(ref tracker) = lsn_tracker {
-            if let Some((saved_file_path, saved_start_index)) = tracker.get_resume_position() {
+        let start_index =
+            if let Some((saved_file_path, saved_start_index)) = lsn_tracker.get_resume_position() {
                 // Only use the saved index if it's for the current file
                 if saved_file_path == file_path_str {
                     saved_start_index
                 } else {
                     info!(
-                        "Saved position is for different file ('{}' vs '{}'). Starting from index 0",
-                        saved_file_path, file_path_str
-                    );
+                    "Saved position is for different file ('{}' vs '{}'). Starting from index 0",
+                    saved_file_path, file_path_str
+                );
                     0
                 }
             } else {
                 info!("No saved consumer position found, starting from index 0");
                 0
-            }
-        } else {
-            info!("No LSN tracker available, starting from index 0");
-            0
-        };
+            };
 
         info!(
             "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
@@ -1032,9 +1040,7 @@ impl CdcClient {
             );
 
             // Clear position and delete file
-            if let Some(ref tracker) = lsn_tracker {
-                tracker.clear_consumer_position();
-            }
+            lsn_tracker.clear_consumer_position();
 
             // Update LSN and delete file
             Self::finalize_transaction_file(
@@ -1084,7 +1090,7 @@ impl CdcClient {
             //     INSERT INTO users ...;       ← Execute batch commands
             //     UPDATE products ...;
             //
-            //     [pre_commit_hook()]          ← Update checkpoint (in-memory + persist)
+            //     [pre_commit_hook()]          ← Update checkpoint (in-memory)
             //   COMMIT;                        ← Both data and checkpoint committed atomically
             //
             // If crash/rollback occurs:
@@ -1092,27 +1098,22 @@ impl CdcClient {
             //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
             //   - No race condition possible!
             let next_command_index = current_command_index + chunk.len();
-            let pre_commit_hook = if let Some(ref tracker) = lsn_tracker {
-                let tracker_clone = tracker.clone();
-                let file_path_clone = file_path_str.clone();
-                let last_executed_index = next_command_index - 1;
+            let tracker_clone = lsn_tracker.clone();
+            let file_path_clone = file_path_str.clone();
+            let last_executed_index = next_command_index - 1;
 
-                Some(Box::new(move || {
-                    Box::pin(async move {
-                        tracker_clone
-                            .update_consumer_position(file_path_clone, last_executed_index);
-                        Ok(())
-                    })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            let pre_commit_hook = Some(Box::new(move || {
+                Box::pin(async move {
+                    tracker_clone.update_consumer_position(file_path_clone, last_executed_index);
+                    Ok(())
                 })
-                    as Box<
-                        dyn FnOnce() -> std::pin::Pin<
-                                Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                            > + Send,
-                    >)
-            } else {
-                None
-            };
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            })
+                as Box<
+                    dyn FnOnce() -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                        > + Send,
+                >);
 
             let batch_start_time = Instant::now();
             debug!(
@@ -1171,13 +1172,11 @@ impl CdcClient {
         );
 
         // Clear consumer position since file is fully processed and persist immediately
-        if let Some(ref tracker) = lsn_tracker {
-            if let Err(e) = tracker
-                .clear_consumer_position_and_persist_immediately()
-                .await
-            {
-                warn!("Failed to clear and persist consumer position: {}", e);
-            }
+        if let Err(e) = lsn_tracker
+            .clear_consumer_position_and_persist_immediately()
+            .await
+        {
+            warn!("Failed to clear and persist consumer position: {}", e);
         }
 
         // Finalize: update LSN, record metrics, delete file
@@ -1197,7 +1196,7 @@ impl CdcClient {
     async fn finalize_transaction_file(
         pending_tx: &PendingTransactionFile,
         file_manager: &TransactionManager,
-        lsn_tracker: &Option<Arc<LsnTracker>>,
+        lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         total_commands: usize,
     ) -> Result<()> {
@@ -1209,10 +1208,8 @@ impl CdcClient {
             // For recovery processing, we only update the lsn_tracker
             debug!("Transaction {} commit LSN: {}", tx_id, commit_lsn);
 
-            if let Some(ref tracker) = lsn_tracker {
-                // Update flush LSN (last committed to destination)
-                tracker.commit_lsn(commit_lsn.0);
-            }
+            // Update flush LSN (last committed to destination)
+            lsn_tracker.commit_lsn(commit_lsn.0);
         }
 
         // Record metrics - create a transaction object for metrics recording
@@ -1251,19 +1248,17 @@ impl CdcClient {
         }
 
         if pending_tx.metadata.commit_lsn.is_some() {
-            if let Some(ref tracker) = lsn_tracker {
-                let pending_count = file_manager.list_pending_transactions().await?.len();
-                tracker.update_consumer_state(
-                    tx_id,
-                    pending_tx.metadata.commit_timestamp,
-                    pending_count,
-                );
+            let pending_count = file_manager.list_pending_transactions().await?.len();
+            lsn_tracker.update_consumer_state(
+                tx_id,
+                pending_tx.metadata.commit_timestamp,
+                pending_count,
+            );
 
-                debug!(
+            debug!(
                 "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
                 tx_id, pending_count
             );
-            }
         }
 
         Ok(())
@@ -1285,22 +1280,21 @@ impl CdcClient {
         }
 
         // Shutdown LSN tracker to persist final state
-        if let Some(ref tracker) = self.lsn_tracker {
-            info!("Shutting down LSN tracker and persisting final state");
+        info!("Shutting down LSN tracker and persisting final state");
+        info!("Shutting down LSN tracker and persisting final state");
 
-            // Shutdown LSN tracker, which includes a final state persistence.
-            tracker.shutdown_async().await;
+        // Shutdown LSN tracker, which includes a final state persistence.
+        self.lsn_tracker.shutdown_async().await;
 
-            // Log final state after shutdown
-            let post_shutdown_metadata = tracker.get_metadata();
-            info!(
+        // Log final state after shutdown
+        let post_shutdown_metadata = self.lsn_tracker.get_metadata();
+        info!(
                 "Post-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}, last_executed_index={:?}",
                 pg_walstream::format_lsn(post_shutdown_metadata.lsn_tracking.flush_lsn),
                 post_shutdown_metadata.consumer_state.pending_file_count,
                 post_shutdown_metadata.consumer_state.current_file_path,
                 post_shutdown_metadata.consumer_state.last_executed_command_index
             );
-        }
 
         info!("CDC replication stopped gracefully");
         Ok(())
@@ -1464,6 +1458,10 @@ mod tests {
         }
     }
 
+    async fn cleanup_default_metadata_file() {
+        let _ = tokio::fs::remove_file("./pg2any_last_lsn.metadata").await;
+    }
+
     fn create_test_config() -> Config {
         ConfigBuilder::default()
             .source_connection_string(
@@ -1487,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_creation_and_basic_properties() {
         let config = create_test_config();
-        let client = CdcClient::new(config)
+        let (client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1497,12 +1495,14 @@ mod tests {
         // Test that we can get a cancellation token
         let token = client.cancellation_token();
         assert!(!token.is_cancelled());
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_cancellation_token_cancellation() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config)
+        let (mut client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1515,12 +1515,14 @@ mod tests {
         // The token should be cancelled
         assert!(token.is_cancelled());
         assert!(!client.is_running());
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_cancellation_token_propagation() {
         let config = create_test_config();
-        let client = CdcClient::new(config)
+        let (client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1538,6 +1540,8 @@ mod tests {
         assert!(token1.is_cancelled());
         assert!(token2.is_cancelled());
         assert!(!client.is_running());
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
@@ -1583,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn test_graceful_shutdown_with_task_handles() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config)
+        let (mut client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1597,12 +1601,14 @@ mod tests {
             .await
             .expect("Stop should succeed even without tasks");
         assert!(!client.is_running());
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_wait_for_tasks_completion_with_no_tasks() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config)
+        let (mut client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1611,12 +1617,14 @@ mod tests {
             .wait_for_tasks_completion()
             .await
             .expect("Should succeed with no tasks");
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_multiple_shutdown_calls_are_safe() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config)
+        let (mut client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1634,12 +1642,14 @@ mod tests {
         // Third stop call should also succeed
         client.stop().await.expect("Third stop call should succeed");
         assert!(!client.is_running());
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_client_stats_reflect_cancellation_state() {
         let config = create_test_config();
-        let mut client = CdcClient::new(config)
+        let (mut client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1653,12 +1663,14 @@ mod tests {
         // Stats should reflect stopped state
         let stats = client.get_stats();
         assert!(!stats.is_running);
+
+        cleanup_default_metadata_file().await;
     }
 
     #[tokio::test]
     async fn test_cancellation_token_from_external_source() {
         let config = create_test_config();
-        let client = CdcClient::new(config)
+        let (client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
@@ -1690,6 +1702,8 @@ mod tests {
         // Client token should now be cancelled
         assert!(client_token.is_cancelled());
         assert!(!client.is_running());
+
+        cleanup_default_metadata_file().await;
     }
     #[tokio::test]
     async fn test_configurable_buffer_size() {
@@ -1707,11 +1721,13 @@ mod tests {
 
         assert_eq!(config.buffer_size, custom_buffer_size);
 
-        let client = CdcClient::new(config)
+        let (client, _start_lsn) = CdcClient::new(config, None)
             .await
             .expect("Failed to create client");
 
         // Verify the client was created successfully with custom buffer
         assert_eq!(client.config().buffer_size, custom_buffer_size);
+
+        cleanup_default_metadata_file().await;
     }
 }

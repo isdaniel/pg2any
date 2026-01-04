@@ -8,7 +8,6 @@
 //!
 //! - `GET /metrics` - Prometheus-formatted metrics
 //! - `GET /health` - Health check endpoint
-//! - `GET /memory/stats` - Jemalloc memory statistics (JSON) - requires `jemalloc` feature
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -18,9 +17,6 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-
-#[cfg(feature = "metrics")]
-use serde_json;
 
 /// Configuration for the metrics HTTP server
 #[derive(Debug, Clone)]
@@ -100,54 +96,25 @@ impl MetricsServer {
 /// Handle HTTP requests for metrics and health endpoints
 async fn metrics_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     match (req.method(), req.uri().path()) {
-        (&hyper::Method::GET, "/metrics") => {
-            // Update jemalloc metrics before gathering
-            #[cfg(feature = "metrics")]
-            crate::monitoring::metrics::update_jemalloc_metrics();
-
-            match crate::monitoring::metrics::gather_metrics() {
-                Ok(metrics) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(Full::new(Bytes::from(metrics)))
-                    .unwrap()),
-                Err(err) => {
-                    error!("Failed to collect metrics: {}", err);
-                    Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("Failed to collect metrics")))
-                        .unwrap())
-                }
+        (&hyper::Method::GET, "/metrics") => match crate::monitoring::metrics::gather_metrics() {
+            Ok(metrics) => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .body(Full::new(Bytes::from(metrics)))
+                .unwrap()),
+            Err(err) => {
+                error!("Failed to collect metrics: {}", err);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from("Failed to collect metrics")))
+                    .unwrap())
             }
-        }
+        },
         (&hyper::Method::GET, "/health") => Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(r#"{"status":"healthy"}"#)))
             .unwrap()),
-
-        // jemalloc memory statistics endpoint (JSON format)
-        #[cfg(feature = "metrics")]
-        (&hyper::Method::GET, "/memory/stats") => {
-            use crate::monitoring::jemalloc_stats::get_jemalloc_stats;
-            let stats = get_jemalloc_stats();
-            let json = serde_json::json!({
-                "allocated_bytes": stats.allocated,
-                "resident_bytes": stats.resident,
-                "active_bytes": stats.active,
-                "mapped_bytes": stats.mapped,
-                "metadata_bytes": stats.metadata,
-                "retained_bytes": stats.retained,
-                "overhead_bytes": stats.overhead(),
-                "fragmentation_bytes": stats.fragmentation(),
-                "utilization_percent": stats.utilization_percent(),
-            });
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(json.to_string())))
-                .unwrap())
-        }
 
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)

@@ -33,8 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create and run CDC application - all feature handling is encapsulated in the library
-    let mut cdc_app = CdcApp::new(app_config).await?;
-    let result = cdc_app.run(None).await;
+    let mut cdc_app = CdcApp::new(app_config, None).await?;
+    let result = cdc_app.run().await;
 
     tracing::info!("CDC application stopped");
     result.map_err(|e| e.into())

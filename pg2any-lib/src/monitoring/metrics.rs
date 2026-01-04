@@ -129,58 +129,6 @@ lazy_static! {
         "pg2any_full_transactions_processed_total",
         "Total number of complete transactions (final batches) successfully processed"
     ).expect("metric can be created");
-
-    // =============================================================================
-    // Memory Metrics (jemalloc)
-    // =============================================================================
-
-    /// Total bytes allocated by the application (jemalloc)
-    pub static ref MEMORY_ALLOCATED_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_allocated_bytes",
-        "Total bytes allocated by the application (jemalloc)"
-    ).expect("metric can be created");
-
-    /// Total bytes in physically resident data pages (jemalloc)
-    pub static ref MEMORY_RESIDENT_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_resident_bytes",
-        "Total bytes in physically resident data pages (jemalloc)"
-    ).expect("metric can be created");
-
-    /// Total bytes in active pages (jemalloc)
-    pub static ref MEMORY_ACTIVE_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_active_bytes",
-        "Total bytes in active pages allocated by the application (jemalloc)"
-    ).expect("metric can be created");
-
-    /// Total bytes in mapped chunks (jemalloc)
-    pub static ref MEMORY_MAPPED_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_mapped_bytes",
-        "Total bytes in chunks mapped by the allocator (jemalloc)"
-    ).expect("metric can be created");
-
-    /// Total bytes dedicated to metadata (jemalloc)
-    pub static ref MEMORY_METADATA_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_metadata_bytes",
-        "Total bytes dedicated to jemalloc metadata"
-    ).expect("metric can be created");
-
-    /// Total bytes retained (not returned to OS) (jemalloc)
-    pub static ref MEMORY_RETAINED_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_retained_bytes",
-        "Total bytes retained by jemalloc (not returned to OS)"
-    ).expect("metric can be created");
-
-    /// Memory fragmentation bytes (jemalloc)
-    pub static ref MEMORY_FRAGMENTATION_BYTES: Gauge = register_gauge!(
-        "pg2any_memory_fragmentation_bytes",
-        "Memory fragmentation in bytes (resident - active)"
-    ).expect("metric can be created");
-
-    /// Memory utilization percentage (jemalloc)
-    pub static ref MEMORY_UTILIZATION_PERCENT: Gauge = register_gauge!(
-        "pg2any_memory_utilization_percent",
-        "Memory utilization percentage (allocated/resident * 100)"
-    ).expect("metric can be created");
 }
 
 /// Initialize all metrics with the global registry
@@ -245,38 +193,6 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
         .register(Box::new(FULL_TRANSACTIONS_PROCESSED_TOTAL.clone()))
         .map_err(|e| format!("Failed to register FULL_TRANSACTIONS_PROCESSED_TOTAL: {e}"))?;
 
-    REGISTRY
-        .register(Box::new(MEMORY_ALLOCATED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_ALLOCATED_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_RESIDENT_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_RESIDENT_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_ACTIVE_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_ACTIVE_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_MAPPED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_MAPPED_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_METADATA_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_METADATA_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_RETAINED_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_RETAINED_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_FRAGMENTATION_BYTES.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_FRAGMENTATION_BYTES: {e}"))?;
-
-    REGISTRY
-        .register(Box::new(MEMORY_UTILIZATION_PERCENT.clone()))
-        .map_err(|e| format!("Failed to register MEMORY_UTILIZATION_PERCENT: {e}"))?;
-
     debug!("All metrics registered successfully");
     Ok(())
 }
@@ -288,32 +204,4 @@ pub fn gather_metrics() -> Result<String, Box<dyn std::error::Error>> {
     let mut output = Vec::new();
     encoder.encode(&metric_families, &mut output)?;
     Ok(String::from_utf8(output)?)
-}
-
-/// Update jemalloc memory metrics
-///
-/// This function reads current memory statistics from jemalloc and updates
-/// the corresponding Prometheus metrics. It should be called periodically
-/// to keep memory metrics up to date.
-///
-/// This function is only available when the `jemalloc` feature is enabled.
-#[cfg(feature = "metrics")]
-pub fn update_jemalloc_metrics() {
-    use crate::monitoring::jemalloc_stats::get_jemalloc_stats;
-
-    let stats = get_jemalloc_stats();
-
-    MEMORY_ALLOCATED_BYTES.set(stats.allocated as f64);
-    MEMORY_RESIDENT_BYTES.set(stats.resident as f64);
-    MEMORY_ACTIVE_BYTES.set(stats.active as f64);
-    MEMORY_MAPPED_BYTES.set(stats.mapped as f64);
-    MEMORY_METADATA_BYTES.set(stats.metadata as f64);
-    MEMORY_RETAINED_BYTES.set(stats.retained as f64);
-    MEMORY_FRAGMENTATION_BYTES.set(stats.fragmentation() as f64);
-    MEMORY_UTILIZATION_PERCENT.set(stats.utilization_percent());
-}
-
-#[cfg(not(feature = "metrics"))]
-pub fn update_jemalloc_metrics() {
-    // No-op when jemalloc is not enabled
 }

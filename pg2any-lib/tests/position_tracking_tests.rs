@@ -8,7 +8,9 @@
 #[cfg(test)]
 mod position_tracking_tests {
     use chrono::Utc;
-    use pg2any_lib::lsn_tracker::{CdcMetadata, ConsumerState, LsnTracker, LsnTracking};
+    use pg2any_lib::lsn_tracker::{
+        CdcMetadata, ConsumerState, LsnTracker, LsnTracking, ProducerState,
+    };
     use tokio::fs;
 
     fn get_test_file_path(test_name: &str) -> String {
@@ -168,6 +170,7 @@ mod position_tracking_tests {
                 current_file_path: None,
                 last_executed_command_index: None,
             },
+            producer_state: ProducerState::new(),
         };
 
         let json = serde_json::to_string_pretty(&old_metadata).unwrap();

@@ -32,14 +32,11 @@ prometheus = { workspace = true, optional = true  }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-# Memory allocator statistics support
-tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [features]
 default = ["mysql", "sqlserver", "sqlite"]
 mysql = ["sqlx/mysql"]
 sqlserver = ["tiberius"]
 sqlite = ["sqlx/sqlite"]
-metrics = ["hyper", "hyper-util", "http-body-util", "prometheus", "jemalloc"]
-jemalloc = ["tikv-jemalloc-ctl"]
+metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 

@@ -142,9 +142,9 @@ jobs:
         docker ps -a
 
     - name: Setup tmate session
-        if: ${{ failure() }}
-        uses: mxschmitt/action-tmate@v3
-        
+      if: failure()
+      uses: mxschmitt/action-tmate@v3
+
     - name: Stop and remove containers
       if: always()
       run: |

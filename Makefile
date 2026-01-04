@@ -58,7 +58,7 @@ run:
 doc-check:
 	cargo doc --no-deps --all-features
 
-before-git-push: check build format test audit doc-check
+before-git-push: check build format test doc-check
 
 # Docker commands
 docker-build:

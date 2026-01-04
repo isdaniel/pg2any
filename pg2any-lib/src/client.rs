@@ -10,6 +10,7 @@ use crate::transaction_manager::{
 use crate::types::{EventType, Lsn, TransactionContext};
 use std::sync::Arc;
 use std::time::Instant;
+use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -434,14 +435,34 @@ impl CdcClient {
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // Track current transaction context
-        let mut current_context = TransactionContext::None;
+        // RECOVERY: Restore producer state from metadata
+        let producer_state = lsn_tracker.get_producer_state();
+        let mut current_context = if let Some((ctx_type, tx_id)) = producer_state.get_context() {
+            if ctx_type == "Normal" {
+                info!("Recovered producer context: Normal transaction {}", tx_id);
+                TransactionContext::Normal(tx_id)
+            } else if ctx_type == "Streaming" {
+                info!(
+                    "Recovered producer context: Streaming transaction {}",
+                    tx_id
+                );
+                TransactionContext::Streaming(tx_id)
+            } else {
+                TransactionContext::None
+            }
+        } else {
+            TransactionContext::None
+        };
 
-        // Track active transaction files: tx_id -> (file_path, timestamp)
-        let mut active_tx_files: std::collections::HashMap<
-            u32,
-            (std::path::PathBuf, chrono::DateTime<chrono::Utc>),
-        > = std::collections::HashMap::new();
+        // RECOVERY: Restore active transaction files from sql_received_tx/
+        let mut active_tx_files = transaction_file_manager
+            .list_received_transactions()
+            .await?;
+
+        info!(
+            "Producer starting with {} active transaction file(s)",
+            active_tx_files.len()
+        );
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
@@ -453,7 +474,6 @@ impl CdcClient {
 
                     // Record current LSN for metrics
                     metrics_collector.record_received_lsn(event.lsn.0);
-
                     metrics_collector.record_event(&event);
 
                     // Handle transaction boundaries
@@ -478,7 +498,6 @@ impl CdcClient {
                                 .await
                             {
                                 Ok(file_path) => {
-                                    debug!("Created transaction file: {:?}", file_path);
                                     active_tx_files
                                         .insert(*transaction_id, (file_path, *commit_timestamp));
                                 }
@@ -650,7 +669,7 @@ impl CdcClient {
                                 TransactionContext::Streaming(xid) => Some(*xid),
                                 TransactionContext::Normal(tx_id) => Some(*tx_id),
                                 TransactionContext::None => {
-                                    warn!("Received DML event outside of transaction context");
+                                    warn!("Received DML event outside of transaction context: {event:?}");
                                     None
                                 }
                             };
@@ -694,23 +713,26 @@ impl CdcClient {
             info!("Successfully flushed all buffers");
         }
 
-        // If there's an incomplete transaction, log a warning
-        match current_context {
+        // PERSISTENCE: Save producer state before shutdown
+        let context_str = match current_context {
             TransactionContext::Normal(tx_id) => {
                 warn!(
-                    "Discarding incomplete normal transaction {} due to shutdown",
+                    "Incomplete normal transaction {} will be resumed on restart",
                     tx_id
                 );
-                // File will remain in sql_received_tx/ and can be cleaned up on restart
+                Some(format!("Normal:{}", tx_id))
             }
             TransactionContext::Streaming(xid) => {
                 warn!(
-                    "Discarding incomplete streaming transaction {} due to shutdown",
+                    "Incomplete streaming transaction {} will be resumed on restart",
                     xid
                 );
+                Some(format!("Streaming:{}", xid))
             }
-            TransactionContext::None => {}
-        }
+            TransactionContext::None => None,
+        };
+
+        lsn_tracker.update_producer_state(context_str, active_tx_files.len());
 
         // Update connection status on shutdown
         metrics_collector.update_source_connection_status(false);
@@ -1106,14 +1128,9 @@ impl CdcClient {
                 Box::pin(async move {
                     tracker_clone.update_consumer_position(file_path_clone, last_executed_index);
                     Ok(())
-                })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>
             })
-                as Box<
-                    dyn FnOnce() -> std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                        > + Send,
-                >);
+                as Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>);
 
             let batch_start_time = Instant::now();
             debug!(
@@ -1280,7 +1297,6 @@ impl CdcClient {
         }
 
         // Shutdown LSN tracker to persist final state
-        info!("Shutting down LSN tracker and persisting final state");
         info!("Shutting down LSN tracker and persisting final state");
 
         // Shutdown LSN tracker, which includes a final state persistence.

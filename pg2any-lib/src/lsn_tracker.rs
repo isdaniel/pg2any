@@ -131,8 +131,8 @@ pub struct ProducerState {
     /// Current transaction context
     /// Possible values:
     /// - "None": No active transaction
-    /// - "Normal:<tx_id>": Normal transaction in progress
-    /// - "Streaming:<xid>": Streaming transaction in progress
+    /// - "Normal:\<tx_id\>": Normal transaction in progress
+    /// - "Streaming:\<xid\>": Streaming transaction in progress
     pub current_context: Option<String>,
 
     /// Number of active transaction files at last update
@@ -221,7 +221,7 @@ impl CdcMetadata {
     /// Update producer state with current transaction context
     ///
     /// # Arguments
-    /// * `context_str` - String representation of context: "None", "Normal:<tx_id>", or "Streaming:<xid>"
+    /// * `context_str` - String representation of context: "None", "Normal:\<tx_id\>", or "Streaming:\<xid\>"
     /// * `active_count` - Number of active transaction files
     pub fn update_producer_state(&mut self, context_str: Option<String>, active_count: usize) {
         self.producer_state
@@ -598,7 +598,7 @@ impl LsnTracker {
     /// Update producer state with current transaction context
     ///
     /// # Arguments
-    /// * `context_str` - String representation of context: "None", "Normal:<tx_id>", or "Streaming:<xid>"
+    /// * `context_str` - String representation of context: "None", "Normal:\<tx_id\>", or "Streaming:\<xid\>"
     /// * `active_count` - Number of active transaction files
     pub fn update_producer_state(&self, context_str: Option<String>, active_count: usize) {
         let context_str_debug = context_str.clone();

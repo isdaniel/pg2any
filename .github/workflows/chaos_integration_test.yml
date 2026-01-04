@@ -97,25 +97,6 @@ jobs:
         CDC_MYSQL_DB: cdc_db
         CDC_CONTAINER_NAME: cdc_application
     
-    - name: Capture and upload CDC application logs
-      if: failure()
-      run: |
-        echo "Installing colorized-logs for log conversion..."
-        sudo apt-get update
-        sudo apt-get install -y colorized-logs
-        echo "Capturing full CDC application logs..."
-        docker logs cdc_application | ansi2txt > cdc_application_log.txt
-        echo "Log file created: cdc_application_log.txt"
-        ls -lh cdc_application_log.txt
-    
-    - name: Upload CDC application logs
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: cdc-application-logs-${{ matrix.os }}
-        path: cdc_application_log.txt
-        retention-days: 30
-    
     - name: Show PostgreSQL logs on failure
       if: failure()
       run: |
@@ -140,6 +121,25 @@ jobs:
         echo "=========================================="
         docker-compose -f docker-compose.chaos-test.yml ps
         docker ps -a
+    
+    - name: Capture and upload CDC application logs
+      if: failure()
+      run: |
+        echo "Installing colorized-logs for log conversion..."
+        sudo apt-get update
+        sudo apt-get install -y colorized-logs
+        echo "Capturing full CDC application logs..."
+        docker logs cdc_application | ansi2txt > cdc_application_log.txt
+        echo "Log file created: cdc_application_log.txt"
+        ls -lh cdc_application_log.txt
+    
+    - name: Upload CDC application logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdc-application-logs-${{ matrix.os }}
+        path: cdc_application_log.txt
+        retention-days: 30
 
     - name: Setup tmate session
       if: failure()

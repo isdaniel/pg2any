@@ -583,19 +583,8 @@ impl TransactionManager {
         let total_commands = all_commands.len();
         let commands_to_return = if start_index >= total_commands {
             // All commands already processed, return empty vector
-            debug!(
-                "start_index ({}) >= total_commands ({}), returning empty vector",
-                start_index, total_commands
-            );
             Vec::new()
         } else {
-            // Skip already-processed commands
-            let skipped = start_index;
-            let remaining = total_commands - start_index;
-            debug!(
-                "Skipping {} already-processed commands, returning {} remaining commands",
-                skipped, remaining
-            );
             all_commands[start_index..].to_vec()
         };
 

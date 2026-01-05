@@ -54,8 +54,6 @@ pub struct CdcClient {
     metrics_collector: Arc<MetricsCollector>,
     /// LSN tracker for tracking last committed LSN to destination (for file persistence)
     lsn_tracker: Arc<LsnTracker>,
-    /// Shared LSN feedback for replication protocol (write/flush/replay separation)
-    shared_lsn_feedback: Arc<SharedLsnFeedback>,
     /// Transaction file manager for file-based workflow
     transaction_file_manager: Option<Arc<TransactionManager>>,
 }
@@ -85,9 +83,6 @@ impl CdcClient {
 
         let replication_manager = ReplicationManager::new(config.clone());
 
-        // Create shared LSN feedback for proper replication protocol handling
-        let shared_lsn_feedback = SharedLsnFeedback::new_shared();
-
         // Create transaction file manager (always enabled for data safety)
         info!(
             "Transaction file persistence enabled at: {}",
@@ -114,7 +109,6 @@ impl CdcClient {
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
-            shared_lsn_feedback,
             transaction_file_manager: Some(Arc::new(manager)),
         };
 
@@ -205,8 +199,13 @@ impl CdcClient {
             .ok_or_else(|| CdcError::generic("Transaction file manager not available"))?;
 
         let (tx_commit_notifier, rx_commit_notifier) =
-            mpsc::channel::<PendingTransactionFile>(1000);
-        info!("Created transaction commit notification channel with buffer size 1000");
+            mpsc::channel::<PendingTransactionFile>(self.config.buffer_size);
+        info!(
+            "Created transaction commit notification channel with buffer size {}",
+            self.config.buffer_size
+        );
+
+        let shared_lsn_feedback = replication_stream.shared_lsn_feedback().clone();
 
         // Start producer (writes to files only)
         let producer_handle = {
@@ -214,7 +213,7 @@ impl CdcClient {
             let metrics = self.metrics_collector.clone();
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
             let file_mgr = transaction_file_manager.clone();
-            let lsn_feedback = self.shared_lsn_feedback.clone();
+            let lsn_feedback = shared_lsn_feedback.clone();
             let lsn_tracker = self.lsn_tracker.clone();
 
             tokio::spawn(Self::run_producer(
@@ -266,7 +265,7 @@ impl CdcClient {
         let metrics = self.metrics_collector.clone();
         let dest_type_str = dest_type.to_string();
         let lsn_tracker = self.lsn_tracker.clone();
-        let shared_lsn_feedback = self.shared_lsn_feedback.clone();
+        let shared_lsn_feedback_for_consumer = shared_lsn_feedback.clone();
 
         let consumer_handle = tokio::spawn(Self::run_consumer_loop(
             transaction_file_manager,
@@ -275,7 +274,7 @@ impl CdcClient {
             metrics,
             dest_type_str,
             lsn_tracker,
-            shared_lsn_feedback,
+            shared_lsn_feedback_for_consumer,
             self.config.batch_size,
             rx_commit_notifier,
         ));

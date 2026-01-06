@@ -1233,7 +1233,7 @@ impl CdcClient {
 
             // Update flush LSN (last committed to destination)
             lsn_tracker.commit_lsn(commit_lsn.0);
-            
+
             // Update shared LSN feedback for PostgreSQL replication protocol
             shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
         }

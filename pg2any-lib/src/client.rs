@@ -130,27 +130,6 @@ impl CdcClient {
                 handler.set_schema_mappings(self.config.schema_mappings.clone());
                 info!("Schema mappings applied: {:?}", self.config.schema_mappings);
             }
-
-            // Process pending transaction files from previous run (recovery)
-            if let Some(ref file_mgr) = self.transaction_file_manager {
-                info!("Transaction file persistence - checking for pending files");
-                if let Err(e) = Self::process_pending_transaction_files(
-                    file_mgr,
-                    handler,
-                    &self.cancellation_token,
-                    &self.lsn_tracker,
-                    &self.metrics_collector,
-                    self.config.batch_size,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to process pending transaction files during recovery: {}",
-                        e
-                    );
-                    return Err(e);
-                }
-            }
         }
 
         info!("CDC client initialized successfully");
@@ -206,6 +185,27 @@ impl CdcClient {
         );
 
         let shared_lsn_feedback = replication_stream.shared_lsn_feedback().clone();
+
+        if let Some(ref mut handler) = self.destination_handler {
+            info!("Processing pending transaction files from previous run (recovery)...");
+            if let Err(e) = Self::process_pending_transaction_files(
+                &transaction_file_manager,
+                handler,
+                &self.cancellation_token,
+                &self.lsn_tracker,
+                &self.metrics_collector,
+                self.config.batch_size,
+                &shared_lsn_feedback,
+            )
+            .await
+            {
+                error!(
+                    "Failed to process pending transaction files during recovery: {}",
+                    e
+                );
+                return Err(e);
+            }
+        }
 
         // Start producer (writes to files only)
         let producer_handle = {
@@ -436,21 +436,19 @@ impl CdcClient {
 
         // RECOVERY: Restore producer state from metadata
         let producer_state = lsn_tracker.get_producer_state();
-        let mut current_context = if let Some((ctx_type, tx_id)) = producer_state.get_context() {
-            if ctx_type == "Normal" {
+        let mut current_context = match producer_state.get_context() {
+            Some((ctx_type, tx_id)) if ctx_type == "Normal" => {
                 info!("Recovered producer context: Normal transaction {}", tx_id);
                 TransactionContext::Normal(tx_id)
-            } else if ctx_type == "Streaming" {
+            }
+            Some((ctx_type, tx_id)) if ctx_type == "Streaming" => {
                 info!(
                     "Recovered producer context: Streaming transaction {}",
                     tx_id
                 );
                 TransactionContext::Streaming(tx_id)
-            } else {
-                TransactionContext::None
             }
-        } else {
-            TransactionContext::None
+            _ => TransactionContext::None,
         };
 
         // RECOVERY: Restore active transaction files from sql_received_tx/
@@ -757,6 +755,7 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
         info!("Checking for pending transaction files from previous run...");
 
@@ -801,6 +800,7 @@ impl CdcClient {
                 lsn_tracker,
                 metrics_collector,
                 batch_size,
+                shared_lsn_feedback,
             )
             .await
             {
@@ -873,6 +873,7 @@ impl CdcClient {
                         &lsn_tracker,
                         batch_size,
                         &cancellation_token,
+                        &shared_lsn_feedback,
                     ).await;
 
                     // Log final LSN state
@@ -905,6 +906,7 @@ impl CdcClient {
                                 &lsn_tracker,
                                 &metrics_collector,
                                 batch_size,
+                                &shared_lsn_feedback,
                             ).await {
                                 error!(
                                     "Failed to process transaction {} from file {:?}: {}",
@@ -926,6 +928,7 @@ impl CdcClient {
                                 &lsn_tracker,
                                 batch_size,
                                 &cancellation_token,
+                                &shared_lsn_feedback,
                             ).await;
 
                             break;
@@ -954,6 +957,7 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         batch_size: usize,
         cancellation_token: &CancellationToken,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
         // Get all pending files
         match transaction_file_manager.list_pending_transactions().await {
@@ -981,6 +985,7 @@ impl CdcClient {
                         lsn_tracker,
                         metrics_collector,
                         batch_size,
+                        shared_lsn_feedback,
                     )
                     .await
                     {
@@ -1015,6 +1020,7 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
@@ -1070,6 +1076,7 @@ impl CdcClient {
                 lsn_tracker,
                 metrics_collector,
                 total_commands,
+                shared_lsn_feedback,
             )
             .await?;
 
@@ -1202,6 +1209,7 @@ impl CdcClient {
             lsn_tracker,
             metrics_collector,
             total_commands,
+            shared_lsn_feedback,
         )
         .await?;
 
@@ -1215,17 +1223,19 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         total_commands: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
         let tx_id = pending_tx.metadata.transaction_id;
 
-        // Update LSN tracking (replay_lsn only, pending_file_count will be updated after deletion)
+        // Update LSN tracking (both lsn_tracker and shared_lsn_feedback)
         if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            // Note: We don't have shared_lsn_feedback here, which is only used by the consumer loop
-            // For recovery processing, we only update the lsn_tracker
             debug!("Transaction {} commit LSN: {}", tx_id, commit_lsn);
 
             // Update flush LSN (last committed to destination)
             lsn_tracker.commit_lsn(commit_lsn.0);
+            
+            // Update shared LSN feedback for PostgreSQL replication protocol
+            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
         }
 
         // Record metrics - create a transaction object for metrics recording
@@ -1409,24 +1419,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct ProcessedTransactionInfo {
-        pub transaction_id: u32,
-        pub commit_lsn: Option<Lsn>,
-        pub event_count: usize,
-    }
-
-    impl From<&Transaction> for ProcessedTransactionInfo {
-        fn from(tx: &Transaction) -> Self {
-            Self {
-                transaction_id: tx.transaction_id,
-                commit_lsn: tx.commit_lsn,
-                event_count: tx.event_count(),
-            }
-        }
-    }
-
     // Mock destination handler for testing
+    #[warn(dead_code)]
     pub struct MockDestinationHandler {
         pub should_fail: bool,
     }

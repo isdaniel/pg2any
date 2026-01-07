@@ -124,6 +124,15 @@ pub struct TransactionFileMetadata {
     pub destination_type: DestinationType,
     /// Path to the SQL data file in sql_data_tx/
     pub data_file_path: PathBuf,
+    /// Transaction type: "normal" or "streaming"
+    /// Used for recovery to correctly classify transactions on restart
+    #[serde(default = "default_transaction_type")]
+    pub transaction_type: String,
+}
+
+/// Default transaction type ("normal" for backward compatibility)
+fn default_transaction_type() -> String {
+    "normal".to_string()
 }
 
 /// A committed transaction file ready for execution
@@ -138,7 +147,7 @@ impl Eq for PendingTransactionFile {}
 
 impl PartialEq for PendingTransactionFile {
     fn eq(&self, other: &Self) -> bool {
-        self.metadata.transaction_id == other.metadata.transaction_id
+        self.metadata.commit_lsn == other.metadata.commit_lsn
     }
 }
 
@@ -150,7 +159,10 @@ impl Ord for PendingTransactionFile {
             (Some(a), Some(b)) => a.0.cmp(&b.0),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
+            (None, None) => self
+                .metadata
+                .transaction_id
+                .cmp(&other.metadata.transaction_id),
         }
     }
 }
@@ -256,7 +268,12 @@ impl TransactionManager {
     }
 
     /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
-    pub async fn begin_transaction(&self, tx_id: u32, timestamp: DateTime<Utc>) -> Result<PathBuf> {
+    pub async fn begin_transaction(
+        &self,
+        tx_id: u32,
+        timestamp: DateTime<Utc>,
+        transaction_type: &str,
+    ) -> Result<PathBuf> {
         let data_file_path = self.get_data_file_path(tx_id);
         let metadata_path = self.get_received_tx_path(tx_id);
 
@@ -272,6 +289,7 @@ impl TransactionManager {
             commit_lsn: None,
             destination_type: self.destination_type.clone(),
             data_file_path: data_file_path.clone(),
+            transaction_type: transaction_type.to_string(),
         };
 
         let metadata_json = serde_json::to_string_pretty(&metadata)?;
@@ -470,11 +488,11 @@ impl TransactionManager {
 
     /// List all incomplete (received but not committed) transactions from sql_received_tx/
     ///
-    /// Returns a HashMap mapping transaction_id -> (data_file_path, timestamp)
+    /// Returns a HashMap mapping transaction_id -> (data_file_path, timestamp, transaction_type)
     /// This is used by the producer to restore its active_tx_files state on restart
     pub async fn list_received_transactions(
         &self,
-    ) -> Result<HashMap<u32, (PathBuf, DateTime<Utc>)>> {
+    ) -> Result<HashMap<u32, (PathBuf, DateTime<Utc>, String)>> {
         let received_dir = self.base_path.join(RECEIVED_TX_DIR);
         let mut entries = fs::read_dir(&received_dir).await?;
 
@@ -498,7 +516,11 @@ impl TransactionManager {
             if let Ok(metadata) = self.read_metadata(&path).await {
                 active_txs.insert(
                     metadata.transaction_id,
-                    (metadata.data_file_path.clone(), metadata.commit_timestamp),
+                    (
+                        metadata.data_file_path.clone(),
+                        metadata.commit_timestamp,
+                        metadata.transaction_type.clone(),
+                    ),
                 );
             }
         }

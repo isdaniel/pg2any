@@ -454,9 +454,31 @@ impl CdcClient {
         // Track streaming transactions (multiple can be active, indexed by xid)
         let mut streaming_txs: HashMap<u32, (PathBuf, DateTime<Utc>)> = HashMap::new();
 
-        // Restore streaming transactions from active_tx_files
-        for (tx_id, (file_path, timestamp)) in active_tx_files {
-            streaming_txs.insert(tx_id, (file_path, timestamp));
+        // Track which streaming transaction is currently receiving DML events
+        let mut active_streaming_dml_txid: Option<u32> = None;
+
+        // Restore transactions from active_tx_files based on their type
+        for (tx_id, (file_path, timestamp, transaction_type)) in active_tx_files {
+            if transaction_type == "streaming" {
+                streaming_txs.insert(tx_id, (file_path, timestamp));
+                info!(
+                    "Restored streaming transaction {} from sql_received_tx/",
+                    tx_id
+                );
+            } else {
+                // Normal transaction
+                if current_normal_tx.is_some() {
+                    warn!(
+                        "Multiple normal transactions found in sql_received_tx/, only one expected. Keeping tx {}",
+                        tx_id
+                    );
+                }
+                current_normal_tx = Some((tx_id, file_path, timestamp));
+                info!(
+                    "Restored normal transaction {} from sql_received_tx/",
+                    tx_id
+                );
+            }
         }
 
         while !cancellation_token.is_cancelled() {
@@ -492,7 +514,7 @@ impl CdcClient {
 
                             // Create transaction file
                             match transaction_file_manager
-                                .begin_transaction(*transaction_id, *commit_timestamp)
+                                .begin_transaction(*transaction_id, *commit_timestamp, "normal")
                                 .await
                             {
                                 Ok(file_path) => {
@@ -553,11 +575,14 @@ impl CdcClient {
                                 transaction_id, first_segment
                             );
 
+                            // Set active streaming transaction for DML routing
+                            active_streaming_dml_txid = Some(*transaction_id);
+
                             // Create transaction file on first segment
                             if *first_segment {
                                 let timestamp = chrono::Utc::now();
                                 match transaction_file_manager
-                                    .begin_transaction(*transaction_id, timestamp)
+                                    .begin_transaction(*transaction_id, timestamp, "streaming")
                                     .await
                                 {
                                     Ok(file_path) => {
@@ -581,7 +606,13 @@ impl CdcClient {
 
                         EventType::StreamStop => {
                             // StreamStop marks the end of a segment in streaming transactions
-                            debug!("Producer: StreamStop for streaming transaction");
+                            // Clear the active streaming DML transaction
+                            if let Some(txid) = active_streaming_dml_txid {
+                                info!("Producer: StreamStop for streaming transaction {}", txid);
+                                active_streaming_dml_txid = None;
+                            } else {
+                                warn!("Producer: StreamStop received but no active streaming DML transaction");
+                            }
                         }
 
                         EventType::StreamCommit {
@@ -660,23 +691,26 @@ impl CdcClient {
                                 // DML belongs to current normal transaction
                                 debug!("Appending DML to normal transaction {}", tx_id);
                                 Some(file_path.clone())
-                            } else if streaming_txs.len() == 1 {
-                                // Single streaming transaction active
-                                let (tx_id, (ref file_path, _)) =
-                                    streaming_txs.iter().next().unwrap();
-                                debug!("Appending DML to streaming transaction {}", tx_id);
-                                Some(file_path.clone())
-                            } else if streaming_txs.is_empty() {
-                                warn!(
-                                    "Received DML event with no active transaction: {:?}",
-                                    event.event_type
-                                );
-                                None
+                            } else if let Some(streaming_txid) = active_streaming_dml_txid {
+                                // DML belongs to the active streaming transaction
+                                if let Some((ref file_path, _)) = streaming_txs.get(&streaming_txid)
+                                {
+                                    debug!(
+                                        "Appending DML to streaming transaction {}",
+                                        streaming_txid
+                                    );
+                                    Some(file_path.clone())
+                                } else {
+                                    error!(
+                                        "Active streaming DML txid {} not found in streaming_txs map",
+                                        streaming_txid
+                                    );
+                                    None
+                                }
                             } else {
-                                // Multiple streaming transactions - this shouldn't happen in protocol
                                 warn!(
-                                    "Multiple streaming transactions active ({}), cannot determine target for DML",
-                                    streaming_txs.len()
+                                    "Received DML event with no active transaction (normal or streaming): {:?}",
+                                    event.event_type
                                 );
                                 None
                             };

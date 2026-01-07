@@ -68,7 +68,6 @@ const METADATA_VERSION: &str = "1.0";
 /// This structure stores comprehensive state information for recovery:
 /// - LSN tracking for all three replication positions (write, flush, replay)
 /// - Consumer execution state for resuming from correct position
-/// - Producer execution state for resuming transaction context
 /// - Timestamp information for monitoring and debugging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdcMetadata {
@@ -83,10 +82,6 @@ pub struct CdcMetadata {
 
     /// Consumer execution state
     pub consumer_state: ConsumerState,
-
-    /// Producer execution state (for transaction context recovery)
-    #[serde(default)]
-    pub producer_state: ProducerState,
 }
 
 /// LSN position for CDC replication tracking
@@ -122,57 +117,6 @@ pub struct ConsumerState {
     pub last_executed_command_index: Option<usize>,
 }
 
-/// Producer execution state for transaction context recovery
-///
-/// This structure stores the producer's transaction context state to enable
-/// resuming from the correct position after graceful shutdown.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProducerState {
-    /// Current transaction context
-    /// Possible values:
-    /// - "None": No active transaction
-    /// - "Normal:\<tx_id\>": Normal transaction in progress
-    /// - "Streaming:\<xid\>": Streaming transaction in progress
-    pub current_context: Option<String>,
-
-    /// Number of active transaction files at last update
-    /// This is informational and helps validate recovery
-    pub active_tx_count: usize,
-}
-
-impl ProducerState {
-    /// Create a new producer state with no active transaction
-    pub fn new() -> Self {
-        Self {
-            current_context: None,
-            active_tx_count: 0,
-        }
-    }
-
-    /// Update producer state with current transaction context
-    pub fn update_context(&mut self, context_str: Option<String>, active_count: usize) {
-        self.current_context = context_str;
-        self.active_tx_count = active_count;
-    }
-
-    /// Get the transaction context for recovery
-    /// Returns None, Normal(tx_id), or Streaming(xid)
-    pub fn get_context(&self) -> Option<(String, u32)> {
-        if let Some(ref ctx) = self.current_context {
-            if let Some(normal_id) = ctx.strip_prefix("Normal:") {
-                if let Ok(tx_id) = normal_id.parse::<u32>() {
-                    return Some(("Normal".to_string(), tx_id));
-                }
-            } else if let Some(streaming_id) = ctx.strip_prefix("Streaming:") {
-                if let Ok(xid) = streaming_id.parse::<u32>() {
-                    return Some(("Streaming".to_string(), xid));
-                }
-            }
-        }
-        None
-    }
-}
-
 impl Default for CdcMetadata {
     fn default() -> Self {
         Self {
@@ -186,7 +130,6 @@ impl Default for CdcMetadata {
                 current_file_path: None,
                 last_executed_command_index: None,
             },
-            producer_state: ProducerState::new(),
         }
     }
 }
@@ -216,22 +159,6 @@ impl CdcMetadata {
         self.consumer_state.last_processed_timestamp = Some(timestamp);
         self.consumer_state.pending_file_count = pending_count;
         self.last_updated = Utc::now();
-    }
-
-    /// Update producer state with current transaction context
-    ///
-    /// # Arguments
-    /// * `context_str` - String representation of context: "None", "Normal:\<tx_id\>", or "Streaming:\<xid\>"
-    /// * `active_count` - Number of active transaction files
-    pub fn update_producer_state(&mut self, context_str: Option<String>, active_count: usize) {
-        self.producer_state
-            .update_context(context_str, active_count);
-        self.last_updated = Utc::now();
-    }
-
-    /// Get producer state for recovery
-    pub fn get_producer_state(&self) -> &ProducerState {
-        &self.producer_state
     }
 
     /// Update consumer position within a transaction file
@@ -562,7 +489,7 @@ impl LsnTracker {
     }
 
     /// Clear consumer position when a file is fully processed
-    pub fn clear_consumer_position(&self) {
+    fn clear_consumer_position(&self) {
         {
             let mut metadata = self.metadata.lock().unwrap();
             metadata.clear_consumer_position();
@@ -581,11 +508,7 @@ impl LsnTracker {
     /// * `Err(io::Error)` - Persistence failed (position still cleared in memory)
     pub async fn clear_consumer_position_and_persist_immediately(&self) -> std::io::Result<()> {
         // Clear position in memory
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.clear_consumer_position();
-        }
-        self.dirty.store(true, Ordering::Release);
+        self.clear_consumer_position();
 
         // CRITICAL: Immediately persist to disk
         self.persist_async().await?;
@@ -593,29 +516,6 @@ impl LsnTracker {
         debug!("Atomically cleared and persisted consumer position");
 
         Ok(())
-    }
-
-    /// Update producer state with current transaction context
-    ///
-    /// # Arguments
-    /// * `context_str` - String representation of context: "None", "Normal:\<tx_id\>", or "Streaming:\<xid\>"
-    /// * `active_count` - Number of active transaction files
-    pub fn update_producer_state(&self, context_str: Option<String>, active_count: usize) {
-        let context_str_debug = context_str.clone();
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.update_producer_state(context_str, active_count);
-        }
-        self.dirty.store(true, Ordering::Release);
-        debug!(
-            "Updated producer state: context={:?}, active_count={}",
-            context_str_debug, active_count
-        );
-    }
-    /// Get producer state for recovery
-    pub fn get_producer_state(&self) -> ProducerState {
-        let metadata = self.metadata.lock().unwrap();
-        metadata.producer_state.clone()
     }
 
     /// Get the resume position for recovery
@@ -848,7 +748,6 @@ mod lsn_tracker_tests {
                 current_file_path: None,
                 last_executed_command_index: None,
             },
-            producer_state: ProducerState::new(),
         };
 
         let json = serde_json::to_string_pretty(&metadata).unwrap();
@@ -887,7 +786,6 @@ mod lsn_tracker_tests {
                 current_file_path: None,
                 last_executed_command_index: None,
             },
-            producer_state: ProducerState::new(),
         };
 
         let json = serde_json::to_string_pretty(&metadata).unwrap();

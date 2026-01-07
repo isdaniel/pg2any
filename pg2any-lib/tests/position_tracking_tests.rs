@@ -8,9 +8,7 @@
 #[cfg(test)]
 mod position_tracking_tests {
     use chrono::Utc;
-    use pg2any_lib::lsn_tracker::{
-        CdcMetadata, ConsumerState, LsnTracker, LsnTracking, ProducerState,
-    };
+    use pg2any_lib::lsn_tracker::{CdcMetadata, ConsumerState, LsnTracker, LsnTracking};
     use tokio::fs;
 
     fn get_test_file_path(test_name: &str) -> String {
@@ -81,7 +79,9 @@ mod position_tracking_tests {
         tracker.update_consumer_position("/path/to/file.meta".to_string(), 499);
 
         // Clear position
-        tracker.clear_consumer_position();
+        let _ = tracker
+            .clear_consumer_position_and_persist_immediately()
+            .await;
 
         // Verify position is cleared
         let resume_position = tracker.get_resume_position();
@@ -170,7 +170,6 @@ mod position_tracking_tests {
                 current_file_path: None,
                 last_executed_command_index: None,
             },
-            producer_state: ProducerState::new(),
         };
 
         let json = serde_json::to_string_pretty(&old_metadata).unwrap();
@@ -219,7 +218,9 @@ mod position_tracking_tests {
         assert_eq!(tracker.get_resume_position().unwrap().1, 1000);
 
         // Clear position after file completion
-        tracker.clear_consumer_position();
+        let _ = tracker
+            .clear_consumer_position_and_persist_immediately()
+            .await;
         assert!(tracker.get_resume_position().is_none());
 
         tracker.shutdown_async().await;
@@ -234,7 +235,9 @@ mod position_tracking_tests {
 
         // Process file 1 completely
         tracker.update_consumer_position("/path/to/file1.meta".to_string(), 999);
-        tracker.clear_consumer_position();
+        let _ = tracker
+            .clear_consumer_position_and_persist_immediately()
+            .await;
 
         // Start processing file 2, interrupt mid-way
         tracker.update_consumer_position("/path/to/file2.meta".to_string(), 499);

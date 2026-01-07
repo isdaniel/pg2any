@@ -7,7 +7,7 @@ use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::transaction_manager::{
     PendingTransactionFile, TransactionFileMetadata, TransactionManager,
 };
-use crate::types::{EventType, Lsn, TransactionContext};
+use crate::types::{EventType, Lsn};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{future::Future, pin::Pin};
@@ -132,7 +132,6 @@ impl CdcClient {
             }
         }
 
-        info!("CDC client initialized successfully");
         Ok(())
     }
 
@@ -214,7 +213,6 @@ impl CdcClient {
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
             let file_mgr = transaction_file_manager.clone();
             let lsn_feedback = shared_lsn_feedback.clone();
-            let lsn_tracker = self.lsn_tracker.clone();
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
@@ -223,7 +221,6 @@ impl CdcClient {
                 metrics,
                 file_mgr,
                 lsn_feedback,
-                lsn_tracker,
                 tx_commit_notifier,
             ))
         };
@@ -314,10 +311,9 @@ impl CdcClient {
     /// This function encapsulates the common logic for committing a transaction:
     /// 1. Move transaction file from sql_received_tx/ to sql_pending_tx/
     /// 2. Update flush_lsn for PostgreSQL feedback
-    /// 3. Update lsn_tracker for persistence
-    /// 4. Read metadata from pending file
-    /// 5. Notify consumer via mpsc channel
-    /// 6. Handle errors with metrics recording
+    /// 3. Read metadata from pending file
+    /// 4. Notify consumer via mpsc channel
+    /// 5. Handle errors with metrics recording
     ///
     /// # Arguments
     /// * `transaction_id` - Transaction ID being committed
@@ -326,7 +322,6 @@ impl CdcClient {
     /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
     /// * `transaction_file_manager` - File manager for moving transaction files
     /// * `shared_lsn_feedback` - Shared LSN feedback for PostgreSQL protocol
-    /// * `lsn_tracker` - LSN tracker for persistence
     /// * `commit_notifier` - Channel sender for notifying consumer
     /// * `metrics_collector` - Metrics collector for error recording
     async fn handle_transaction_commit(
@@ -336,7 +331,6 @@ impl CdcClient {
         transaction_type: &str,
         transaction_file_manager: &Arc<TransactionManager>,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-        lsn_tracker: &Arc<LsnTracker>,
         commit_notifier: &mpsc::Sender<PendingTransactionFile>,
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
@@ -357,8 +351,6 @@ impl CdcClient {
                     "Updated flush LSN to {} for {} transaction {} (file persisted to sql_pending_tx/)",
                         lsn, transaction_type, transaction_id
                 );
-
-                    lsn_tracker.update_if_greater(lsn.0);
                 }
 
                 // Notify consumer with transaction details for immediate processing
@@ -423,7 +415,6 @@ impl CdcClient {
         metrics_collector: Arc<MetricsCollector>,
         transaction_file_manager: Arc<TransactionManager>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
-        lsn_tracker: Arc<LsnTracker>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
     ) -> Result<()> {
         info!(
@@ -434,38 +425,24 @@ impl CdcClient {
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // RECOVERY: Restore producer state from metadata
-        let producer_state = lsn_tracker.get_producer_state();
-        let mut current_context = match producer_state.get_context() {
-            Some((ctx_type, tx_id)) if ctx_type == "Normal" => {
-                info!("Recovered producer context: Normal transaction {}", tx_id);
-                TransactionContext::Normal(tx_id)
-            }
-            Some((ctx_type, tx_id)) if ctx_type == "Streaming" => {
-                info!(
-                    "Recovered producer context: Streaming transaction {}",
-                    tx_id
-                );
-                TransactionContext::Streaming(tx_id)
-            }
-            _ => TransactionContext::None,
-        };
-
         // RECOVERY: Restore active transaction files from sql_received_tx/
         let mut active_tx_files = transaction_file_manager
             .list_received_transactions()
             .await?;
 
         info!(
-            "Producer starting with {} active transaction file(s)",
+            "Producer starting with {} active transaction file(s) from sql_received_tx/",
             active_tx_files.len()
         );
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
                 Ok(event) => {
-                    if event.lsn <= start_lsn {
-                        debug!("Skipping event with LSN {} <= {}", event.lsn, start_lsn);
+                    if event.lsn < start_lsn {
+                        debug!(
+                            "Skipping event with LSN {} < {} (already processed)",
+                            event.lsn, start_lsn
+                        );
                         continue;
                     }
 
@@ -480,15 +457,10 @@ impl CdcClient {
                             commit_timestamp,
                         } => {
                             // Start a new normal transaction
-                            if !matches!(current_context, TransactionContext::None) {
-                                warn!("Received BEGIN while transaction is in progress, discarding incomplete transaction");
-                            }
                             debug!(
                                 "Starting transaction {} commit_timestamp: {}",
                                 transaction_id, commit_timestamp
                             );
-                            current_context = TransactionContext::Normal(*transaction_id);
-
                             // Create transaction file
                             match transaction_file_manager
                                 .begin_transaction(*transaction_id, *commit_timestamp)
@@ -511,7 +483,8 @@ impl CdcClient {
 
                         EventType::Commit { .. } => {
                             // Complete and commit the normal transaction file
-                            if let TransactionContext::Normal(tx_id) = current_context {
+                            // Determine transaction ID from active files
+                            if let Some(tx_id) = active_tx_files.keys().next().copied() {
                                 info!("Producer: Committing normal transaction {}", tx_id);
 
                                 // Move transaction file to pending and notify consumer
@@ -524,7 +497,6 @@ impl CdcClient {
                                         "normal",
                                         &transaction_file_manager,
                                         &shared_lsn_feedback,
-                                        &lsn_tracker,
                                         &commit_notifier,
                                         &metrics_collector,
                                     )
@@ -536,10 +508,8 @@ impl CdcClient {
                                         );
                                     }
                                 }
-
-                                current_context = TransactionContext::None;
                             } else {
-                                warn!("Received COMMIT without BEGIN, ignoring");
+                                warn!("Received COMMIT without active transaction, ignoring");
                             }
                         }
 
@@ -551,7 +521,6 @@ impl CdcClient {
                                 "StreamStart: transaction_id={}, first_segment={}",
                                 transaction_id, first_segment
                             );
-                            current_context = TransactionContext::Streaming(*transaction_id);
 
                             // Create transaction file on first segment
                             if *first_segment {
@@ -581,9 +550,7 @@ impl CdcClient {
 
                         EventType::StreamStop => {
                             // StreamStop marks the end of a segment in streaming transactions
-                            if let TransactionContext::Streaming(xid) = current_context {
-                                debug!("Producer: StreamStop for transaction {}", xid);
-                            }
+                            debug!("Producer: StreamStop for streaming transaction");
                         }
 
                         EventType::StreamCommit {
@@ -602,7 +569,6 @@ impl CdcClient {
                                     "streaming",
                                     &transaction_file_manager,
                                     &shared_lsn_feedback,
-                                    &lsn_tracker,
                                     &commit_notifier,
                                     &metrics_collector,
                                 )
@@ -612,12 +578,6 @@ impl CdcClient {
                                         "Failed to handle streaming transaction commit for tx {}: {}",
                                         transaction_id, e
                                     );
-                                }
-                            }
-
-                            if let TransactionContext::Streaming(xid) = current_context {
-                                if xid == *transaction_id {
-                                    current_context = TransactionContext::None;
                                 }
                             }
                         }
@@ -649,12 +609,6 @@ impl CdcClient {
                                     }
                                 }
                             }
-
-                            if let TransactionContext::Streaming(xid) = current_context {
-                                if xid == *transaction_id {
-                                    current_context = TransactionContext::None;
-                                }
-                            }
                         }
 
                         EventType::Insert { .. }
@@ -662,13 +616,23 @@ impl CdcClient {
                         | EventType::Delete { .. }
                         | EventType::Truncate(_) => {
                             // Append event to transaction file
-                            let tx_id = match &current_context {
-                                TransactionContext::Streaming(xid) => Some(*xid),
-                                TransactionContext::Normal(tx_id) => Some(*tx_id),
-                                TransactionContext::None => {
-                                    warn!("Received DML event outside of transaction context: {event:?}");
-                                    None
-                                }
+                            // Transaction ID is determined from active files
+                            // In normal cases, there should be exactly one active transaction
+                            let tx_id = if active_tx_files.len() == 1 {
+                                active_tx_files.keys().next().copied()
+                            } else if active_tx_files.is_empty() {
+                                warn!(
+                                    "Received DML event outside of transaction context: {event:?}"
+                                );
+                                None
+                            } else {
+                                // Multiple active transactions - find the right one
+                                // This shouldn't happen in normal operation but handle it gracefully
+                                warn!(
+                                    "Multiple active transactions ({}), using first one for DML event",
+                                    active_tx_files.len()
+                                );
+                                active_tx_files.keys().next().copied()
                             };
 
                             if let Some(tx_id) = tx_id {
@@ -710,26 +674,15 @@ impl CdcClient {
             info!("Successfully flushed all buffers");
         }
 
-        // PERSISTENCE: Save producer state before shutdown
-        let context_str = match current_context {
-            TransactionContext::Normal(tx_id) => {
-                warn!(
-                    "Incomplete normal transaction {} will be resumed on restart",
-                    tx_id
-                );
-                Some(format!("Normal:{}", tx_id))
-            }
-            TransactionContext::Streaming(xid) => {
-                warn!(
-                    "Incomplete streaming transaction {} will be resumed on restart",
-                    xid
-                );
-                Some(format!("Streaming:{}", xid))
-            }
-            TransactionContext::None => None,
-        };
-
-        lsn_tracker.update_producer_state(context_str, active_tx_files.len());
+        // Note: Producer state is fully tracked in sql_received_tx/ metadata files
+        // No need to persist producer context to pg2any.metadata
+        // Active transactions will be recovered from sql_received_tx/ on restart
+        if !active_tx_files.is_empty() {
+            info!(
+                "Producer shutdown with {} incomplete transaction(s) in sql_received_tx/ (will be recovered on restart)",
+                active_tx_files.len()
+            );
+        }
 
         // Update connection status on shutdown
         metrics_collector.update_source_connection_status(false);
@@ -1066,9 +1019,6 @@ impl CdcClient {
                 tx_id
             );
 
-            // Clear position and delete file
-            lsn_tracker.clear_consumer_position();
-
             // Update LSN and delete file
             Self::finalize_transaction_file(
                 pending_tx,
@@ -1194,14 +1144,6 @@ impl CdcClient {
             duration / batch_count.max(1) as u32
         );
 
-        // Clear consumer position since file is fully processed and persist immediately
-        if let Err(e) = lsn_tracker
-            .clear_consumer_position_and_persist_immediately()
-            .await
-        {
-            warn!("Failed to clear and persist consumer position: {}", e);
-        }
-
         // Finalize: update LSN, record metrics, delete file
         Self::finalize_transaction_file(
             pending_tx,
@@ -1285,6 +1227,14 @@ impl CdcClient {
                 "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
                 tx_id, pending_count
             );
+
+            // Clear consumer position since file is fully processed and persist immediately
+            if let Err(e) = lsn_tracker
+                .clear_consumer_position_and_persist_immediately()
+                .await
+            {
+                warn!("Failed to clear and persist consumer position: {}", e);
+            }
         }
 
         Ok(())
@@ -1420,7 +1370,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     // Mock destination handler for testing
-    #[warn(dead_code)]
+    #[allow(dead_code)]
     pub struct MockDestinationHandler {
         pub should_fail: bool,
     }

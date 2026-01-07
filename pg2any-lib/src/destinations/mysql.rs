@@ -133,10 +133,8 @@ impl DestinationHandler for MySQLDestination {
                     e
                 )));
             }
-            debug!("Pre-commit hook executed successfully within transaction");
         }
 
-        // Commit the transaction (data + checkpoint updates)
         tx.commit()
             .await
             .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {e}")))?;

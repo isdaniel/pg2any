@@ -15,7 +15,8 @@ use tracing::{debug, info};
 pub use pg_walstream::{
     format_lsn, format_postgres_timestamp, parse_lsn, postgres_timestamp_to_chrono,
     system_time_to_postgres_timestamp, Oid, PgReplicationConnection, PgResult,
-    ReplicationConnectionRetry, RetryConfig, TimestampTz, XLogRecPtr, Xid, INVALID_XLOG_REC_PTR,
+    ReplicationConnectionRetry, RetryConfig, SharedLsnFeedback, TimestampTz, XLogRecPtr, Xid,
+    INVALID_XLOG_REC_PTR,
 };
 
 pub struct ReplicationStream {
@@ -101,6 +102,16 @@ impl ReplicationStream {
     #[inline]
     pub fn current_lsn(&self) -> Lsn {
         Lsn::from(self.logical_stream.state.last_received_lsn)
+    }
+
+    /// Get a reference to the shared LSN feedback tracker
+    ///
+    /// This allows the consumer to update the flushed/applied LSN values after
+    /// committing transactions to the destination database. The stream uses
+    /// these values to send accurate feedback to PostgreSQL.
+    #[inline]
+    pub fn shared_lsn_feedback(&self) -> &std::sync::Arc<SharedLsnFeedback> {
+        &self.logical_stream.shared_lsn_feedback
     }
 }
 

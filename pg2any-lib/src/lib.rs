@@ -75,8 +75,8 @@ pub mod replication_state;
 // High-level client interface
 pub mod client;
 
-// Transaction file persistence
-mod transaction_manager;
+// SQL generation for change events
+mod sql_generator;
 
 // Monitoring and metrics
 pub mod monitoring;

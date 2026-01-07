@@ -1,4 +1,4 @@
-//! Transaction Manager for SQL Generation
+//! SQL Generator for Change Data Capture
 //!
 //! This module implements SQL generation for change events from PostgreSQL logical replication.
 //! It handles schema mappings and generates SQL statements for INSERT, UPDATE, DELETE, and TRUNCATE operations.
@@ -6,7 +6,7 @@
 //! ## Protocol-Compliant Architecture
 //!
 //! In the new architecture, transactions are buffered in-memory (ReplicationState) and applied
-//! directly from the commit queue. This TransactionManager is used solely for SQL generation,
+//! directly from the commit queue. This SqlGenerator is used solely for SQL generation,
 //! not for file-based persistence.
 
 use crate::error::{CdcError, Result};
@@ -14,17 +14,17 @@ use crate::types::{ChangeEvent, DestinationType, EventType, ReplicaIdentity};
 use std::collections::HashMap;
 use tracing::info;
 
-/// Transaction Manager for SQL generation and schema mapping
-pub struct TransactionManager {
+/// SQL Generator for converting PostgreSQL change events to destination SQL statements
+pub struct SqlGenerator {
     destination_type: DestinationType,
     schema_mappings: HashMap<String, String>,
 }
 
-impl TransactionManager {
-    /// Create a new transaction manager for SQL generation
+impl SqlGenerator {
+    /// Create a new SQL generator for the specified destination type
     pub async fn new(destination_type: DestinationType) -> Result<Self> {
         info!(
-            "Transaction manager initialized for SQL generation: {:?}",
+            "SQL generator initialized for destination: {:?}",
             destination_type
         );
 

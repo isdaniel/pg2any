@@ -5,7 +5,7 @@ use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::replication_state::{CommittedTx, ReplicationState, TxBuffer};
-use crate::transaction_manager::TransactionManager;
+use crate::sql_generator::SqlGenerator;
 use crate::types::{EventType, Lsn};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 /// ### Streaming transactions (StreamStart...StreamCommit):
 /// - Multiple open transactions allowed
 /// - Each message includes xid
-/// - Flow: StreamStart → buffer to streaming_txs[xid] → StreamCommit → move to commit_queue → apply → ACK
+/// - Flow: StreamStart → buffer to streaming_txs\[xid\] → StreamCommit → move to commit_queue → apply → ACK
 ///
 /// ## State Model
 ///
@@ -71,8 +71,8 @@ pub struct CdcClient {
     lsn_tracker: Arc<LsnTracker>,
     /// Replication state (transaction buffers and commit queue) - shared between producer/consumer
     replication_state: Arc<TokioMutex<ReplicationState>>,
-    /// Transaction file manager for file-based workflow (backward compatibility)
-    transaction_file_manager: Option<Arc<TransactionManager>>,
+    /// SQL generator for converting change events to destination SQL statements
+    sql_generator: Option<Arc<SqlGenerator>>,
     /// Channel receiver for committed transactions
     commit_rx: Option<mpsc::Receiver<CommittedTx>>,
 }
@@ -102,17 +102,10 @@ impl CdcClient {
 
         let replication_manager = ReplicationManager::new(config.clone());
 
-        // Create transaction file manager (always enabled for data safety)
-        info!(
-            "Transaction file persistence enabled at: {}",
-            config.transaction_file_base_path
-        );
-        let mut manager = TransactionManager::new(
-            &config.transaction_file_base_path,
-            config.destination_type.clone(),
-        )
-        .await?;
-        manager.set_schema_mappings(config.schema_mappings.clone());
+        // Create SQL generator for converting change events to destination SQL
+        info!("Initializing SQL generator for {:?}", config.destination_type);
+        let mut generator = SqlGenerator::new(config.destination_type.clone()).await?;
+        generator.set_schema_mappings(config.schema_mappings.clone());
 
         // Create LSN tracker and load last known LSN
         info!("Initializing LSN tracker for position tracking");
@@ -132,7 +125,7 @@ impl CdcClient {
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
             replication_state: Arc::new(TokioMutex::new(ReplicationState::new(commit_tx))),
-            transaction_file_manager: Some(Arc::new(manager)),
+            sql_generator: Some(Arc::new(generator)),
             commit_rx: Some(commit_rx),
         };
 
@@ -195,10 +188,10 @@ impl CdcClient {
         replication_stream: ReplicationStream,
         start_lsn: Option<Lsn>,
     ) -> Result<()> {
-        let transaction_file_manager = self
-            .transaction_file_manager
+        let sql_generator = self
+            .sql_generator
             .clone()
-            .ok_or_else(|| CdcError::generic("Transaction file manager not available"))?;
+            .ok_or_else(|| CdcError::generic("SQL generator not available"))?;
 
         let shared_lsn_feedback = replication_stream.shared_lsn_feedback().clone();
 
@@ -258,7 +251,7 @@ impl CdcClient {
             dest_type_str,
             lsn_tracker,
             shared_lsn_feedback_for_consumer,
-            transaction_file_manager,
+            sql_generator,
         ));
 
         self.consumer_handle = Some(consumer_handle);
@@ -331,14 +324,6 @@ impl CdcClient {
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
                 Ok(event) => {
-                    // if event.lsn < start_lsn {
-                    //     debug!(
-                    //         "Skipping event with LSN {} < {} (already processed)",
-                    //         event.lsn, start_lsn
-                    //     );
-                    //     continue;
-                    // }
-
                     // Record current LSN for metrics
                     metrics_collector.record_received_lsn(event.lsn.0);
                     metrics_collector.record_event(&event);
@@ -472,6 +457,7 @@ impl CdcClient {
                                 debug!("Skipping metadata event: {:?}", event.event_type);
                             }
                         }
+                        
                     }
                 }
                 Err(e) => {
@@ -536,7 +522,7 @@ impl CdcClient {
         destination_type: String,
         lsn_tracker: Arc<LsnTracker>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
-        transaction_file_manager: Arc<TransactionManager>,
+        sql_generator: Arc<SqlGenerator>,
     ) -> Result<()> {
         info!("Starting protocol-compliant consumer with commit_lsn ordering and channel-based communication");
 
@@ -575,7 +561,7 @@ impl CdcClient {
                         &destination_type,
                         &lsn_tracker,
                         &shared_lsn_feedback,
-                        &transaction_file_manager,
+                        &sql_generator,
                     ).await {
                         error!("Failed to apply transaction {}: {}", tx_buffer.xid, e);
                         metrics_collector.record_error("transaction_apply_failed", "consumer");
@@ -612,7 +598,7 @@ impl CdcClient {
                 &destination_type,
                 &lsn_tracker,
                 &shared_lsn_feedback,
-                &transaction_file_manager,
+                &sql_generator,
             )
             .await
             {
@@ -649,7 +635,7 @@ impl CdcClient {
         destination_type: &str,
         lsn_tracker: &Arc<LsnTracker>,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-        transaction_file_manager: &Arc<TransactionManager>,
+        sql_generator: &Arc<SqlGenerator>,
     ) -> Result<()> {
         let start_time = Instant::now();
         let xid = tx_buffer.xid;
@@ -658,7 +644,7 @@ impl CdcClient {
         // Generate SQL for all changes
         let mut sql_commands = Vec::with_capacity(change_count);
         for change in &tx_buffer.changes {
-            match transaction_file_manager.generate_sql_for_event(change) {
+            match sql_generator.generate_sql_for_event(change) {
                 Ok(sql) => {
                     if !sql.is_empty() {
                         sql_commands.push(sql);

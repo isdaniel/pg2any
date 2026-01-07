@@ -17,8 +17,12 @@
 //!
 //! ## Transaction Flow
 //! - Non-streaming: Begin → buffer to current_tx → Commit → move to commit_queue
-//! - Streaming: StreamStart → buffer to streaming_txs[xid] → StreamCommit → move to commit_queue
+//! - Streaming: StreamStart → buffer to streaming_txs\[xid\] → StreamCommit → move to commit_queue
 //! - Consumer pops from commit_queue in commit_lsn ascending order
+//!
+//! ## Communication
+//! - Producer to Consumer: tokio::sync::mpsc::channel for committed transactions
+//! - Backpressure: Channel capacity provides natural backpressure control
 
 use crate::error::{CdcError, Result};
 use crate::types::{ChangeEvent, Lsn};
@@ -489,6 +493,9 @@ mod tests {
         // Third transaction with LSN 2000
         state.handle_begin(3, Utc::now()).unwrap();
         state.handle_commit(Lsn::new(2000), Utc::now()).unwrap();
+
+        // Now call try_send_ordered() to send transactions in commit_lsn order
+        state.try_send_ordered();
         // Sent immediately: LSN 2000
 
         // Receive in the order they were sent (commit order)

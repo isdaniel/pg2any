@@ -148,17 +148,23 @@ impl Eq for PendingTransactionFile {}
 impl PartialEq for PendingTransactionFile {
     fn eq(&self, other: &Self) -> bool {
         self.metadata.commit_lsn == other.metadata.commit_lsn
+            && self.metadata.transaction_id == other.metadata.transaction_id
     }
 }
 
 impl Ord for PendingTransactionFile {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // For min-heap: smaller commit_lsn comes first
-        // If commit_lsn is None, treat as "infinity" (should never happen for pending tx)
+        // For min-heap: smaller commit_lsn comes first.
+        // `None` is treated as "infinity" (greater than any `Some`).
+        // `transaction_id` is used as a tie-breaker for a stable, total ordering.
         match (self.metadata.commit_lsn, other.metadata.commit_lsn) {
-            (Some(a), Some(b)) => a.0.cmp(&b.0),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.cmp(&b).then_with(|| {
+                self.metadata
+                    .transaction_id
+                    .cmp(&other.metadata.transaction_id)
+            }),
+            (Some(_), None) => std::cmp::Ordering::Less, // `Some` is smaller than `None`
+            (None, Some(_)) => std::cmp::Ordering::Greater, // `None` is greater than `Some`
             (None, None) => self
                 .metadata
                 .transaction_id

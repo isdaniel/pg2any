@@ -133,6 +133,34 @@ pub struct PendingTransactionFile {
     pub metadata: TransactionFileMetadata,
 }
 
+// Ordering implementation for priority queue: order by commit_lsn (ascending)
+impl Eq for PendingTransactionFile {}
+
+impl PartialEq for PendingTransactionFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata.transaction_id == other.metadata.transaction_id
+    }
+}
+
+impl Ord for PendingTransactionFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // For min-heap: smaller commit_lsn comes first
+        // If commit_lsn is None, treat as "infinity" (should never happen for pending tx)
+        match (self.metadata.commit_lsn, other.metadata.commit_lsn) {
+            (Some(a), Some(b)) => a.0.cmp(&b.0),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for PendingTransactionFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Transaction File Manager for persisting and executing transactions
 pub struct TransactionManager {
     base_path: PathBuf,
@@ -295,12 +323,7 @@ impl TransactionManager {
 
     /// Move metadata from sql_received_tx to sql_pending_tx
     /// Flushes any pending buffered events before marking transaction as committed
-    pub async fn commit_transaction(
-        &self,
-        tx_id: u32,
-        _timestamp: DateTime<Utc>,
-        commit_lsn: Option<Lsn>,
-    ) -> Result<PathBuf> {
+    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
 

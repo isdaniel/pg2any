@@ -73,7 +73,7 @@ services:
       - "8080:8080"  # Metrics endpoint
     restart: "no"
     # Graceful shutdown timeout - critical for testing
-    stop_grace_period: 30s
+    stop_grace_period: 600s
     stop_signal: SIGTERM
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"] 

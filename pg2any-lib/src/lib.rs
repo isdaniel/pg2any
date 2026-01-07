@@ -69,6 +69,9 @@ pub mod pg_replication;
 
 pub mod lsn_tracker;
 
+// Replication state management (transaction buffers and commit queue)
+pub mod replication_state;
+
 // High-level client interface
 pub mod client;
 

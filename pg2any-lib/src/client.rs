@@ -4,46 +4,61 @@ use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
-use crate::transaction_manager::{
-    PendingTransactionFile, TransactionFileMetadata, TransactionManager,
-};
+use crate::replication_state::{CommittedTx, ReplicationState, TxBuffer};
+use crate::transaction_manager::TransactionManager;
 use crate::types::{EventType, Lsn};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
-use std::{future::Future, pin::Pin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Main CDC client for coordinating replication and destination writes
 ///
-/// # File-Based Transaction Processing Architecture
+/// # PostgreSQL Logical Replication Protocol Compliance
 ///
-/// This client uses a file-based producer-consumer pattern for reliable transaction processing:
+/// This implementation strictly follows PostgreSQL logical replication protocol rules:
 ///
-/// ## Producer (PostgreSQL Reader)
-/// - Reads from PostgreSQL logical replication stream
-/// - Collects events from BEGIN to COMMIT
-/// - Writes transaction files to sql_received_tx/ directory
-/// - Moves completed transactions to sql_pending_tx/ on COMMIT
-/// - Handles LSN tracking and heartbeats
-/// - Sends feedback to PostgreSQL
+/// ## Core Principles
+/// 1. **LSN is the only valid resume cursor** - Never use txid for resume
+/// 2. **Commit defines transaction boundaries** - Changes not durable until commit
+/// 3. **commit_lsn is globally ordered** - Apply transactions in commit_lsn order
+/// 4. **Change arrival order NOT guaranteed** - Streaming fragments may interleave
+/// 5. **Replication slot guarantees** - WAL resent until ACKed, no partial replays
 ///
-/// ## Consumer (Destination Writer)
-/// - Receives notifications via mpsc channel when transactions are committed
-/// - Reads and executes SQL commands from transaction files
-/// - Processes complete transactions atomically
-/// - Deletes transaction files after successful execution
-/// - Transaction consistency: all events in a transaction succeed or fail together
-/// - Updates flush_lsn after successful commits
+/// ## Transaction Flow
 ///
-/// ## LSN Tracking
+/// ### Non-streaming transactions (BEGIN...COMMIT):
+/// - Only ONE active transaction at a time
+/// - Change messages have NO xid
+/// - Flow: Begin → buffer to current_tx → Commit → move to commit_queue → apply → ACK
 ///
-/// The client uses simplified LSN tracking with a single flush_lsn value:
-/// - flush_lsn: Updated by consumer when transaction is committed to destination
-/// - This LSN serves as the start_lsn for recovery on restart
-/// - Persisted to disk periodically for graceful shutdown support
+/// ### Streaming transactions (StreamStart...StreamCommit):
+/// - Multiple open transactions allowed
+/// - Each message includes xid
+/// - Flow: StreamStart → buffer to streaming_txs[xid] → StreamCommit → move to commit_queue → apply → ACK
+///
+/// ## State Model
+///
+/// ### In-Memory (ReplicationState):
+/// - `current_tx`: Active non-streaming transaction (only ONE)
+/// - `streaming_txs`: Map<Xid, TxBuffer> for active streaming transactions
+/// - `commit_queue`: Min-heap ordered by commit_lsn for correct apply order
+///
+/// ### Persistent (LsnTracker):
+/// - `confirmed_flush_lsn`: ONLY LSN persisted, updated AFTER successful apply
+///
+///
+/// ## Graceful Shutdown:
+/// 1. Stop receiving new replication messages
+/// 2. Finish applying ONLY committed transactions in commit_queue
+/// 3. DO NOT apply or ACK open transactions (current_tx, streaming_txs)
+/// 4. Persist confirmed_flush_lsn
+/// 5. Close replication connection
+/// Result: PostgreSQL will resend incomplete transactions on restart
+///
 pub struct CdcClient {
     config: Config,
     replication_manager: Option<ReplicationManager>,
@@ -52,10 +67,14 @@ pub struct CdcClient {
     producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     metrics_collector: Arc<MetricsCollector>,
-    /// LSN tracker for tracking last committed LSN to destination (for file persistence)
+    /// LSN tracker for persisting confirmed_flush_lsn (ONLY LSN that matters for resume)
     lsn_tracker: Arc<LsnTracker>,
-    /// Transaction file manager for file-based workflow
+    /// Replication state (transaction buffers and commit queue) - shared between producer/consumer
+    replication_state: Arc<TokioMutex<ReplicationState>>,
+    /// Transaction file manager for file-based workflow (backward compatibility)
     transaction_file_manager: Option<Arc<TransactionManager>>,
+    /// Channel receiver for committed transactions
+    commit_rx: Option<mpsc::Receiver<CommittedTx>>,
 }
 
 impl CdcClient {
@@ -100,6 +119,9 @@ impl CdcClient {
         let (lsn_tracker, start_lsn) =
             crate::lsn_tracker::create_lsn_tracker_with_load(lsn_file_path).await;
 
+        // Create channel for producer->consumer communication with backpressure
+        let (commit_tx, commit_rx) = mpsc::channel(config.batch_size);
+
         let client = Self {
             config,
             replication_manager: Some(replication_manager),
@@ -109,7 +131,9 @@ impl CdcClient {
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
+            replication_state: Arc::new(TokioMutex::new(ReplicationState::new(commit_tx))),
             transaction_file_manager: Some(Arc::new(manager)),
+            commit_rx: Some(commit_rx),
         };
 
         Ok((client, start_lsn))
@@ -176,74 +200,30 @@ impl CdcClient {
             .clone()
             .ok_or_else(|| CdcError::generic("Transaction file manager not available"))?;
 
-        let (tx_commit_notifier, rx_commit_notifier) =
-            mpsc::channel::<PendingTransactionFile>(self.config.buffer_size);
-        info!(
-            "Created transaction commit notification channel with buffer size {}",
-            self.config.buffer_size
-        );
-
         let shared_lsn_feedback = replication_stream.shared_lsn_feedback().clone();
 
-        if let Some(ref mut handler) = self.destination_handler {
-            info!("Processing pending transaction files from previous run (recovery)...");
-            if let Err(e) = Self::process_pending_transaction_files(
-                &transaction_file_manager,
-                handler,
-                &self.cancellation_token,
-                &self.lsn_tracker,
-                &self.metrics_collector,
-                self.config.batch_size,
-                &shared_lsn_feedback,
-            )
-            .await
-            {
-                error!(
-                    "Failed to process pending transaction files during recovery: {}",
-                    e
-                );
-                return Err(e);
-            }
-        }
-
-        // Start producer (writes to files only)
+        // Start producer
         let producer_handle = {
             let token = self.cancellation_token.clone();
             let metrics = self.metrics_collector.clone();
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
-            let file_mgr = transaction_file_manager.clone();
-            let lsn_feedback = shared_lsn_feedback.clone();
+            let repl_state = self.replication_state.clone();
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
                 token,
                 start_lsn,
                 metrics,
-                file_mgr,
-                lsn_feedback,
-                tx_commit_notifier,
+                repl_state,
             ))
         };
 
-        // Process any pending transactions from previous run before starting consumer
-        info!("Checking for pending transaction files from previous run...");
-        let pending_count = transaction_file_manager
-            .list_pending_transactions()
-            .await?
-            .len();
-        if pending_count > 0 {
-            info!(
-                "Found {} pending transaction files to process before starting consumer",
-                pending_count
-            );
-        }
-
-        // Start consumer (reads from files only)
+        // Start consumer with protocol-compliant logic
         let dest_type = &self.config.destination_type;
         let dest_connection_string = &self.config.destination_connection_string;
         let schema_mappings = self.config.schema_mappings.clone();
 
-        info!("Starting file-based consumer for transaction processing");
+        info!("Starting protocol-compliant consumer with commit_lsn ordering");
 
         // Create destination handler for the consumer
         let mut consumer_destination = DestinationFactory::create(&dest_type)?;
@@ -264,16 +244,21 @@ impl CdcClient {
         let lsn_tracker = self.lsn_tracker.clone();
         let shared_lsn_feedback_for_consumer = shared_lsn_feedback.clone();
 
-        let consumer_handle = tokio::spawn(Self::run_consumer_loop(
-            transaction_file_manager,
+        // Take the receiver from self (it will be moved to the consumer task)
+        let commit_rx = self
+            .commit_rx
+            .take()
+            .ok_or_else(|| CdcError::generic("Commit receiver not available"))?;
+
+        let consumer_handle = tokio::spawn(Self::run_consumer(
+            commit_rx,
             consumer_destination,
             token,
             metrics,
             dest_type_str,
             lsn_tracker,
             shared_lsn_feedback_for_consumer,
-            self.config.batch_size,
-            rx_commit_notifier,
+            transaction_file_manager,
         ));
 
         self.consumer_handle = Some(consumer_handle);
@@ -306,354 +291,186 @@ impl CdcClient {
         });
     }
 
-    /// Helper function to handle transaction commit logic (shared between Commit and StreamCommit)
+    /// Protocol-compliant producer task: reads events and buffers transactions
     ///
-    /// This function encapsulates the common logic for committing a transaction:
-    /// 1. Move transaction file from sql_received_tx/ to sql_pending_tx/
-    /// 2. Update flush_lsn for PostgreSQL feedback
-    /// 3. Read metadata from pending file
-    /// 4. Notify consumer via mpsc channel
-    /// 5. Handle errors with metrics recording
+    /// This producer follows PostgreSQL logical replication protocol strictly:
     ///
-    /// # Arguments
-    /// * `transaction_id` - Transaction ID being committed
-    /// * `timestamp` - Commit timestamp
-    /// * `event_lsn` - LSN of the commit event
-    /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
-    /// * `transaction_file_manager` - File manager for moving transaction files
-    /// * `shared_lsn_feedback` - Shared LSN feedback for PostgreSQL protocol
-    /// * `commit_notifier` - Channel sender for notifying consumer
-    /// * `metrics_collector` - Metrics collector for error recording
-    async fn handle_transaction_commit(
-        transaction_id: u32,
-        timestamp: chrono::DateTime<chrono::Utc>,
-        event_lsn: Option<Lsn>,
-        transaction_type: &str,
-        transaction_file_manager: &Arc<TransactionManager>,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-        commit_notifier: &mpsc::Sender<PendingTransactionFile>,
-        metrics_collector: &Arc<MetricsCollector>,
-    ) -> Result<()> {
-        match transaction_file_manager
-            .commit_transaction(transaction_id, timestamp, event_lsn)
-            .await
-        {
-            Ok(pending_path) => {
-                info!(
-                    "Committed {} transaction file to: {:?}",
-                    transaction_type, pending_path
-                );
-
-                // Update flush_lsn - transaction file is now durably persisted to disk
-                if let Some(lsn) = event_lsn {
-                    shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                    debug!(
-                    "Updated flush LSN to {} for {} transaction {} (file persisted to sql_pending_tx/)",
-                        lsn, transaction_type, transaction_id
-                );
-                }
-
-                // Notify consumer with transaction details for immediate processing
-                match tokio::fs::read_to_string(&pending_path).await {
-                    Ok(content) => {
-                        match serde_json::from_str::<TransactionFileMetadata>(&content) {
-                            Ok(metadata) => {
-                                let notification = PendingTransactionFile {
-                                    file_path: pending_path.clone(),
-                                    metadata,
-                                };
-                                if let Err(e) = commit_notifier.send(notification).await {
-                                    warn!(
-                                    "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
-                                    e
-                                );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse metadata from {:?}: {}", pending_path, e);
-                                metrics_collector.record_error("metadata_parse_failed", "producer");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read metadata from {:?}: {}", pending_path, e);
-                        metrics_collector.record_error("metadata_read_failed", "producer");
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    "Failed to commit {} transaction file for tx {}: {}",
-                    transaction_type, transaction_id, e
-                );
-                metrics_collector.record_error("transaction_file_commit_failed", "producer");
-                Err(e)
-            }
-        }
-    }
-
-    /// File-based producer task: reads events from PostgreSQL replication stream and writes to transaction files
+    /// ## Non-streaming transactions (BEGIN...COMMIT):
+    /// - Only ONE active transaction at a time in current_tx
+    /// - Change events have NO xid
+    /// - Flow: Begin → add to current_tx → Commit → move to commit_queue
     ///
-    /// This producer collects events between BEGIN and COMMIT, writing them to transaction files.
-    /// Files are moved from sql_received_tx/ to sql_pending_tx/ on COMMIT, making them available
-    /// for the consumer to process. The producer notifies the consumer via mpsc channel on each commit,
-    /// sending the exact file path and transaction metadata for immediate processing.
+    /// ## Streaming transactions (StreamStart...StreamCommit):
+    /// - Multiple concurrent transactions in streaming_txs HashMap
+    /// - StreamStart/StreamStop establish context with xid
+    /// - DML events between StreamStart/StreamStop belong to that xid
+    /// - Flow: StreamStart(xid) → add to streaming_txs[xid] → StreamCommit → move to commit_queue
     ///
-    /// ## Transaction Types
-    ///
-    /// - Normal transactions (BEGIN...COMMIT): Single transaction file
-    /// - Streaming transactions (StreamStart...StreamCommit): Large transactions in one file
-    ///
-    /// ## LSN Tracking
-    ///
-    /// The producer updates shared_lsn_feedback with flush_lsn when transaction files are moved to sql_pending_tx/
+    /// ## CRITICAL: NO ACK in Producer
+    /// - Producer NEVER sends ACK to PostgreSQL
+    /// - Only consumer sends ACK AFTER successful apply
+    /// - This prevents data loss on crash/restart
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
-        transaction_file_manager: Arc<TransactionManager>,
-        shared_lsn_feedback: Arc<SharedLsnFeedback>,
-        commit_notifier: mpsc::Sender<PendingTransactionFile>,
+        replication_state: Arc<TokioMutex<ReplicationState>>,
     ) -> Result<()> {
         info!(
-            "Starting replication producer, last time start_lsn: {}",
+            "Starting protocol-compliant replication producer from LSN: {}",
             start_lsn
         );
 
         // Initialize connection status
         metrics_collector.update_source_connection_status(true);
 
-        // RECOVERY: Restore active transaction files from sql_received_tx/
-        let mut active_tx_files = transaction_file_manager
-            .list_received_transactions()
-            .await?;
-
-        info!(
-            "Producer starting with {} active transaction file(s) from sql_received_tx/",
-            active_tx_files.len()
-        );
+        // Track current streaming context (which streaming transaction we're in)
+        let mut current_streaming_xid: Option<u32> = None;
 
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
                 Ok(event) => {
-                    if event.lsn < start_lsn {
-                        debug!(
-                            "Skipping event with LSN {} < {} (already processed)",
-                            event.lsn, start_lsn
-                        );
-                        continue;
-                    }
+                    // if event.lsn < start_lsn {
+                    //     debug!(
+                    //         "Skipping event with LSN {} < {} (already processed)",
+                    //         event.lsn, start_lsn
+                    //     );
+                    //     continue;
+                    // }
 
                     // Record current LSN for metrics
                     metrics_collector.record_received_lsn(event.lsn.0);
                     metrics_collector.record_event(&event);
 
-                    // Handle transaction boundaries
-                    match &event.event_type {
-                        EventType::Begin {
-                            transaction_id,
-                            commit_timestamp,
-                        } => {
-                            // Start a new normal transaction
-                            debug!(
-                                "Starting transaction {} commit_timestamp: {}",
-                                transaction_id, commit_timestamp
-                            );
-                            // Create transaction file
-                            match transaction_file_manager
-                                .begin_transaction(*transaction_id, *commit_timestamp)
-                                .await
-                            {
-                                Ok(file_path) => {
-                                    active_tx_files
-                                        .insert(*transaction_id, (file_path, *commit_timestamp));
+                    // Handle transaction boundaries and buffer changes
+                    {
+                        let mut state = replication_state.lock().await;
+                        match &event.event_type {
+                            EventType::Begin {
+                                transaction_id,
+                                commit_timestamp,
+                            } => {
+                                if let Err(e) =
+                                    state.handle_begin(*transaction_id, *commit_timestamp)
+                                {
+                                    error!("Failed to handle Begin: {}", e);
+                                    metrics_collector.record_error("begin_failed", "producer");
                                 }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to create transaction file for tx {}: {}",
-                                        transaction_id, e
+                            }
+
+                            EventType::Commit { commit_timestamp } => {
+                                if let Err(e) = state.handle_commit(event.lsn, *commit_timestamp) {
+                                    error!("Failed to handle Commit: {}", e);
+                                    metrics_collector.record_error("commit_failed", "producer");
+                                } else {
+                                    debug!(
+                                        "Non-streaming transaction committed at LSN {} (queue size: {})",
+                                        event.lsn,
+                                        state.commit_queue_size()
                                     );
+                                }
+                            }
+
+                            EventType::StreamStart {
+                                transaction_id,
+                                first_segment,
+                            } => {
+                                if let Err(e) =
+                                    state.handle_stream_start(*transaction_id, *first_segment)
+                                {
+                                    error!("Failed to handle StreamStart: {}", e);
                                     metrics_collector
-                                        .record_error("transaction_file_create_failed", "producer");
+                                        .record_error("stream_start_failed", "producer");
+                                } else {
+                                    // Set streaming context
+                                    current_streaming_xid = Some(*transaction_id);
+                                    debug!("Streaming context set to xid {}", transaction_id);
                                 }
                             }
-                        }
 
-                        EventType::Commit { .. } => {
-                            // Complete and commit the normal transaction file
-                            // Determine transaction ID from active files
-                            if let Some(tx_id) = active_tx_files.keys().next().copied() {
-                                info!("Producer: Committing normal transaction {}", tx_id);
+                            EventType::StreamStop => {
+                                debug!("StreamStop received, clearing streaming context");
+                                current_streaming_xid = None;
+                            }
 
-                                // Move transaction file to pending and notify consumer
-                                if let Some((_, timestamp)) = active_tx_files.remove(&tx_id) {
-                                    // Use helper function to handle commit logic
-                                    if let Err(e) = Self::handle_transaction_commit(
-                                        tx_id,
-                                        timestamp,
-                                        Some(event.lsn),
-                                        "normal",
-                                        &transaction_file_manager,
-                                        &shared_lsn_feedback,
-                                        &commit_notifier,
-                                        &metrics_collector,
-                                    )
-                                    .await
+                            EventType::StreamCommit {
+                                transaction_id,
+                                commit_timestamp,
+                            } => {
+                                if let Err(e) = state.handle_stream_commit(
+                                    *transaction_id,
+                                    event.lsn,
+                                    *commit_timestamp,
+                                ) {
+                                    error!("Failed to handle StreamCommit: {}", e);
+                                    metrics_collector
+                                        .record_error("stream_commit_failed", "producer");
+                                } else {
+                                    debug!(
+                                        "Streaming transaction {} committed at LSN {} (queue size: {})",
+                                        transaction_id,
+                                        event.lsn,
+                                        state.commit_queue_size()
+                                    );
+                                }
+                                // Clear streaming context
+                                current_streaming_xid = None;
+                            }
+
+                            EventType::StreamAbort { transaction_id } => {
+                                if let Err(e) = state.handle_stream_abort(*transaction_id) {
+                                    error!("Failed to handle StreamAbort: {}", e);
+                                    metrics_collector
+                                        .record_error("stream_abort_failed", "producer");
+                                }
+                                // Clear streaming context if it's the current one
+                                if current_streaming_xid == Some(*transaction_id) {
+                                    current_streaming_xid = None;
+                                }
+                            }
+
+                            EventType::Insert { .. }
+                            | EventType::Update { .. }
+                            | EventType::Delete { .. }
+                            | EventType::Truncate(_) => {
+                                // Route DML event to correct transaction based on context
+                                if let Some(xid) = current_streaming_xid {
+                                    // Streaming transaction context - add to streaming_txs[xid]
+                                    if let Err(e) =
+                                        state.add_change_to_streaming(xid, event.clone())
                                     {
                                         error!(
-                                            "Failed to handle normal transaction commit for tx {}: {}",
-                                            tx_id, e
+                                            "Failed to add change to streaming transaction {}: {}",
+                                            xid, e
                                         );
-                                    }
-                                }
-                            } else {
-                                warn!("Received COMMIT without active transaction, ignoring");
-                            }
-                        }
-
-                        EventType::StreamStart {
-                            transaction_id,
-                            first_segment,
-                        } => {
-                            debug!(
-                                "StreamStart: transaction_id={}, first_segment={}",
-                                transaction_id, first_segment
-                            );
-
-                            // Create transaction file on first segment
-                            if *first_segment {
-                                let timestamp = chrono::Utc::now();
-                                match transaction_file_manager
-                                    .begin_transaction(*transaction_id, timestamp)
-                                    .await
-                                {
-                                    Ok(file_path) => {
-                                        debug!(
-                                            "Created streaming transaction file: {:?}",
-                                            file_path
-                                        );
-                                        active_tx_files
-                                            .insert(*transaction_id, (file_path, timestamp));
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to create streaming transaction file for tx {}: {}", transaction_id, e);
                                         metrics_collector.record_error(
-                                            "transaction_file_create_failed",
+                                            "add_streaming_change_failed",
                                             "producer",
                                         );
                                     }
-                                }
-                            }
-                        }
-
-                        EventType::StreamStop => {
-                            // StreamStop marks the end of a segment in streaming transactions
-                            debug!("Producer: StreamStop for streaming transaction");
-                        }
-
-                        EventType::StreamCommit {
-                            transaction_id,
-                            commit_timestamp: _,
-                        } => {
-                            info!("Producer: StreamCommit for transaction {}", transaction_id);
-
-                            // Move streaming transaction file to pending and notify consumer
-                            if let Some((_, timestamp)) = active_tx_files.remove(transaction_id) {
-                                // Use helper function to handle commit logic
-                                if let Err(e) = Self::handle_transaction_commit(
-                                    *transaction_id,
-                                    timestamp,
-                                    Some(event.lsn),
-                                    "streaming",
-                                    &transaction_file_manager,
-                                    &shared_lsn_feedback,
-                                    &commit_notifier,
-                                    &metrics_collector,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Failed to handle streaming transaction commit for tx {}: {}",
-                                        transaction_id, e
+                                } else if state.has_current_tx() {
+                                    // Non-streaming transaction context - add to current_tx
+                                    if let Err(e) = state.add_change_to_current(event.clone()) {
+                                        error!(
+                                            "Failed to add change to current transaction: {}",
+                                            e
+                                        );
+                                        metrics_collector
+                                            .record_error("add_change_failed", "producer");
+                                    }
+                                } else {
+                                    warn!(
+                                        "Received DML event outside transaction context: {:?}",
+                                        event.event_type
                                     );
                                 }
                             }
-                        }
 
-                        EventType::StreamAbort { transaction_id } => {
-                            debug!("StreamAbort: transaction_id={}", transaction_id);
-
-                            // Delete transaction file
-                            if let Some((_, timestamp)) = active_tx_files.remove(transaction_id) {
-                                match transaction_file_manager
-                                    .abort_transaction(*transaction_id, timestamp)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        debug!(
-                                            "Aborted transaction file for tx {}",
-                                            transaction_id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to abort transaction file for tx {}: {}",
-                                            transaction_id, e
-                                        );
-                                        metrics_collector.record_error(
-                                            "transaction_file_abort_failed",
-                                            "producer",
-                                        );
-                                    }
-                                }
+                            // Skip metadata events
+                            _ => {
+                                debug!("Skipping metadata event: {:?}", event.event_type);
                             }
-                        }
-
-                        EventType::Insert { .. }
-                        | EventType::Update { .. }
-                        | EventType::Delete { .. }
-                        | EventType::Truncate(_) => {
-                            // Append event to transaction file
-                            // Transaction ID is determined from active files
-                            // In normal cases, there should be exactly one active transaction
-                            let tx_id = if active_tx_files.len() == 1 {
-                                active_tx_files.keys().next().copied()
-                            } else if active_tx_files.is_empty() {
-                                warn!(
-                                    "Received DML event outside of transaction context: {event:?}"
-                                );
-                                None
-                            } else {
-                                // Multiple active transactions - find the right one
-                                // This shouldn't happen in normal operation but handle it gracefully
-                                warn!(
-                                    "Multiple active transactions ({}), using first one for DML event",
-                                    active_tx_files.len()
-                                );
-                                active_tx_files.keys().next().copied()
-                            };
-
-                            if let Some(tx_id) = tx_id {
-                                if let Some((file_path, _)) = active_tx_files.get(&tx_id) {
-                                    if let Err(e) = transaction_file_manager
-                                        .append_event(file_path, &event)
-                                        .await
-                                    {
-                                        error!("Failed to append event to transaction file for tx {}: {}", tx_id, e);
-                                        metrics_collector.record_error(
-                                            "transaction_file_append_failed",
-                                            "producer",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Skip metadata events (Relation, Type, Origin, Message)
-                        _ => {
-                            debug!("Skipping metadata event: {:?}", event.event_type);
                         }
                     }
                 }
@@ -665,23 +482,19 @@ impl CdcClient {
             }
         }
 
-        info!("File-based producer shutting down");
+        info!("Producer shutting down");
 
-        if let Err(e) = transaction_file_manager.flush_all_buffers().await {
-            error!("Failed to flush buffers during shutdown: {}", e);
-            metrics_collector.record_error("buffer_flush_failed", "producer");
-        } else {
-            info!("Successfully flushed all buffers");
-        }
-
-        // Note: Producer state is fully tracked in sql_received_tx/ metadata files
-        // No need to persist producer context to pg2any.metadata
-        // Active transactions will be recovered from sql_received_tx/ on restart
-        if !active_tx_files.is_empty() {
-            info!(
-                "Producer shutdown with {} incomplete transaction(s) in sql_received_tx/ (will be recovered on restart)",
-                active_tx_files.len()
-            );
+        // Log incomplete transactions (will be resent by PostgreSQL on restart)
+        {
+            let state = replication_state.lock().await;
+            let (current_tx_count, streaming_tx_count) = state.incomplete_transactions();
+            if current_tx_count > 0 || streaming_tx_count > 0 {
+                info!(
+                    "Producer shutdown with {} non-streaming + {} streaming incomplete transactions (PostgreSQL will resend on restart)",
+                    current_tx_count, streaming_tx_count
+                );
+            }
+            info!("Replication state at shutdown: {}", state.stats());
         }
 
         // Update connection status on shutdown
@@ -690,122 +503,42 @@ impl CdcClient {
         // Gracefully stop the replication stream
         replication_stream.stop().await?;
 
-        info!("File-based replication producer stopped gracefully");
+        info!("Protocol-compliant producer stopped gracefully");
         Ok(())
     }
 
-    /// Process pending transaction files on startup (recovery)
+    /// Protocol-compliant consumer: pops from commit_queue, applies in commit_lsn order, then ACKs
     ///
-    /// This function processes all committed transaction files from sql_pending_tx/
-    /// in commit timestamp order before starting normal replication processing.
+    /// This consumer follows PostgreSQL logical replication protocol strictly:
     ///
-    /// This method now respects cancellation token for graceful shutdown during recovery.
+    /// ## Apply Flow (CRITICAL ORDER):
+    /// 1. Pop transaction with smallest commit_lsn from commit_queue
+    /// 2. Generate SQL for all changes in transaction
+    /// 3. Apply transaction atomically to destination
+    /// 4. Update confirmed_flush_lsn = transaction.commit_lsn
+    /// 5. Send ACK to PostgreSQL via SharedLsnFeedback
+    /// 6. Persist confirmed_flush_lsn to disk
     ///
-    async fn process_pending_transaction_files(
-        file_mgr: &TransactionManager,
-        destination: &mut Box<dyn DestinationHandler>,
-        cancellation_token: &CancellationToken,
-        lsn_tracker: &Arc<LsnTracker>,
-        metrics_collector: &Arc<MetricsCollector>,
-        batch_size: usize,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-    ) -> Result<()> {
-        info!("Checking for pending transaction files from previous run...");
-
-        let pending_txs = file_mgr.list_pending_transactions().await?;
-
-        if pending_txs.is_empty() {
-            info!("No pending transaction files found");
-            return Ok(());
-        }
-
-        let total_count = pending_txs.len();
-        info!(
-            "Found {} pending transaction file(s) to process",
-            total_count
-        );
-
-        for (idx, pending_tx) in pending_txs.iter().enumerate() {
-            // Check for cancellation before processing each file
-            if cancellation_token.is_cancelled() {
-                info!(
-                    "Cancellation detected during recovery, processed {} of {} files",
-                    idx, total_count
-                );
-                return Err(CdcError::cancelled("Recovery cancelled by shutdown signal"));
-            }
-
-            info!(
-                "Processing pending transaction file {} of {}: {} (tx_id: {}, lsn: {:?})",
-                idx + 1,
-                total_count,
-                pending_tx.file_path.display(),
-                pending_tx.metadata.transaction_id,
-                pending_tx.metadata.commit_lsn
-            );
-
-            // Call the core processing logic directly
-            if let Err(e) = Self::process_transaction_file(
-                pending_tx,
-                file_mgr,
-                destination,
-                cancellation_token,
-                lsn_tracker,
-                metrics_collector,
-                batch_size,
-                shared_lsn_feedback,
-            )
-            .await
-            {
-                error!(
-                    "Failed to process pending transaction file {}: {}",
-                    pending_tx.file_path.display(),
-                    e
-                );
-                metrics_collector.record_error("transaction_file_execution_failed", "consumer");
-                return Err(e);
-            }
-        }
-
-        info!(
-            "Successfully processed all {} pending transaction file(s)",
-            total_count
-        );
-        Ok(())
-    }
-
-    /// Consumer loop for file-based transaction processing
+    /// ## Graceful Shutdown:
+    /// - Process ALL transactions in commit_queue
+    /// - DO NOT wait for new commits
+    /// - Persist final confirmed_flush_lsn
+    /// - Incomplete transactions (in current_tx/streaming_txs) are NOT applied
     ///
-    /// The consumer waits for notifications from the producer via mpsc channel.
-    /// Each notification contains the exact transaction file path and metadata,
-    /// allowing the consumer to process transactions in the precise order they were committed
-    /// without needing to scan the directory.
-    ///
-    /// LSN tracking: After each successful transaction file execution,
-    /// the flush_lsn is updated and persisted to ensure graceful shutdown doesn't lose data.
-    ///
-    /// # Arguments
-    /// * `transaction_file_manager` - File manager for reading pending transaction files
-    /// * `destination_handler` - Destination handler for executing SQL
-    /// * `cancellation_token` - Token for graceful shutdown
-    /// * `metrics_collector` - Metrics collector
-    /// * `destination_type` - Type of destination for metrics labeling
-    /// * `lsn_tracker` - Optional LSN tracker for persisting committed LSN
-    /// * `shared_lsn_feedback` - Shared feedback for updating applied LSN for replication protocol
-    /// * `batch_size` - Batch size for SQL log truncation control
-    /// * `mut commit_receiver` - Channel receiver for transaction commit notifications with file details
-    async fn run_consumer_loop(
-        transaction_file_manager: Arc<TransactionManager>,
+    /// ## CRITICAL: ACK Only After Apply
+    /// - Never ACK before transaction is committed to destination
+    /// - This ensures exactly-once at the consumer boundary
+    async fn run_consumer(
+        mut commit_rx: mpsc::Receiver<CommittedTx>,
         mut destination_handler: Box<dyn DestinationHandler>,
         cancellation_token: CancellationToken,
         metrics_collector: Arc<MetricsCollector>,
         destination_type: String,
         lsn_tracker: Arc<LsnTracker>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
-        batch_size: usize,
-        mut commit_receiver: mpsc::Receiver<PendingTransactionFile>,
+        transaction_file_manager: Arc<TransactionManager>,
     ) -> Result<()> {
-        info!("Starting file-based consumer loop for transaction processing");
+        info!("Starting protocol-compliant consumer with commit_lsn ordering and channel-based communication");
 
         // Update destination connection status
         metrics_collector.update_destination_connection_status(&destination_type, true);
@@ -817,79 +550,83 @@ impl CdcClient {
                 // Handle graceful shutdown
                 _ = cancellation_token.cancelled() => {
                     info!("Consumer received cancellation signal");
-
-                    // Process any remaining pending transaction files before shutdown
-                    Self::drain_remaining_files(
-                        &transaction_file_manager,
-                        &mut destination_handler,
-                        &metrics_collector,
-                        &lsn_tracker,
-                        batch_size,
-                        &cancellation_token,
-                        &shared_lsn_feedback,
-                    ).await;
-
-                    // Log final LSN state
-                    shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                     break;
                 }
 
-                // Wait for transaction commit notification from producer
-                result = commit_receiver.recv() => {
-                    match result {
-                        Some(notification) => {
-                            // Received notification with exact transaction details
-                            debug!(
-                                "Consumer received commit notification for transaction {} with file {:?}",
-                                notification.metadata.transaction_id, notification.file_path
-                            );
+                // Receive committed transaction from channel
+                Some(committed_tx) = commit_rx.recv() => {
+                    let tx_buffer = committed_tx.tx_buffer;
+                    let commit_lsn = committed_tx.commit_lsn;
 
-                            // Check for cancellation before processing
-                            if cancellation_token.is_cancelled() {
-                                debug!("Consumer: Cancellation detected, not processing transaction {}", notification.metadata.transaction_id);
-                                break;
-                            }
+                    info!(
+                        "Consumer processing transaction {} with {} changes at commit_lsn {} ({})",
+                        tx_buffer.xid,
+                        tx_buffer.change_count(),
+                        commit_lsn,
+                        if tx_buffer.is_streaming { "streaming" } else { "normal" }
+                    );
 
-                            // Process the transaction directly from notification (already a PendingTransactionFile)
-                            if let Err(e) = Self::process_transaction_file(
-                                &notification,
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &cancellation_token,
-                                &lsn_tracker,
-                                &metrics_collector,
-                                batch_size,
-                                &shared_lsn_feedback,
-                            ).await {
-                                error!(
-                                    "Failed to process transaction {} from file {:?}: {}",
-                                    notification.metadata.transaction_id, notification.file_path, e
-                                );
-                                metrics_collector.record_error("transaction_file_processing_failed", "consumer");
-                                // Continue to next transaction rather than failing completely
-                            }
-                        }
-                        None => {
-                            // Channel closed - producer has stopped
-                            info!("Consumer: Commit notification channel closed, producer has stopped");
-
-                            // Process any remaining files before exiting
-                            Self::drain_remaining_files(
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &metrics_collector,
-                                &lsn_tracker,
-                                batch_size,
-                                &cancellation_token,
-                                &shared_lsn_feedback,
-                            ).await;
-
-                            break;
-                        }
+                    // Apply transaction
+                    if let Err(e) = Self::apply_transaction(
+                        &tx_buffer,
+                        commit_lsn,
+                        &mut destination_handler,
+                        &metrics_collector,
+                        &destination_type,
+                        &lsn_tracker,
+                        &shared_lsn_feedback,
+                        &transaction_file_manager,
+                    ).await {
+                        error!("Failed to apply transaction {}: {}", tx_buffer.xid, e);
+                        metrics_collector.record_error("transaction_apply_failed", "consumer");
+                        // On error, we DON'T ACK and will retry from last confirmed_flush_lsn on restart
+                        return Err(e);
                     }
+
+                    info!(
+                        "Successfully applied and ACKed transaction {} at commit_lsn {}",
+                        tx_buffer.xid, commit_lsn
+                    );
                 }
             }
         }
+
+        // Graceful shutdown: drain remaining committed transactions from channel
+        info!("Consumer draining remaining transactions from channel");
+        let mut drained_count = 0;
+
+        while let Ok(committed_tx) = commit_rx.try_recv() {
+            let tx_buffer = committed_tx.tx_buffer;
+            let commit_lsn = committed_tx.commit_lsn;
+
+            info!(
+                "Draining transaction {} at commit_lsn {}",
+                tx_buffer.xid, commit_lsn
+            );
+
+            if let Err(e) = Self::apply_transaction(
+                &tx_buffer,
+                commit_lsn,
+                &mut destination_handler,
+                &metrics_collector,
+                &destination_type,
+                &lsn_tracker,
+                &shared_lsn_feedback,
+                &transaction_file_manager,
+            )
+            .await
+            {
+                error!("Failed to drain transaction {}: {}", tx_buffer.xid, e);
+                break;
+            }
+
+            drained_count += 1;
+        }
+
+        info!(
+            "Consumer drained {} transactions during shutdown",
+            drained_count
+        );
 
         // Close the destination connection
         if let Err(e) = destination_handler.close().await {
@@ -898,344 +635,122 @@ impl CdcClient {
 
         metrics_collector.update_destination_connection_status(&destination_type, false);
 
-        info!("Consumer stopped gracefully");
+        info!("Protocol-compliant consumer stopped gracefully");
         Ok(())
     }
 
-    /// Drain any remaining transaction files from sql_pending_tx/ during shutdown
-    async fn drain_remaining_files(
-        transaction_file_manager: &TransactionManager,
+    /// Apply a single transaction to the destination
+    /// CRITICAL: Only ACKs after successful apply
+    async fn apply_transaction(
+        tx_buffer: &TxBuffer,
+        commit_lsn: Lsn,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
+        destination_type: &str,
         lsn_tracker: &Arc<LsnTracker>,
-        batch_size: usize,
-        cancellation_token: &CancellationToken,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-    ) {
-        // Get all pending files
-        match transaction_file_manager.list_pending_transactions().await {
-            Ok(pending_files) => {
-                info!(
-                    "Consumer: Draining {} remaining transaction files during shutdown",
-                    pending_files.len()
-                );
-                for pending_tx in pending_files {
-                    // Check for cancellation before processing each file during drain
-                    if cancellation_token.is_cancelled() {
-                        break;
-                    }
-
-                    debug!(
-                        "Consumer: Processing remaining file {:?} during shutdown (tx_id: {})",
-                        pending_tx.file_path, pending_tx.metadata.transaction_id
-                    );
-
-                    match Self::process_transaction_file(
-                        &pending_tx,
-                        transaction_file_manager,
-                        destination_handler,
-                        cancellation_token,
-                        lsn_tracker,
-                        metrics_collector,
-                        batch_size,
-                        shared_lsn_feedback,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            error!(
-                                "Failed to process remaining file {:?}: {}",
-                                pending_tx.file_path, e
-                            );
-                        }
-                    };
-                }
-            }
-            Err(e) => {
-                error!("Failed to list remaining files during shutdown: {}", e);
-            }
-        }
-    }
-
-    /// Process a single transaction file
-    /// Reads SQL commands from the file, executes them via the destination handler in batches,
-    /// updates LSN tracking, and deletes the file upon success.
-    /// This method supports resumable processing: it tracks the position after each batch
-    /// and can resume from where it left off if interrupted.
-    ///
-    /// Checks cancellation token between batches to support graceful shutdown.
-    async fn process_transaction_file(
-        pending_tx: &PendingTransactionFile,
-        file_manager: &TransactionManager,
-        destination_handler: &mut Box<dyn DestinationHandler>,
-        cancellation_token: &CancellationToken,
-        lsn_tracker: &Arc<LsnTracker>,
-        metrics_collector: &Arc<MetricsCollector>,
-        batch_size: usize,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        transaction_file_manager: &Arc<TransactionManager>,
     ) -> Result<()> {
         let start_time = Instant::now();
-        let tx_id = pending_tx.metadata.transaction_id;
-        let file_path_str = pending_tx.file_path.to_string_lossy().to_string();
+        let xid = tx_buffer.xid;
+        let change_count = tx_buffer.change_count();
 
-        // Check if we're resuming from a saved position for THIS specific file
-        let start_index =
-            if let Some((saved_file_path, saved_start_index)) = lsn_tracker.get_resume_position() {
-                // Only use the saved index if it's for the current file
-                if saved_file_path == file_path_str {
-                    saved_start_index
-                } else {
-                    info!(
-                    "Saved position is for different file ('{}' vs '{}'). Starting from index 0",
-                    saved_file_path, file_path_str
-                );
-                    0
+        // Generate SQL for all changes
+        let mut sql_commands = Vec::with_capacity(change_count);
+        for change in &tx_buffer.changes {
+            match transaction_file_manager.generate_sql_for_event(change) {
+                Ok(sql) => {
+                    if !sql.is_empty() {
+                        sql_commands.push(sql);
+                    }
                 }
-            } else {
-                info!("No saved consumer position found, starting from index 0");
-                0
-            };
-
-        info!(
-            "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
-            pending_tx.file_path.display(),
-            tx_id,
-            pending_tx.metadata.commit_lsn,
-            start_index
-        );
-
-        // Read SQL commands from file starting from the saved position
-        let commands = file_manager
-            .read_sql_commands_from_index(&pending_tx.file_path, start_index)
-            .await?;
-        let command_count = commands.len();
-        let total_commands = start_index + command_count;
-
-        if command_count == 0 {
-            info!(
-                "All commands already executed for transaction file: {} (tx_id: {})",
-                pending_tx.file_path.display(),
-                tx_id
-            );
-
-            // Update LSN and delete file
-            Self::finalize_transaction_file(
-                pending_tx,
-                file_manager,
-                lsn_tracker,
-                metrics_collector,
-                total_commands,
-                shared_lsn_feedback,
-            )
-            .await?;
-
-            return Ok(());
+                Err(e) => {
+                    error!(
+                        "Failed to generate SQL for event in transaction {}: {}",
+                        xid, e
+                    );
+                    return Err(e);
+                }
+            }
         }
 
-        info!(
-            "Executing {} remaining SQL command(s) from file in batches of {} (total: {}, skipped: {})",
-            command_count, batch_size, total_commands, start_index
+        debug!(
+            "Generated {} SQL commands from {} changes for transaction {}",
+            sql_commands.len(),
+            change_count,
+            xid
         );
 
-        // Execute commands in batches within transactions for better performance
-        let mut batch_count = 0;
-        let mut current_command_index = start_index;
+        // CRITICAL: Update LSN BEFORE commit to ensure atomicity
+        // The pre_commit_hook executes within the destination transaction,
+        // ensuring LSN is updated only if the transaction commits successfully
+        let lsn_tracker_clone = lsn_tracker.clone();
+        let shared_lsn_feedback_clone = shared_lsn_feedback.clone();
+        let lsn_value = commit_lsn.0;
+        let xid_for_hook = xid;
+        let commit_lsn_for_hook = commit_lsn;
 
-        for (batch_idx, chunk) in commands.chunks(batch_size).enumerate() {
-            // Check for cancellation before processing each batch
-            if cancellation_token.is_cancelled() {
-                info!(
-                    "Cancellation detected during transaction file processing at batch {}/{}",
-                    batch_idx,
-                    (command_count + batch_size - 1) / batch_size
+        let pre_commit_hook = Box::new(move || {
+            Box::pin(async move {
+                lsn_tracker_clone.commit_lsn(lsn_value);
+                shared_lsn_feedback_clone.update_flushed_lsn(lsn_value);
+                debug!(
+                    "Pre-commit hook: Updated confirmed_flush_lsn to {} for transaction {}",
+                    commit_lsn_for_hook, xid_for_hook
                 );
-
-                warn!(
-                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                    tx_id
-                );
-
-                return Ok(());
-            }
-
-            // CRITICAL: Transactional checkpoint update for atomicity
-            // The pre-commit hook executes WITHIN the database transaction, BEFORE COMMIT.
-            // This provides true atomicity:
-            //
-            // Timeline:
-            //   BEGIN;
-            //     INSERT INTO users ...;       ← Execute batch commands
-            //     UPDATE products ...;
-            //
-            //     [pre_commit_hook()]          ← Update checkpoint (in-memory)
-            //   COMMIT;                        ← Both data and checkpoint committed atomically
-            //
-            // If crash/rollback occurs:
-            //   - Before COMMIT: Both data and checkpoint rolled back → Safe, resume from old position
-            //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
-            //   - No race condition possible!
-            let next_command_index = current_command_index + chunk.len();
-            let tracker_clone = lsn_tracker.clone();
-            let file_path_clone = file_path_str.clone();
-            let last_executed_index = next_command_index - 1;
-
-            let pre_commit_hook = Some(Box::new(move || {
-                Box::pin(async move {
-                    tracker_clone.update_consumer_position(file_path_clone, last_executed_index);
-                    Ok(())
-                }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>
+                Ok(())
             })
-                as Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>);
+                as Pin<
+                    Box<
+                        dyn std::future::Future<Output = std::result::Result<(), CdcError>>
+                            + Send
+                            + 'static,
+                    >,
+                >
+        });
 
-            let batch_start_time = Instant::now();
-            debug!(
-                "Executing batch {}/{} with {} commands (tx_id: {}, global indices: {}-{})",
-                batch_idx + 1,
-                (command_count + batch_size - 1) / batch_size,
-                chunk.len(),
-                tx_id,
-                current_command_index,
-                next_command_index - 1
+        // Apply SQL commands atomically to destination with pre-commit LSN update
+        if let Err(e) = destination_handler
+            .execute_sql_batch_with_hook(&sql_commands, Some(pre_commit_hook))
+            .await
+        {
+            error!(
+                "Failed to execute transaction {} with {} commands: {}",
+                xid,
+                sql_commands.len(),
+                e
             );
-
-            // Execute the batch with transactional checkpoint hook
-            if let Err(e) = destination_handler
-                .execute_sql_batch_with_hook(chunk, pre_commit_hook)
-                .await
-            {
-                error!(
-                    "Failed to execute SQL batch {} from file {}: {}",
-                    batch_idx + 1,
-                    pending_tx.file_path.display(),
-                    e
-                );
-                metrics_collector.record_error("transaction_file_execution_failed", "consumer");
-
-                info!(
-                    "Batch and checkpoint rolled back together, will retry from last committed position on restart"
-                );
-
-                return Err(e);
-            }
-
-            // Update current position after successful batch
-            current_command_index = next_command_index;
-
-            let batch_duration = batch_start_time.elapsed();
-            debug!(
-                "Successfully executed batch {}/{} with {} commands in {:?}",
-                batch_idx + 1,
-                (command_count + batch_size - 1) / batch_size,
-                chunk.len(),
-                batch_duration
-            );
-            batch_count += 1;
+            metrics_collector.record_error("sql_execution_failed", "consumer");
+            return Err(e);
         }
 
         let duration = start_time.elapsed();
         info!(
-            "Successfully executed all {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
-            command_count,
-            total_commands,
-            batch_count,
-            duration,
-            tx_id,
-            duration / batch_count.max(1) as u32
+            "Applied transaction {} with {} commands in {:?}",
+            xid,
+            sql_commands.len(),
+            duration
         );
-
-        // Finalize: update LSN, record metrics, delete file
-        Self::finalize_transaction_file(
-            pending_tx,
-            file_manager,
-            lsn_tracker,
-            metrics_collector,
-            total_commands,
-            shared_lsn_feedback,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Core logic for finalizing transaction file processing
-    async fn finalize_transaction_file(
-        pending_tx: &PendingTransactionFile,
-        file_manager: &TransactionManager,
-        lsn_tracker: &Arc<LsnTracker>,
-        metrics_collector: &Arc<MetricsCollector>,
-        total_commands: usize,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-    ) -> Result<()> {
-        let tx_id = pending_tx.metadata.transaction_id;
-
-        // Update LSN tracking (both lsn_tracker and shared_lsn_feedback)
-        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            debug!("Transaction {} commit LSN: {}", tx_id, commit_lsn);
-
-            // Update flush LSN (last committed to destination)
-            lsn_tracker.commit_lsn(commit_lsn.0);
-
-            // Update shared LSN feedback for PostgreSQL replication protocol
-            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
-        }
-
-        // Record metrics - create a transaction object for metrics recording
-        let destination_type_str = pending_tx.metadata.destination_type.to_string();
-
-        // Create a transaction object for metrics (events are already executed, so we use empty vec)
-        // The event_count is derived from the number of SQL commands executed
-        let mut transaction = crate::types::Transaction::new(
-            pending_tx.metadata.transaction_id,
-            pending_tx.metadata.commit_timestamp,
-        );
-        transaction.commit_lsn = pending_tx.metadata.commit_lsn;
-
-        // Record transaction processed metrics
-        metrics_collector.record_transaction_processed(&transaction, &destination_type_str);
-
-        // Since file-based processing always processes complete transactions,
-        // we also record this as a full transaction
-        metrics_collector.record_full_transaction_processed(&transaction, &destination_type_str);
 
         debug!(
-            "Successfully processed transaction file with {} commands and recorded metrics",
-            total_commands
+            "Transaction {} committed with LSN {} updated atomically",
+            xid, commit_lsn
         );
 
-        // Delete the file after successful processing
-        if let Err(e) = file_manager
-            .delete_pending_transaction(&pending_tx.file_path)
-            .await
-        {
-            error!(
-                "Failed to delete processed transaction file {}: {}",
-                pending_tx.file_path.display(),
-                e
-            );
+        // Record metrics
+        let mut transaction = crate::types::Transaction::new(
+            xid,
+            tx_buffer
+                .commit_timestamp
+                .unwrap_or_else(|| chrono::Utc::now()),
+        );
+        transaction.commit_lsn = Some(commit_lsn);
+        for change in &tx_buffer.changes {
+            transaction.add_event(change.clone());
         }
 
-        if pending_tx.metadata.commit_lsn.is_some() {
-            let pending_count = file_manager.list_pending_transactions().await?.len();
-            lsn_tracker.update_consumer_state(
-                tx_id,
-                pending_tx.metadata.commit_timestamp,
-                pending_count,
-            );
-
-            debug!(
-                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
-                tx_id, pending_count
-            );
-
-            // Clear consumer position since file is fully processed and persist immediately
-            if let Err(e) = lsn_tracker
-                .clear_consumer_position_and_persist_immediately()
-                .await
-            {
-                warn!("Failed to clear and persist consumer position: {}", e);
-            }
-        }
+        metrics_collector.record_transaction_processed(&transaction, destination_type);
+        metrics_collector.record_full_transaction_processed(&transaction, destination_type);
 
         Ok(())
     }

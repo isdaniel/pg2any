@@ -484,14 +484,6 @@ impl CdcClient {
         while !cancellation_token.is_cancelled() {
             match replication_stream.next_event(&cancellation_token).await {
                 Ok(event) => {
-                    if event.lsn < start_lsn {
-                        debug!(
-                            "Skipping event with LSN {} < {} (already processed)",
-                            event.lsn, start_lsn
-                        );
-                        continue;
-                    }
-
                     // Record current LSN for metrics
                     metrics_collector.record_received_lsn(event.lsn.0);
                     metrics_collector.record_event(&event);

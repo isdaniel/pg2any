@@ -49,16 +49,18 @@ use tracing::{debug, error, info, warn};
 /// - Persisted to disk periodically for graceful shutdown support
 pub struct CdcClient {
     config: Config,
-    replication_manager: Option<ReplicationManager>,
     destination_handler: Option<Box<dyn DestinationHandler>>,
     cancellation_token: CancellationToken,
-    producer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    producer_handle: Option<tokio::task::JoinHandle<Result<ReplicationStream>>>,
     consumer_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     metrics_collector: Arc<MetricsCollector>,
     /// LSN tracker for tracking last committed LSN to destination (for file persistence)
     lsn_tracker: Arc<LsnTracker>,
     /// Transaction file manager for file-based workflow
     transaction_file_manager: Option<Arc<TransactionManager>>,
+    /// Replication stream - created during construction, moved to producer during start,
+    /// returned after tasks complete for final ACK
+    replication_stream: Option<ReplicationStream>,
 }
 
 impl CdcClient {
@@ -84,7 +86,10 @@ impl CdcClient {
         // Create destination handler
         let destination_handler = DestinationFactory::create(&config.destination_type)?;
 
+        // Create replication manager and stream
+        info!("Creating replication stream");
         let replication_manager = ReplicationManager::new(config.clone());
+        let replication_stream = replication_manager.create_stream_async().await?;
 
         // Create transaction file manager (always enabled for data safety)
         info!(
@@ -105,7 +110,6 @@ impl CdcClient {
 
         let client = Self {
             config,
-            replication_manager: Some(replication_manager),
             destination_handler: Some(destination_handler),
             cancellation_token: CancellationToken::new(),
             producer_handle: None,
@@ -113,6 +117,7 @@ impl CdcClient {
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
             transaction_file_manager: Some(Arc::new(manager)),
+            replication_stream: Some(replication_stream),
         };
 
         Ok((client, start_lsn))
@@ -147,13 +152,11 @@ impl CdcClient {
         self.init().await?;
         info!("CDC client initialized successfully");
 
-        // Create replication stream using async method
-        let replication_manager = self
-            .replication_manager
+        // Take the replication stream that was created in new()
+        let mut replication_stream = self
+            .replication_stream
             .take()
-            .ok_or_else(|| CdcError::generic("Replication manager not available"))?;
-
-        let mut replication_stream = replication_manager.create_stream_async().await?;
+            .ok_or_else(|| CdcError::generic("Replication stream not available"))?;
 
         // Start the replication stream
         replication_stream.start(start_lsn).await?;
@@ -406,6 +409,7 @@ impl CdcClient {
     /// - Moves transaction files to sql_pending_tx/ on commit
     /// - Updates flush_lsn when transaction file is persisted (data flushed to durable storage)
     /// - Maintains separate tracking for non-streaming (single active) and streaming (multiple active by xid)
+    /// - Waits for consumer completion signal before sending final ACK to PostgreSQL
     ///
     /// This producer collects events between BEGIN and COMMIT, writing them to transaction files.
     /// Files are moved from sql_received_tx/ to sql_pending_tx/ on COMMIT, making them available
@@ -421,6 +425,13 @@ impl CdcClient {
     ///
     /// The producer updates flush_lsn when transaction file is persisted to disk (durable storage).
     /// The consumer updates apply_lsn when transaction is applied to destination database.
+    ///
+    /// ## Shutdown Coordination
+    ///
+    /// During graceful shutdown, the producer returns the ReplicationStream to the main thread,
+    /// which then calls stop() AFTER both producer and consumer tasks complete. This ensures
+    /// the final ACK to PostgreSQL includes all transactions processed by the consumer,
+    /// preventing re-download of already applied transactions on restart.
     async fn run_producer(
         mut replication_stream: ReplicationStream,
         cancellation_token: CancellationToken,
@@ -429,7 +440,7 @@ impl CdcClient {
         transaction_file_manager: Arc<TransactionManager>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
-    ) -> Result<()> {
+    ) -> Result<ReplicationStream> {
         info!(
             "Starting replication producer, last time start_lsn: {}",
             start_lsn
@@ -501,6 +512,10 @@ impl CdcClient {
                             );
 
                             if current_normal_tx.is_some() {
+                                // This can happen during recovery if PostgreSQL re-sends transactions
+                                // that were already received but not ACKed (due to improper shutdown).
+                                // The fix: Producer now waits for consumer completion before sending
+                                // final ACK, ensuring all applied transactions are confirmed.
                                 warn!("BEGIN received while normal transaction already active - replacing");
                             }
 
@@ -765,11 +780,8 @@ impl CdcClient {
         // Update connection status on shutdown
         metrics_collector.update_source_connection_status(false);
 
-        // Gracefully stop the replication stream
-        replication_stream.stop().await?;
-
-        info!("File-based replication producer stopped gracefully");
-        Ok(())
+        info!("Returning replication stream to main thread for final ACK after consumer completes");
+        Ok(replication_stream)
     }
 
     /// Process pending transaction files on startup (recovery)
@@ -1395,7 +1407,21 @@ impl CdcClient {
         self.cancellation_token.cancel();
 
         // Wait for both tasks to complete gracefully
+        // This retrieves the ReplicationStream from the producer
         self.wait_for_tasks_completion().await?;
+
+        // CRITICAL: Send final ACK to PostgreSQL AFTER both tasks complete
+        // This ensures the ACK includes all transactions successfully applied by the consumer
+        if let Some(mut stream) = self.replication_stream.take() {
+            info!("Sending final ACK to PostgreSQL with latest apply_lsn");
+            stream
+                .shared_lsn_feedback()
+                .log_state("Final shutdown - LSN state before ACK");
+            stream.stop().await?;
+            info!("Final ACK sent successfully");
+        } else {
+            warn!("No replication stream available for final ACK");
+        }
 
         // Close destination connection
         if let Some(ref mut handler) = self.destination_handler {
@@ -1422,25 +1448,41 @@ impl CdcClient {
         Ok(())
     }
 
-    async fn wait_handle(handle: Option<JoinHandle<Result<()>>>, name: &str) -> Result<()> {
+    async fn wait_producer_handle(
+        handle: Option<JoinHandle<Result<ReplicationStream>>>,
+    ) -> Result<Option<ReplicationStream>> {
         if let Some(h) = handle {
-            h.await.expect(&format!("{} task panicked", name))?;
-            info!("{} task completed successfully", name);
+            let stream = h.await.expect("Producer task panicked")?;
+            info!("Producer task completed successfully");
+            Ok(Some(stream))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn wait_consumer_handle(handle: Option<JoinHandle<Result<()>>>) -> Result<()> {
+        if let Some(h) = handle {
+            h.await.expect("Consumer task panicked")?;
+            info!("Consumer task completed successfully");
         }
         Ok(())
     }
 
     /// Wait for producer and consumer tasks to complete gracefully
+    /// Returns the ReplicationStream from the producer for final ACK sending
     pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
-        let producer_task = Self::wait_handle(self.producer_handle.take(), "Producer");
-        let consumer_task = Self::wait_handle(self.consumer_handle.take(), "Consumer");
+        let producer_task = Self::wait_producer_handle(self.producer_handle.take());
+        let consumer_task = Self::wait_consumer_handle(self.consumer_handle.take());
 
         match tokio::join!(producer_task, consumer_task) {
-            (Ok(_), Ok(_)) => {
+            (Ok(stream_opt), Ok(())) => {
                 info!("All CDC tasks completed successfully");
+                // Store the stream for final ACK
+                self.replication_stream = stream_opt;
             }
             (Err(e), _) | (_, Err(e)) => {
                 error!("Task failed: {}", e);
+                return Err(e);
             }
         }
 

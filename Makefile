@@ -1,7 +1,7 @@
 # PostgreSQL CDC Makefile
 # Provides convenient commands for development and deployment
 
-.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean chaos-test chaos-test-setup chaos-test-clean
+.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean chaos-test chaos-test-setup chaos-test-clean pgbench-test pgbench-test-setup pgbench-test-clean
 
 # Default target
 help:
@@ -33,6 +33,11 @@ help:
 	@echo "  chaos-test-setup   Set up and start services for chaos testing"
 	@echo "  chaos-test         Run chaos integration tests"
 	@echo "  chaos-test-clean   Clean up after chaos testing"
+	@echo ""
+	@echo "PGBench Testing:"
+	@echo "  pgbench-test-setup Set up and start services for pgbench testing"
+	@echo "  pgbench-test       Run pgbench chaos integration tests"
+	@echo "  pgbench-test-clean Clean up after pgbench testing"
 	@echo ""
 
 # Development commands
@@ -115,5 +120,32 @@ chaos-test-full: chaos-test-setup chaos-test chaos-test-clean
 	@echo "Full chaos test cycle complete!"
 
 chaos-test-logs:
+	@echo "Showing CDC application logs..."
+	@docker logs -f cdc_application
+
+# PGBench Testing commands
+pgbench-test-setup:
+	@echo "Setting up pgbench testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test.yml up --build -d
+	@echo "Waiting for services to be healthy..."
+	@docker-compose -f docker-compose.chaos-test.yml ps
+
+pgbench-test:
+	@echo "Running pgbench chaos integration test..."
+	@echo "This will run pgbench while randomly restarting the CDC application"
+	@cd tests/chaos/scripts && ./run_pgbench_chaos_test.sh
+
+pgbench-test-clean:
+	@echo "Cleaning up pgbench testing environment..."
+	@docker-compose -f docker-compose.chaos-test.yml down -v
+	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+pgbench-test-full: pgbench-test-setup pgbench-test pgbench-test-clean
+	@echo "Full pgbench test cycle complete!"
+
+pgbench-test-logs:
 	@echo "Showing CDC application logs..."
 	@docker logs -f cdc_application

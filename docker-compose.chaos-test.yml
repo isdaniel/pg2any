@@ -25,7 +25,7 @@ services:
       -c wal_level=logical 
       -c max_replication_slots=10 
       -c max_wal_senders=10
-      -c max_connections=100
+      -c max_connections=500
     networks:
       - chaos_test_network
 

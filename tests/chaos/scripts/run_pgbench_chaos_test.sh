@@ -55,7 +55,7 @@ PGBENCH_SCALE="${PGBENCH_SCALE:-32}"
 PGBENCH_CLIENTS="${PGBENCH_CLIENTS:-100}"
 PGBENCH_THREADS="${PGBENCH_THREADS:-8}"
 PGBENCH_TRANSACTIONS="${PGBENCH_TRANSACTIONS:-12}"
-PGBENCH_SCRIPT="${PGBENCH_SCRIPT:-./examples/scripts/pgbench_testing.sql}"
+PGBENCH_SCRIPT="${PGBENCH_SCRIPT:-$PROJECT_ROOT/examples/scripts/pgbench_testing.sql}"
 
 # Verification configuration
 MAX_RETRIES=60
@@ -227,7 +227,6 @@ run_pgbench_benchmark() {
         pgbench_cmd="$pgbench_cmd -f $PGBENCH_SCRIPT"
     else
         log_warning "Custom script not found: $PGBENCH_SCRIPT"
-        log_info "Using default select-only mode"
     fi
     
     pgbench_cmd="$pgbench_cmd $POSTGRES_CONNSTRING"

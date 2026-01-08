@@ -1,0 +1,258 @@
+name: PGBench Chaos Integration Test
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 4 * * *' 
+  workflow_dispatch:  
+
+jobs:
+  pgbench-integration-test:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+      fail-fast: false 
+    
+    runs-on: ${{ matrix.os }}
+    
+    timeout-minutes: 480  
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Compose
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+    
+    - name: Install PostgreSQL client tools (for pgbench)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client-common postgresql-client
+        pgbench --version
+    
+    - name: Install MySQL client tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mysql-client
+        mysql --version
+    
+    - name: Verify test structure
+      run: |
+        echo "Verifying pgbench test structure..."
+        ls -la tests/chaos/scripts/
+        test -f tests/chaos/scripts/run_pgbench_chaos_test.sh || (echo "PGBench test script not found!" && exit 1)
+        test -f tests/chaos/scripts/chaos_script.sh || (echo "Chaos script not found!" && exit 1)
+    
+    - name: Verify pgbench SQL script
+      run: |
+        if [ -f examples/scripts/pgbench_testing.sql ]; then
+          echo "Custom pgbench SQL script found"
+          cat examples/scripts/pgbench_testing.sql
+        else
+          echo "No custom pgbench script, will use default select-only mode"
+        fi
+    
+    - name: Start Docker Compose services
+      run: |
+        echo "Starting all services with docker-compose..."
+        docker-compose -f docker-compose.chaos-test.yml up --build -d
+      working-directory: .
+    
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for services to become healthy..."
+        timeout 120 bash -c 'until docker ps | grep -q "healthy"; do sleep 5; done' || true
+        docker-compose -f docker-compose.chaos-test.yml ps
+      working-directory: .
+    
+    - name: Verify PostgreSQL is ready
+      run: |
+        echo "Verifying PostgreSQL connection..."
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
+        echo "Checking PostgreSQL configuration..."
+        docker exec cdc_postgres psql -U postgres -c "SHOW wal_level;"
+        docker exec cdc_postgres psql -U postgres -c "SHOW max_replication_slots;"
+    
+    - name: Verify MySQL is ready
+      run: |
+        echo "Verifying MySQL connection..."
+        docker exec cdc_mysql mysqladmin ping -h localhost -u root -ptest.123
+        docker exec cdc_mysql mysql -u root -ptest.123 -e "SELECT VERSION();"
+        echo "Checking MySQL configuration..."
+        docker exec cdc_mysql mysql -u root -ptest.123 -e "SHOW VARIABLES LIKE 'max_allowed_packet';"
+        docker exec cdc_mysql mysql -u root -ptest.123 -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';"
+    
+    - name: Make scripts executable
+      run: |
+        chmod +x tests/chaos/scripts/*.sh
+        ls -la tests/chaos/scripts/
+    
+    - name: Run pgbench chaos integration test
+      run: |
+        echo "=========================================="
+        echo "Starting PGBench Chaos Integration Test"
+        echo "=========================================="
+        echo "OS: ${{ matrix.os }}"
+        echo "This test will:"
+        echo "  1. Initialize pgbench with scale factor 32"
+        echo "  2. Run pgbench benchmark (100 clients, 8 threads)"
+        echo "  3. Randomly restart CDC application during load"
+        echo "  4. Verify all data replicated to MySQL"
+        echo ""
+        
+        cd tests/chaos/scripts
+        ./run_pgbench_chaos_test.sh
+      env:
+        CDC_POSTGRES_HOST: 127.0.0.1
+        CDC_POSTGRES_PORT: 5432
+        CDC_POSTGRES_USER: postgres
+        CDC_POSTGRES_PASSWORD: test.123
+        CDC_POSTGRES_DB: postgres
+        CDC_MYSQL_HOST: 127.0.0.1
+        CDC_MYSQL_PORT: 3306
+        CDC_MYSQL_USER: root
+        CDC_MYSQL_PASSWORD: test.123
+        CDC_MYSQL_DB: cdc_db
+        CDC_CONTAINER_NAME: cdc_application
+        PGBENCH_SCALE: 32
+        PGBENCH_CLIENTS: 100
+        PGBENCH_THREADS: 8
+        PGBENCH_TRANSACTIONS: 12
+    
+    - name: Show pgbench results
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "PGBench Test Results"
+        echo "=========================================="
+        if [ -f tests/chaos/scripts/pgbench_chaos_results_*.log ]; then
+          cat tests/chaos/scripts/pgbench_chaos_results_*.log
+        else
+          echo "No results file found"
+        fi
+    
+    - name: Show chaos script logs
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Chaos Script Activity Log"
+        echo "=========================================="
+        if [ -f tests/chaos/scripts/pgbench_chaos_script.log ]; then
+          cat tests/chaos/scripts/pgbench_chaos_script.log
+        else
+          echo "No chaos script log found"
+        fi
+    
+    - name: Verify replication statistics
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Final Replication Statistics"
+        echo "=========================================="
+        echo "PostgreSQL row count:"
+        docker exec cdc_postgres psql -U postgres -c "SELECT COUNT(*) FROM t1;"
+        echo ""
+        echo "MySQL row count:"
+        docker exec cdc_mysql mysql -u root -ptest.123 cdc_db -e "SELECT COUNT(*) FROM t1;"
+    
+    - name: Show PostgreSQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "PostgreSQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_postgres --tail 100
+    
+    - name: Show MySQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "MySQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_mysql --tail 100
+    
+    - name: Show container status on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Docker Container Status"
+        echo "=========================================="
+        docker-compose -f docker-compose.chaos-test.yml ps
+        docker ps -a
+    
+    - name: Capture and upload CDC application logs
+      if: failure()
+      run: |
+        echo "Installing colorized-logs for log conversion..."
+        sudo apt-get update
+        sudo apt-get install -y colorized-logs || sudo apt-get install -y ansifilter
+        echo "Capturing full CDC application logs..."
+        if command -v ansi2txt &> /dev/null; then
+          docker logs cdc_application | ansi2txt > cdc_application_log.txt
+        elif command -v ansifilter &> /dev/null; then
+          docker logs cdc_application | ansifilter > cdc_application_log.txt
+        else
+          docker logs cdc_application > cdc_application_log.txt
+        fi
+        echo "Log file created: cdc_application_log.txt"
+        ls -lh cdc_application_log.txt
+    
+    - name: Upload CDC application logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdc-pgbench-logs-${{ matrix.os }}
+        path: cdc_application_log.txt
+        retention-days: 30
+    
+    - name: Upload pgbench results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pgbench-results-${{ matrix.os }}
+        path: tests/chaos/scripts/pgbench_chaos_results_*.log
+        retention-days: 30
+
+    - name: Setup tmate session
+      if: failure()
+      uses: mxschmitt/action-tmate@v3
+
+    - name: Stop and remove containers
+      if: always()
+      run: |
+        echo "Cleaning up Docker containers..."
+        docker-compose -f docker-compose.chaos-test.yml down -v
+        docker volume rm chaos_test_lsn_data 2>/dev/null || true
+        docker network rm chaos_test_network 2>/dev/null || true
+        docker system prune -f
+      working-directory: .
+    
+    - name: Show disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df
+
+  notify:
+    needs: pgbench-integration-test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Test result summary
+      run: |
+        echo "=========================================="
+        echo "PGBench Integration Test Summary"
+        echo "=========================================="
+        echo "Job status: ${{ needs.pgbench-integration-test.result }}"
+        if [ "${{ needs.pgbench-integration-test.result }}" = "success" ]; then
+          echo "✓ PGBench chaos integration test passed!"
+          echo "✓ CDC application handled high load with random restarts successfully"
+        else
+          echo "✗ PGBench chaos integration test failed."
+        fi

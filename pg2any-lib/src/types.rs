@@ -135,12 +135,3 @@ pub enum TransactionContext {
     /// Streaming transaction (StreamStart...StreamCommit)
     Streaming(u32), // transaction_id
 }
-
-/// Tracks state of an in-flight normal (non-streaming) transaction.
-/// Required because EventType::Commit doesn't include transaction_id,
-/// so we must maintain the Begin context until Commit arrives.
-#[derive(Debug, Clone)]
-pub struct InFlightNormalTransaction {
-    pub transaction_id: u32,
-    pub event_count: usize,
-}

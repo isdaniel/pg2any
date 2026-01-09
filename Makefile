@@ -130,6 +130,7 @@ pgbench-test-setup:
 	@docker-compose -f docker-compose.chaos-test.yml up --build -d
 	@echo "Waiting for services to be healthy..."
 	@docker-compose -f docker-compose.chaos-test.yml ps
+	@sleep 10 # Wait for the CDC application to fully initialize
 
 pgbench-test:
 	@echo "Running pgbench chaos integration test..."

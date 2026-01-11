@@ -721,15 +721,15 @@ impl TransactionManager {
         let metadata = self.read_metadata(metadata_file_path).await?;
         let data_file_path = &metadata.data_file_path;
 
+        // Delete metadata file from sql_pending_tx/
+        if data_file_path.exists() {
+            fs::remove_file(metadata_file_path).await?;
+        }
+        
         // Delete data file from sql_data_tx/
         if data_file_path.exists() {
             fs::remove_file(data_file_path).await?;
-            debug!("Deleted data file: {:?}", data_file_path);
         }
-
-        // Delete metadata file from sql_pending_tx/
-        fs::remove_file(metadata_file_path).await?;
-        debug!("Deleted metadata file: {:?}", metadata_file_path);
 
         info!(
             "Deleted executed transaction files: metadata={:?}, data={:?}",

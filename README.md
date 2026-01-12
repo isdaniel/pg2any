@@ -34,6 +34,8 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
 - **Transaction Atomicity**: Complete transactions processed atomically with rollback on failure
 - **Streaming Transaction Support**: Handles large transactions with mid-stream batching and buffered I/O
+- **Memory-Efficient SQL Parsing**: Streaming SQL parser with state machine for parsing SQL statements without loading entire files into memory
+- **SQL Compression**: Optional SQL file compression with streaming decompression for reduced disk usage and network transfer
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
 - **LSN Metadata Tracking**: Enhanced tracking with consumer position for fine-grained resume capability
 - **Resumable Processing**: Can restart from exact position within large transaction files
@@ -371,6 +373,11 @@ pg2any/                          # Workspace root
 │   │   ├── lsn_tracker.rs       # LSN tracking with metadata persistence (.metadata files)
 │   │   ├── transaction_manager.rs # File-based transaction persistence (sql_data_tx/, sql_received_tx/, sql_pending_tx/)
 │   │   ├── types.rs             # Core data types and enums
+│   │   ├── storage/             # Storage abstraction for transaction files
+│   │   │   ├── mod.rs           # Storage factory and exports
+│   │   │   ├── traits.rs        # TransactionStorage trait definition
+│   │   │   ├── compressed.rs    # Compressed storage with sync points (.sql.gz)
+│   │   │   └── uncompressed.rs  # Uncompressed storage (.sql)
 │   │   ├── destinations/        # Database destination implementations
 │   │   │   ├── mod.rs           # Destination trait and factory pattern
 │   │   │   ├── destination_factory.rs # Factory for creating destinations
@@ -393,6 +400,9 @@ pg2any/                          # Workspace root
 │       ├── replica_identity_tests.rs       # Replica identity handling
 │       ├── sqlite_comprehensive_tests.rs   # SQLite comprehensive testing
 │       ├── sqlite_destination_tests.rs     # SQLite destination tests
+│       ├── compression_feature_flag_tests.rs # SQL compression feature testing
+│       ├── large_compressed_file_tests.rs  # Large file compression and memory efficiency tests
+│       ├── streaming_transaction_tests.rs  # Streaming transaction handling tests
 │       └── where_clause_fix_tests.rs       # WHERE clause bug fixes
 ```
 
@@ -446,6 +456,8 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
 | **Performance** | | | | | |
 | | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `500` | `3000`, `6000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
+| **SQL data Compression** | | | | | |
+| | `PG2ANY_ENABLE_COMPRESSION` | Enable SQL file compression with streaming decompression | `false` | `true`, `1` | Boolean. Compresses transaction SQL files (.sql.gz) to reduce disk usage and network transfer. Uses gzip with sync points for efficient seeking |
 | **System** | | | | | |
 | | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores comprehensive CDC metadata including LSN tracking and consumer position |
 | | `CDC_TRANSACTION_FILE_BASE_PATH` | Base directory for transaction file storage | `./` | `/data/transactions` | Contains sql_data_tx/, sql_received_tx/, sql_pending_tx/ subdirectories |
@@ -557,6 +569,24 @@ CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
 ```
 
 **Note:** Schema mapping is primarily useful for MySQL and SQL Server destinations. SQLite doesn't use schema namespacing, so mappings are ignored for SQLite destinations.
+
+### SQL Compression Configuration
+
+pg2any supports optional SQL file compression to reduce disk usage and optimize storage for large transactions. When enabled, transaction SQL files are compressed using gzip with sync points, allowing efficient seeking and streaming decompression without loading entire files into memory.
+
+#### Enabling Compression
+
+```bash
+# Enable SQL compression (compresses .sql files to .sql.gz)
+PG2ANY_ENABLE_COMPRESSION=true
+
+# Or use numeric value
+PG2ANY_ENABLE_COMPRESSION=1
+
+# Disable compression (default)
+PG2ANY_ENABLE_COMPRESSION=false
+# Or simply omit the variable
+```
 
 ### Performance Tuning
 

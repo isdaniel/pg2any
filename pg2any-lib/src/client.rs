@@ -553,6 +553,7 @@ impl CdcClient {
                         EventType::Begin {
                             transaction_id,
                             commit_timestamp,
+                            ..
                         } => {
                             // Start a new normal transaction
                             debug!(
@@ -674,6 +675,7 @@ impl CdcClient {
                         EventType::StreamCommit {
                             transaction_id,
                             commit_timestamp: _,
+                            ..
                         } => {
                             info!("Producer: StreamCommit for transaction {}", transaction_id);
 
@@ -701,7 +703,7 @@ impl CdcClient {
                             }
                         }
 
-                        EventType::StreamAbort { transaction_id } => {
+                        EventType::StreamAbort { transaction_id, .. } => {
                             debug!("StreamAbort: transaction_id={}", transaction_id);
 
                             // Delete transaction file

@@ -259,7 +259,7 @@ pub struct LsnTracker {
 
 impl LsnTracker {
     /// Create a new LSN tracker with the specified file path
-    pub fn new(lsn_file_path: Option<&str>) -> Arc<Self> {
+    pub async fn new(lsn_file_path: Option<&str>) -> Arc<Self> {
         let mut path: String = lsn_file_path
             .map(String::from)
             .or_else(|| std::env::var("CDC_LAST_LSN_FILE").ok())
@@ -272,11 +272,13 @@ impl LsnTracker {
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = std::path::Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    warn!("Failed to create directory for LSN file {}: {}", path, e);
-                } else {
-                    info!("Created directory for LSN metadata: {:?}", parent);
+            if !parent.as_os_str().is_empty() {
+                if tokio::fs::metadata(parent).await.is_err() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        warn!("Failed to create directory for LSN file {}: {}", path, e);
+                    } else {
+                        info!("Created directory for LSN metadata: {:?}", parent);
+                    }
                 }
             }
         }
@@ -294,7 +296,7 @@ impl LsnTracker {
     /// # Arguments
     /// * `lsn_file_path` - Optional path to the LSN metadata file
     pub async fn new_with_load(lsn_file_path: Option<&str>) -> (Arc<Self>, Option<Lsn>) {
-        let tracker = Self::new(lsn_file_path);
+        let tracker = Self::new(lsn_file_path).await;
 
         let loaded_metadata = tracker.load_from_file().await;
 
@@ -587,7 +589,7 @@ impl LsnTracker {
         Ok(())
     }
 
-    /// Synchronous persist for use in Drop or non-async contexts
+    /// Persist for use in Drop or non-async contexts via spawn_blocking
     fn persist_sync(&self) -> std::io::Result<()> {
         let metadata = {
             let m = self.metadata.lock().unwrap();
@@ -603,6 +605,7 @@ impl LsnTracker {
         // Write to temp file first for atomic write
         let temp_path = format!("{}.tmp", self.lsn_file_path);
         debug!("Writing LSN metadata to temp file (sync): {}", temp_path);
+
         std::fs::write(&temp_path, &json_content)?;
         debug!("Renaming (sync) {} -> {}", temp_path, self.lsn_file_path);
         std::fs::rename(&temp_path, &self.lsn_file_path)?;
@@ -645,14 +648,14 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_lsn_tracker_new() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn")).await;
         assert_eq!(tracker.get(), 0);
         assert_eq!(tracker.file_path(), "/tmp/test_lsn.metadata");
     }
 
     #[tokio::test]
     async fn test_lsn_tracker_get_lsn() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_get_lsn"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_get_lsn")).await;
         tracker.commit_lsn(100);
         let lsn = tracker.get_lsn();
         assert_eq!(lsn, Some(Lsn(100)));
@@ -660,7 +663,7 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_lsn_tracker_update_if_greater() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_update_if_greater"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_update_if_greater")).await;
 
         tracker.update_if_greater(100);
         assert_eq!(tracker.get(), 100);
@@ -676,7 +679,7 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_zero_lsn_ignored() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_zero"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_zero")).await;
 
         tracker.update_if_greater(100);
         tracker.update_if_greater(0); // Should be ignored
@@ -689,7 +692,7 @@ mod lsn_tracker_tests {
         let path = "/tmp/test_lsn_persist_async";
         let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        let tracker = LsnTracker::new(Some(path));
+        let tracker = LsnTracker::new(Some(path)).await;
         tracker.commit_lsn(12345);
         tracker.persist_async().await.unwrap();
 
@@ -709,7 +712,7 @@ mod lsn_tracker_tests {
         let path = "/tmp/test_lsn_persist_skip";
         let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        let tracker = LsnTracker::new(Some(path));
+        let tracker = LsnTracker::new(Some(path)).await;
         tracker.commit_lsn(12345);
         tracker.persist_async().await.unwrap();
 
@@ -723,7 +726,7 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_commit_lsn_marks_dirty() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_dirty"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_dirty")).await;
 
         assert!(!tracker.is_dirty());
 
@@ -754,7 +757,7 @@ mod lsn_tracker_tests {
         tokio::fs::write(&metadata_path, json).await.unwrap();
 
         // Load it
-        let tracker = LsnTracker::new(Some(path));
+        let tracker = LsnTracker::new(Some(path)).await;
         let loaded = tracker.load_from_file().await;
 
         assert!(loaded.is_some());
@@ -803,20 +806,20 @@ mod lsn_tracker_tests {
 
     #[tokio::test]
     async fn test_metadata_extension_not_present() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_no_ext"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_no_ext")).await;
         assert!(tracker.file_path().ends_with(".metadata"));
     }
 
     #[tokio::test]
     async fn test_metadata_extension_already_present() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn.metadata"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn.metadata")).await;
         // Should not double-add the extension
         assert_eq!(tracker.file_path().matches(".metadata").count(), 1);
     }
 
     #[tokio::test]
     async fn test_shared_across_threads() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_threads"));
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_threads")).await;
         let tracker_clone = tracker.clone();
 
         let handle = tokio::spawn(async move {
@@ -832,7 +835,7 @@ mod lsn_tracker_tests {
         let path = "/tmp/test_lsn_shutdown_simple";
         let _ = std::fs::remove_file(format!("{}.metadata", path));
 
-        let tracker = LsnTracker::new(Some(path));
+        let tracker = LsnTracker::new(Some(path)).await;
         tracker.commit_lsn(99999);
 
         // Shutdown should persist
@@ -852,7 +855,7 @@ mod lsn_tracker_tests {
     #[tokio::test]
     async fn test_double_shutdown_is_safe() {
         let path = "/tmp/test_lsn_double_shutdown";
-        let tracker = LsnTracker::new(Some(path));
+        let tracker = LsnTracker::new(Some(path)).await;
         tracker.shutdown_async().await;
         // Second shutdown should be safe
         tracker.shutdown_async().await;

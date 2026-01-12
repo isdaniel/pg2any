@@ -59,7 +59,7 @@ impl DestinationHandler for SQLiteDestination {
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = Path::new(db_path).parent() {
-            if !parent.exists() {
+            if tokio::fs::metadata(parent).await.is_err() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     CdcError::generic(format!(
                         "Failed to create directory for SQLite database: {e}"

@@ -37,6 +37,8 @@
 //! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
 use crate::error::{CdcError, Result};
+use crate::storage::sql_parser::SqlStreamParser;
+use crate::storage::{StorageFactory, TransactionStorage};
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -44,8 +46,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tracing::{debug, info, warn};
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tracing::{debug, info};
 
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
@@ -84,11 +86,13 @@ impl BufferedEventWriter {
     }
 
     /// Flush the buffer to disk
+    /// Always writes uncompressed data - compression happens on commit if enabled
     async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
+        // Always write uncompressed to avoid multiple gzip stream problem
         let file = fs::OpenOptions::new()
             .append(true)
             .open(&self.file_path)
@@ -189,6 +193,8 @@ pub struct TransactionManager {
     active_writers: Arc<tokio::sync::Mutex<HashMap<PathBuf, BufferedEventWriter>>>,
     /// Maximum buffer size before forced flush
     buffer_size: usize,
+    /// Storage implementation (compressed or uncompressed)
+    storage: Arc<dyn TransactionStorage>,
 }
 
 impl TransactionManager {
@@ -208,6 +214,9 @@ impl TransactionManager {
         fs::create_dir_all(&pending_tx_dir).await?;
         fs::create_dir_all(&data_tx_dir).await?;
 
+        // Create storage based on environment variable
+        let storage = StorageFactory::from_env();
+
         info!(
             "Transaction file manager initialized at {:?} for {:?}",
             base_path, destination_type
@@ -220,6 +229,7 @@ impl TransactionManager {
             schema_mappings: HashMap::new(),
             active_writers: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
+            storage,
         })
     }
 
@@ -268,6 +278,7 @@ impl TransactionManager {
     }
 
     /// Get the file path for the SQL data file
+    /// Always returns .sql - compression happens on commit if enabled
     fn get_data_file_path(&self, tx_id: u32) -> PathBuf {
         let filename = format!("{}.sql", tx_id);
         self.base_path.join(DATA_TX_DIR).join(filename)
@@ -379,6 +390,34 @@ impl TransactionManager {
             }
         }
 
+        let mut parser = SqlStreamParser::new();
+        let statements = parser
+            .parse_file_from_index_collect(&data_file_path, 0)
+            .await?;
+
+        debug!(
+            "Read {} statements from transaction {} for storage processing",
+            statements.len(),
+            tx_id
+        );
+
+        // Use storage trait to write transaction (handles compression if enabled)
+        let final_data_path = self
+            .storage
+            .write_transaction(&data_file_path, &statements)
+            .await?;
+
+        // If storage wrote to a different path (e.g., compressed), delete the original
+        if final_data_path != data_file_path {
+            fs::remove_file(&data_file_path).await.map_err(|e| {
+                CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+            })?;
+            debug!("Removed original uncompressed file: {:?}", data_file_path);
+        }
+
+        // Update metadata to point to final file
+        metadata.data_file_path = final_data_path;
+
         // Update commit LSN
         metadata.commit_lsn = commit_lsn;
 
@@ -425,7 +464,7 @@ impl TransactionManager {
         let data_file_path = self.get_data_file_path(tx_id);
 
         // Read metadata to get data file path (in case it's different)
-        let actual_data_path = if received_metadata_path.exists() {
+        let actual_data_path = if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
             if let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await {
                 if let Ok(metadata) =
                     serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
@@ -448,16 +487,13 @@ impl TransactionManager {
         }
 
         // Delete metadata file
-        if received_metadata_path.exists() {
+        if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
             fs::remove_file(&received_metadata_path).await?;
             debug!("Deleted metadata file: {:?}", received_metadata_path);
         }
 
-        // Delete data file
-        if actual_data_path.exists() {
-            fs::remove_file(&actual_data_path).await?;
-            debug!("Deleted data file: {:?}", actual_data_path);
-        }
+        // Delete data file using storage trait
+        self.storage.delete_transaction(&actual_data_path).await?;
 
         info!(
             "Aborted transaction {}, deleted metadata and data files",
@@ -579,140 +615,20 @@ impl TransactionManager {
             data_file_path, metadata_file_path, start_index
         );
 
-        let file = File::open(data_file_path).await.map_err(|e| {
-            CdcError::generic(format!("Failed to open data file {data_file_path:?}: {e}"))
-        })?;
+        // Use storage trait to read transaction (handles both compressed and uncompressed)
+        let statements = self
+            .storage
+            .read_transaction(data_file_path, start_index)
+            .await?;
 
-        let reader = BufReader::with_capacity(65536, file); // 64KB buffer for optimal I/O
-        let mut lines = reader.lines();
-
-        // Streaming parser state
-        let mut current_statement = String::with_capacity(512);
-        let mut statement_index = 0;
-        let mut collected_statements = Vec::new();
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_backtick = false;
-        let mut in_bracket = false;
-
-        // Process file line by line
-        while let Some(line) = lines.next_line().await.map_err(|e| {
-            CdcError::generic(format!("Failed to read line from {data_file_path:?}: {e}"))
-        })? {
-            let trimmed = line.trim();
-
-            // Skip SQL comments (lines starting with --)
-            // This provides defense against any comments in SQL data files
-            if trimmed.starts_with("--") {
-                continue;
-            }
-
-            // Skip empty lines
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Parse the line character by character
-            let mut chars = line.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\'' if !in_double_quote && !in_backtick && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_single_quote {
-                            // Check for escaped quote ('')
-                            if chars.peek() == Some(&'\'') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_single_quote = false;
-                            }
-                        } else {
-                            in_single_quote = true;
-                        }
-                    }
-                    '"' if !in_single_quote && !in_backtick && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_double_quote {
-                            // Check for escaped quote ("")
-                            if chars.peek() == Some(&'"') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_double_quote = false;
-                            }
-                        } else {
-                            in_double_quote = true;
-                        }
-                    }
-                    '`' if !in_single_quote && !in_double_quote && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_backtick {
-                            // Check for escaped backtick (``)
-                            if chars.peek() == Some(&'`') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_backtick = false;
-                            }
-                        } else {
-                            in_backtick = true;
-                        }
-                    }
-                    '[' if !in_single_quote && !in_double_quote && !in_backtick => {
-                        current_statement.push(ch);
-                        in_bracket = true;
-                    }
-                    ']' if in_bracket => {
-                        current_statement.push(ch);
-                        in_bracket = false;
-                    }
-                    ';' if !in_single_quote && !in_double_quote && !in_backtick && !in_bracket => {
-                        // Found a statement terminator outside of any quotes
-                        let trimmed_stmt = current_statement.trim();
-                        if !trimmed_stmt.is_empty() {
-                            // Only collect statements >= start_index
-                            if statement_index >= start_index {
-                                collected_statements.push(trimmed_stmt.to_string());
-                            }
-                            statement_index += 1;
-                        }
-                        current_statement.clear();
-                    }
-                    _ => {
-                        current_statement.push(ch);
-                    }
-                }
-            }
-
-            // Add newline to preserve multi-line statements
-            current_statement.push('\n');
-        }
-
-        // Handle any remaining content (statement without trailing semicolon)
-        let trimmed_stmt = current_statement.trim();
-        if !trimmed_stmt.is_empty() {
-            warn!(
-                "SQL statement without trailing semicolon (length: {} chars): {}",
-                trimmed_stmt.len(),
-                if trimmed_stmt.len() > 100 {
-                    format!("{}...", &trimmed_stmt[..100])
-                } else {
-                    trimmed_stmt.to_string()
-                }
-            );
-            if statement_index >= start_index {
-                collected_statements.push(trimmed_stmt.to_string());
-            }
-            statement_index += 1;
-        }
-
-        let total_statements = statement_index;
         debug!(
-            "Read {} total SQL statements from {:?}, collected {} statements starting from index {}",
-            total_statements,
+            "Read {} SQL statements from {:?} (starting from index {})",
+            statements.len(),
             data_file_path,
-            collected_statements.len(),
             start_index
         );
 
-        Ok(collected_statements)
+        Ok(statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution
@@ -722,14 +638,12 @@ impl TransactionManager {
         let data_file_path = &metadata.data_file_path;
 
         // Delete metadata file from sql_pending_tx/
-        if data_file_path.exists() {
+        if tokio::fs::metadata(metadata_file_path).await.is_ok() {
             fs::remove_file(metadata_file_path).await?;
         }
 
-        // Delete data file from sql_data_tx/
-        if data_file_path.exists() {
-            fs::remove_file(data_file_path).await?;
-        }
+        // Delete data file using storage trait (handles both compressed and uncompressed)
+        self.storage.delete_transaction(data_file_path).await?;
 
         info!(
             "Deleted executed transaction files: metadata={:?}, data={:?}",

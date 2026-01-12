@@ -849,8 +849,10 @@ async fn test_sqlite_transaction_events() {
     create_users_table(&pool).await.unwrap();
 
     // Test transaction BEGIN/COMMIT events
-    let begin_event = ChangeEvent::begin(100, Utc::now(), Lsn::from(0));
-    let commit_event = ChangeEvent::commit(110, Utc::now(), Lsn::from(0));
+    let timestamp = Utc::now();
+    let begin_event = ChangeEvent::begin(100, Lsn::from(0), timestamp, Lsn::from(100));
+    let commit_event =
+        ChangeEvent::commit(timestamp, Lsn::from(100), Lsn::from(110), Lsn::from(110));
 
     // These should not fail (even though SQLite handles transactions automatically)
     let begin_result = destination

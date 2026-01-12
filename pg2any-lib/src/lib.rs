@@ -75,6 +75,10 @@ pub mod client;
 // Transaction file persistence
 mod transaction_manager;
 
+// SQL streaming and compression
+pub mod sql_compression;
+pub mod sql_streaming;
+
 // Monitoring and metrics
 pub mod monitoring;
 

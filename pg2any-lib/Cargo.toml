@@ -14,7 +14,6 @@ categories = ["database", "asynchronous"]
 
 [dependencies]
 pg_walstream = { workspace = true }
-# Core replication library with libpq connection support
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -23,12 +22,14 @@ chrono = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 lazy_static = { workspace = true }
+tracing = { workspace = true }
+flate2 = { workspace = true }
+async-compression = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-# Monitoring dependencies (optional)
-prometheus = { workspace = true, optional = true  }
+
+prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }

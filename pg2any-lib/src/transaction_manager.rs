@@ -37,6 +37,8 @@
 //! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
 use crate::error::{CdcError, Result};
+use crate::sql_compression::{self, is_compressed_file};
+use crate::sql_streaming::SqlStreamParser;
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -44,8 +46,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tracing::{debug, info, warn};
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tracing::{debug, info};
 
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
@@ -84,11 +86,13 @@ impl BufferedEventWriter {
     }
 
     /// Flush the buffer to disk
+    /// Always writes uncompressed data - compression happens on commit if enabled
     async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
+        // Always write uncompressed to avoid multiple gzip stream problem
         let file = fs::OpenOptions::new()
             .append(true)
             .open(&self.file_path)
@@ -189,6 +193,8 @@ pub struct TransactionManager {
     active_writers: Arc<tokio::sync::Mutex<HashMap<PathBuf, BufferedEventWriter>>>,
     /// Maximum buffer size before forced flush
     buffer_size: usize,
+    /// Enable gzip compression for SQL files (controlled by PG2ANY_ENABLE_COMPRESSION env var)
+    compression_enabled: bool,
 }
 
 impl TransactionManager {
@@ -208,11 +214,22 @@ impl TransactionManager {
         fs::create_dir_all(&pending_tx_dir).await?;
         fs::create_dir_all(&data_tx_dir).await?;
 
+        // Check if compression is enabled via environment variable
+        let compression_enabled = std::env::var("PG2ANY_ENABLE_COMPRESSION")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
         info!(
             "Transaction file manager initialized at {:?} for {:?}",
             base_path, destination_type
         );
         info!("Three-directory structure: sql_data_tx/ (data), sql_received_tx/ (in-progress metadata), sql_pending_tx/ (committed metadata)");
+
+        if compression_enabled {
+            info!("Compression ENABLED: SQL files will be written as .sql.gz with index files");
+        } else {
+            info!("Compression DISABLED: SQL files will be written as uncompressed .sql files");
+        }
 
         Ok(Self {
             base_path,
@@ -220,6 +237,7 @@ impl TransactionManager {
             schema_mappings: HashMap::new(),
             active_writers: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
+            compression_enabled,
         })
     }
 
@@ -268,6 +286,7 @@ impl TransactionManager {
     }
 
     /// Get the file path for the SQL data file
+    /// Always returns .sql - compression happens on commit if enabled
     fn get_data_file_path(&self, tx_id: u32) -> PathBuf {
         let filename = format!("{}.sql", tx_id);
         self.base_path.join(DATA_TX_DIR).join(filename)
@@ -378,6 +397,35 @@ impl TransactionManager {
                 );
             }
         }
+
+        // Compress the data file if compression is enabled
+        let _final_data_path = if self.compression_enabled {
+            let compressed_path = data_file_path.with_extension("sql.gz");
+
+            // Use compression with sync points for efficient seeking
+            let total_statements =
+                sql_compression::compress_file_with_sync_points(&data_file_path, &compressed_path)
+                    .await?;
+
+            info!(
+                "Compressed transaction {} with sync points: {} statements, {} -> {}",
+                tx_id,
+                total_statements,
+                data_file_path.display(),
+                compressed_path.display()
+            );
+
+            // Delete the uncompressed file
+            fs::remove_file(&data_file_path).await.map_err(|e| {
+                CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+            })?;
+
+            // Update metadata to point to compressed file
+            metadata.data_file_path = compressed_path.clone();
+            compressed_path
+        } else {
+            data_file_path.clone()
+        };
 
         // Update commit LSN
         metadata.commit_lsn = commit_lsn;
@@ -579,140 +627,57 @@ impl TransactionManager {
             data_file_path, metadata_file_path, start_index
         );
 
-        let file = File::open(data_file_path).await.map_err(|e| {
-            CdcError::generic(format!("Failed to open data file {data_file_path:?}: {e}"))
-        })?;
-
-        let reader = BufReader::with_capacity(65536, file); // 64KB buffer for optimal I/O
-        let mut lines = reader.lines();
-
-        // Streaming parser state
-        let mut current_statement = String::with_capacity(512);
-        let mut statement_index = 0;
-        let mut collected_statements = Vec::new();
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_backtick = false;
-        let mut in_bracket = false;
-
-        // Process file line by line
-        while let Some(line) = lines.next_line().await.map_err(|e| {
-            CdcError::generic(format!("Failed to read line from {data_file_path:?}: {e}"))
-        })? {
-            let trimmed = line.trim();
-
-            // Skip SQL comments (lines starting with --)
-            // This provides defense against any comments in SQL data files
-            if trimmed.starts_with("--") {
-                continue;
-            }
-
-            // Skip empty lines
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Parse the line character by character
-            let mut chars = line.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\'' if !in_double_quote && !in_backtick && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_single_quote {
-                            // Check for escaped quote ('')
-                            if chars.peek() == Some(&'\'') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_single_quote = false;
-                            }
-                        } else {
-                            in_single_quote = true;
-                        }
-                    }
-                    '"' if !in_single_quote && !in_backtick && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_double_quote {
-                            // Check for escaped quote ("")
-                            if chars.peek() == Some(&'"') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_double_quote = false;
-                            }
-                        } else {
-                            in_double_quote = true;
-                        }
-                    }
-                    '`' if !in_single_quote && !in_double_quote && !in_bracket => {
-                        current_statement.push(ch);
-                        if in_backtick {
-                            // Check for escaped backtick (``)
-                            if chars.peek() == Some(&'`') {
-                                current_statement.push(chars.next().unwrap());
-                            } else {
-                                in_backtick = false;
-                            }
-                        } else {
-                            in_backtick = true;
-                        }
-                    }
-                    '[' if !in_single_quote && !in_double_quote && !in_backtick => {
-                        current_statement.push(ch);
-                        in_bracket = true;
-                    }
-                    ']' if in_bracket => {
-                        current_statement.push(ch);
-                        in_bracket = false;
-                    }
-                    ';' if !in_single_quote && !in_double_quote && !in_backtick && !in_bracket => {
-                        // Found a statement terminator outside of any quotes
-                        let trimmed_stmt = current_statement.trim();
-                        if !trimmed_stmt.is_empty() {
-                            // Only collect statements >= start_index
-                            if statement_index >= start_index {
-                                collected_statements.push(trimmed_stmt.to_string());
-                            }
-                            statement_index += 1;
-                        }
-                        current_statement.clear();
-                    }
-                    _ => {
-                        current_statement.push(ch);
-                    }
-                }
-            }
-
-            // Add newline to preserve multi-line statements
-            current_statement.push('\n');
+        // Check if file is compressed
+        if is_compressed_file(data_file_path) {
+            return self.read_compressed_file(data_file_path, start_index).await;
         }
 
-        // Handle any remaining content (statement without trailing semicolon)
-        let trimmed_stmt = current_statement.trim();
-        if !trimmed_stmt.is_empty() {
-            warn!(
-                "SQL statement without trailing semicolon (length: {} chars): {}",
-                trimmed_stmt.len(),
-                if trimmed_stmt.len() > 100 {
-                    format!("{}...", &trimmed_stmt[..100])
-                } else {
-                    trimmed_stmt.to_string()
-                }
-            );
-            if statement_index >= start_index {
-                collected_statements.push(trimmed_stmt.to_string());
-            }
-            statement_index += 1;
-        }
+        // Use streaming parser for uncompressed files
+        let mut parser = SqlStreamParser::new();
 
-        let total_statements = statement_index;
+        let collected_statements = parser
+            .parse_file_from_index_collect(&data_file_path, start_index)
+            .await?;
+
         debug!(
-            "Read {} total SQL statements from {:?}, collected {} statements starting from index {}",
-            total_statements,
-            data_file_path,
+            "Read {} SQL statements from {:?} (starting from index {})",
             collected_statements.len(),
+            data_file_path,
             start_index
         );
 
         Ok(collected_statements)
+    }
+
+    /// Read commands from a compressed SQL file with streaming decompression
+    ///
+    /// Uses compression with sync points for efficient seeking in large files.
+    /// Falls back to full streaming decompression for v1 files without index.
+    ///
+    /// Memory usage: O(buffer_size + statements_since_start_index)
+    /// instead of O(entire_uncompressed_file_size)
+    async fn read_compressed_file(
+        &self,
+        data_file_path: &Path,
+        start_index: usize,
+    ) -> Result<Vec<String>> {
+        debug!(
+            "Reading compressed file {:?} from statement index {}",
+            data_file_path, start_index
+        );
+
+        // Use compression reader which automatically detects and uses sync points
+        let statements =
+            sql_compression::read_compressed_file_with_seeking(data_file_path, start_index).await?;
+
+        debug!(
+            "Read {} SQL statements from compressed file {:?} (starting from index {})",
+            statements.len(),
+            data_file_path,
+            start_index
+        );
+
+        Ok(statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution

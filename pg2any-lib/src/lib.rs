@@ -75,6 +75,9 @@ pub mod client;
 // Transaction file persistence
 mod transaction_manager;
 
+// Storage abstraction for transaction files
+pub mod storage;
+
 // Monitoring and metrics
 pub mod monitoring;
 

@@ -18,11 +18,14 @@
 //! - Seeking: O(1) to find sync point, then O(k) to decompress k statements
 
 use crate::error::{CdcError, Result};
+use crate::sql_streaming::SqlStreamParser;
+use async_compression::tokio::bufread::GzipDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -114,25 +117,13 @@ pub async fn compress_file_with_sync_points(source_path: &Path, dest_path: &Path
         source_path, dest_path, SYNC_POINT_INTERVAL
     );
 
-    let source_content = tokio::fs::read_to_string(source_path)
-        .await
-        .map_err(|e| CdcError::generic(format!("Failed to read source file: {e}")))?;
+    // Use SqlStreamParser to read statements in a streaming manner
+    let mut parser = SqlStreamParser::new();
+    let cancel_token = CancellationToken::new();
 
-    // Parse SQL statements
-    let statements: Vec<String> = source_content
-        .lines()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .split(';')
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(format!("{};", trimmed))
-            }
-        })
-        .collect();
+    let statements = parser
+        .parse_file_from_index_collect(source_path, 0, &cancel_token)
+        .await?;
 
     let total_statements = statements.len();
 
@@ -140,89 +131,103 @@ pub async fn compress_file_with_sync_points(source_path: &Path, dest_path: &Path
         return Err(CdcError::generic("No statements found in source file"));
     }
 
-    // Compress with sync points using blocking I/O
-    tokio::task::spawn_blocking({
-        let dest = dest_path.to_path_buf();
-        let statements = statements.clone();
-        move || -> Result<CompressionIndex> {
-            let _dest_file = std::fs::File::create(&dest)
-                .map_err(|e| CdcError::generic(format!("Failed to create dest file: {e}")))?;
-
-            let mut current_offset: u64 = 0;
-            let mut uncompressed_offset: u64 = 0;
-            let mut index = CompressionIndex::new();
-            index.total_statements = statements.len();
-
-            // Process statements in chunks of SYNC_POINT_INTERVAL
-            for (chunk_idx, chunk) in statements.chunks(SYNC_POINT_INTERVAL).enumerate() {
-                let statement_index = chunk_idx * SYNC_POINT_INTERVAL;
-
-                // Record sync point at start of this chunk
-                index.sync_points.push(StatementOffset {
-                    statement_index,
-                    compressed_offset: current_offset,
-                    uncompressed_offset,
-                    is_sync_point: true,
-                });
-
-                // Compress this chunk as a separate gzip block
-                let chunk_data = chunk.join("\n");
-                let uncompressed_size = chunk_data.len() as u64;
-
-                // Create a new gzip encoder for this block
-                let mut buffer = Vec::new();
-                {
-                    let mut encoder = GzEncoder::new(&mut buffer, Compression::default());
-                    encoder
-                        .write_all(chunk_data.as_bytes())
-                        .map_err(|e| CdcError::generic(format!("Failed to compress chunk: {e}")))?;
-                    encoder.finish().map_err(|e| {
-                        CdcError::generic(format!("Failed to finish compression: {e}"))
-                    })?;
-                }
-
-                // Write compressed block to file
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&dest)
-                    .map_err(|e| {
-                        CdcError::generic(format!("Failed to open dest for append: {e}"))
-                    })?;
-
-                file.write_all(&buffer).map_err(|e| {
-                    CdcError::generic(format!("Failed to write compressed block: {e}"))
-                })?;
-
-                let compressed_size = buffer.len() as u64;
-                current_offset += compressed_size;
-                uncompressed_offset += uncompressed_size;
-
-                debug!(
-                    "Sync point {}: statements {}-{}, compressed offset: {}, size: {} bytes",
-                    chunk_idx,
-                    statement_index,
-                    statement_index + chunk.len() - 1,
-                    current_offset - compressed_size,
-                    compressed_size
-                );
+    // SqlStreamParser returns statements without semicolons, so add them back
+    let statements_with_semicolons: Vec<String> = statements
+        .into_iter()
+        .map(|stmt| {
+            if stmt.trim().ends_with(';') {
+                stmt
+            } else {
+                format!("{};", stmt)
             }
+        })
+        .collect();
 
-            Ok(index)
-        }
-    })
-    .await
-    .map_err(|e| CdcError::generic(format!("Compression task failed: {e}")))?
-    .and_then(|idx| {
-        // Save index file
-        let index_path = dest_path.with_extension("sql.gz.idx");
-        idx.save_to_file(&index_path)?;
-        info!(
-            "Created compression index: {:?} ({} sync points)",
-            index_path,
-            idx.sync_points.len()
+    // Create destination file once before the loop using tokio async I/O
+    let mut dest_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dest_path)
+        .await
+        .map_err(|e| CdcError::generic(format!("Failed to create dest file: {e}")))?;
+
+    let mut current_offset: u64 = 0;
+    let mut uncompressed_offset: u64 = 0;
+    let mut index = CompressionIndex::new();
+    index.total_statements = statements_with_semicolons.len();
+
+    // Process statements in chunks of SYNC_POINT_INTERVAL
+    for (chunk_idx, chunk) in statements_with_semicolons
+        .chunks(SYNC_POINT_INTERVAL)
+        .enumerate()
+    {
+        let statement_index = chunk_idx * SYNC_POINT_INTERVAL;
+
+        // Record sync point at start of this chunk
+        index.sync_points.push(StatementOffset {
+            statement_index,
+            compressed_offset: current_offset,
+            uncompressed_offset,
+            is_sync_point: true,
+        });
+
+        // Compress this chunk as a separate gzip block in a blocking task
+        let chunk_data = chunk.join("\n");
+        let uncompressed_size = chunk_data.len() as u64;
+
+        let buffer = tokio::task::spawn_blocking({
+            let chunk_data = chunk_data.clone();
+            move || -> Result<Vec<u8>> {
+                let mut buffer = Vec::new();
+                let mut encoder = GzEncoder::new(&mut buffer, Compression::default());
+                encoder
+                    .write_all(chunk_data.as_bytes())
+                    .map_err(|e| CdcError::generic(format!("Failed to compress chunk: {e}")))?;
+                encoder
+                    .finish()
+                    .map_err(|e| CdcError::generic(format!("Failed to finish compression: {e}")))?;
+                Ok(buffer)
+            }
+        })
+        .await
+        .map_err(|e| CdcError::generic(format!("Compression task failed: {e}")))?;
+
+        let buffer = buffer?;
+
+        dest_file
+            .write_all(&buffer)
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to write compressed block: {e}")))?;
+
+        let compressed_size = buffer.len() as u64;
+        current_offset += compressed_size;
+        uncompressed_offset += uncompressed_size;
+
+        debug!(
+            "Sync point {}: statements {}-{}, compressed offset: {}, size: {} bytes",
+            chunk_idx,
+            statement_index,
+            statement_index + chunk.len() - 1,
+            current_offset - compressed_size,
+            compressed_size
         );
-        Ok(total_statements)
-    })
+    }
+
+    dest_file
+        .flush()
+        .await
+        .map_err(|e| CdcError::generic(format!("Failed to flush dest file: {e}")))?;
+
+    // Save index file
+    let index_path = dest_path.with_extension("sql.gz.idx");
+    index.save_to_file(&index_path)?;
+    info!(
+        "Created compression index: {:?} ({} sync points)",
+        index_path,
+        index.sync_points.len()
+    );
+    Ok(total_statements)
 }
 
 /// Read compressed file from a specific statement index using sync points
@@ -286,75 +291,48 @@ pub async fn read_compressed_file_with_seeking(
 /// This implements true block-level seeking by:
 /// 1. Seeking to the compressed byte offset of the sync point
 /// 2. Reading and decompressing only from that point forward
-/// 3. Parsing statements and skipping to the requested start_index
+/// 3. Parsing statements using SqlStreamParser and skipping to the requested start_index
 async fn read_from_sync_point(
     compressed_path: &Path,
     sync_point: &StatementOffset,
     start_index: usize,
-    _cancel_token: &CancellationToken,
+    cancel_token: &CancellationToken,
 ) -> Result<Vec<String>> {
-    // Read compressed file starting from the sync point offset
-    let compressed_data = tokio::fs::read(compressed_path).await.map_err(|e| {
+    // Open the compressed file and seek to the sync point offset
+    let mut file = tokio::fs::File::open(compressed_path).await.map_err(|e| {
         CdcError::generic(format!(
-            "Failed to read compressed file {:?}: {}",
+            "Failed to open compressed file {:?}: {}",
             compressed_path, e
         ))
     })?;
 
-    // Extract data from sync point offset onwards
-    let offset = sync_point.compressed_offset as usize;
-    if offset > compressed_data.len() {
-        return Err(CdcError::generic(format!(
-            "Invalid sync point offset: {} > file size {}",
-            offset,
-            compressed_data.len()
-        )));
-    }
-
-    let data_from_sync_point = &compressed_data[offset..];
+    let offset = sync_point.compressed_offset;
+    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+        CdcError::generic(format!(
+            "Failed to seek to offset {} in compressed file: {}",
+            offset, e
+        ))
+    })?;
 
     debug!(
-        "Reading {} bytes from compressed offset {} ({}% of file)",
-        data_from_sync_point.len(),
-        offset,
-        (data_from_sync_point.len() * 100) / compressed_data.len().max(1)
+        "Seeking to compressed offset {} (sync point at statement {})",
+        offset, sync_point.statement_index
     );
 
-    // Decompress from sync point in a blocking task
-    let decompressed_data = tokio::task::spawn_blocking({
-        let data = data_from_sync_point.to_vec();
-        move || -> Result<Vec<u8>> {
-            use flate2::read::MultiGzDecoder;
-            use std::io::Read;
+    // Create a buffered reader and gzip decoder for streaming decompression
+    let buf_reader = BufReader::new(file);
+    let mut decoder = GzipDecoder::new(buf_reader);
 
-            let mut decoder = MultiGzDecoder::new(&data[..]);
-            let mut result = Vec::new();
+    // Enable multi-member decoding to handle multiple concatenated gzip streams (sync points)
+    decoder.multiple_members(true);
 
-            decoder.read_to_end(&mut result).map_err(|e| {
-                CdcError::generic(format!("Failed to decompress from sync point: {}", e))
-            })?;
+    // Use SqlStreamParser to correctly parse SQL statements
+    let mut parser = SqlStreamParser::new();
 
-            Ok(result)
-        }
-    })
-    .await
-    .map_err(|e| CdcError::generic(format!("Decompression task failed: {}", e)))??;
-
-    // Parse SQL statements from decompressed data
-    let decompressed_str = String::from_utf8_lossy(&decompressed_data);
-
-    // Parse all statements from this sync point onwards
-    let statements_from_sync: Vec<String> = decompressed_str
-        .split(';')
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed.starts_with("--") {
-                None
-            } else {
-                Some(format!("{};", trimmed))
-            }
-        })
-        .collect();
+    // Parse all statements from this sync point onwards (starting at index 0 relative to sync point)
+    let statements_from_sync = parser
+        .parse_stream_collect(decoder, 0, cancel_token)
+        .await?;
 
     // Calculate how many statements to skip within this decompressed chunk
     // We decompressed from sync_point.statement_index, but we want to start at start_index
@@ -372,54 +350,31 @@ async fn read_from_sync_point(
 /// Read entire compressed file (fallback for v1 files or when no seeking needed)
 ///
 /// Handles both single gzip streams and multiple concatenated gzip streams (sync points)
+/// Uses streaming decompression and SqlStreamParser for memory efficiency
 async fn read_compressed_file_full(
     compressed_path: &Path,
     start_index: usize,
-    _cancel_token: &CancellationToken,
+    cancel_token: &CancellationToken,
 ) -> Result<Vec<String>> {
-    // Read and decompress all gzip blocks manually
-    let compressed_data = tokio::fs::read(compressed_path).await.map_err(|e| {
+    use async_compression::tokio::bufread::GzipDecoder;
+
+    let file = tokio::fs::File::open(compressed_path).await.map_err(|e| {
         CdcError::generic(format!(
-            "Failed to read compressed file {:?}: {}",
+            "Failed to open compressed file {:?}: {}",
             compressed_path, e
         ))
     })?;
 
-    // Decompress all concatenated gzip streams in a blocking task
-    let decompressed_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        use flate2::read::MultiGzDecoder;
-        use std::io::Read;
+    let buf_reader = BufReader::new(file);
+    let mut decoder = GzipDecoder::new(buf_reader);
 
-        let mut decoder = MultiGzDecoder::new(&compressed_data[..]);
-        let mut result = Vec::new();
+    // Enable multi-member decoding to handle multiple concatenated gzip streams
+    decoder.multiple_members(true);
 
-        decoder
-            .read_to_end(&mut result)
-            .map_err(|e| CdcError::generic(format!("Failed to decompress: {}", e)))?;
-
-        Ok(result)
-    })
-    .await
-    .map_err(|e| CdcError::generic(format!("Decompression task failed: {}", e)))??;
-
-    // Parse SQL statements from decompressed data
-    let decompressed_str = String::from_utf8_lossy(&decompressed_data);
-
-    // Parse statements
-    let all_statements: Vec<String> = decompressed_str
-        .split(';')
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed.starts_with("--") {
-                None
-            } else {
-                Some(format!("{};", trimmed))
-            }
-        })
-        .collect();
-
-    // Return only statements from start_index onwards
-    let statements: Vec<String> = all_statements.into_iter().skip(start_index).collect();
+    let mut parser = SqlStreamParser::new();
+    let statements = parser
+        .parse_stream_collect(decoder, start_index, cancel_token)
+        .await?;
 
     debug!(
         "Read {} statements from compressed file {:?} (starting from index {})",

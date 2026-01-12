@@ -117,11 +117,12 @@ fn test_new_event_type_delete() {
 fn test_new_event_type_begin_commit() {
     let timestamp = Utc::now();
 
-    let begin_event = ChangeEvent::begin(12345, timestamp, Lsn::from(0));
+    let begin_event = ChangeEvent::begin(12345, Lsn::from(0), timestamp, Lsn::from(100));
     match begin_event.event_type {
         EventType::Begin {
             transaction_id,
             commit_timestamp,
+            ..
         } => {
             assert_eq!(transaction_id, 12345);
             assert_eq!(commit_timestamp, timestamp);
@@ -129,9 +130,12 @@ fn test_new_event_type_begin_commit() {
         _ => panic!("Expected Begin variant"),
     }
 
-    let commit_event = ChangeEvent::commit(12345, timestamp, Lsn::from(0));
+    let commit_event =
+        ChangeEvent::commit(timestamp, Lsn::from(100), Lsn::from(110), Lsn::from(110));
     match commit_event.event_type {
-        EventType::Commit { commit_timestamp } => {
+        EventType::Commit {
+            commit_timestamp, ..
+        } => {
             assert_eq!(commit_timestamp, timestamp);
         }
         _ => panic!("Expected Commit variant"),

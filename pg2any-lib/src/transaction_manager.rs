@@ -399,7 +399,7 @@ impl TransactionManager {
         }
 
         // Compress the data file if compression is enabled
-        let _final_data_path = if self.compression_enabled {
+        let _ = if self.compression_enabled {
             let compressed_path = data_file_path.with_extension("sql.gz");
 
             // Use compression with sync points for efficient seeking

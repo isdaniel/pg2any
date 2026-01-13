@@ -69,10 +69,10 @@ impl CompressionIndex {
     /// Find the sync point to use for seeking to a given statement index
     pub fn find_sync_point_for_index(&self, target_index: usize) -> Option<&StatementOffset> {
         // Binary search for the largest sync point <= target_index
-        self.sync_points
-            .iter()
-            .rev()
-            .find(|sp| sp.statement_index <= target_index)
+        let partition_idx = self
+            .sync_points
+            .partition_point(|sp| sp.statement_index <= target_index);
+        self.sync_points.get(partition_idx.saturating_sub(1))
     }
 
     /// Save index to a file
@@ -285,7 +285,7 @@ pub async fn read_compressed_file_with_seeking(
 /// This implements true block-level seeking by:
 /// 1. Seeking to the compressed byte offset of the sync point
 /// 2. Reading and decompressing only from that point forward
-/// 3. Parsing statements using SqlStreamParser and skipping to the requested start_index
+/// 3. Parsing statements using SqlStreamParser with skip_count to avoid collecting unwanted statements
 async fn read_from_sync_point(
     compressed_path: &Path,
     sync_point: &StatementOffset,
@@ -322,18 +322,8 @@ async fn read_from_sync_point(
     // Use SqlStreamParser to correctly parse SQL statements
     let mut parser = SqlStreamParser::new();
 
-    // Parse all statements from this sync point onwards (starting at index 0 relative to sync point)
-    let statements_from_sync = parser.parse_stream_collect(decoder, 0).await?;
-
-    // Calculate how many statements to skip within this decompressed chunk
-    // We decompressed from sync_point.statement_index, but we want to start at start_index
-    let skip_count = if start_index > sync_point.statement_index {
-        start_index - sync_point.statement_index
-    } else {
-        0
-    };
-
-    let result: Vec<String> = statements_from_sync.into_iter().skip(skip_count).collect();
+    let skip_count = start_index.saturating_sub(sync_point.statement_index);
+    let result = parser.parse_stream_collect(decoder, skip_count).await?;
 
     Ok(result)
 }

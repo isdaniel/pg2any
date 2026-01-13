@@ -84,7 +84,7 @@ impl TransactionStorage for UncompressedStorage {
     }
 
     async fn delete_transaction(&self, file_path: &Path) -> Result<()> {
-        if file_path.exists() {
+        if tokio::fs::metadata(file_path).await.is_ok() {
             fs::remove_file(file_path).await.map_err(|e| {
                 CdcError::generic(format!("Failed to delete file {file_path:?}: {e}"))
             })?;
@@ -94,7 +94,7 @@ impl TransactionStorage for UncompressedStorage {
     }
 
     async fn file_exists(&self, file_path: &Path) -> bool {
-        file_path.exists()
+        tokio::fs::metadata(file_path).await.is_ok()
     }
 
     fn file_extension(&self) -> &str {

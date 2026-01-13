@@ -25,7 +25,7 @@ mod position_tracking_tests {
     async fn test_update_consumer_position() {
         let lsn_file = get_test_file_path("update_position");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Update position
         tracker.update_consumer_position(
@@ -52,7 +52,7 @@ mod position_tracking_tests {
     async fn test_get_resume_position() {
         let lsn_file = get_test_file_path("resume_position");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Update position to command 499 (0-indexed)
         tracker.update_consumer_position("/path/to/file.meta".to_string(), 499);
@@ -73,7 +73,7 @@ mod position_tracking_tests {
     async fn test_clear_consumer_position() {
         let lsn_file = get_test_file_path("clear_position");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Set position
         tracker.update_consumer_position("/path/to/file.meta".to_string(), 499);
@@ -101,7 +101,7 @@ mod position_tracking_tests {
 
         // First session: save position
         {
-            let tracker = LsnTracker::new(Some(&lsn_file));
+            let tracker = LsnTracker::new(Some(&lsn_file)).await;
             tracker.update_consumer_position("/path/to/transaction_123.meta".to_string(), 2499);
             tracker.commit_lsn(123456789);
 
@@ -134,7 +134,7 @@ mod position_tracking_tests {
     async fn test_position_at_file_boundary() {
         let lsn_file = get_test_file_path("boundary");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Simulate processing all commands (last_executed = total - 1)
         tracker.update_consumer_position(
@@ -194,7 +194,7 @@ mod position_tracking_tests {
     async fn test_position_update_sequence() {
         let lsn_file = get_test_file_path("sequence");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Simulate processing batches of 100 commands
         let file_path = "/path/to/file.meta".to_string();
@@ -231,7 +231,7 @@ mod position_tracking_tests {
     async fn test_multiple_files_with_position() {
         let lsn_file = get_test_file_path("multiple_files");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // Process file 1 completely
         tracker.update_consumer_position("/path/to/file1.meta".to_string(), 999);
@@ -258,7 +258,7 @@ mod position_tracking_tests {
     async fn test_position_with_single_command_file() {
         let lsn_file = get_test_file_path("single_command");
 
-        let tracker = LsnTracker::new(Some(&lsn_file));
+        let tracker = LsnTracker::new(Some(&lsn_file)).await;
 
         // File with single command
         tracker.update_consumer_position("/path/to/single.meta".to_string(), 0);
@@ -276,7 +276,7 @@ mod position_tracking_tests {
     async fn test_position_dirty_flag() {
         let lsn_file = get_test_file_path("dirty_flag");
 
-        let tracker = LsnTracker::new(Some(&lsn_file)); // Long interval
+        let tracker = LsnTracker::new(Some(&lsn_file)).await; // Long interval
 
         // Initially not dirty
         assert!(!tracker.is_dirty());

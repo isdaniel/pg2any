@@ -465,7 +465,7 @@ impl TransactionManager {
         let data_file_path = self.get_data_file_path(tx_id);
 
         // Read metadata to get data file path (in case it's different)
-        let actual_data_path = if received_metadata_path.exists() {
+        let actual_data_path = if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
             if let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await {
                 if let Ok(metadata) =
                     serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
@@ -488,7 +488,7 @@ impl TransactionManager {
         }
 
         // Delete metadata file
-        if received_metadata_path.exists() {
+        if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
             fs::remove_file(&received_metadata_path).await?;
             debug!("Deleted metadata file: {:?}", received_metadata_path);
         }
@@ -639,7 +639,7 @@ impl TransactionManager {
         let data_file_path = &metadata.data_file_path;
 
         // Delete metadata file from sql_pending_tx/
-        if metadata_file_path.exists() {
+        if tokio::fs::metadata(metadata_file_path).await.is_ok() {
             fs::remove_file(metadata_file_path).await?;
         }
 

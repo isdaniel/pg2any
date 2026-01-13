@@ -64,19 +64,21 @@ impl CompressionIndex {
     }
 
     /// Save index to a file
-    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+    pub async fn save_to_file(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| CdcError::generic(format!("Failed to serialize index: {e}")))?;
 
-        std::fs::write(path, json)
+        tokio::fs::write(path, json)
+            .await
             .map_err(|e| CdcError::generic(format!("Failed to write index file: {e}")))?;
 
         Ok(())
     }
 
     /// Load index from a file
-    pub fn load_from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
+    pub async fn load_from_file(path: &Path) -> Result<Self> {
+        let content = tokio::fs::read_to_string(path)
+            .await
             .map_err(|e| CdcError::generic(format!("Failed to read index file: {e}")))?;
 
         let index: Self = serde_json::from_str(&content)
@@ -222,7 +224,7 @@ impl TransactionStorage for CompressedStorage {
 
         // Save index file
         let index_path = Self::index_path(&compressed_path);
-        index.save_to_file(&index_path)?;
+        index.save_to_file(&index_path).await?;
 
         info!(
             "Created compression index: {:?} ({} sync points, {} statements)",
@@ -238,7 +240,7 @@ impl TransactionStorage for CompressedStorage {
         let index_path = Self::index_path(file_path);
 
         // Check if index file exists
-        if !index_path.exists() {
+        if tokio::fs::metadata(&index_path).await.is_err() {
             // Fall back to full decompression for v1 files
             debug!(
                 "No index file found for {:?}, falling back to full decompression",
@@ -248,7 +250,7 @@ impl TransactionStorage for CompressedStorage {
         }
 
         // Load index
-        let index = CompressionIndex::load_from_file(&index_path)?;
+        let index = CompressionIndex::load_from_file(&index_path).await?;
 
         if start_index >= index.total_statements {
             return Ok(Vec::new());
@@ -274,7 +276,7 @@ impl TransactionStorage for CompressedStorage {
 
     async fn delete_transaction(&self, file_path: &Path) -> Result<()> {
         // Delete main compressed file
-        if file_path.exists() {
+        if tokio::fs::metadata(file_path).await.is_ok() {
             fs::remove_file(file_path).await.map_err(|e| {
                 CdcError::generic(format!("Failed to delete file {file_path:?}: {e}"))
             })?;
@@ -283,7 +285,7 @@ impl TransactionStorage for CompressedStorage {
 
         // Delete index file
         let index_path = Self::index_path(file_path);
-        if index_path.exists() {
+        if tokio::fs::metadata(&index_path).await.is_ok() {
             fs::remove_file(&index_path).await.map_err(|e| {
                 CdcError::generic(format!("Failed to delete index {index_path:?}: {e}"))
             })?;
@@ -294,7 +296,7 @@ impl TransactionStorage for CompressedStorage {
     }
 
     async fn file_exists(&self, file_path: &Path) -> bool {
-        file_path.exists()
+        tokio::fs::metadata(file_path).await.is_ok()
     }
 
     fn file_extension(&self) -> &str {
@@ -448,7 +450,7 @@ mod tests {
 
         // Check index
         let index_path = CompressedStorage::index_path(&written_path);
-        let index = CompressionIndex::load_from_file(&index_path).unwrap();
+        let index = CompressionIndex::load_from_file(&index_path).await.unwrap();
 
         assert_eq!(index.version, 2);
         assert_eq!(index.total_statements, 2500);

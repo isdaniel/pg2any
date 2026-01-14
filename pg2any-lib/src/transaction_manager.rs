@@ -390,7 +390,6 @@ impl TransactionManager {
             }
         }
 
-        // Read the uncompressed file content
         let mut parser = SqlStreamParser::new();
         let statements = parser
             .parse_file_from_index_collect(&data_file_path, 0)

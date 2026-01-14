@@ -2,12 +2,12 @@
 //!
 //! This module implements a byte-by-byte streaming SQL parser that:
 //! - Parses SQL statements without accumulating all of them in memory
-//! - Uses a state machine for quote/comment handling
-//! - Maintains correctness with quote types, escapes, comments, multi-line statements
+//! - Uses a state machine for quote handling
+//! - Maintains correctness with quote types, escapes, and multi-line statements
 //!
 //! ## Design Goals
 //! - **Memory Efficiency**: O(1) memory per statement instead of O(n)
-//! - **Correctness**: Handle all quote types, escapes, comments, multi-line statements
+//! - **Correctness**: Handle all quote types, escapes, and multi-line statements
 //! - **Performance**: Single-pass parsing with minimal allocations
 //! - **Compatibility**: Can be used as a drop-in replacement for existing parser
 
@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 /// Parser state for tracking quote context
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseState {
-    /// Normal SQL parsing (outside quotes/comments)
+    /// Normal SQL parsing (outside quotes)
     Normal,
     /// Inside single-quoted string
     SingleQuote,
@@ -29,8 +29,6 @@ enum ParseState {
     Backtick,
     /// Inside bracket-quoted identifier (SQL Server)
     Bracket,
-    /// Inside line comment (-- ...)
-    LineComment,
 }
 
 /// Streaming SQL statement parser
@@ -99,13 +97,6 @@ impl SqlStreamParser {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let trimmed = line.trim();
-            if self.state == ParseState::Normal {
-                if trimmed.starts_with("--") || trimmed.is_empty() {
-                    continue;
-                }
-            }
-
             // Parse line and collect statements
             self.parse_line_collect(&line, start_index, &mut statements)?;
         }
@@ -155,10 +146,6 @@ impl SqlStreamParser {
                     '[' => {
                         self.statement_buffer.push(byte);
                         self.state = ParseState::Bracket;
-                    }
-                    '-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                        self.state = ParseState::LineComment;
-                        break;
                     }
                     ';' => {
                         let stmt_bytes = self.trim_statement_buffer();
@@ -213,19 +200,12 @@ impl SqlStreamParser {
                         self.state = ParseState::Normal;
                     }
                 }
-                ParseState::LineComment => {
-                    break;
-                }
             }
 
             i += 1;
         }
 
-        if self.state != ParseState::LineComment {
-            self.statement_buffer.push(b'\n');
-        } else {
-            self.state = ParseState::Normal;
-        }
+        self.statement_buffer.push(b'\n');
 
         Ok(())
     }
@@ -309,23 +289,6 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert!(statements[0].contains("INSERT INTO users"));
         assert!(statements[0].contains("Alice"));
-    }
-
-    #[tokio::test]
-    async fn test_comments() {
-        let content = "-- This is a comment\nINSERT INTO users VALUES (1, 'Alice'); -- inline comment\nINSERT INTO users VALUES (2, 'Bob');\n";
-        let (file_path, _temp_dir) = create_test_file(content).await;
-
-        let mut parser = SqlStreamParser::new();
-
-        let statements = parser
-            .parse_file_from_index_collect(Path::new(&file_path), 0)
-            .await
-            .unwrap();
-
-        assert_eq!(statements.len(), 2);
-        assert_eq!(statements[0], "INSERT INTO users VALUES (1, 'Alice')");
-        assert_eq!(statements[1], "INSERT INTO users VALUES (2, 'Bob')");
     }
 
     #[tokio::test]

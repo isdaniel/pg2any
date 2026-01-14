@@ -6,6 +6,7 @@
 use crate::error::{CdcError, Result};
 use crate::storage::sql_parser::SqlStreamParser;
 use crate::storage::traits::TransactionStorage;
+use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -27,17 +28,11 @@ pub struct StatementOffset {
     pub statement_index: usize,
     /// Byte offset in compressed file where this block starts
     pub compressed_offset: u64,
-    /// Byte offset in uncompressed stream where this statement starts
-    pub uncompressed_offset: u64,
-    /// Whether this is a sync point (start of new gzip block)
-    pub is_sync_point: bool,
 }
 
 /// Index for a compressed SQL file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompressionIndex {
-    /// Version of the index format
-    pub version: u32,
     /// Total number of statements
     pub total_statements: usize,
     /// Sync points (every N statements)
@@ -48,7 +43,6 @@ impl CompressionIndex {
     /// Create a new empty index
     pub fn new() -> Self {
         Self {
-            version: 2,
             total_statements: 0,
             sync_points: Vec::new(),
         }
@@ -158,7 +152,6 @@ impl TransactionStorage for CompressedStorage {
             .map_err(|e| CdcError::generic(format!("Failed to create dest file: {e}")))?;
 
         let mut current_offset: u64 = 0;
-        let mut uncompressed_offset: u64 = 0;
         let mut index = CompressionIndex::new();
         index.total_statements = total_statements;
 
@@ -173,13 +166,10 @@ impl TransactionStorage for CompressedStorage {
             index.sync_points.push(StatementOffset {
                 statement_index,
                 compressed_offset: current_offset,
-                uncompressed_offset,
-                is_sync_point: true,
             });
 
             // Compress this chunk as a separate gzip block
             let chunk_data = chunk.join("\n");
-            let uncompressed_size = chunk_data.len() as u64;
 
             let buffer = tokio::task::spawn_blocking({
                 let chunk_data = chunk_data.clone();
@@ -205,14 +195,12 @@ impl TransactionStorage for CompressedStorage {
 
             let compressed_size = buffer.len() as u64;
             current_offset += compressed_size;
-            uncompressed_offset += uncompressed_size;
 
             debug!(
-                "Compressed chunk {} (statements {}-{}): {} bytes uncompressed → {} bytes compressed",
+                "Compressed chunk {} (statements {}-{}): {} bytes compressed",
                 chunk_idx,
                 statement_index,
                 statement_index + chunk.len() - 1,
-                uncompressed_size,
                 compressed_size
             );
         }
@@ -353,8 +341,6 @@ impl CompressedStorage {
 
     /// Read entire compressed file (fallback for v1 files or when no seeking needed)
     async fn read_full(&self, compressed_path: &Path, start_index: usize) -> Result<Vec<String>> {
-        use async_compression::tokio::bufread::GzipDecoder;
-
         let file = tokio::fs::File::open(compressed_path).await.map_err(|e| {
             CdcError::generic(format!(
                 "Failed to open compressed file {compressed_path:?}: {e}"
@@ -452,7 +438,6 @@ mod tests {
         let index_path = CompressedStorage::index_path(&written_path);
         let index = CompressionIndex::load_from_file(&index_path).await.unwrap();
 
-        assert_eq!(index.version, 2);
         assert_eq!(index.total_statements, 2500);
         assert_eq!(index.sync_points.len(), 3); // 0, 1000, 2000
 

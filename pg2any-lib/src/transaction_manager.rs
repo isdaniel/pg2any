@@ -6,18 +6,18 @@
 //! ## Architecture
 //!
 //! - **sql_data_tx/**: Stores actual SQL data (append-only, never moved)
-//!   - File naming: `{txid}_{timestamp}.sql`
+//!   - File naming: `{txid}_{seq}.sql` (e.g., `774_000001.sql`, `774_000002.sql`)
 //!   - Events are appended as SQL commands as they arrive
 //!   - Files are NOT moved or deleted until transaction is fully executed
 //!
 //! - **sql_received_tx/**: Stores metadata for in-progress transactions
-//!   - File naming: `{txid}_{timestamp}.meta`
-//!   - Contains JSON metadata: transaction_id, timestamp, data_file_path
+//!   - File naming: `{txid}.meta`
+//!   - Contains JSON metadata: transaction_id, timestamp, segments, current_segment_index
 //!   - Small files (~100 bytes) for fast operations
 //!
 //! - **sql_pending_tx/**: Stores metadata for committed transactions ready for execution
-//!   - File naming: `{txid}_{timestamp}.meta`
-//!   - Contains JSON metadata: transaction_id, timestamp, commit_lsn, data_file_path
+//!   - File naming: `{txid}.meta`
+//!   - Contains JSON metadata: transaction_id, timestamp, commit_lsn, segments
 //!   - Metadata moved here from sql_received_tx on COMMIT/StreamCommit
 //!   - Consumer reads these to find which data files to execute
 //!
@@ -49,13 +49,14 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{debug, info};
 
+const MB: usize = 1024 * 1024;
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
 const DATA_TX_DIR: &str = "sql_data_tx";
-
 /// Default buffer size for event accumulation (1MB)
-const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
-
+const DEFAULT_BUFFER_SIZE: usize = 1 * MB;
+/// Default max segment size before rotating to a new data file (64MB)
+const DEFAULT_SEGMENT_SIZE_BYTES: usize = 64 * MB;
 struct BufferedEventWriter {
     /// File path being written to
     file_path: PathBuf,
@@ -119,6 +120,16 @@ impl BufferedEventWriter {
     }
 }
 
+/// Transaction segment metadata stored in sql_received_tx/ and sql_pending_tx/
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionSegment {
+    /// Path to the SQL data file for this segment
+    pub path: PathBuf,
+    /// Number of SQL statements in this segment (0 means unknown/uncomputed)
+    #[serde(default)]
+    pub statement_count: usize,
+}
+
 /// Transaction file metadata stored in sql_received_tx/ and sql_pending_tx/
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionFileMetadata {
@@ -126,8 +137,20 @@ pub struct TransactionFileMetadata {
     pub commit_timestamp: DateTime<Utc>,
     pub commit_lsn: Option<Lsn>,
     pub destination_type: DestinationType,
-    /// Path to the SQL data file in sql_data_tx/
+    /// Current segment path
     pub data_file_path: PathBuf,
+    /// Ordered list of transaction segments
+    #[serde(default)]
+    pub segments: Vec<TransactionSegment>,
+    /// Index of the current segment in `segments`
+    #[serde(default)]
+    pub current_segment_index: usize,
+    /// Index of the last successfully executed SQL command for this transaction, Commands are 0-indexed. None means no commands have been executed yet.
+    #[serde(default)]
+    pub last_executed_command_index: Option<usize>,
+    /// Timestamp of the last persisted progress update (pending transactions only)
+    #[serde(default)]
+    pub last_update_timestamp: Option<DateTime<Utc>>,
     /// Transaction type: "normal" or "streaming"
     /// Used for recovery to correctly classify transactions on restart
     #[serde(default = "default_transaction_type")]
@@ -183,16 +206,37 @@ impl PartialOrd for PendingTransactionFile {
     }
 }
 
+struct ActiveTransactionState {
+    /// Ordered list of segment paths for this transaction
+    segments: Vec<PathBuf>,
+    /// Index of the current segment being written
+    current_segment_index: usize,
+    /// Current segment size on disk (bytes)
+    current_segment_size_bytes: usize,
+    /// Buffered writer for the current segment
+    writer: BufferedEventWriter,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProgress {
+    last_executed_command_index: usize,
+    last_update_timestamp: DateTime<Utc>,
+}
+
 /// Transaction File Manager for persisting and executing transactions
 pub struct TransactionManager {
     base_path: PathBuf,
     destination_type: DestinationType,
     schema_mappings: HashMap<String, String>,
-    /// Buffered writers for active transactions
-    /// Key: transaction file path, Value: buffered writer
-    active_writers: Arc<tokio::sync::Mutex<HashMap<PathBuf, BufferedEventWriter>>>,
+    /// Active transactions and their current segment writers
+    /// Key: transaction ID
+    active_transactions: Arc<tokio::sync::Mutex<HashMap<u32, ActiveTransactionState>>>,
+    /// Staged progress updates for pending metadata (persisted on shutdown)
+    staged_pending_progress: Arc<tokio::sync::Mutex<HashMap<PathBuf, PendingProgress>>>,
     /// Maximum buffer size before forced flush
     buffer_size: usize,
+    /// Maximum segment size before rotating to a new file
+    segment_size_bytes: usize,
     /// Storage implementation (compressed or uncompressed)
     storage: Arc<dyn TransactionStorage>,
 }
@@ -202,6 +246,7 @@ impl TransactionManager {
     pub async fn new(
         base_path: impl AsRef<Path>,
         destination_type: DestinationType,
+        segment_size_bytes: usize,
     ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
 
@@ -223,12 +268,20 @@ impl TransactionManager {
         );
         info!("Three-directory structure: sql_data_tx/ (data), sql_received_tx/ (in-progress metadata), sql_pending_tx/ (committed metadata)");
 
+        let segment_size_bytes = if segment_size_bytes == 0 {
+            DEFAULT_SEGMENT_SIZE_BYTES
+        } else {
+            segment_size_bytes
+        };
+
         Ok(Self {
             base_path,
             destination_type,
             schema_mappings: HashMap::new(),
-            active_writers: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_transactions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            staged_pending_progress: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
+            segment_size_bytes,
             storage,
         })
     }
@@ -241,15 +294,16 @@ impl TransactionManager {
     /// Flush all pending buffered writes
     /// Called during graceful shutdown to ensure no data is lost
     pub async fn flush_all_buffers(&self) -> Result<()> {
-        let mut writers = self.active_writers.lock().await;
+        let mut transactions = self.active_transactions.lock().await;
 
         let mut flush_count = 0;
         let mut total_bytes = 0;
 
-        for (_, writer) in writers.iter_mut() {
-            let buffer_size = writer.buffer_size();
+        for (_, tx_state) in transactions.iter_mut() {
+            let buffer_size = tx_state.writer.buffer_size();
             if buffer_size > 0 {
-                writer.flush().await?;
+                tx_state.writer.flush().await?;
+                tx_state.current_segment_size_bytes += buffer_size;
                 flush_count += 1;
                 total_bytes += buffer_size;
             }
@@ -284,6 +338,13 @@ impl TransactionManager {
         self.base_path.join(DATA_TX_DIR).join(filename)
     }
 
+    /// Get the file path for a specific segment of a transaction
+    /// Segment index is 0-based but file names are 1-based (txid_000001.sql)
+    fn get_segment_data_file_path(&self, tx_id: u32, segment_index: usize) -> PathBuf {
+        let filename = format!("{}_{:06}.sql", tx_id, segment_index + 1);
+        self.base_path.join(DATA_TX_DIR).join(filename)
+    }
+
     /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
     pub async fn begin_transaction(
         &self,
@@ -291,7 +352,7 @@ impl TransactionManager {
         timestamp: DateTime<Utc>,
         transaction_type: &str,
     ) -> Result<PathBuf> {
-        let data_file_path = self.get_data_file_path(tx_id);
+        let data_file_path = self.get_segment_data_file_path(tx_id, 0);
         let metadata_path = self.get_received_tx_path(tx_id);
 
         // Create the SQL data file in sql_data_tx/
@@ -306,6 +367,13 @@ impl TransactionManager {
             commit_lsn: None,
             destination_type: self.destination_type.clone(),
             data_file_path: data_file_path.clone(),
+            segments: vec![TransactionSegment {
+                path: data_file_path.clone(),
+                statement_count: 0,
+            }],
+            current_segment_index: 0,
+            last_executed_command_index: None,
+            last_update_timestamp: None,
             transaction_type: transaction_type.to_string(),
         };
 
@@ -315,10 +383,15 @@ impl TransactionManager {
         metadata_file.flush().await?;
 
         // Create a buffered writer for this transaction
-        let mut writers = self.active_writers.lock().await;
-        writers.insert(
-            data_file_path.clone(),
-            BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
+        let mut transactions = self.active_transactions.lock().await;
+        transactions.insert(
+            tx_id,
+            ActiveTransactionState {
+                segments: vec![data_file_path.clone()],
+                current_segment_index: 0,
+                current_segment_size_bytes: 0,
+                writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
+            },
         );
 
         info!(
@@ -330,10 +403,58 @@ impl TransactionManager {
         Ok(data_file_path)
     }
 
+    /// Update metadata for an in-progress transaction with segment info
+    async fn update_received_metadata_segments(
+        &self,
+        tx_id: u32,
+        segments: &[PathBuf],
+        current_segment_index: usize,
+    ) -> Result<()> {
+        let received_metadata_path = self.get_received_tx_path(tx_id);
+
+        let metadata_content = fs::read_to_string(&received_metadata_path)
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to read metadata from {received_metadata_path:?}: {e}"
+                ))
+            })?;
+
+        let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
+            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
+
+        metadata.segments = segments
+            .iter()
+            .map(|path| TransactionSegment {
+                path: path.clone(),
+                statement_count: 0,
+            })
+            .collect();
+        metadata.current_segment_index = current_segment_index;
+        metadata.data_file_path = segments
+            .get(current_segment_index)
+            .cloned()
+            .unwrap_or_else(|| self.get_data_file_path(tx_id));
+
+        let metadata_json = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
+
+        let mut metadata_file = File::create(&received_metadata_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to create received metadata {received_metadata_path:?}: {e}"
+            ))
+        })?;
+
+        metadata_file.write_all(metadata_json.as_bytes()).await?;
+        metadata_file.flush().await?;
+
+        Ok(())
+    }
+
     /// Append a change event to a running transaction file
     /// Uses buffered I/O to accumulate events in memory before flushing to disk
     /// Automatically flushes when buffer reaches capacity
-    pub async fn append_event(&self, file_path: &Path, event: &ChangeEvent) -> Result<()> {
+    pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
         let sql = self.generate_sql_for_event(event)?;
 
         // Skip empty SQL (metadata events)
@@ -341,16 +462,57 @@ impl TransactionManager {
             return Ok(());
         }
 
-        let mut writers = self.active_writers.lock().await;
+        let mut transactions = self.active_transactions.lock().await;
 
-        if let Some(writer) = writers.get_mut(file_path) {
-            // Append to buffer
-            let should_flush = writer.append(&sql);
+        let tx_state = transactions.get_mut(&tx_id).ok_or_else(|| {
+            CdcError::generic(format!(
+                "Active transaction {} not found for append_event",
+                tx_id
+            ))
+        })?;
 
-            // Flush if buffer is full
-            if should_flush {
-                writer.flush().await?;
-            }
+        let sql_bytes = sql.as_bytes().len() + 1; // include newline
+        let estimated_size =
+            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
+
+        let should_rotate = estimated_size > self.segment_size_bytes
+            && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
+
+        if should_rotate {
+            let buffered_bytes = tx_state.writer.buffer_size();
+            tx_state.writer.flush().await?;
+            tx_state.current_segment_size_bytes += buffered_bytes;
+
+            let next_segment_index = tx_state.current_segment_index + 1;
+            let next_segment_path = self.get_segment_data_file_path(tx_id, next_segment_index);
+
+            File::create(&next_segment_path).await?;
+
+            tx_state.segments.push(next_segment_path.clone());
+            tx_state.current_segment_index = next_segment_index;
+            tx_state.current_segment_size_bytes = 0;
+            tx_state.writer = BufferedEventWriter::new(next_segment_path.clone(), self.buffer_size);
+
+            self.update_received_metadata_segments(
+                tx_id,
+                &tx_state.segments,
+                tx_state.current_segment_index,
+            )
+            .await?;
+
+            info!(
+                "Rotated transaction {} to new segment {:?} ({} segments total)",
+                tx_id,
+                next_segment_path,
+                tx_state.segments.len()
+            );
+        }
+
+        let should_flush = tx_state.writer.append(&sql);
+        if should_flush {
+            let buffered_bytes = tx_state.writer.buffer_size();
+            tx_state.writer.flush().await?;
+            tx_state.current_segment_size_bytes += buffered_bytes;
         }
 
         Ok(())
@@ -374,54 +536,82 @@ impl TransactionManager {
         let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
             .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
 
-        let data_file_path = metadata.data_file_path.clone();
+        let mut segments = if !metadata.segments.is_empty() {
+            metadata.segments.clone()
+        } else {
+            vec![TransactionSegment {
+                path: metadata.data_file_path.clone(),
+                statement_count: 0,
+            }]
+        };
+
+        if segments.is_empty() {
+            return Err(CdcError::generic(format!(
+                "No transaction segments found for tx {}",
+                tx_id
+            )));
+        }
 
         // CRITICAL: Flush any pending buffered events before committing
         {
-            let mut writers = self.active_writers.lock().await;
-            if let Some(mut writer) = writers.remove(&data_file_path) {
-                // Flush remaining buffer
+            let mut transactions = self.active_transactions.lock().await;
+            if let Some(tx_state) = transactions.remove(&tx_id) {
+                let buffered_bytes = tx_state.writer.buffer_size();
+                let mut writer = tx_state.writer;
                 writer.flush().await?;
-                debug!(
-                    "Flushed final buffer for transaction {} ({} bytes)",
-                    tx_id,
-                    writer.buffer_size()
-                );
+                if buffered_bytes > 0 {
+                    debug!(
+                        "Flushed final buffer for transaction {} ({} bytes)",
+                        tx_id, buffered_bytes
+                    );
+                }
             }
         }
 
         let mut parser = SqlStreamParser::new();
-        let statements = parser
-            .parse_file_from_index_collect(&data_file_path, 0)
-            .await?;
+        let mut final_segments: Vec<TransactionSegment> = Vec::new();
 
-        debug!(
-            "Read {} statements from transaction {} for storage processing",
-            statements.len(),
-            tx_id
-        );
+        for segment in segments.drain(..) {
+            let statements = parser
+                .parse_file_from_index_collect(&segment.path, 0)
+                .await?;
 
-        // Use storage trait to write transaction (handles compression if enabled)
-        let final_data_path = self
-            .storage
-            .write_transaction(&data_file_path, &statements)
-            .await?;
+            debug!(
+                "Read {} statements from transaction {} segment {:?} for storage processing",
+                statements.len(),
+                tx_id,
+                segment.path
+            );
 
-        // If storage wrote to a different path (e.g., compressed), delete the original
-        if final_data_path != data_file_path {
-            fs::remove_file(&data_file_path).await.map_err(|e| {
-                CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-            })?;
-            debug!("Removed original uncompressed file: {:?}", data_file_path);
+            let final_data_path = self
+                .storage
+                .write_transaction(&segment.path, &statements)
+                .await?;
+
+            if final_data_path != segment.path {
+                fs::remove_file(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+                })?;
+                debug!("Removed original uncompressed file: {:?}", segment.path);
+            }
+
+            final_segments.push(TransactionSegment {
+                path: final_data_path,
+                statement_count: statements.len(),
+            });
         }
 
-        // Update metadata to point to final file
-        metadata.data_file_path = final_data_path;
-
-        // Update commit LSN
+        metadata.segments = final_segments;
+        metadata.current_segment_index = 0;
+        metadata.data_file_path = metadata
+            .segments
+            .first()
+            .map(|segment| segment.path.clone())
+            .unwrap_or_else(|| self.get_data_file_path(tx_id));
+        metadata.last_executed_command_index = None;
+        metadata.last_update_timestamp = None;
         metadata.commit_lsn = commit_lsn;
 
-        // Write updated metadata to sql_pending_tx/
         let updated_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
@@ -441,7 +631,6 @@ impl TransactionManager {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {e}")))?;
 
-        // Remove metadata from sql_received_tx/ only after successful write
         fs::remove_file(&received_metadata_path)
             .await
             .map_err(|e| {
@@ -463,27 +652,34 @@ impl TransactionManager {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let data_file_path = self.get_data_file_path(tx_id);
 
-        // Read metadata to get data file path (in case it's different)
-        let actual_data_path = if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
+        let segment_paths = if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
             if let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await {
                 if let Ok(metadata) =
                     serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
                 {
-                    metadata.data_file_path
+                    if !metadata.segments.is_empty() {
+                        metadata
+                            .segments
+                            .into_iter()
+                            .map(|seg| seg.path)
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![metadata.data_file_path]
+                    }
                 } else {
-                    data_file_path.clone()
+                    vec![data_file_path.clone()]
                 }
             } else {
-                data_file_path.clone()
+                vec![data_file_path.clone()]
             }
         } else {
-            data_file_path
+            vec![data_file_path]
         };
 
         // Remove buffered writer (discard any pending writes)
         {
-            let mut writers = self.active_writers.lock().await;
-            writers.remove(&actual_data_path);
+            let mut transactions = self.active_transactions.lock().await;
+            transactions.remove(&tx_id);
         }
 
         // Delete metadata file
@@ -492,8 +688,10 @@ impl TransactionManager {
             debug!("Deleted metadata file: {:?}", received_metadata_path);
         }
 
-        // Delete data file using storage trait
-        self.storage.delete_transaction(&actual_data_path).await?;
+        // Delete data files using storage trait
+        for path in segment_paths {
+            self.storage.delete_transaction(&path).await?;
+        }
 
         info!(
             "Aborted transaction {}, deleted metadata and data files",
@@ -528,13 +726,11 @@ impl TransactionManager {
         Ok(files)
     }
 
-    /// List all incomplete (received but not committed) transactions from sql_received_tx/
+    /// Restore incomplete (received but not committed) transactions from sql_received_tx/
     ///
-    /// Returns a HashMap mapping transaction_id -> (data_file_path, timestamp, transaction_type)
-    /// This is used by the producer to restore its active_tx_files state on restart
-    pub async fn list_received_transactions(
-        &self,
-    ) -> Result<HashMap<u32, (PathBuf, DateTime<Utc>, String)>> {
+    /// Returns a list of metadata entries ordered by timestamp and seeds active writers
+    /// for the current segment so producers can continue appending after restart.
+    pub async fn restore_received_transactions(&self) -> Result<Vec<TransactionFileMetadata>> {
         let received_dir = self.base_path.join(RECEIVED_TX_DIR);
         let mut entries = fs::read_dir(&received_dir).await?;
 
@@ -552,18 +748,12 @@ impl TransactionManager {
 
         metas.sort_by_key(|(_, t)| *t);
 
-        let mut active_txs = HashMap::new();
+        let mut active_txs = Vec::new();
 
         for (path, _file_time) in metas {
             if let Ok(metadata) = self.read_metadata(&path).await {
-                active_txs.insert(
-                    metadata.transaction_id,
-                    (
-                        metadata.data_file_path.clone(),
-                        metadata.commit_timestamp,
-                        metadata.transaction_type.clone(),
-                    ),
-                );
+                self.restore_active_transaction(&metadata).await?;
+                active_txs.push(metadata);
             }
         }
 
@@ -571,10 +761,148 @@ impl TransactionManager {
     }
 
     /// Read metadata from a transaction metadata file (.meta)
-    async fn read_metadata(&self, file_path: &Path) -> Result<TransactionFileMetadata> {
+    pub(crate) async fn read_metadata(&self, file_path: &Path) -> Result<TransactionFileMetadata> {
         let metadata_content = fs::read_to_string(file_path).await?;
         let metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)?;
         Ok(metadata)
+    }
+
+    async fn write_pending_metadata(
+        &self,
+        metadata_file_path: &Path,
+        metadata: &TransactionFileMetadata,
+    ) -> Result<()> {
+        let metadata_json = serde_json::to_string_pretty(metadata)
+            .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
+
+        let temp_path = metadata_file_path.with_extension("meta.tmp");
+
+        let mut metadata_file = File::create(&temp_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to create pending metadata {temp_path:?}: {e}"
+            ))
+        })?;
+
+        metadata_file.write_all(metadata_json.as_bytes()).await?;
+        metadata_file.flush().await?;
+
+        fs::rename(&temp_path, metadata_file_path)
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to replace pending metadata {metadata_file_path:?}: {e}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    /// Stage progress updates for a pending transaction (persisted on shutdown)
+    pub async fn stage_pending_metadata_progress(
+        &self,
+        metadata_file_path: &Path,
+        last_executed_command_index: usize,
+    ) -> Result<()> {
+        let mut staged = self.staged_pending_progress.lock().await;
+        staged.insert(
+            metadata_file_path.to_path_buf(),
+            PendingProgress {
+                last_executed_command_index,
+                last_update_timestamp: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Flush any staged pending progress updates to disk
+    pub async fn flush_staged_pending_progress(&self) -> Result<()> {
+        let staged_entries = {
+            let mut staged = self.staged_pending_progress.lock().await;
+            if staged.is_empty() {
+                return Ok(());
+            }
+            staged.drain().collect::<Vec<_>>()
+        };
+
+        let mut last_error: Option<CdcError> = None;
+
+        for (metadata_path, progress) in staged_entries {
+            if fs::metadata(&metadata_path).await.is_err() {
+                continue;
+            }
+
+            match self.read_metadata(&metadata_path).await {
+                Ok(mut metadata) => {
+                    metadata.last_executed_command_index =
+                        Some(progress.last_executed_command_index);
+                    metadata.last_update_timestamp = Some(progress.last_update_timestamp);
+
+                    if let Err(e) = self.write_pending_metadata(&metadata_path, &metadata).await {
+                        last_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Remove any staged progress update for a pending transaction
+    pub async fn clear_staged_pending_progress(&self, metadata_file_path: &Path) {
+        let mut staged = self.staged_pending_progress.lock().await;
+        staged.remove(metadata_file_path);
+    }
+
+    /// Restore an active transaction writer from received metadata
+    async fn restore_active_transaction(&self, metadata: &TransactionFileMetadata) -> Result<()> {
+        let segments = if !metadata.segments.is_empty() {
+            metadata
+                .segments
+                .iter()
+                .map(|seg| seg.path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![metadata.data_file_path.clone()]
+        };
+
+        let mut current_segment_index = metadata.current_segment_index;
+        if current_segment_index >= segments.len() {
+            current_segment_index = segments.len() - 1;
+        }
+
+        let current_segment_path = segments[current_segment_index].clone();
+
+        // Ensure the current segment file exists without truncating
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&current_segment_path)
+            .await?;
+
+        let current_size = match tokio::fs::metadata(&current_segment_path).await {
+            Ok(meta) => meta.len() as usize,
+            Err(_) => 0,
+        };
+
+        let mut transactions = self.active_transactions.lock().await;
+        transactions.insert(
+            metadata.transaction_id,
+            ActiveTransactionState {
+                segments,
+                current_segment_index,
+                current_segment_size_bytes: current_size,
+                writer: BufferedEventWriter::new(current_segment_path, self.buffer_size),
+            },
+        );
+
+        Ok(())
     }
 
     /// Read SQL commands starting from a specific command index
@@ -608,46 +936,97 @@ impl TransactionManager {
     ) -> Result<Vec<String>> {
         // Read metadata to get the data file path
         let metadata = self.read_metadata(metadata_file_path).await?;
-        let data_file_path = &metadata.data_file_path;
+        let mut segments = if !metadata.segments.is_empty() {
+            metadata.segments.clone()
+        } else {
+            vec![TransactionSegment {
+                path: metadata.data_file_path.clone(),
+                statement_count: 0,
+            }]
+        };
+
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
 
         debug!(
-            "Reading SQL commands from data file: {:?} (referenced by metadata: {:?}), starting from index {}",
-            data_file_path, metadata_file_path, start_index
-        );
-
-        // Use storage trait to read transaction (handles both compressed and uncompressed)
-        let statements = self
-            .storage
-            .read_transaction(data_file_path, start_index)
-            .await?;
-
-        debug!(
-            "Read {} SQL statements from {:?} (starting from index {})",
-            statements.len(),
-            data_file_path,
+            "Reading SQL commands from {} segment(s) (metadata: {:?}), starting from index {}",
+            segments.len(),
+            metadata_file_path,
             start_index
         );
 
-        Ok(statements)
+        let mut remaining_start_index = start_index;
+        let mut all_statements: Vec<String> = Vec::new();
+
+        for segment in segments.drain(..) {
+            if remaining_start_index == 0 {
+                let statements = self.storage.read_transaction(&segment.path, 0).await?;
+                all_statements.extend(statements);
+                continue;
+            }
+
+            if segment.statement_count > 0 {
+                if remaining_start_index >= segment.statement_count {
+                    remaining_start_index -= segment.statement_count;
+                    continue;
+                }
+
+                let statements = self
+                    .storage
+                    .read_transaction(&segment.path, remaining_start_index)
+                    .await?;
+                all_statements.extend(statements);
+                remaining_start_index = 0;
+                continue;
+            }
+
+            let statements = self.storage.read_transaction(&segment.path, 0).await?;
+            if remaining_start_index >= statements.len() {
+                remaining_start_index -= statements.len();
+                continue;
+            }
+
+            all_statements.extend(statements.into_iter().skip(remaining_start_index));
+            remaining_start_index = 0;
+        }
+
+        debug!(
+            "Read {} SQL statements across segments (starting from index {})",
+            all_statements.len(),
+            start_index
+        );
+
+        Ok(all_statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution
     pub async fn delete_pending_transaction(&self, metadata_file_path: &Path) -> Result<()> {
         // Read metadata to get data file path
         let metadata = self.read_metadata(metadata_file_path).await?;
-        let data_file_path = &metadata.data_file_path;
+        let data_file_paths = if !metadata.segments.is_empty() {
+            metadata
+                .segments
+                .iter()
+                .map(|seg| seg.path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![metadata.data_file_path.clone()]
+        };
 
         // Delete metadata file from sql_pending_tx/
         if tokio::fs::metadata(metadata_file_path).await.is_ok() {
             fs::remove_file(metadata_file_path).await?;
         }
 
-        // Delete data file using storage trait (handles both compressed and uncompressed)
-        self.storage.delete_transaction(data_file_path).await?;
+        // Delete data files using storage trait (handles both compressed and uncompressed)
+        for path in data_file_paths.iter() {
+            self.storage.delete_transaction(path).await?;
+        }
 
         info!(
-            "Deleted executed transaction files: metadata={:?}, data={:?}",
-            metadata_file_path, data_file_path
+            "Deleted executed transaction files: metadata={:?}, data_files={:?}",
+            metadata_file_path, data_file_paths
         );
         Ok(())
     }

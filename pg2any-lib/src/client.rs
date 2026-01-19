@@ -10,10 +10,8 @@ use crate::transaction_manager::{
 use crate::types::{EventType, Lsn};
 use chrono::{DateTime, Utc};
 use std::collections::{BinaryHeap, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use std::{future::Future, pin::Pin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -79,7 +77,7 @@ pub struct CdcClient {
     /// LSN tracker for tracking last committed LSN to destination (for file persistence)
     lsn_tracker: Arc<LsnTracker>,
     /// Transaction file manager for file-based workflow
-    transaction_file_manager: Option<Arc<TransactionManager>>,
+    transaction_file_manager: Arc<TransactionManager>,
     /// Replication stream for PostgreSQL connection
     replication_stream: Arc<Mutex<ReplicationStream>>,
 }
@@ -115,6 +113,7 @@ impl CdcClient {
         let mut manager = TransactionManager::new(
             &config.transaction_file_base_path,
             config.destination_type.clone(),
+            config.transaction_segment_size_bytes,
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
@@ -137,7 +136,7 @@ impl CdcClient {
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
-            transaction_file_manager: Some(Arc::new(manager)),
+            transaction_file_manager: Arc::new(manager),
             replication_stream: Arc::new(Mutex::new(replication_stream)),
         };
 
@@ -193,10 +192,7 @@ impl CdcClient {
     }
 
     async fn start_file_based_workflow(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
-        let transaction_file_manager = self
-            .transaction_file_manager
-            .clone()
-            .ok_or_else(|| CdcError::generic("Transaction file manager not available"))?;
+        let transaction_file_manager = self.transaction_file_manager.clone();
 
         let (tx_commit_notifier, rx_commit_notifier) =
             mpsc::channel::<PendingTransactionFile>(self.config.buffer_size);
@@ -494,7 +490,7 @@ impl CdcClient {
 
         // RECOVERY: Restore active transaction files from sql_received_tx/
         let active_tx_files = transaction_file_manager
-            .list_received_transactions()
+            .restore_received_transactions()
             .await?;
 
         info!(
@@ -503,18 +499,22 @@ impl CdcClient {
         );
 
         // Track non-streaming transaction (only ONE active at a time, Commit has no xid)
-        let mut current_normal_tx: Option<(u32, PathBuf, DateTime<Utc>)> = None;
+        let mut current_normal_tx: Option<(u32, DateTime<Utc>)> = None;
 
         // Track streaming transactions (multiple can be active, indexed by xid)
-        let mut streaming_txs: HashMap<u32, (PathBuf, DateTime<Utc>)> = HashMap::new();
+        let mut streaming_txs: HashMap<u32, DateTime<Utc>> = HashMap::new();
 
         // Track which streaming transaction is currently receiving DML events
         let mut active_streaming_dml_txid: Option<u32> = None;
 
         // Restore transactions from active_tx_files based on their type
-        for (tx_id, (file_path, timestamp, transaction_type)) in active_tx_files {
+        for metadata in active_tx_files {
+            let tx_id = metadata.transaction_id;
+            let timestamp = metadata.commit_timestamp;
+            let transaction_type = metadata.transaction_type;
+
             if transaction_type == "streaming" {
-                streaming_txs.insert(tx_id, (file_path, timestamp));
+                streaming_txs.insert(tx_id, timestamp);
                 info!(
                     "Restored streaming transaction {} from sql_received_tx/",
                     tx_id
@@ -527,7 +527,7 @@ impl CdcClient {
                         tx_id
                     );
                 }
-                current_normal_tx = Some((tx_id, file_path, timestamp));
+                current_normal_tx = Some((tx_id, timestamp));
                 info!(
                     "Restored normal transaction {} from sql_received_tx/",
                     tx_id
@@ -574,9 +574,8 @@ impl CdcClient {
                                 .begin_transaction(*transaction_id, *commit_timestamp, "normal")
                                 .await
                             {
-                                Ok(file_path) => {
-                                    current_normal_tx =
-                                        Some((*transaction_id, file_path, *commit_timestamp));
+                                Ok(_) => {
+                                    current_normal_tx = Some((*transaction_id, *commit_timestamp));
                                     debug!(
                                         "Created normal transaction file for tx {}",
                                         transaction_id
@@ -596,7 +595,7 @@ impl CdcClient {
                         EventType::Commit { .. } => {
                             // Complete and commit the normal transaction file
                             // Commit event has NO xid, so we use current_normal_tx
-                            if let Some((tx_id, _file_path, _)) = current_normal_tx.take() {
+                            if let Some((tx_id, _)) = current_normal_tx.take() {
                                 info!("Producer: Committing normal transaction {}", tx_id);
 
                                 // Use helper function to handle commit logic
@@ -642,13 +641,12 @@ impl CdcClient {
                                     .begin_transaction(*transaction_id, timestamp, "streaming")
                                     .await
                                 {
-                                    Ok(file_path) => {
+                                    Ok(_) => {
                                         debug!(
-                                            "Created streaming transaction file: {:?}",
-                                            file_path
+                                            "Created streaming transaction file for tx {}",
+                                            transaction_id
                                         );
-                                        streaming_txs
-                                            .insert(*transaction_id, (file_path, timestamp));
+                                        streaming_txs.insert(*transaction_id, timestamp);
                                     }
                                     Err(e) => {
                                         error!("Failed to create streaming transaction file for tx {}: {}", transaction_id, e);
@@ -707,9 +705,7 @@ impl CdcClient {
                             debug!("StreamAbort: transaction_id={}", transaction_id);
 
                             // Delete transaction file
-                            if let Some((_file_path, timestamp)) =
-                                streaming_txs.remove(transaction_id)
-                            {
+                            if let Some(timestamp) = streaming_txs.remove(transaction_id) {
                                 match transaction_file_manager
                                     .abort_transaction(*transaction_id, timestamp)
                                     .await
@@ -743,21 +739,16 @@ impl CdcClient {
                             // Append event to the appropriate transaction file
                             // For DML events, we need to determine which transaction they belong to
 
-                            let target_file = if let Some((tx_id, ref file_path, _)) =
-                                current_normal_tx
-                            {
-                                // DML belongs to current normal transaction
+                            let target_tx_id = if let Some((tx_id, _)) = current_normal_tx {
                                 debug!("Appending DML to normal transaction {}", tx_id);
-                                Some(file_path.clone())
+                                Some(tx_id)
                             } else if let Some(streaming_txid) = active_streaming_dml_txid {
-                                // DML belongs to the active streaming transaction
-                                if let Some((ref file_path, _)) = streaming_txs.get(&streaming_txid)
-                                {
+                                if streaming_txs.contains_key(&streaming_txid) {
                                     debug!(
                                         "Appending DML to streaming transaction {}",
                                         streaming_txid
                                     );
-                                    Some(file_path.clone())
+                                    Some(streaming_txid)
                                 } else {
                                     error!(
                                         "Active streaming DML txid {} not found in streaming_txs map",
@@ -773,12 +764,14 @@ impl CdcClient {
                                 None
                             };
 
-                            if let Some(file_path) = target_file {
-                                if let Err(e) = transaction_file_manager
-                                    .append_event(&file_path, &event)
-                                    .await
+                            if let Some(tx_id) = target_tx_id {
+                                if let Err(e) =
+                                    transaction_file_manager.append_event(tx_id, &event).await
                                 {
-                                    error!("Failed to append event to transaction file: {}", e);
+                                    error!(
+                                        "Failed to append event to transaction {}: {}",
+                                        tx_id, e
+                                    );
                                     metrics_collector
                                         .record_error("transaction_file_append_failed", "producer");
                                 }
@@ -811,7 +804,7 @@ impl CdcClient {
         // Note: Producer state is fully tracked in sql_received_tx/ metadata files
         // No need to persist producer context to pg2any.metadata
         // Active transactions will be recovered from sql_received_tx/ on restart
-        let total_incomplete = if let Some((tx_id, _, _)) = current_normal_tx {
+        let total_incomplete = if let Some((tx_id, _)) = current_normal_tx {
             info!(
                 "Producer shutdown with incomplete normal transaction {}",
                 tx_id
@@ -851,7 +844,7 @@ impl CdcClient {
     /// This method now respects cancellation token for graceful shutdown during recovery.
     ///
     async fn process_pending_transaction_files(
-        file_mgr: &TransactionManager,
+        file_mgr: &Arc<TransactionManager>,
         destination: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
         lsn_tracker: &Arc<LsnTracker>,
@@ -896,7 +889,7 @@ impl CdcClient {
             // Call the core processing logic directly
             if let Err(e) = Self::process_transaction_file(
                 pending_tx,
-                file_mgr,
+                file_mgr.clone(),
                 destination,
                 cancellation_token,
                 lsn_tracker,
@@ -999,7 +992,7 @@ impl CdcClient {
 
                         if let Err(e) = Self::process_transaction_file(
                             &next_tx,
-                            &transaction_file_manager,
+                            transaction_file_manager.clone(),
                             &mut destination_handler,
                             &cancellation_token,
                             &lsn_tracker,
@@ -1025,6 +1018,12 @@ impl CdcClient {
                         &cancellation_token,
                         &shared_lsn_feedback,
                     ).await;
+
+                    Self::flush_and_persist_on_shutdown(
+                        &transaction_file_manager,
+                        &lsn_tracker,
+                    )
+                    .await;
 
                     info!("Consumer: Completed processing all transactions after producer shutdown");
                     shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
@@ -1054,7 +1053,7 @@ impl CdcClient {
                                 // Process the transaction - THIS IS WHERE APPLY HAPPENS
                                 if let Err(e) = Self::process_transaction_file(
                                     &next_tx,
-                                    &transaction_file_manager,
+                                    transaction_file_manager.clone(),
                                     &mut destination_handler,
                                     &cancellation_token,
                                     &lsn_tracker,
@@ -1086,7 +1085,7 @@ impl CdcClient {
                             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
                                 if let Err(e) = Self::process_transaction_file(
                                     &next_tx,
-                                    &transaction_file_manager,
+                                    transaction_file_manager.clone(),
                                     &mut destination_handler,
                                     &cancellation_token,
                                     &lsn_tracker,
@@ -1113,6 +1112,12 @@ impl CdcClient {
                                 &shared_lsn_feedback,
                             ).await;
 
+                            Self::flush_and_persist_on_shutdown(
+                                &transaction_file_manager,
+                                &lsn_tracker,
+                            )
+                            .await;
+
                             shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                             break;
                         }
@@ -1129,7 +1134,7 @@ impl CdcClient {
 
     /// Drain any remaining transaction files from sql_pending_tx/ during shutdown
     async fn drain_remaining_files(
-        transaction_file_manager: &TransactionManager,
+        transaction_file_manager: &Arc<TransactionManager>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metrics_collector: &Arc<MetricsCollector>,
         lsn_tracker: &Arc<LsnTracker>,
@@ -1157,7 +1162,7 @@ impl CdcClient {
 
                     match Self::process_transaction_file(
                         &pending_tx,
-                        transaction_file_manager,
+                        transaction_file_manager.clone(),
                         destination_handler,
                         cancellation_token,
                         lsn_tracker,
@@ -1183,6 +1188,24 @@ impl CdcClient {
         }
     }
 
+    #[inline]
+    async fn flush_and_persist_on_shutdown(
+        transaction_file_manager: &Arc<TransactionManager>,
+        lsn_tracker: &Arc<LsnTracker>,
+    ) {
+        if let Err(e) = transaction_file_manager
+            .flush_staged_pending_progress()
+            .await
+        {
+            warn!("Failed to flush staged pending progress on shutdown: {}", e);
+        }
+
+        // Persist LSN after flushing staged progress
+        if let Err(e) = lsn_tracker.persist_async().await {
+            warn!("Failed to persist LSN on consumer shutdown: {}", e);
+        }
+    }
+
     /// Process a single transaction file
     /// Reads SQL commands from the file, executes them via the destination handler in batches,
     /// updates LSN tracking, and deletes the file upon success.
@@ -1192,7 +1215,7 @@ impl CdcClient {
     /// Checks cancellation token between batches to support graceful shutdown.
     async fn process_transaction_file(
         pending_tx: &PendingTransactionFile,
-        file_manager: &TransactionManager,
+        file_manager: Arc<TransactionManager>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
         lsn_tracker: &Arc<LsnTracker>,
@@ -1202,25 +1225,12 @@ impl CdcClient {
     ) -> Result<()> {
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
-        let file_path_str = pending_tx.file_path.to_string_lossy().to_string();
 
-        // Check if we're resuming from a saved position for THIS specific file
-        let start_index =
-            if let Some((saved_file_path, saved_start_index)) = lsn_tracker.get_resume_position() {
-                // Only use the saved index if it's for the current file
-                if saved_file_path == file_path_str {
-                    saved_start_index
-                } else {
-                    info!(
-                    "Saved position is for different file ('{}' vs '{}'). Starting from index 0",
-                    saved_file_path, file_path_str
-                );
-                    0
-                }
-            } else {
-                info!("No saved consumer position found, starting from index 0");
-                0
-            };
+        let latest_metadata = file_manager.read_metadata(&pending_tx.file_path).await?;
+        let start_index = latest_metadata
+            .last_executed_command_index
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
 
         info!(
             "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
@@ -1284,7 +1294,13 @@ impl CdcClient {
                 return Ok(());
             }
 
-            // CRITICAL: Transactional checkpoint update for atomicity
+            let next_command_index = current_command_index + chunk.len();
+            let last_executed_index = next_command_index - 1;
+            let batch_start_time = Instant::now();
+            // Execute the batch with transactional checkpoint hook
+            let metadata_path = pending_tx.file_path.clone();
+            let file_manager_for_hook = file_manager.clone();
+            let staged_index = last_executed_index;
             // The pre-commit hook executes WITHIN the database transaction, BEFORE COMMIT.
             // This provides true atomicity:
             //
@@ -1300,31 +1316,23 @@ impl CdcClient {
             //   - Before COMMIT: Both data and checkpoint rolled back → Safe, resume from old position
             //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
             //   - No race condition possible!
-            let next_command_index = current_command_index + chunk.len();
-            let tracker_clone = lsn_tracker.clone();
-            let file_path_clone = file_path_str.clone();
-            let last_executed_index = next_command_index - 1;
-
-            let pre_commit_hook = Some(Box::new(move || {
+            let pre_commit_hook: Option<
+                Box<
+                    dyn FnOnce() -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                        > + Send,
+                >,
+            > = Some(Box::new(move || {
+                let metadata_path = metadata_path.clone();
+                let file_manager_for_hook = file_manager_for_hook.clone();
                 Box::pin(async move {
-                    tracker_clone.update_consumer_position(file_path_clone, last_executed_index);
+                    file_manager_for_hook
+                        .stage_pending_metadata_progress(&metadata_path, staged_index)
+                        .await?;
                     Ok(())
-                }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>
-            })
-                as Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>);
+                })
+            }));
 
-            let batch_start_time = Instant::now();
-            debug!(
-                "Executing batch {}/{} with {} commands (tx_id: {}, global indices: {}-{})",
-                batch_idx + 1,
-                (command_count + batch_size - 1) / batch_size,
-                chunk.len(),
-                tx_id,
-                current_command_index,
-                next_command_index - 1
-            );
-
-            // Execute the batch with transactional checkpoint hook
             if let Err(e) = destination_handler
                 .execute_sql_batch_with_hook(chunk, pre_commit_hook)
                 .await
@@ -1343,8 +1351,6 @@ impl CdcClient {
 
                 return Err(e);
             }
-
-            // Update current position after successful batch
             current_command_index = next_command_index;
 
             let batch_duration = batch_start_time.elapsed();
@@ -1391,7 +1397,7 @@ impl CdcClient {
     /// This ensures we never ACK a transaction that hasn't been successfully applied.
     async fn finalize_transaction_file(
         pending_tx: &PendingTransactionFile,
-        file_manager: &TransactionManager,
+        file_manager: Arc<TransactionManager>,
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         total_commands: usize,
@@ -1414,7 +1420,7 @@ impl CdcClient {
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
 
             info!(
-                "✓ Updated apply_lsn to {} (transaction {} applied to destination)",
+                "Updated apply_lsn to {} (transaction {} applied to destination)",
                 commit_lsn, tx_id
             );
         } else {
@@ -1459,6 +1465,10 @@ impl CdcClient {
             );
         }
 
+        file_manager
+            .clear_staged_pending_progress(&pending_tx.file_path)
+            .await;
+
         if pending_tx.metadata.commit_lsn.is_some() {
             let pending_count = file_manager.list_pending_transactions().await?.len();
             lsn_tracker.update_consumer_state(
@@ -1471,14 +1481,6 @@ impl CdcClient {
                 "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
                 tx_id, pending_count
             );
-
-            // Clear consumer position since file is fully processed and persist immediately
-            if let Err(e) = lsn_tracker
-                .clear_consumer_position_and_persist_immediately()
-                .await
-            {
-                warn!("Failed to clear and persist consumer position: {}", e);
-            }
         }
 
         Ok(())
@@ -1515,6 +1517,16 @@ impl CdcClient {
 
         // Shutdown LSN tracker to persist final state
         info!("Shutting down LSN tracker and persisting final state");
+        if let Err(e) = self
+            .transaction_file_manager
+            .flush_staged_pending_progress()
+            .await
+        {
+            warn!(
+                "Failed to flush staged pending progress during shutdown: {}",
+                e
+            );
+        }
 
         // Shutdown LSN tracker, which includes a final state persistence.
         self.lsn_tracker.shutdown_async().await;
@@ -1522,12 +1534,10 @@ impl CdcClient {
         // Log final state after shutdown
         let post_shutdown_metadata = self.lsn_tracker.get_metadata();
         info!(
-                "Post-shutdown state - flush_lsn={}, pending_files={}, current_file={:?}, last_executed_index={:?}",
-                pg_walstream::format_lsn(post_shutdown_metadata.lsn_tracking.flush_lsn),
-                post_shutdown_metadata.consumer_state.pending_file_count,
-                post_shutdown_metadata.consumer_state.current_file_path,
-                post_shutdown_metadata.consumer_state.last_executed_command_index
-            );
+            "Post-shutdown state - flush_lsn={}, pending_files={}",
+            pg_walstream::format_lsn(post_shutdown_metadata.lsn_tracking.flush_lsn),
+            post_shutdown_metadata.consumer_state.pending_file_count
+        );
 
         info!("CDC replication stopped gracefully");
         Ok(())
@@ -1535,7 +1545,7 @@ impl CdcClient {
 
     /// Wait for producer and consumer tasks to complete gracefully
     /// Both tasks should complete before signaling the producer to send final ACK
-    pub async fn wait_for_tasks_completion(&mut self) -> Result<()> {
+    async fn wait_for_tasks_completion(&mut self) -> Result<()> {
         let producer_handle = self.producer_handle.take();
         let consumer_handle = self.consumer_handle.take();
 

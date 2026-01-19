@@ -140,7 +140,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: cdc-application-logs-${{ matrix.os }}
+        name: cdc-application-logs-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: cdc_application_log.txt
         retention-days: 30
 

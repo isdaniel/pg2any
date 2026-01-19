@@ -106,15 +106,6 @@ pub struct ConsumerState {
 
     /// Number of pending transaction files at last update
     pub pending_file_count: usize,
-
-    /// Path to the transaction file currently being processed (metadata file path in sql_pending_tx/)
-    /// This allows resuming from the exact file on restart
-    pub current_file_path: Option<String>,
-
-    /// Index of the last successfully executed SQL command within the current transaction file
-    /// Commands are 0-indexed. None means no commands have been executed yet.
-    /// This allows resuming from the exact position within a large transaction file.
-    pub last_executed_command_index: Option<usize>,
 }
 
 impl Default for CdcMetadata {
@@ -127,8 +118,6 @@ impl Default for CdcMetadata {
                 last_processed_tx_id: None,
                 last_processed_timestamp: None,
                 pending_file_count: 0,
-                current_file_path: None,
-                last_executed_command_index: None,
             },
         }
     }
@@ -159,42 +148,6 @@ impl CdcMetadata {
         self.consumer_state.last_processed_timestamp = Some(timestamp);
         self.consumer_state.pending_file_count = pending_count;
         self.last_updated = Utc::now();
-    }
-
-    /// Update consumer position within a transaction file
-    /// This tracks the exact command index being processed for fine-grained recovery
-    pub fn update_consumer_position(
-        &mut self,
-        file_path: String,
-        last_executed_command_index: usize,
-    ) {
-        self.consumer_state.current_file_path = Some(file_path);
-        self.consumer_state.last_executed_command_index = Some(last_executed_command_index);
-        self.last_updated = Utc::now();
-    }
-
-    /// Clear consumer position when a file is fully processed
-    /// This resets the position tracking for the next transaction file
-    pub fn clear_consumer_position(&mut self) {
-        self.consumer_state.current_file_path = None;
-        self.consumer_state.last_executed_command_index = None;
-        self.last_updated = Utc::now();
-    }
-
-    /// Get the resume position for recovery
-    /// Returns (file_path, start_command_index) if there's a partially processed file
-    pub fn get_resume_position(&self) -> Option<(String, usize)> {
-        if let Some(ref file_path) = self.consumer_state.current_file_path {
-            // Resume from the next command after the last executed one
-            let start_index = self
-                .consumer_state
-                .last_executed_command_index
-                .map(|idx| idx + 1)
-                .unwrap_or(0);
-            Some((file_path.clone(), start_index))
-        } else {
-            None
-        }
     }
 
     /// Get the flush LSN (last committed to destination)
@@ -439,94 +392,6 @@ impl LsnTracker {
         );
     }
 
-    /// Update consumer position within a transaction file (non-persistent)
-    pub fn update_consumer_position(&self, file_path: String, last_executed_command_index: usize) {
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.update_consumer_position(file_path.clone(), last_executed_command_index);
-        }
-        self.dirty.store(true, Ordering::Release);
-        debug!(
-            "Updated consumer position: file={}, command_index={}",
-            file_path, last_executed_command_index
-        );
-    }
-
-    /// Update consumer position AND persist immediately in one atomic operation
-    ///
-    /// This method is designed to prevent data inconsistency during graceful shutdown.
-    /// It combines the position update with immediate persistence to eliminate the
-    /// race condition where:
-    /// 1. DB transaction commits
-    /// 2. Position updated in memory
-    /// 3. **SIGTERM arrives before persist_async() is called**
-    /// 4. On restart: old position → duplicate replay
-    ///
-    /// By persisting immediately after position update, we ensure the tracking file
-    /// reflects the actual state of committed data in the destination database.
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the transaction file being processed
-    /// * `last_executed_command_index` - 0-based index of the last executed command
-    ///
-    /// # Returns
-    /// * `Ok(())` - Position updated and persisted successfully
-    /// * `Err(io::Error)` - Persistence failed (position still updated in memory)
-    pub async fn update_consumer_position_and_persist_immediately(
-        &self,
-        file_path: String,
-        last_executed_command_index: usize,
-    ) -> std::io::Result<()> {
-        // Update position in memory
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.update_consumer_position(file_path.clone(), last_executed_command_index);
-        }
-        self.dirty.store(true, Ordering::Release);
-
-        // CRITICAL: Immediately persist to disk to prevent race condition
-        self.persist_internal().await?;
-
-        Ok(())
-    }
-
-    /// Clear consumer position when a file is fully processed
-    fn clear_consumer_position(&self) {
-        {
-            let mut metadata = self.metadata.lock().unwrap();
-            metadata.clear_consumer_position();
-        }
-        self.dirty.store(true, Ordering::Release);
-        debug!("Cleared consumer position after file completion");
-    }
-
-    /// Clear consumer position AND persist immediately in one atomic operation
-    ///
-    /// Used when a transaction file is fully processed to ensure the cleared
-    /// state is immediately written to disk.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Position cleared and persisted successfully
-    /// * `Err(io::Error)` - Persistence failed (position still cleared in memory)
-    pub async fn clear_consumer_position_and_persist_immediately(&self) -> std::io::Result<()> {
-        // Clear position in memory
-        self.clear_consumer_position();
-
-        // CRITICAL: Immediately persist to disk
-        self.persist_async().await?;
-
-        debug!("Atomically cleared and persisted consumer position");
-
-        Ok(())
-    }
-
-    /// Get the resume position for recovery
-    /// Returns (file_path, start_command_index) if there's a partially processed file
-    pub fn get_resume_position(&self) -> Option<(String, usize)> {
-        let metadata = self.metadata.lock().unwrap();
-        metadata.get_resume_position()
-    }
-
     /// Get the current last committed LSN (flush_lsn)
     #[inline]
     pub fn get(&self) -> u64 {
@@ -581,10 +446,9 @@ impl LsnTracker {
         self.dirty.store(false, Ordering::Release);
 
         debug!(
-            "Persisted CDC metadata to {} (flush_lsn: {}, consumer_file: {:?})",
+            "Persisted CDC metadata to {} (flush_lsn: {})",
             self.lsn_file_path,
-            format_lsn(flush_lsn),
-            metadata.consumer_state.current_file_path
+            format_lsn(flush_lsn)
         );
         Ok(())
     }
@@ -615,10 +479,9 @@ impl LsnTracker {
         self.dirty.store(false, Ordering::Release);
 
         debug!(
-            "Persisted CDC metadata to {} (sync) - flush_lsn: {}, consumer_file: {:?}",
+            "Persisted CDC metadata to {} (sync) - flush_lsn: {}",
             self.lsn_file_path,
-            format_lsn(flush_lsn),
-            metadata.consumer_state.current_file_path
+            format_lsn(flush_lsn)
         );
         Ok(())
     }
@@ -748,8 +611,6 @@ mod lsn_tracker_tests {
                 last_processed_tx_id: Some(999),
                 last_processed_timestamp: Some(Utc::now()),
                 pending_file_count: 5,
-                current_file_path: None,
-                last_executed_command_index: None,
             },
         };
 
@@ -786,8 +647,6 @@ mod lsn_tracker_tests {
                 last_processed_tx_id: None,
                 last_processed_timestamp: None,
                 pending_file_count: 0,
-                current_file_path: None,
-                last_executed_command_index: None,
             },
         };
 

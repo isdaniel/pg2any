@@ -88,6 +88,9 @@ pub struct Config {
     /// Transaction file persistence is always enabled for data safety
     pub transaction_file_base_path: String,
 
+    /// Maximum size in bytes for a single transaction segment file
+    pub transaction_segment_size_bytes: usize,
+
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
 }
@@ -188,6 +191,7 @@ impl Default for Config {
             schema_mappings: HashMap::new(),
             batch_size: 1000,
             transaction_file_base_path: ".".to_string(),
+            transaction_segment_size_bytes: 64 * 1024 * 1024,
             extra_options: HashMap::new(),
         }
     }
@@ -369,6 +373,12 @@ impl ConfigBuilder {
     /// Transaction file persistence is always enabled for data safety
     pub fn transaction_file_base_path<S: Into<String>>(mut self, path: S) -> Self {
         self.config.transaction_file_base_path = path.into();
+        self
+    }
+
+    /// Set the maximum size for a transaction segment file
+    pub fn transaction_segment_size_bytes(mut self, size: usize) -> Self {
+        self.config.transaction_segment_size_bytes = size;
         self
     }
 

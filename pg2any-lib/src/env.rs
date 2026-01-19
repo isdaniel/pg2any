@@ -99,6 +99,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
     let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
     let batch_size = parse_usize_env("CDC_COMMIT_BATCH_SIZE", 1000)?;
+    let segment_size_bytes =
+        parse_usize_env("CDC_TRANSACTION_SEGMENT_SIZE_BYTES", 64 * 1024 * 1024)?;
 
     // Transaction file persistence configuration
     let transaction_file_base_path =
@@ -126,6 +128,11 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     );
 
     tracing::info!(
+        "Transaction file segment size: {} bytes",
+        segment_size_bytes
+    );
+
+    tracing::info!(
         "Transaction file persistence at: {}",
         transaction_file_base_path
     );
@@ -146,6 +153,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .buffer_size(buffer_size)
         .batch_size(batch_size)
         .transaction_file_base_path(transaction_file_base_path)
+        .transaction_segment_size_bytes(segment_size_bytes)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");

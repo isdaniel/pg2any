@@ -21,7 +21,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Crash Recovery**: Automatic recovery from incomplete transactions on restart
 - **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations
 - **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
-- **LSN Metadata Tracking**: Enhanced LSN tracking with consumer position and resume capability
+- **LSN Metadata Tracking**: Enhanced LSN tracking with consumer position and resume capability (tracks current_file_path and last_executed_command_index for exact-position resumption)
 - **Configuration Management**: Environment variables and builder pattern with validation
 - **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - **Development Tooling**: Makefile automation, formatting, linting, and quality checks
@@ -37,8 +37,8 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Memory-Efficient SQL Parsing**: Streaming SQL parser with state machine for parsing SQL statements without loading entire files into memory
 - **SQL Compression**: Optional SQL file compression with streaming decompression for reduced disk usage and network transfer
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
-- **LSN Metadata Tracking**: Enhanced tracking with consumer position for fine-grained resume capability
-- **Resumable Processing**: Can restart from exact position within large transaction files
+- **LSN Metadata Tracking**: Enhanced tracking with consumer position for fine-grained resume capability including current_file_path and last_executed_command_index
+- **Resumable Processing**: Can restart from exact position within large transaction files, avoiding duplicate execution and minimizing re-processing overhead
 - **Configuration**: Environment variables, builder pattern, and validation
 - **Error Handling**: Comprehensive error types with thiserror and proper propagation
 - **Real-time Streaming**: Live change capture for all DML operations
@@ -459,7 +459,7 @@ pg2any supports comprehensive configuration through environment variables or the
 | **SQL data Compression** | | | | | |
 | | `PG2ANY_ENABLE_COMPRESSION` | Enable SQL file compression with streaming decompression | `false` | `true`, `1` | Boolean. Compresses transaction SQL files (.sql.gz) to reduce disk usage and network transfer. Uses gzip with sync points for efficient seeking |
 | **System** | | | | | |
-| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores comprehensive CDC metadata including LSN tracking and consumer position |
+| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores comprehensive CDC metadata including flush_lsn, consumer position (current_file_path, last_executed_command_index), and transaction state for crash recovery |
 | | `CDC_TRANSACTION_FILE_BASE_PATH` | Base directory for transaction file storage | `./` | `/data/transactions` | Contains sql_data_tx/, sql_received_tx/, sql_pending_tx/ subdirectories |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
 

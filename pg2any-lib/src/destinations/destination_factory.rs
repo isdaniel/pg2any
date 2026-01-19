@@ -5,6 +5,9 @@ use crate::{
 use async_trait::async_trait;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
+pub type PreCommitHook =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
+
 // Import destination implementations
 #[cfg(feature = "mysql")]
 use super::mysql::MySQLDestination;
@@ -68,9 +71,7 @@ pub trait DestinationHandler: Send + Sync {
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
-        pre_commit_hook: Option<
-            Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>,
-        >,
+        pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()>;
 
     /// Close the connection

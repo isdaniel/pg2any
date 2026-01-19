@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::destinations::{DestinationFactory, DestinationHandler};
+use crate::destinations::{DestinationFactory, DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
@@ -1316,13 +1316,7 @@ impl CdcClient {
             //   - Before COMMIT: Both data and checkpoint rolled back → Safe, resume from old position
             //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
             //   - No race condition possible!
-            let pre_commit_hook: Option<
-                Box<
-                    dyn FnOnce() -> std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                        > + Send,
-                >,
-            > = Some(Box::new(move || {
+            let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
                 let metadata_path = metadata_path.clone();
                 let file_manager_for_hook = file_manager_for_hook.clone();
                 Box::pin(async move {
@@ -1675,13 +1669,7 @@ mod tests {
         async fn execute_sql_batch_with_hook(
             &mut self,
             commands: &[String],
-            pre_commit_hook: Option<
-                Box<
-                    dyn FnOnce() -> std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                        > + Send,
-                >,
-            >,
+            pre_commit_hook: Option<PreCommitHook>,
         ) -> Result<()> {
             if self.should_fail {
                 return Err(CdcError::generic("Mock execute_sql_batch error"));

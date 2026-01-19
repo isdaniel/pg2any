@@ -1,4 +1,4 @@
-use super::destination_factory::DestinationHandler;
+use super::destination_factory::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use sqlx::MySqlPool;
@@ -71,13 +71,7 @@ impl DestinationHandler for MySQLDestination {
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
-        pre_commit_hook: Option<
-            Box<
-                dyn FnOnce() -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                    > + Send,
-            >,
-        >,
+        pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()> {
         if commands.is_empty() {
             return Ok(());

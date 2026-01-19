@@ -47,16 +47,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 const MB: usize = 1024 * 1024;
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
 const PENDING_TX_DIR: &str = "sql_pending_tx";
 const DATA_TX_DIR: &str = "sql_data_tx";
-/// Default buffer size for event accumulation (1MB)
-const DEFAULT_BUFFER_SIZE: usize = 1 * MB;
-/// Default max segment size before rotating to a new data file (64MB)
-const DEFAULT_SEGMENT_SIZE_BYTES: usize = 64 * MB;
+/// Default buffer size for event accumulation (8MB)
+const DEFAULT_BUFFER_SIZE: usize = 8 * MB;
 struct BufferedEventWriter {
     /// File path being written to
     file_path: PathBuf,
@@ -137,8 +136,6 @@ pub struct TransactionFileMetadata {
     pub commit_timestamp: DateTime<Utc>,
     pub commit_lsn: Option<Lsn>,
     pub destination_type: DestinationType,
-    /// Current segment path
-    pub data_file_path: PathBuf,
     /// Ordered list of transaction segments
     #[serde(default)]
     pub segments: Vec<TransactionSegment>,
@@ -230,9 +227,9 @@ pub struct TransactionManager {
     schema_mappings: HashMap<String, String>,
     /// Active transactions and their current segment writers
     /// Key: transaction ID
-    active_transactions: Arc<tokio::sync::Mutex<HashMap<u32, ActiveTransactionState>>>,
+    active_transactions: Arc<Mutex<HashMap<u32, ActiveTransactionState>>>,
     /// Staged progress updates for pending metadata (persisted on shutdown)
-    staged_pending_progress: Arc<tokio::sync::Mutex<HashMap<PathBuf, PendingProgress>>>,
+    staged_pending_progress: Arc<Mutex<HashMap<PathBuf, PendingProgress>>>,
     /// Maximum buffer size before forced flush
     buffer_size: usize,
     /// Maximum segment size before rotating to a new file
@@ -263,23 +260,16 @@ impl TransactionManager {
         let storage = StorageFactory::from_env();
 
         info!(
-            "Transaction file manager initialized at {:?} for {:?}",
-            base_path, destination_type
+            "Transaction file manager initialized at {:?} for {:?}, segment_size_bytes={:?}",
+            base_path, destination_type, segment_size_bytes
         );
-        info!("Three-directory structure: sql_data_tx/ (data), sql_received_tx/ (in-progress metadata), sql_pending_tx/ (committed metadata)");
-
-        let segment_size_bytes = if segment_size_bytes == 0 {
-            DEFAULT_SEGMENT_SIZE_BYTES
-        } else {
-            segment_size_bytes
-        };
 
         Ok(Self {
             base_path,
             destination_type,
             schema_mappings: HashMap::new(),
-            active_transactions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            staged_pending_progress: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_transactions: Arc::new(Mutex::new(HashMap::new())),
+            staged_pending_progress: Arc::new(Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
             storage,
@@ -331,13 +321,6 @@ impl TransactionManager {
         self.base_path.join(PENDING_TX_DIR).join(filename)
     }
 
-    /// Get the file path for the SQL data file
-    /// Always returns .sql - compression happens on commit if enabled
-    fn get_data_file_path(&self, tx_id: u32) -> PathBuf {
-        let filename = format!("{}.sql", tx_id);
-        self.base_path.join(DATA_TX_DIR).join(filename)
-    }
-
     /// Get the file path for a specific segment of a transaction
     /// Segment index is 0-based but file names are 1-based (txid_000001.sql)
     fn get_segment_data_file_path(&self, tx_id: u32, segment_index: usize) -> PathBuf {
@@ -366,7 +349,6 @@ impl TransactionManager {
             commit_timestamp: timestamp,
             commit_lsn: None,
             destination_type: self.destination_type.clone(),
-            data_file_path: data_file_path.clone(),
             segments: vec![TransactionSegment {
                 path: data_file_path.clone(),
                 statement_count: 0,
@@ -431,10 +413,6 @@ impl TransactionManager {
             })
             .collect();
         metadata.current_segment_index = current_segment_index;
-        metadata.data_file_path = segments
-            .get(current_segment_index)
-            .cloned()
-            .unwrap_or_else(|| self.get_data_file_path(tx_id));
 
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
@@ -540,7 +518,7 @@ impl TransactionManager {
             metadata.segments.clone()
         } else {
             vec![TransactionSegment {
-                path: metadata.data_file_path.clone(),
+                path: self.get_segment_data_file_path(tx_id, 0),
                 statement_count: 0,
             }]
         };
@@ -603,11 +581,6 @@ impl TransactionManager {
 
         metadata.segments = final_segments;
         metadata.current_segment_index = 0;
-        metadata.data_file_path = metadata
-            .segments
-            .first()
-            .map(|segment| segment.path.clone())
-            .unwrap_or_else(|| self.get_data_file_path(tx_id));
         metadata.last_executed_command_index = None;
         metadata.last_update_timestamp = None;
         metadata.commit_lsn = commit_lsn;
@@ -648,32 +621,40 @@ impl TransactionManager {
     }
 
     /// Delete transaction files (metadata and data) on abort
-    pub async fn abort_transaction(&self, tx_id: u32, _timestamp: DateTime<Utc>) -> Result<()> {
+    pub async fn abort_transaction(
+        &self,
+        tx_id: u32,
+        _timestamp: DateTime<Utc>,
+    ) -> Result<()> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
-        let data_file_path = self.get_data_file_path(tx_id);
+        let first_segment_path = self.get_segment_data_file_path(tx_id, 0);
 
-        let segment_paths = if tokio::fs::metadata(&received_metadata_path).await.is_ok() {
-            if let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await {
-                if let Ok(metadata) =
-                    serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
-                {
-                    if !metadata.segments.is_empty() {
-                        metadata
-                            .segments
-                            .into_iter()
-                            .map(|seg| seg.path)
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![metadata.data_file_path]
-                    }
-                } else {
-                    vec![data_file_path.clone()]
-                }
-            } else {
-                vec![data_file_path.clone()]
+        let segment_paths = 'paths: {
+            if tokio::fs::metadata(&received_metadata_path).await.is_err() {
+                break 'paths vec![first_segment_path.clone()];
             }
-        } else {
-            vec![data_file_path]
+
+            let Ok(metadata_content) =
+                fs::read_to_string(&received_metadata_path).await
+            else {
+                break 'paths vec![first_segment_path.clone()];
+            };
+
+            let Ok(metadata) =
+                serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
+            else {
+                break 'paths vec![first_segment_path.clone()];
+            };
+
+            if metadata.segments.is_empty() {
+                break 'paths vec![first_segment_path.clone()];
+            }
+            
+            metadata
+                .segments
+                .into_iter()
+                .map(|seg| seg.path)
+                .collect::<Vec<_>>()
         };
 
         // Remove buffered writer (discard any pending writes)
@@ -688,7 +669,7 @@ impl TransactionManager {
             debug!("Deleted metadata file: {:?}", received_metadata_path);
         }
 
-        // Delete data files using storage trait
+        // Delete data files
         for path in segment_paths {
             self.storage.delete_transaction(&path).await?;
         }
@@ -697,6 +678,7 @@ impl TransactionManager {
             "Aborted transaction {}, deleted metadata and data files",
             tx_id
         );
+
         Ok(())
     }
 
@@ -869,7 +851,7 @@ impl TransactionManager {
                 .map(|seg| seg.path.clone())
                 .collect::<Vec<_>>()
         } else {
-            vec![metadata.data_file_path.clone()]
+            vec![self.get_segment_data_file_path(metadata.transaction_id, 0)]
         };
 
         let mut current_segment_index = metadata.current_segment_index;
@@ -940,7 +922,7 @@ impl TransactionManager {
             metadata.segments.clone()
         } else {
             vec![TransactionSegment {
-                path: metadata.data_file_path.clone(),
+                path: self.get_segment_data_file_path(metadata.transaction_id, 0),
                 statement_count: 0,
             }]
         };
@@ -1011,7 +993,7 @@ impl TransactionManager {
                 .map(|seg| seg.path.clone())
                 .collect::<Vec<_>>()
         } else {
-            vec![metadata.data_file_path.clone()]
+            vec![self.get_segment_data_file_path(metadata.transaction_id, 0)]
         };
 
         // Delete metadata file from sql_pending_tx/

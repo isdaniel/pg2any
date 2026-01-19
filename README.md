@@ -21,7 +21,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Crash Recovery**: Automatic recovery from incomplete transactions on restart
 - **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations
 - **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
-- **LSN Metadata Tracking**: Enhanced LSN tracking with consumer position and resume capability (tracks current_file_path and last_executed_command_index for exact-position resumption)
+- **LSN Metadata Tracking**: Flush LSN plus high-level consumer state for recovery; per-transaction resume position is stored in sql_pending_tx/.meta files
 - **Configuration Management**: Environment variables and builder pattern with validation
 - **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
 - **Development Tooling**: Makefile automation, formatting, linting, and quality checks
@@ -37,7 +37,7 @@ This is a **fully functional CDC implementation** providing enterprise-grade Pos
 - **Memory-Efficient SQL Parsing**: Streaming SQL parser with state machine for parsing SQL statements without loading entire files into memory
 - **SQL Compression**: Optional SQL file compression with streaming decompression for reduced disk usage and network transfer
 - **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
-- **LSN Metadata Tracking**: Enhanced tracking with consumer position for fine-grained resume capability including current_file_path and last_executed_command_index
+- **LSN Metadata Tracking**: Flush LSN plus high-level consumer state; per-transaction progress is stored in sql_pending_tx/.meta files
 - **Resumable Processing**: Can restart from exact position within large transaction files, avoiding duplicate execution and minimizing re-processing overhead
 - **Configuration**: Environment variables, builder pattern, and validation
 - **Error Handling**: Comprehensive error types with thiserror and proper propagation
@@ -249,22 +249,21 @@ sequenceDiagram
     
     Channel->>Consumer: Transaction ready
     Consumer->>FS: Read 12345.meta from sql_pending_tx/
-    Consumer->>FS: Get data path from metadata
+    Consumer->>FS: Get segment paths from metadata
     Consumer->>FS: Read SQL commands from 12345.sql
     
     loop For each SQL batch (100 commands)
         Consumer->>Dest: BEGIN TRANSACTION
         Consumer->>Dest: Execute SQL batch
         Consumer->>Dest: COMMIT TRANSACTION
-        Consumer->>LSN: Update consumer position (index: 99)
-        Consumer->>LSN: Persist metadata
+        Consumer->>FS: Update pending .meta progress (last_executed_command_index)
+        Consumer->>FS: Persist pending .meta progress
     end
     
     Consumer->>FS: Delete 12345.meta from sql_pending_tx/
     Consumer->>FS: Delete 12345.sql from sql_data_tx/
     Consumer->>LSN: Update flush_lsn (0/1A2B3C4D)
-    Consumer->>LSN: Clear consumer position
-    Consumer->>LSN: Persist metadata
+    Consumer->>LSN: Persist metadata (flush_lsn + consumer summary)
     Consumer->>PG: Send LSN feedback (flush_lsn, replay_lsn)
 ```
 
@@ -280,12 +279,8 @@ graph TB
     CheckMeta -->|Yes| ParseMeta[Parse JSON Metadata]
     
     ParseMeta --> GetLSN[Extract flush_lsn]
-    ParseMeta --> GetPosition[Extract consumer_state]
     
-    GetPosition --> CheckPosition{current_file_path<br/>exists?}
-    
-    CheckPosition -->|No| CleanReceived[Cleanup sql_received_tx/]
-    CheckPosition -->|Yes| ResumePosition[Resume from<br/>last_executed_command_index + 1]
+    GetLSN --> CleanReceived[Cleanup sql_received_tx/]
     
     CleanReceived --> ScanReceived[Scan sql_received_tx/<br/>for .meta files]
     ScanReceived --> ForEachReceived{For Each<br/>.meta}
@@ -293,7 +288,7 @@ graph TB
     ForEachReceived -->|More files| ReadReceivedMeta[Read .meta]
     ForEachReceived -->|Done| ProcessPending[Process sql_pending_tx/]
     
-    ReadReceivedMeta --> GetDataFile[Get data_file_path]
+    ReadReceivedMeta --> GetDataFile[Get segment paths]
     GetDataFile --> DeleteIncomplete[Delete .meta and .sql]
     DeleteIncomplete --> ForEachReceived
     
@@ -301,7 +296,7 @@ graph TB
     ScanPending --> SortByTimestamp[Sort by commit_timestamp]
     SortByTimestamp --> ForEachPending{For Each<br/>.meta}
     
-    ForEachPending -->|More files| CheckResumeFile{Is current_file_path?}
+    ForEachPending -->|More files| CheckResumeFile{Has last_executed_command_index?}
     ForEachPending -->|Done| SetStartLSN[Set start_lsn = flush_lsn]
     
     CheckResumeFile -->|Yes| ResumeFromIndex[Read SQL from<br/>last_executed_command_index + 1]
@@ -456,10 +451,11 @@ pg2any supports comprehensive configuration through environment variables or the
 | | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
 | **Performance** | | | | | |
 | | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `500` | `3000`, `6000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
+| | `CDC_TRANSACTION_SEGMENT_SIZE_MB` | Max size in MB per transaction segment | `64` | `128` | Controls when a new segment file is created for large transactions |
 | **SQL data Compression** | | | | | |
 | | `PG2ANY_ENABLE_COMPRESSION` | Enable SQL file compression with streaming decompression | `false` | `true`, `1` | Boolean. Compresses transaction SQL files (.sql.gz) to reduce disk usage and network transfer. Uses gzip with sync points for efficient seeking |
 | **System** | | | | | |
-| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores comprehensive CDC metadata including flush_lsn, consumer position (current_file_path, last_executed_command_index), and transaction state for crash recovery |
+| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores flush_lsn and high-level consumer state (e.g., pending_file_count). Per-transaction resume position is stored in sql_pending_tx/.meta files |
 | | `CDC_TRANSACTION_FILE_BASE_PATH` | Base directory for transaction file storage | `./` | `/data/transactions` | Contains sql_data_tx/, sql_received_tx/, sql_pending_tx/ subdirectories |
 | | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
 

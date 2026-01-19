@@ -26,4 +26,4 @@ pub use sqlserver::SqlServerDestination;
 pub use sqlite::SQLiteDestination;
 
 // Re-export factory and trait
-pub use destination_factory::{DestinationFactory, DestinationHandler};
+pub use destination_factory::{DestinationFactory, DestinationHandler, PreCommitHook};

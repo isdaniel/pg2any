@@ -621,11 +621,7 @@ impl TransactionManager {
     }
 
     /// Delete transaction files (metadata and data) on abort
-    pub async fn abort_transaction(
-        &self,
-        tx_id: u32,
-        _timestamp: DateTime<Utc>,
-    ) -> Result<()> {
+    pub async fn abort_transaction(&self, tx_id: u32, _timestamp: DateTime<Utc>) -> Result<()> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let first_segment_path = self.get_segment_data_file_path(tx_id, 0);
 
@@ -634,14 +630,11 @@ impl TransactionManager {
                 break 'paths vec![first_segment_path.clone()];
             }
 
-            let Ok(metadata_content) =
-                fs::read_to_string(&received_metadata_path).await
-            else {
+            let Ok(metadata_content) = fs::read_to_string(&received_metadata_path).await else {
                 break 'paths vec![first_segment_path.clone()];
             };
 
-            let Ok(metadata) =
-                serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
+            let Ok(metadata) = serde_json::from_str::<TransactionFileMetadata>(&metadata_content)
             else {
                 break 'paths vec![first_segment_path.clone()];
             };
@@ -649,7 +642,7 @@ impl TransactionManager {
             if metadata.segments.is_empty() {
                 break 'paths vec![first_segment_path.clone()];
             }
-            
+
             metadata
                 .segments
                 .into_iter()

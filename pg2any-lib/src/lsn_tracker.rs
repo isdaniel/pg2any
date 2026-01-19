@@ -347,12 +347,12 @@ impl LsnTracker {
         }
     }
 
-    /// Update the last committed LSN if the new value is greater
-    ///
-    /// This ensures monotonic LSN progression and prevents regression
-    /// in case of out-of-order processing.
+    /// Update and mark LSN for persistence
+    /// This should be called after each successful transaction commit to the destination.
+    /// It updates the in-memory LSN and marks it as dirty.
+    /// Note: This does NOT automatically persist to disk - caller must explicitly call `persist_async()`.
     #[inline]
-    pub fn update_if_greater(&self, lsn: u64) {
+    pub fn commit_lsn(&self, lsn: u64) {
         if lsn == 0 {
             return;
         }
@@ -363,15 +363,6 @@ impl LsnTracker {
             drop(metadata);
             self.dirty.store(true, Ordering::Release);
         }
-    }
-
-    /// Update and mark LSN for persistence
-    /// This should be called after each successful transaction commit to the destination.
-    /// It updates the in-memory LSN and marks it as dirty.
-    /// Note: This does NOT automatically persist to disk - caller must explicitly call `persist_async()`.
-    #[inline]
-    pub fn commit_lsn(&self, lsn: u64) {
-        self.update_if_greater(lsn);
     }
 
     /// Update consumer state after successful transaction execution
@@ -525,18 +516,18 @@ mod lsn_tracker_tests {
     }
 
     #[tokio::test]
-    async fn test_lsn_tracker_update_if_greater() {
-        let tracker = LsnTracker::new(Some("/tmp/test_lsn_update_if_greater")).await;
+    async fn test_lsn_tracker_commit_lsn() {
+        let tracker = LsnTracker::new(Some("/tmp/test_lsn_commit_lsn")).await;
 
-        tracker.update_if_greater(100);
+        tracker.commit_lsn(100);
         assert_eq!(tracker.get(), 100);
 
         // Smaller value should be ignored
-        tracker.update_if_greater(50);
+        tracker.commit_lsn(50);
         assert_eq!(tracker.get(), 100);
 
         // Greater value should update
-        tracker.update_if_greater(200);
+        tracker.commit_lsn(200);
         assert_eq!(tracker.get(), 200);
     }
 
@@ -544,8 +535,8 @@ mod lsn_tracker_tests {
     async fn test_zero_lsn_ignored() {
         let tracker = LsnTracker::new(Some("/tmp/test_lsn_zero")).await;
 
-        tracker.update_if_greater(100);
-        tracker.update_if_greater(0); // Should be ignored
+        tracker.commit_lsn(100);
+        tracker.commit_lsn(0); // Should be ignored
 
         assert_eq!(tracker.get(), 100);
     }

@@ -77,7 +77,7 @@ pub struct CdcClient {
     /// LSN tracker for tracking last committed LSN to destination (for file persistence)
     lsn_tracker: Arc<LsnTracker>,
     /// Transaction file manager for file-based workflow
-    transaction_file_manager: Option<Arc<TransactionManager>>,
+    transaction_file_manager: Arc<TransactionManager>,
     /// Replication stream for PostgreSQL connection
     replication_stream: Arc<Mutex<ReplicationStream>>,
 }
@@ -136,7 +136,7 @@ impl CdcClient {
             consumer_handle: None,
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
-            transaction_file_manager: Some(Arc::new(manager)),
+            transaction_file_manager: Arc::new(manager),
             replication_stream: Arc::new(Mutex::new(replication_stream)),
         };
 
@@ -192,10 +192,7 @@ impl CdcClient {
     }
 
     async fn start_file_based_workflow(&mut self, start_lsn: Option<Lsn>) -> Result<()> {
-        let transaction_file_manager = self
-            .transaction_file_manager
-            .clone()
-            .ok_or_else(|| CdcError::generic("Transaction file manager not available"))?;
+        let transaction_file_manager = self.transaction_file_manager.clone();
 
         let (tx_commit_notifier, rx_commit_notifier) =
             mpsc::channel::<PendingTransactionFile>(self.config.buffer_size);
@@ -1029,6 +1026,11 @@ impl CdcClient {
                         warn!("Failed to flush staged pending progress on shutdown: {}", e);
                     }
 
+                    // Persist LSN after flushing staged progress
+                    if let Err(e) = lsn_tracker.persist_async().await {
+                        warn!("Failed to persist LSN on consumer shutdown: {}", e);
+                    }
+
                     info!("Consumer: Completed processing all transactions after producer shutdown");
                     shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                     break;
@@ -1121,6 +1123,11 @@ impl CdcClient {
                                 .await
                             {
                                 warn!("Failed to flush staged pending progress on shutdown: {}", e);
+                            }
+
+                            // Persist LSN after flushing staged progress
+                            if let Err(e) = lsn_tracker.persist_async().await {
+                                warn!("Failed to persist LSN on consumer shutdown: {}", e);
                             }
 
                             shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
@@ -1359,7 +1366,7 @@ impl CdcClient {
             batch_count,
             duration,
             tx_id,
-            duration / batch_count.max(1) as u32
+            duration / batch_count as u32
         );
 
         // Finalize: update LSN, record metrics, delete file
@@ -1407,7 +1414,7 @@ impl CdcClient {
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
 
             info!(
-                "✓ Updated apply_lsn to {} (transaction {} applied to destination)",
+                "Updated apply_lsn to {} (transaction {} applied to destination)",
                 commit_lsn, tx_id
             );
         } else {
@@ -1483,15 +1490,6 @@ impl CdcClient {
         // Wait for both tasks to complete gracefully
         self.wait_for_tasks_completion().await?;
 
-        if let Some(ref file_manager) = self.transaction_file_manager {
-            if let Err(e) = file_manager.flush_staged_pending_progress().await {
-                warn!(
-                    "Failed to flush staged pending progress during shutdown: {}",
-                    e
-                );
-            }
-        }
-
         info!("Both producer and consumer completed gracefully");
         {
             info!("Sending final ACK to PostgreSQL before shutdown");
@@ -1513,6 +1511,16 @@ impl CdcClient {
 
         // Shutdown LSN tracker to persist final state
         info!("Shutting down LSN tracker and persisting final state");
+        if let Err(e) = self
+            .transaction_file_manager
+            .flush_staged_pending_progress()
+            .await
+        {
+            warn!(
+                "Failed to flush staged pending progress during shutdown: {}",
+                e
+            );
+        }
 
         // Shutdown LSN tracker, which includes a final state persistence.
         self.lsn_tracker.shutdown_async().await;

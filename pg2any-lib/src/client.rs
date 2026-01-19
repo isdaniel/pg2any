@@ -1019,17 +1019,11 @@ impl CdcClient {
                         &shared_lsn_feedback,
                     ).await;
 
-                    if let Err(e) = transaction_file_manager
-                        .flush_staged_pending_progress()
-                        .await
-                    {
-                        warn!("Failed to flush staged pending progress on shutdown: {}", e);
-                    }
-
-                    // Persist LSN after flushing staged progress
-                    if let Err(e) = lsn_tracker.persist_async().await {
-                        warn!("Failed to persist LSN on consumer shutdown: {}", e);
-                    }
+                    Self::flush_and_persist_on_shutdown(
+                        &transaction_file_manager,
+                        &lsn_tracker,
+                    )
+                    .await;
 
                     info!("Consumer: Completed processing all transactions after producer shutdown");
                     shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
@@ -1118,17 +1112,11 @@ impl CdcClient {
                                 &shared_lsn_feedback,
                             ).await;
 
-                            if let Err(e) = transaction_file_manager
-                                .flush_staged_pending_progress()
-                                .await
-                            {
-                                warn!("Failed to flush staged pending progress on shutdown: {}", e);
-                            }
-
-                            // Persist LSN after flushing staged progress
-                            if let Err(e) = lsn_tracker.persist_async().await {
-                                warn!("Failed to persist LSN on consumer shutdown: {}", e);
-                            }
+                            Self::flush_and_persist_on_shutdown(
+                                &transaction_file_manager,
+                                &lsn_tracker,
+                            )
+                            .await;
 
                             shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                             break;
@@ -1197,6 +1185,24 @@ impl CdcClient {
             Err(e) => {
                 error!("Failed to list remaining files during shutdown: {}", e);
             }
+        }
+    }
+
+    #[inline]
+    async fn flush_and_persist_on_shutdown(
+        transaction_file_manager: &Arc<TransactionManager>,
+        lsn_tracker: &Arc<LsnTracker>,
+    ) {
+        if let Err(e) = transaction_file_manager
+            .flush_staged_pending_progress()
+            .await
+        {
+            warn!("Failed to flush staged pending progress on shutdown: {}", e);
+        }
+
+        // Persist LSN after flushing staged progress
+        if let Err(e) = lsn_tracker.persist_async().await {
+            warn!("Failed to persist LSN on consumer shutdown: {}", e);
         }
     }
 
@@ -1366,7 +1372,7 @@ impl CdcClient {
             batch_count,
             duration,
             tx_id,
-            duration / batch_count as u32
+            duration / batch_count.max(1) as u32
         );
 
         // Finalize: update LSN, record metrics, delete file

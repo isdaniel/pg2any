@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
 use tracing::{debug, info};
 
 /// Number of SQL statements per sync point
@@ -224,6 +224,105 @@ impl TransactionStorage for CompressedStorage {
         Ok(compressed_path)
     }
 
+    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+        let compressed_path = file_path.with_extension("sql.gz");
+
+        info!(
+            "Compressing {:?} to {:?} with sync points (interval: {})",
+            file_path, compressed_path, SYNC_POINT_INTERVAL
+        );
+
+        let source_file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            CdcError::generic(format!("Failed to open source file {file_path:?}: {e}"))
+        })?;
+
+        let mut dest_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&compressed_path)
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to create dest file: {e}")))?;
+
+        let mut parser = SqlStreamParser::new();
+        let mut index = CompressionIndex::new();
+        let mut total_statements: usize = 0;
+        let mut current_offset: u64 = 0;
+        let mut current_chunk: Vec<String> = Vec::with_capacity(SYNC_POINT_INTERVAL);
+
+        let buf_reader = BufReader::with_capacity(65536, source_file);
+        let mut lines = buf_reader.lines();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        {
+            let statements = parser.parse_line(&line)?;
+            for stmt in statements {
+                self.add_statement_to_chunk(
+                    stmt,
+                    &mut current_chunk,
+                    &mut index,
+                    &mut total_statements,
+                    current_offset,
+                );
+
+                if current_chunk.len() >= SYNC_POINT_INTERVAL {
+                    let compressed = Self::compress_chunk(&current_chunk).await?;
+                    dest_file.write_all(&compressed).await.map_err(|e| {
+                        CdcError::generic(format!("Failed to write compressed data: {e}"))
+                    })?;
+
+                    current_offset += compressed.len() as u64;
+                    current_chunk.clear();
+                }
+            }
+        }
+
+        if let Some(stmt) = parser.finish_statement() {
+            self.add_statement_to_chunk(
+                stmt,
+                &mut current_chunk,
+                &mut index,
+                &mut total_statements,
+                current_offset,
+            );
+        }
+
+        if !current_chunk.is_empty() {
+            let compressed = Self::compress_chunk(&current_chunk).await?;
+            dest_file
+                .write_all(&compressed)
+                .await
+                .map_err(|e| CdcError::generic(format!("Failed to write compressed data: {e}")))?;
+        }
+
+        if total_statements == 0 {
+            let _ = fs::remove_file(&compressed_path).await;
+            return Err(CdcError::generic("No statements to compress"));
+        }
+
+        dest_file
+            .flush()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to flush dest file: {e}")))?;
+
+        index.total_statements = total_statements;
+
+        let index_path = Self::index_path(&compressed_path);
+        index.save_to_file(&index_path).await?;
+
+        info!(
+            "Created compression index: {:?} ({} sync points, {} statements)",
+            index_path,
+            index.sync_points.len(),
+            total_statements
+        );
+
+        Ok((compressed_path, total_statements))
+    }
+
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
         let index_path = Self::index_path(file_path);
 
@@ -297,6 +396,47 @@ impl TransactionStorage for CompressedStorage {
 }
 
 impl CompressedStorage {
+    fn add_statement_to_chunk(
+        &self,
+        stmt: String,
+        current_chunk: &mut Vec<String>,
+        index: &mut CompressionIndex,
+        total_statements: &mut usize,
+        current_offset: u64,
+    ) {
+        if current_chunk.is_empty() {
+            index.sync_points.push(StatementOffset {
+                statement_index: *total_statements,
+                compressed_offset: current_offset,
+            });
+        }
+
+        current_chunk.push(stmt);
+        *total_statements += 1;
+    }
+
+    async fn compress_chunk(chunk: &[String]) -> Result<Vec<u8>> {
+        let chunk_data = chunk
+            .iter()
+            .map(|stmt| format!("{};", stmt))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(chunk_data.as_bytes())
+                .map_err(|e| CdcError::generic(format!("Compression write failed: {e}")))?;
+            encoder
+                .finish()
+                .map_err(|e| CdcError::generic(format!("Compression finish failed: {e}")))
+        })
+        .await
+        .map_err(|e| CdcError::generic(format!("Compression task failed: {e}")))?;
+
+        buffer
+    }
+
     /// Read from a specific sync point in the compressed file
     async fn read_from_sync_point(
         &self,
@@ -304,8 +444,6 @@ impl CompressedStorage {
         sync_point: &StatementOffset,
         start_index: usize,
     ) -> Result<Vec<String>> {
-        use async_compression::tokio::bufread::GzipDecoder;
-
         // Open the compressed file and seek to the sync point offset
         let mut file = tokio::fs::File::open(compressed_path).await.map_err(|e| {
             CdcError::generic(format!(

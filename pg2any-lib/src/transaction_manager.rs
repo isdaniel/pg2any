@@ -37,7 +37,6 @@
 //! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
 use crate::error::{CdcError, Result};
-use crate::storage::sql_parser::SqlStreamParser;
 use crate::storage::{StorageFactory, TransactionStorage};
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
 use chrono::{DateTime, Utc};
@@ -206,6 +205,8 @@ impl PartialOrd for PendingTransactionFile {
 struct ActiveTransactionState {
     /// Ordered list of segment paths for this transaction
     segments: Vec<PathBuf>,
+    /// Statement counts per segment (aligned with `segments`)
+    segment_statement_counts: Vec<usize>,
     /// Index of the current segment being written
     current_segment_index: usize,
     /// Current segment size on disk (bytes)
@@ -370,6 +371,7 @@ impl TransactionManager {
             tx_id,
             ActiveTransactionState {
                 segments: vec![data_file_path.clone()],
+                segment_statement_counts: vec![0],
                 current_segment_index: 0,
                 current_segment_size_bytes: 0,
                 writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
@@ -467,6 +469,7 @@ impl TransactionManager {
             File::create(&next_segment_path).await?;
 
             tx_state.segments.push(next_segment_path.clone());
+            tx_state.segment_statement_counts.push(0);
             tx_state.current_segment_index = next_segment_index;
             tx_state.current_segment_size_bytes = 0;
             tx_state.writer = BufferedEventWriter::new(next_segment_path.clone(), self.buffer_size);
@@ -487,6 +490,12 @@ impl TransactionManager {
         }
 
         let should_flush = tx_state.writer.append(&sql);
+        if let Some(count) = tx_state
+            .segment_statement_counts
+            .get_mut(tx_state.current_segment_index)
+        {
+            *count += 1;
+        }
         if should_flush {
             let buffered_bytes = tx_state.writer.buffer_size();
             tx_state.writer.flush().await?;
@@ -514,69 +523,98 @@ impl TransactionManager {
         let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
             .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
 
-        let mut segments = if !metadata.segments.is_empty() {
-            metadata.segments.clone()
-        } else {
-            vec![TransactionSegment {
-                path: self.get_segment_data_file_path(tx_id, 0),
-                statement_count: 0,
-            }]
+        let mut tx_state = {
+            let mut transactions = self.active_transactions.lock().await;
+            transactions.remove(&tx_id)
         };
 
-        if segments.is_empty() {
+        // CRITICAL: Flush any pending buffered events before committing
+        if let Some(state) = tx_state.as_mut() {
+            let buffered_bytes = state.writer.buffer_size();
+            state.writer.flush().await?;
+            if buffered_bytes > 0 {
+                debug!(
+                    "Flushed final buffer for transaction {} ({} bytes)",
+                    tx_id, buffered_bytes
+                );
+            }
+        }
+
+        let (segment_paths, segment_counts) = if let Some(ref state) = tx_state {
+            if !state.segments.is_empty() {
+                (
+                    state.segments.clone(),
+                    state.segment_statement_counts.clone(),
+                )
+            } else if !metadata.segments.is_empty() {
+                (
+                    metadata
+                        .segments
+                        .iter()
+                        .map(|seg| seg.path.clone())
+                        .collect::<Vec<_>>(),
+                    metadata
+                        .segments
+                        .iter()
+                        .map(|seg| seg.statement_count)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+            }
+        } else if !metadata.segments.is_empty() {
+            (
+                metadata
+                    .segments
+                    .iter()
+                    .map(|seg| seg.path.clone())
+                    .collect::<Vec<_>>(),
+                metadata
+                    .segments
+                    .iter()
+                    .map(|seg| seg.statement_count)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+        };
+
+        if segment_paths.is_empty() {
             return Err(CdcError::generic(format!(
                 "No transaction segments found for tx {}",
                 tx_id
             )));
         }
 
-        // CRITICAL: Flush any pending buffered events before committing
-        {
-            let mut transactions = self.active_transactions.lock().await;
-            if let Some(tx_state) = transactions.remove(&tx_id) {
-                let buffered_bytes = tx_state.writer.buffer_size();
-                let mut writer = tx_state.writer;
-                writer.flush().await?;
-                if buffered_bytes > 0 {
-                    debug!(
-                        "Flushed final buffer for transaction {} ({} bytes)",
-                        tx_id, buffered_bytes
-                    );
-                }
-            }
-        }
-
-        let mut parser = SqlStreamParser::new();
         let mut final_segments: Vec<TransactionSegment> = Vec::new();
 
-        for segment in segments.drain(..) {
-            let statements = parser
-                .parse_file_from_index_collect(&segment.path, 0)
-                .await?;
-
-            debug!(
-                "Read {} statements from transaction {} segment {:?} for storage processing",
-                statements.len(),
-                tx_id,
-                segment.path
-            );
-
-            let final_data_path = self
-                .storage
-                .write_transaction(&segment.path, &statements)
-                .await?;
-
-            if final_data_path != segment.path {
-                fs::remove_file(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-                })?;
-                debug!("Removed original uncompressed file: {:?}", segment.path);
+        if self.storage.file_extension() == "sql" {
+            for (idx, segment_path) in segment_paths.iter().enumerate() {
+                let statement_count = segment_counts.get(idx).copied().unwrap_or(0);
+                final_segments.push(TransactionSegment {
+                    path: segment_path.clone(),
+                    statement_count,
+                });
             }
+        } else {
+            for segment_path in segment_paths.iter() {
+                let (final_data_path, statement_count) = self
+                    .storage
+                    .write_transaction_from_file(segment_path)
+                    .await?;
 
-            final_segments.push(TransactionSegment {
-                path: final_data_path,
-                statement_count: statements.len(),
-            });
+                if final_data_path.as_path() != segment_path.as_path() {
+                    fs::remove_file(segment_path).await.map_err(|e| {
+                        CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+                    })?;
+                    debug!("Removed original uncompressed file: {:?}", segment_path);
+                }
+
+                final_segments.push(TransactionSegment {
+                    path: final_data_path,
+                    statement_count,
+                });
+            }
         }
 
         metadata.segments = final_segments;
@@ -847,6 +885,16 @@ impl TransactionManager {
             vec![self.get_segment_data_file_path(metadata.transaction_id, 0)]
         };
 
+        let segment_statement_counts = if !metadata.segments.is_empty() {
+            metadata
+                .segments
+                .iter()
+                .map(|seg| seg.statement_count)
+                .collect::<Vec<_>>()
+        } else {
+            vec![0]
+        };
+
         let mut current_segment_index = metadata.current_segment_index;
         if current_segment_index >= segments.len() {
             current_segment_index = segments.len() - 1;
@@ -871,6 +919,7 @@ impl TransactionManager {
             metadata.transaction_id,
             ActiveTransactionState {
                 segments,
+                segment_statement_counts,
                 current_segment_index,
                 current_segment_size_bytes: current_size,
                 writer: BufferedEventWriter::new(current_segment_path, self.buffer_size),
@@ -878,101 +927,6 @@ impl TransactionManager {
         );
 
         Ok(())
-    }
-
-    /// Read SQL commands starting from a specific command index
-    ///
-    /// This method uses streaming parsing to efficiently handle large transaction files
-    /// without loading the entire file into memory.
-    ///
-    /// Performance characteristics:
-    /// - Memory: O(k) where k is the size of statements being collected (after start_index)
-    /// - Time: O(n) where n is file size in bytes
-    /// - Properly handles multi-line SQL statements with quote escaping
-    /// - Can handle files of any size without memory issues
-    ///
-    /// # Arguments
-    /// * `metadata_file_path` - Path to the metadata file in sql_pending_tx/
-    /// * `start_index` - Zero-based index of the first command to return (0 = start from beginning)
-    ///
-    /// # Returns
-    /// Returns a vector of SQL commands starting from start_index. If start_index >= total commands,
-    /// returns an empty vector.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Resume from command 100 (skip first 100 commands that were already executed)
-    /// let remaining_commands = manager.read_sql_commands_from_index(&file_path, 100).await?;
-    /// ```
-    pub async fn read_sql_commands_from_index(
-        &self,
-        metadata_file_path: &Path,
-        start_index: usize,
-    ) -> Result<Vec<String>> {
-        // Read metadata to get the data file path
-        let metadata = self.read_metadata(metadata_file_path).await?;
-        let mut segments = if !metadata.segments.is_empty() {
-            metadata.segments.clone()
-        } else {
-            vec![TransactionSegment {
-                path: self.get_segment_data_file_path(metadata.transaction_id, 0),
-                statement_count: 0,
-            }]
-        };
-
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        debug!(
-            "Reading SQL commands from {} segment(s) (metadata: {:?}), starting from index {}",
-            segments.len(),
-            metadata_file_path,
-            start_index
-        );
-
-        let mut remaining_start_index = start_index;
-        let mut all_statements: Vec<String> = Vec::new();
-
-        for segment in segments.drain(..) {
-            if remaining_start_index == 0 {
-                let statements = self.storage.read_transaction(&segment.path, 0).await?;
-                all_statements.extend(statements);
-                continue;
-            }
-
-            if segment.statement_count > 0 {
-                if remaining_start_index >= segment.statement_count {
-                    remaining_start_index -= segment.statement_count;
-                    continue;
-                }
-
-                let statements = self
-                    .storage
-                    .read_transaction(&segment.path, remaining_start_index)
-                    .await?;
-                all_statements.extend(statements);
-                remaining_start_index = 0;
-                continue;
-            }
-
-            let statements = self.storage.read_transaction(&segment.path, 0).await?;
-            if remaining_start_index >= statements.len() {
-                remaining_start_index -= statements.len();
-                continue;
-            }
-
-            all_statements.extend(statements.into_iter().skip(remaining_start_index));
-            remaining_start_index = 0;
-        }
-
-        debug!(
-            "Read {} SQL statements across segments (starting from index {})",
-            all_statements.len(),
-            start_index
-        );
-
-        Ok(all_statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution

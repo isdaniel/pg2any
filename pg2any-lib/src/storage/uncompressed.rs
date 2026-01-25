@@ -67,6 +67,13 @@ impl TransactionStorage for UncompressedStorage {
         Ok(file_path.to_path_buf())
     }
 
+    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+        let mut parser = SqlStreamParser::new();
+        let statements = parser.parse_file_from_index_collect(file_path, 0).await?;
+
+        Ok((file_path.to_path_buf(), statements.len()))
+    }
+
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
         let mut parser = SqlStreamParser::new();
         let statements = parser

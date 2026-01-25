@@ -4,14 +4,18 @@ use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::pg_replication::{ReplicationManager, ReplicationStream};
+use crate::storage::{CompressionIndex, SqlStreamParser};
 use crate::transaction_manager::{
     PendingTransactionFile, TransactionFileMetadata, TransactionManager,
 };
 use crate::types::{EventType, Lsn};
+use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
 use std::collections::{BinaryHeap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncSeekExt, BufReader, SeekFrom};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1206,6 +1210,232 @@ impl CdcClient {
         }
     }
 
+    async fn execute_sql_batch(
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        file_manager: Arc<TransactionManager>,
+        metadata_path: &Path,
+        commands: &[String],
+        last_executed_index: usize,
+        batch_idx: usize,
+        metrics_collector: &Arc<MetricsCollector>,
+    ) -> Result<()> {
+        let batch_start_time = Instant::now();
+        let metadata_path = metadata_path.to_path_buf();
+        let metadata_path_for_log = metadata_path.clone();
+        let file_manager_for_hook = file_manager.clone();
+        let staged_index = last_executed_index;
+
+        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+            let metadata_path = metadata_path.clone();
+            let file_manager_for_hook = file_manager_for_hook.clone();
+            Box::pin(async move {
+                file_manager_for_hook
+                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                    .await?;
+                Ok(())
+            })
+        }));
+
+        if let Err(e) = destination_handler
+            .execute_sql_batch_with_hook(commands, pre_commit_hook)
+            .await
+        {
+            error!(
+                "Failed to execute SQL batch {} from file {}: {}",
+                batch_idx,
+                metadata_path_for_log.display(),
+                e
+            );
+            metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+
+            info!(
+                "Batch and checkpoint rolled back together, will retry from last committed position on restart"
+            );
+
+            return Err(e);
+        }
+
+        let batch_duration = batch_start_time.elapsed();
+        debug!(
+            "Successfully executed batch {} with {} commands in {:?}",
+            batch_idx,
+            commands.len(),
+            batch_duration
+        );
+
+        Ok(())
+    }
+
+    async fn process_reader_statements<R>(
+        reader: R,
+        initial_statement_index: usize,
+        start_index: usize,
+        pending_tx: &PendingTransactionFile,
+        file_manager: Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        batch: &mut Vec<String>,
+        current_command_index: &mut usize,
+        processed_count: &mut usize,
+        batch_count: &mut usize,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut parser = SqlStreamParser::new();
+        let mut statement_index = initial_statement_index;
+
+        let buf_reader = BufReader::new(reader);
+        let mut lines = buf_reader.lines();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        {
+            let statements = parser.parse_line(&line)?;
+            for stmt in statements {
+                if statement_index >= start_index {
+                    batch.push(stmt);
+
+                    if batch.len() >= batch_size {
+                        if cancellation_token.is_cancelled() {
+                            return Err(CdcError::cancelled(
+                                "Transaction file processing cancelled by shutdown signal",
+                            ));
+                        }
+
+                        let batch_len = batch.len();
+                        let next_command_index = *current_command_index + batch_len;
+                        let last_executed_index = next_command_index - 1;
+                        *batch_count += 1;
+
+                        Self::execute_sql_batch(
+                            destination_handler,
+                            file_manager.clone(),
+                            &pending_tx.file_path,
+                            batch,
+                            last_executed_index,
+                            *batch_count,
+                            metrics_collector,
+                        )
+                        .await?;
+
+                        *current_command_index = next_command_index;
+                        *processed_count += batch_len;
+                        batch.clear();
+                    }
+                }
+
+                statement_index += 1;
+            }
+        }
+
+        if let Some(stmt) = parser.finish_statement() {
+            if statement_index >= start_index {
+                batch.push(stmt);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_segment_statements(
+        segment_path: &Path,
+        start_index: usize,
+        pending_tx: &PendingTransactionFile,
+        file_manager: Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        batch: &mut Vec<String>,
+        current_command_index: &mut usize,
+        processed_count: &mut usize,
+        batch_count: &mut usize,
+    ) -> Result<()> {
+        let is_compressed = segment_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gz"))
+            .unwrap_or(false);
+
+        if !is_compressed {
+            let file = tokio::fs::File::open(segment_path).await.map_err(|e| {
+                CdcError::generic(format!("Failed to open SQL file {segment_path:?}: {e}"))
+            })?;
+
+            return Self::process_reader_statements(
+                file,
+                0,
+                start_index,
+                pending_tx,
+                file_manager,
+                destination_handler,
+                cancellation_token,
+                metrics_collector,
+                batch_size,
+                batch,
+                current_command_index,
+                processed_count,
+                batch_count,
+            )
+            .await;
+        }
+
+        let index_path = segment_path.with_extension("sql.gz.idx");
+        let mut initial_statement_index = 0usize;
+        let mut start_offset = 0u64;
+
+        if tokio::fs::metadata(&index_path).await.is_ok() {
+            if let Ok(index) = CompressionIndex::load_from_file(&index_path).await {
+                if let Some(sync_point) = index.find_sync_point_for_index(start_index) {
+                    initial_statement_index = sync_point.statement_index;
+                    start_offset = sync_point.compressed_offset;
+                }
+            }
+        }
+
+        let mut file = tokio::fs::File::open(segment_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to open compressed file {segment_path:?}: {e}"
+            ))
+        })?;
+
+        if start_offset > 0 {
+            file.seek(SeekFrom::Start(start_offset))
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to seek compressed file {segment_path:?}: {e}"
+                    ))
+                })?;
+        }
+
+        let buf_reader = BufReader::new(file);
+        let mut decoder = GzipDecoder::new(buf_reader);
+        decoder.multiple_members(true);
+
+        Self::process_reader_statements(
+            decoder,
+            initial_statement_index,
+            start_index,
+            pending_tx,
+            file_manager,
+            destination_handler,
+            cancellation_token,
+            metrics_collector,
+            batch_size,
+            batch,
+            current_command_index,
+            processed_count,
+            batch_count,
+        )
+        .await
+    }
+
     /// Process a single transaction file
     /// Reads SQL commands from the file, executes them via the destination handler in batches,
     /// updates LSN tracking, and deletes the file upon success.
@@ -1240,21 +1470,132 @@ impl CdcClient {
             start_index
         );
 
-        // Read SQL commands from file starting from the saved position
-        let commands = file_manager
-            .read_sql_commands_from_index(&pending_tx.file_path, start_index)
-            .await?;
-        let command_count = commands.len();
-        let total_commands = start_index + command_count;
+        let mut segments = if !latest_metadata.segments.is_empty() {
+            latest_metadata.segments.clone()
+        } else {
+            pending_tx.metadata.segments.clone()
+        };
 
-        if command_count == 0 {
+        if segments.is_empty() {
+            return Err(CdcError::generic(format!(
+                "No transaction segments found for tx {}",
+                tx_id
+            )));
+        }
+
+        let total_known_commands = if segments.iter().all(|seg| seg.statement_count > 0) {
+            Some(
+                segments
+                    .iter()
+                    .map(|seg| seg.statement_count)
+                    .sum::<usize>(),
+            )
+        } else {
+            None
+        };
+
+        let remaining_known = total_known_commands.map(|total| total.saturating_sub(start_index));
+
+        match remaining_known {
+            Some(remaining) => info!(
+                "Executing {} remaining SQL command(s) from file in batches of {} (total: {}, skipped: {})",
+                remaining,
+                batch_size,
+                total_known_commands.unwrap_or(0),
+                start_index
+            ),
+            None => info!(
+                "Executing remaining SQL commands from file in batches of {} (skipped: {})",
+                batch_size,
+                start_index
+            ),
+        }
+
+        let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        let mut batch_count = 0usize;
+        let mut processed_count = 0usize;
+        let mut current_command_index = start_index;
+        let mut remaining_start_index = start_index;
+
+        for segment in segments.drain(..) {
+            if remaining_start_index > 0 && segment.statement_count > 0 {
+                if remaining_start_index >= segment.statement_count {
+                    remaining_start_index -= segment.statement_count;
+                    continue;
+                }
+            }
+
+            let segment_start_index = remaining_start_index;
+            remaining_start_index = 0;
+
+            let stream_result = Self::process_segment_statements(
+                &segment.path,
+                segment_start_index,
+                pending_tx,
+                file_manager.clone(),
+                destination_handler,
+                cancellation_token,
+                metrics_collector,
+                batch_size,
+                &mut batch,
+                &mut current_command_index,
+                &mut processed_count,
+                &mut batch_count,
+            )
+            .await;
+
+            if let Err(e) = stream_result {
+                if e.is_cancelled() {
+                    warn!(
+                        "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                        tx_id
+                    );
+                    return Ok(());
+                }
+
+                return Err(e);
+            }
+        }
+
+        if !batch.is_empty() {
+            if cancellation_token.is_cancelled() {
+                warn!(
+                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                    tx_id
+                );
+                return Ok(());
+            }
+
+            let batch_len = batch.len();
+            let next_command_index = current_command_index + batch_len;
+            let last_executed_index = next_command_index - 1;
+            batch_count += 1;
+
+            Self::execute_sql_batch(
+                destination_handler,
+                file_manager.clone(),
+                &pending_tx.file_path,
+                &batch,
+                last_executed_index,
+                batch_count,
+                metrics_collector,
+            )
+            .await?;
+
+            current_command_index = next_command_index;
+            processed_count += batch_len;
+            batch.clear();
+        }
+
+        let total_commands = current_command_index;
+
+        if processed_count == 0 {
             info!(
                 "All commands already executed for transaction file: {} (tx_id: {})",
                 pending_tx.file_path.display(),
                 tx_id
             );
 
-            // Update LSN and delete file
             Self::finalize_transaction_file(
                 pending_tx,
                 file_manager,
@@ -1268,100 +1609,10 @@ impl CdcClient {
             return Ok(());
         }
 
-        info!(
-            "Executing {} remaining SQL command(s) from file in batches of {} (total: {}, skipped: {})",
-            command_count, batch_size, total_commands, start_index
-        );
-
-        // Execute commands in batches within transactions for better performance
-        let mut batch_count = 0;
-        let mut current_command_index = start_index;
-
-        for (batch_idx, chunk) in commands.chunks(batch_size).enumerate() {
-            // Check for cancellation before processing each batch
-            if cancellation_token.is_cancelled() {
-                info!(
-                    "Cancellation detected during transaction file processing at batch {}/{}",
-                    batch_idx,
-                    (command_count + batch_size - 1) / batch_size
-                );
-
-                warn!(
-                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                    tx_id
-                );
-
-                return Ok(());
-            }
-
-            let next_command_index = current_command_index + chunk.len();
-            let last_executed_index = next_command_index - 1;
-            let batch_start_time = Instant::now();
-            // Execute the batch with transactional checkpoint hook
-            let metadata_path = pending_tx.file_path.clone();
-            let file_manager_for_hook = file_manager.clone();
-            let staged_index = last_executed_index;
-            // The pre-commit hook executes WITHIN the database transaction, BEFORE COMMIT.
-            // This provides true atomicity:
-            //
-            // Timeline:
-            //   BEGIN;
-            //     INSERT INTO users ...;       ← Execute batch commands
-            //     UPDATE products ...;
-            //
-            //     [pre_commit_hook()]          ← Update checkpoint (in-memory)
-            //   COMMIT;                        ← Both data and checkpoint committed atomically
-            //
-            // If crash/rollback occurs:
-            //   - Before COMMIT: Both data and checkpoint rolled back → Safe, resume from old position
-            //   - After COMMIT: Both data and checkpoint persisted → Safe, resume from new position
-            //   - No race condition possible!
-            let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                let metadata_path = metadata_path.clone();
-                let file_manager_for_hook = file_manager_for_hook.clone();
-                Box::pin(async move {
-                    file_manager_for_hook
-                        .stage_pending_metadata_progress(&metadata_path, staged_index)
-                        .await?;
-                    Ok(())
-                })
-            }));
-
-            if let Err(e) = destination_handler
-                .execute_sql_batch_with_hook(chunk, pre_commit_hook)
-                .await
-            {
-                error!(
-                    "Failed to execute SQL batch {} from file {}: {}",
-                    batch_idx + 1,
-                    pending_tx.file_path.display(),
-                    e
-                );
-                metrics_collector.record_error("transaction_file_execution_failed", "consumer");
-
-                info!(
-                    "Batch and checkpoint rolled back together, will retry from last committed position on restart"
-                );
-
-                return Err(e);
-            }
-            current_command_index = next_command_index;
-
-            let batch_duration = batch_start_time.elapsed();
-            debug!(
-                "Successfully executed batch {}/{} with {} commands in {:?}",
-                batch_idx + 1,
-                (command_count + batch_size - 1) / batch_size,
-                chunk.len(),
-                batch_duration
-            );
-            batch_count += 1;
-        }
-
         let duration = start_time.elapsed();
         info!(
-            "Successfully executed all {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
-            command_count,
+            "Successfully executed {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
+            processed_count,
             total_commands,
             batch_count,
             duration,

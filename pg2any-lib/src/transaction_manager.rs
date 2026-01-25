@@ -36,19 +36,26 @@
 //! - Metadata in sql_received_tx/ are incomplete transactions (can be cleaned up with data files)
 //! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
+use crate::destinations::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
-use crate::storage::sql_parser::SqlStreamParser;
-use crate::storage::{StorageFactory, TransactionStorage};
+use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
+use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
+use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, TransactionStorage};
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
+use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, SeekFrom,
+};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 const MB: usize = 1024 * 1024;
 const RECEIVED_TX_DIR: &str = "sql_received_tx";
@@ -206,12 +213,21 @@ impl PartialOrd for PendingTransactionFile {
 struct ActiveTransactionState {
     /// Ordered list of segment paths for this transaction
     segments: Vec<PathBuf>,
+    /// Statement counts per segment (aligned with `segments`)
+    segment_statement_counts: Vec<usize>,
     /// Index of the current segment being written
     current_segment_index: usize,
     /// Current segment size on disk (bytes)
     current_segment_size_bytes: usize,
     /// Buffered writer for the current segment
     writer: BufferedEventWriter,
+}
+
+struct StatementProcessingState<'a> {
+    batch: &'a mut Vec<String>,
+    current_command_index: &'a mut usize,
+    processed_count: &'a mut usize,
+    batch_count: &'a mut usize,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +344,34 @@ impl TransactionManager {
         self.base_path.join(DATA_TX_DIR).join(filename)
     }
 
+    fn get_final_segment_info(
+        &self,
+        tx_id: u32,
+        metadata: &TransactionFileMetadata,
+        tx_state: Option<&ActiveTransactionState>,
+    ) -> (Vec<PathBuf>, Vec<usize>) {
+        if let Some(state) = tx_state.filter(|state| !state.segments.is_empty()) {
+            (
+                state.segments.clone(),
+                state.segment_statement_counts.clone(),
+            )
+        } else if !metadata.segments.is_empty() {
+            let paths = metadata
+                .segments
+                .iter()
+                .map(|seg| seg.path.clone())
+                .collect::<Vec<_>>();
+            let counts = metadata
+                .segments
+                .iter()
+                .map(|seg| seg.statement_count)
+                .collect::<Vec<_>>();
+            (paths, counts)
+        } else {
+            (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+        }
+    }
+
     /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
     pub async fn begin_transaction(
         &self,
@@ -370,6 +414,7 @@ impl TransactionManager {
             tx_id,
             ActiveTransactionState {
                 segments: vec![data_file_path.clone()],
+                segment_statement_counts: vec![0],
                 current_segment_index: 0,
                 current_segment_size_bytes: 0,
                 writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
@@ -467,6 +512,7 @@ impl TransactionManager {
             File::create(&next_segment_path).await?;
 
             tx_state.segments.push(next_segment_path.clone());
+            tx_state.segment_statement_counts.push(0);
             tx_state.current_segment_index = next_segment_index;
             tx_state.current_segment_size_bytes = 0;
             tx_state.writer = BufferedEventWriter::new(next_segment_path.clone(), self.buffer_size);
@@ -487,6 +533,12 @@ impl TransactionManager {
         }
 
         let should_flush = tx_state.writer.append(&sql);
+        if let Some(count) = tx_state
+            .segment_statement_counts
+            .get_mut(tx_state.current_segment_index)
+        {
+            *count += 1;
+        }
         if should_flush {
             let buffered_bytes = tx_state.writer.buffer_size();
             tx_state.writer.flush().await?;
@@ -514,69 +566,62 @@ impl TransactionManager {
         let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
             .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
 
-        let mut segments = if !metadata.segments.is_empty() {
-            metadata.segments.clone()
-        } else {
-            vec![TransactionSegment {
-                path: self.get_segment_data_file_path(tx_id, 0),
-                statement_count: 0,
-            }]
+        let mut tx_state = {
+            let mut transactions = self.active_transactions.lock().await;
+            transactions.remove(&tx_id)
         };
 
-        if segments.is_empty() {
+        // CRITICAL: Flush any pending buffered events before committing
+        if let Some(state) = tx_state.as_mut() {
+            let buffered_bytes = state.writer.buffer_size();
+            state.writer.flush().await?;
+            if buffered_bytes > 0 {
+                debug!(
+                    "Flushed final buffer for transaction {} ({} bytes)",
+                    tx_id, buffered_bytes
+                );
+            }
+        }
+
+        let (segment_paths, segment_counts) =
+            self.get_final_segment_info(tx_id, &metadata, tx_state.as_ref());
+
+        if segment_paths.is_empty() {
             return Err(CdcError::generic(format!(
                 "No transaction segments found for tx {}",
                 tx_id
             )));
         }
 
-        // CRITICAL: Flush any pending buffered events before committing
-        {
-            let mut transactions = self.active_transactions.lock().await;
-            if let Some(tx_state) = transactions.remove(&tx_id) {
-                let buffered_bytes = tx_state.writer.buffer_size();
-                let mut writer = tx_state.writer;
-                writer.flush().await?;
-                if buffered_bytes > 0 {
-                    debug!(
-                        "Flushed final buffer for transaction {} ({} bytes)",
-                        tx_id, buffered_bytes
-                    );
-                }
-            }
-        }
-
-        let mut parser = SqlStreamParser::new();
         let mut final_segments: Vec<TransactionSegment> = Vec::new();
 
-        for segment in segments.drain(..) {
-            let statements = parser
-                .parse_file_from_index_collect(&segment.path, 0)
-                .await?;
-
-            debug!(
-                "Read {} statements from transaction {} segment {:?} for storage processing",
-                statements.len(),
-                tx_id,
-                segment.path
-            );
-
-            let final_data_path = self
-                .storage
-                .write_transaction(&segment.path, &statements)
-                .await?;
-
-            if final_data_path != segment.path {
-                fs::remove_file(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-                })?;
-                debug!("Removed original uncompressed file: {:?}", segment.path);
+        if self.storage.file_extension() == "sql" {
+            for (idx, segment_path) in segment_paths.iter().enumerate() {
+                let statement_count = segment_counts.get(idx).copied().unwrap_or(0);
+                final_segments.push(TransactionSegment {
+                    path: segment_path.clone(),
+                    statement_count,
+                });
             }
+        } else {
+            for segment_path in segment_paths.iter() {
+                let (final_data_path, statement_count) = self
+                    .storage
+                    .write_transaction_from_file(segment_path)
+                    .await?;
 
-            final_segments.push(TransactionSegment {
-                path: final_data_path,
-                statement_count: statements.len(),
-            });
+                if final_data_path.as_path() != segment_path.as_path() {
+                    fs::remove_file(segment_path).await.map_err(|e| {
+                        CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+                    })?;
+                    debug!("Removed original uncompressed file: {:?}", segment_path);
+                }
+
+                final_segments.push(TransactionSegment {
+                    path: final_data_path,
+                    statement_count,
+                });
+            }
         }
 
         metadata.segments = final_segments;
@@ -847,6 +892,16 @@ impl TransactionManager {
             vec![self.get_segment_data_file_path(metadata.transaction_id, 0)]
         };
 
+        let segment_statement_counts = if !metadata.segments.is_empty() {
+            metadata
+                .segments
+                .iter()
+                .map(|seg| seg.statement_count)
+                .collect::<Vec<_>>()
+        } else {
+            vec![0]
+        };
+
         let mut current_segment_index = metadata.current_segment_index;
         if current_segment_index >= segments.len() {
             current_segment_index = segments.len() - 1;
@@ -871,6 +926,7 @@ impl TransactionManager {
             metadata.transaction_id,
             ActiveTransactionState {
                 segments,
+                segment_statement_counts,
                 current_segment_index,
                 current_segment_size_bytes: current_size,
                 writer: BufferedEventWriter::new(current_segment_path, self.buffer_size),
@@ -878,101 +934,6 @@ impl TransactionManager {
         );
 
         Ok(())
-    }
-
-    /// Read SQL commands starting from a specific command index
-    ///
-    /// This method uses streaming parsing to efficiently handle large transaction files
-    /// without loading the entire file into memory.
-    ///
-    /// Performance characteristics:
-    /// - Memory: O(k) where k is the size of statements being collected (after start_index)
-    /// - Time: O(n) where n is file size in bytes
-    /// - Properly handles multi-line SQL statements with quote escaping
-    /// - Can handle files of any size without memory issues
-    ///
-    /// # Arguments
-    /// * `metadata_file_path` - Path to the metadata file in sql_pending_tx/
-    /// * `start_index` - Zero-based index of the first command to return (0 = start from beginning)
-    ///
-    /// # Returns
-    /// Returns a vector of SQL commands starting from start_index. If start_index >= total commands,
-    /// returns an empty vector.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Resume from command 100 (skip first 100 commands that were already executed)
-    /// let remaining_commands = manager.read_sql_commands_from_index(&file_path, 100).await?;
-    /// ```
-    pub async fn read_sql_commands_from_index(
-        &self,
-        metadata_file_path: &Path,
-        start_index: usize,
-    ) -> Result<Vec<String>> {
-        // Read metadata to get the data file path
-        let metadata = self.read_metadata(metadata_file_path).await?;
-        let mut segments = if !metadata.segments.is_empty() {
-            metadata.segments.clone()
-        } else {
-            vec![TransactionSegment {
-                path: self.get_segment_data_file_path(metadata.transaction_id, 0),
-                statement_count: 0,
-            }]
-        };
-
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        debug!(
-            "Reading SQL commands from {} segment(s) (metadata: {:?}), starting from index {}",
-            segments.len(),
-            metadata_file_path,
-            start_index
-        );
-
-        let mut remaining_start_index = start_index;
-        let mut all_statements: Vec<String> = Vec::new();
-
-        for segment in segments.drain(..) {
-            if remaining_start_index == 0 {
-                let statements = self.storage.read_transaction(&segment.path, 0).await?;
-                all_statements.extend(statements);
-                continue;
-            }
-
-            if segment.statement_count > 0 {
-                if remaining_start_index >= segment.statement_count {
-                    remaining_start_index -= segment.statement_count;
-                    continue;
-                }
-
-                let statements = self
-                    .storage
-                    .read_transaction(&segment.path, remaining_start_index)
-                    .await?;
-                all_statements.extend(statements);
-                remaining_start_index = 0;
-                continue;
-            }
-
-            let statements = self.storage.read_transaction(&segment.path, 0).await?;
-            if remaining_start_index >= statements.len() {
-                remaining_start_index -= statements.len();
-                continue;
-            }
-
-            all_statements.extend(statements.into_iter().skip(remaining_start_index));
-            remaining_start_index = 0;
-        }
-
-        debug!(
-            "Read {} SQL statements across segments (starting from index {})",
-            all_statements.len(),
-            start_index
-        );
-
-        Ok(all_statements)
     }
 
     /// Delete a pending transaction (metadata and data files) after successful execution
@@ -1323,5 +1284,483 @@ impl TransactionManager {
         } else {
             "public".to_string()
         }
+    }
+}
+
+impl TransactionManager {
+    async fn execute_sql_batch(
+        self: &Arc<Self>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metadata_path: &Path,
+        commands: &[String],
+        last_executed_index: usize,
+        batch_idx: usize,
+        metrics_collector: &Arc<MetricsCollector>,
+    ) -> Result<()> {
+        let batch_start_time = Instant::now();
+        let metadata_path = metadata_path.to_path_buf();
+        let metadata_path_for_log = metadata_path.clone();
+        let file_manager_for_hook = self.clone();
+        let staged_index = last_executed_index;
+
+        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+            let metadata_path = metadata_path.clone();
+            let file_manager_for_hook = file_manager_for_hook.clone();
+            Box::pin(async move {
+                file_manager_for_hook
+                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                    .await?;
+                Ok(())
+            })
+        }));
+
+        if let Err(e) = destination_handler
+            .execute_sql_batch_with_hook(commands, pre_commit_hook)
+            .await
+        {
+            error!(
+                "Failed to execute SQL batch {} from file {}: {}",
+                batch_idx,
+                metadata_path_for_log.display(),
+                e
+            );
+            metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+
+            info!(
+                "Batch and checkpoint rolled back together, will retry from last committed position on restart"
+            );
+
+            return Err(e);
+        }
+
+        let batch_duration = batch_start_time.elapsed();
+        debug!(
+            "Successfully executed batch {} with {} commands in {:?}",
+            batch_idx,
+            commands.len(),
+            batch_duration
+        );
+
+        Ok(())
+    }
+
+    async fn process_reader_statements<R>(
+        self: &Arc<Self>,
+        reader: R,
+        initial_statement_index: usize,
+        start_index: usize,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        state: &mut StatementProcessingState<'_>,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut parser = SqlStreamParser::new();
+        let mut statement_index = initial_statement_index;
+
+        let buf_reader = BufReader::new(reader);
+        let mut lines = buf_reader.lines();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        {
+            let statements = parser.parse_line(&line)?;
+            for stmt in statements {
+                if statement_index >= start_index {
+                    state.batch.push(stmt);
+
+                    if state.batch.len() >= batch_size {
+                        if cancellation_token.is_cancelled() {
+                            return Err(CdcError::cancelled(
+                                "Transaction file processing cancelled by shutdown signal",
+                            ));
+                        }
+
+                        let batch_len = state.batch.len();
+                        let next_command_index = *state.current_command_index + batch_len;
+                        let last_executed_index = next_command_index - 1;
+                        *state.batch_count += 1;
+
+                        self.execute_sql_batch(
+                            destination_handler,
+                            &pending_tx.file_path,
+                            state.batch,
+                            last_executed_index,
+                            *state.batch_count,
+                            metrics_collector,
+                        )
+                        .await?;
+
+                        *state.current_command_index = next_command_index;
+                        *state.processed_count += batch_len;
+                        state.batch.clear();
+                    }
+                }
+
+                statement_index += 1;
+            }
+        }
+
+        if let Some(stmt) = parser.finish_statement() {
+            if statement_index >= start_index {
+                state.batch.push(stmt);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_segment_statements(
+        self: &Arc<Self>,
+        segment_path: &Path,
+        start_index: usize,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        state: &mut StatementProcessingState<'_>,
+    ) -> Result<()> {
+        let is_compressed = segment_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gz"))
+            .unwrap_or(false);
+
+        if !is_compressed {
+            let file = tokio::fs::File::open(segment_path).await.map_err(|e| {
+                CdcError::generic(format!("Failed to open SQL file {segment_path:?}: {e}"))
+            })?;
+
+            return self
+                .process_reader_statements(
+                    file,
+                    0,
+                    start_index,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    metrics_collector,
+                    batch_size,
+                    state,
+                )
+                .await;
+        }
+
+        let index_path = segment_path.with_extension("sql.gz.idx");
+        let mut initial_statement_index = 0usize;
+        let mut start_offset = 0u64;
+
+        if tokio::fs::metadata(&index_path).await.is_ok() {
+            if let Ok(index) = CompressionIndex::load_from_file(&index_path).await {
+                if let Some(sync_point) = index.find_sync_point_for_index(start_index) {
+                    initial_statement_index = sync_point.statement_index;
+                    start_offset = sync_point.compressed_offset;
+                }
+            }
+        }
+
+        let mut file = tokio::fs::File::open(segment_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to open compressed file {segment_path:?}: {e}"
+            ))
+        })?;
+
+        if start_offset > 0 {
+            file.seek(SeekFrom::Start(start_offset))
+                .await
+                .map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to seek compressed file {segment_path:?}: {e}"
+                    ))
+                })?;
+        }
+
+        let buf_reader = BufReader::new(file);
+        let mut decoder = GzipDecoder::new(buf_reader);
+        decoder.multiple_members(true);
+
+        self.process_reader_statements(
+            decoder,
+            initial_statement_index,
+            start_index,
+            pending_tx,
+            destination_handler,
+            cancellation_token,
+            metrics_collector,
+            batch_size,
+            state,
+        )
+        .await
+    }
+
+    /// Process a single transaction file
+    /// Reads SQL commands from the file, executes them via the destination handler in batches,
+    /// updates LSN tracking, and deletes the file upon success.
+    /// This method supports resumable processing: it tracks the position after each batch
+    /// and can resume from where it left off if interrupted.
+    ///
+    /// Checks cancellation token between batches to support graceful shutdown.
+    pub(crate) async fn process_transaction_file(
+        self: Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) -> Result<()> {
+        let start_time = Instant::now();
+        let tx_id = pending_tx.metadata.transaction_id;
+
+        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        let start_index = latest_metadata
+            .last_executed_command_index
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+
+        info!(
+            "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
+            pending_tx.file_path.display(),
+            tx_id,
+            pending_tx.metadata.commit_lsn,
+            start_index
+        );
+
+        let mut segments = if !latest_metadata.segments.is_empty() {
+            latest_metadata.segments.clone()
+        } else {
+            pending_tx.metadata.segments.clone()
+        };
+
+        if segments.is_empty() {
+            return Err(CdcError::generic(format!(
+                "No transaction segments found for tx {}",
+                tx_id
+            )));
+        }
+
+        let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        let mut batch_count = 0usize;
+        let mut processed_count = 0usize;
+        let mut current_command_index = start_index;
+        let mut remaining_start_index = start_index;
+
+        let mut state = StatementProcessingState {
+            batch: &mut batch,
+            current_command_index: &mut current_command_index,
+            processed_count: &mut processed_count,
+            batch_count: &mut batch_count,
+        };
+
+        for segment in segments.drain(..) {
+            if remaining_start_index > 0 && segment.statement_count > 0 {
+                if remaining_start_index >= segment.statement_count {
+                    remaining_start_index -= segment.statement_count;
+                    continue;
+                }
+            }
+
+            let segment_start_index = remaining_start_index;
+            remaining_start_index = 0;
+
+            let stream_result = self
+                .process_segment_statements(
+                    &segment.path,
+                    segment_start_index,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    metrics_collector,
+                    batch_size,
+                    &mut state,
+                )
+                .await;
+
+            if let Err(e) = stream_result {
+                if e.is_cancelled() {
+                    warn!(
+                        "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                        tx_id
+                    );
+                    return Ok(());
+                }
+
+                return Err(e);
+            }
+        }
+
+        if !batch.is_empty() {
+            if cancellation_token.is_cancelled() {
+                warn!(
+                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                    tx_id
+                );
+                return Ok(());
+            }
+
+            let batch_len = batch.len();
+            let next_command_index = current_command_index + batch_len;
+            let last_executed_index = next_command_index - 1;
+            batch_count += 1;
+
+            self.execute_sql_batch(
+                destination_handler,
+                &pending_tx.file_path,
+                &batch,
+                last_executed_index,
+                batch_count,
+                metrics_collector,
+            )
+            .await?;
+
+            current_command_index = next_command_index;
+            processed_count += batch_len;
+            batch.clear();
+        }
+
+        let total_commands = current_command_index;
+
+        if processed_count == 0 {
+            info!(
+                "All commands already executed for transaction file: {} (tx_id: {})",
+                pending_tx.file_path.display(),
+                tx_id
+            );
+
+            self.finalize_transaction_file(
+                pending_tx,
+                lsn_tracker,
+                metrics_collector,
+                total_commands,
+                shared_lsn_feedback,
+            )
+            .await?;
+
+            return Ok(());
+        }
+
+        let duration = start_time.elapsed();
+        info!(
+            "Successfully executed {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
+            processed_count,
+            total_commands,
+            batch_count,
+            duration,
+            tx_id,
+            duration / batch_count.max(1) as u32
+        );
+
+        // Finalize: update LSN, record metrics, delete file
+        self.finalize_transaction_file(
+            pending_tx,
+            lsn_tracker,
+            metrics_collector,
+            total_commands,
+            shared_lsn_feedback,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Core logic for finalizing transaction file processing
+    ///
+    /// PROTOCOL COMPLIANCE - ACK AFTER APPLY:
+    /// This function is called ONLY after successful execution of all SQL commands.
+    /// It updates confirmed_flush_lsn and sends ACK to PostgreSQL.
+    /// This ensures we never ACK a transaction that hasn't been successfully applied.
+    async fn finalize_transaction_file(
+        self: &Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        total_commands: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) -> Result<()> {
+        let tx_id = pending_tx.metadata.transaction_id;
+
+        // PROTOCOL COMPLIANCE: Update LSN and send ACK ONLY after successful apply
+        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
+            info!(
+                "Transaction {} successfully applied to destination, commit_lsn: {}",
+                tx_id, commit_lsn
+            );
+
+            // 1. Update confirmed_flush_lsn (last successfully applied LSN)
+            lsn_tracker.commit_lsn(commit_lsn.0);
+
+            // 2. Update apply_lsn - transaction is now applied to destination
+            // (flush_lsn was already updated by producer when file was persisted)
+            shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
+
+            info!(
+                "Updated apply_lsn to {} (transaction {} applied to destination)",
+                commit_lsn, tx_id
+            );
+        } else {
+            warn!(
+                "Transaction {} has no commit_lsn, cannot send ACK (this should not happen for committed transactions)",
+                tx_id
+            );
+        }
+
+        // Record metrics - create a transaction object for metrics recording
+        let destination_type_str = pending_tx.metadata.destination_type.to_string();
+
+        // Create a transaction object for metrics (events are already executed, so we use empty vec)
+        // The event_count is derived from the number of SQL commands executed
+        let mut transaction = crate::types::Transaction::new(
+            pending_tx.metadata.transaction_id,
+            pending_tx.metadata.commit_timestamp,
+        );
+        transaction.commit_lsn = pending_tx.metadata.commit_lsn;
+
+        // Record transaction processed metrics
+        metrics_collector.record_transaction_processed(&transaction, &destination_type_str);
+
+        // Since file-based processing always processes complete transactions,
+        // we also record this as a full transaction
+        metrics_collector.record_full_transaction_processed(&transaction, &destination_type_str);
+
+        debug!(
+            "Successfully processed transaction file with {} commands and recorded metrics",
+            total_commands
+        );
+
+        // Delete the file after successful processing
+        if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
+            error!(
+                "Failed to delete processed transaction file {}: {}",
+                pending_tx.file_path.display(),
+                e
+            );
+        }
+
+        self.clear_staged_pending_progress(&pending_tx.file_path)
+            .await;
+
+        if pending_tx.metadata.commit_lsn.is_some() {
+            let pending_count = self.list_pending_transactions().await?.len();
+            lsn_tracker.update_consumer_state(
+                tx_id,
+                pending_tx.metadata.commit_timestamp,
+                pending_count,
+            );
+
+            debug!(
+                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
+                tx_id, pending_count
+            );
+        }
+
+        Ok(())
     }
 }

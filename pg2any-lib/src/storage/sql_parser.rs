@@ -97,31 +97,28 @@ impl SqlStreamParser {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            // Parse line and collect statements
-            self.parse_line_collect(&line, start_index, &mut statements)?;
-        }
-
-        // Handle remaining content
-        if !self.statement_buffer.is_empty() {
-            let stmt_bytes = self.trim_statement_buffer();
-            if !stmt_bytes.is_empty() {
+            let line_statements = self.parse_line(&line)?;
+            for stmt in line_statements {
                 if self.statement_count >= start_index {
-                    statements.push(String::from_utf8_lossy(&stmt_bytes).into_owned());
+                    statements.push(stmt);
                 }
                 self.statement_count += 1;
             }
         }
 
+        if let Some(stmt) = self.finish_statement() {
+            if self.statement_count >= start_index {
+                statements.push(stmt);
+            }
+            self.statement_count += 1;
+        }
+
         Ok(statements)
     }
 
-    /// Parse a single line and collect complete statements
-    fn parse_line_collect(
-        &mut self,
-        line: &str,
-        start_index: usize,
-        statements: &mut Vec<String>,
-    ) -> Result<()> {
+    /// Parse a single line and return any completed statements
+    pub fn parse_line(&mut self, line: &str) -> Result<Vec<String>> {
+        let mut statements = Vec::new();
         let bytes = line.as_bytes();
         let mut i = 0;
 
@@ -150,10 +147,7 @@ impl SqlStreamParser {
                     ';' => {
                         let stmt_bytes = self.trim_statement_buffer();
                         if !stmt_bytes.is_empty() {
-                            if self.statement_count >= start_index {
-                                statements.push(String::from_utf8_lossy(&stmt_bytes).into_owned());
-                            }
-                            self.statement_count += 1;
+                            statements.push(String::from_utf8_lossy(&stmt_bytes).into_owned());
                         }
                         self.statement_buffer.clear();
                     }
@@ -207,7 +201,23 @@ impl SqlStreamParser {
 
         self.statement_buffer.push(b'\n');
 
-        Ok(())
+        Ok(statements)
+    }
+
+    /// Finalize parsing at EOF and return the remaining statement, if any
+    pub fn finish_statement(&mut self) -> Option<String> {
+        if self.statement_buffer.is_empty() {
+            return None;
+        }
+
+        let stmt_bytes = self.trim_statement_buffer();
+        self.statement_buffer.clear();
+
+        if stmt_bytes.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&stmt_bytes).into_owned())
+        }
     }
 
     /// Trim whitespace from statement buffer and return a copy

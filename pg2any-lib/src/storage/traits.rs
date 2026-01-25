@@ -24,6 +24,18 @@ pub trait TransactionStorage: Send + Sync {
     /// * `PathBuf` - Actual path where data was written (may differ for compressed storage)
     async fn write_transaction(&self, file_path: &Path, data: &[String]) -> Result<PathBuf>;
 
+    /// Write a transaction file from an existing uncompressed file
+    ///
+    /// Implementations may transform/compress the file. This avoids loading all
+    /// statements into memory at once and can return a statement count for metadata.
+    ///
+    /// # Arguments
+    /// * `file_path` - Uncompressed file path
+    ///
+    /// # Returns
+    /// * `(PathBuf, usize)` - Actual path where data was written and total statements
+    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)>;
+
     /// Read SQL commands from a transaction file, starting from a specific index
     ///
     /// # Arguments

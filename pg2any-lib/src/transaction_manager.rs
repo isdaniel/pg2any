@@ -555,44 +555,27 @@ impl TransactionManager {
             }
         }
 
-        let (segment_paths, segment_counts) = if let Some(ref state) = tx_state {
-            if !state.segments.is_empty() {
+        let (segment_paths, segment_counts) =
+            if let Some(state) = tx_state.as_ref().filter(|state| !state.segments.is_empty()) {
                 (
                     state.segments.clone(),
                     state.segment_statement_counts.clone(),
                 )
             } else if !metadata.segments.is_empty() {
-                (
-                    metadata
-                        .segments
-                        .iter()
-                        .map(|seg| seg.path.clone())
-                        .collect::<Vec<_>>(),
-                    metadata
-                        .segments
-                        .iter()
-                        .map(|seg| seg.statement_count)
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
-            }
-        } else if !metadata.segments.is_empty() {
-            (
-                metadata
+                let paths = metadata
                     .segments
                     .iter()
                     .map(|seg| seg.path.clone())
-                    .collect::<Vec<_>>(),
-                metadata
+                    .collect::<Vec<_>>();
+                let counts = metadata
                     .segments
                     .iter()
                     .map(|seg| seg.statement_count)
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
-        };
+                    .collect::<Vec<_>>();
+                (paths, counts)
+            } else {
+                (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+            };
 
         if segment_paths.is_empty() {
             return Err(CdcError::generic(format!(

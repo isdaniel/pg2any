@@ -1289,8 +1289,8 @@ impl TransactionManager {
 
 impl TransactionManager {
     async fn execute_sql_batch(
+        self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        file_manager: Arc<TransactionManager>,
         metadata_path: &Path,
         commands: &[String],
         last_executed_index: usize,
@@ -1300,7 +1300,7 @@ impl TransactionManager {
         let batch_start_time = Instant::now();
         let metadata_path = metadata_path.to_path_buf();
         let metadata_path_for_log = metadata_path.clone();
-        let file_manager_for_hook = file_manager.clone();
+        let file_manager_for_hook = self.clone();
         let staged_index = last_executed_index;
 
         let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
@@ -1345,11 +1345,11 @@ impl TransactionManager {
     }
 
     async fn process_reader_statements<R>(
+        self: &Arc<Self>,
         reader: R,
         initial_statement_index: usize,
         start_index: usize,
         pending_tx: &PendingTransactionFile,
-        file_manager: Arc<TransactionManager>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
         metrics_collector: &Arc<MetricsCollector>,
@@ -1387,9 +1387,8 @@ impl TransactionManager {
                         let last_executed_index = next_command_index - 1;
                         *state.batch_count += 1;
 
-                        Self::execute_sql_batch(
+                        self.execute_sql_batch(
                             destination_handler,
-                            file_manager.clone(),
                             &pending_tx.file_path,
                             state.batch,
                             last_executed_index,
@@ -1418,10 +1417,10 @@ impl TransactionManager {
     }
 
     async fn process_segment_statements(
+        self: &Arc<Self>,
         segment_path: &Path,
         start_index: usize,
         pending_tx: &PendingTransactionFile,
-        file_manager: Arc<TransactionManager>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
         metrics_collector: &Arc<MetricsCollector>,
@@ -1439,19 +1438,19 @@ impl TransactionManager {
                 CdcError::generic(format!("Failed to open SQL file {segment_path:?}: {e}"))
             })?;
 
-            return Self::process_reader_statements(
-                file,
-                0,
-                start_index,
-                pending_tx,
-                file_manager,
-                destination_handler,
-                cancellation_token,
-                metrics_collector,
-                batch_size,
-                state,
-            )
-            .await;
+            return self
+                .process_reader_statements(
+                    file,
+                    0,
+                    start_index,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    metrics_collector,
+                    batch_size,
+                    state,
+                )
+                .await;
         }
 
         let index_path = segment_path.with_extension("sql.gz.idx");
@@ -1487,12 +1486,11 @@ impl TransactionManager {
         let mut decoder = GzipDecoder::new(buf_reader);
         decoder.multiple_members(true);
 
-        Self::process_reader_statements(
+        self.process_reader_statements(
             decoder,
             initial_statement_index,
             start_index,
             pending_tx,
-            file_manager,
             destination_handler,
             cancellation_token,
             metrics_collector,
@@ -1510,7 +1508,7 @@ impl TransactionManager {
     ///
     /// Checks cancellation token between batches to support graceful shutdown.
     pub(crate) async fn process_transaction_file(
-        file_manager: Arc<TransactionManager>,
+        self: Arc<Self>,
         pending_tx: &PendingTransactionFile,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
@@ -1522,7 +1520,7 @@ impl TransactionManager {
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
 
-        let latest_metadata = file_manager.read_metadata(&pending_tx.file_path).await?;
+        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
         let start_index = latest_metadata
             .last_executed_command_index
             .map(|idx| idx + 1)
@@ -1573,18 +1571,18 @@ impl TransactionManager {
             let segment_start_index = remaining_start_index;
             remaining_start_index = 0;
 
-            let stream_result = Self::process_segment_statements(
-                &segment.path,
-                segment_start_index,
-                pending_tx,
-                file_manager.clone(),
-                destination_handler,
-                cancellation_token,
-                metrics_collector,
-                batch_size,
-                &mut state,
-            )
-            .await;
+            let stream_result = self
+                .process_segment_statements(
+                    &segment.path,
+                    segment_start_index,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    metrics_collector,
+                    batch_size,
+                    &mut state,
+                )
+                .await;
 
             if let Err(e) = stream_result {
                 if e.is_cancelled() {
@@ -1613,9 +1611,8 @@ impl TransactionManager {
             let last_executed_index = next_command_index - 1;
             batch_count += 1;
 
-            Self::execute_sql_batch(
+            self.execute_sql_batch(
                 destination_handler,
-                file_manager.clone(),
                 &pending_tx.file_path,
                 &batch,
                 last_executed_index,
@@ -1638,9 +1635,8 @@ impl TransactionManager {
                 tx_id
             );
 
-            Self::finalize_transaction_file(
+            self.finalize_transaction_file(
                 pending_tx,
-                file_manager,
                 lsn_tracker,
                 metrics_collector,
                 total_commands,
@@ -1663,9 +1659,8 @@ impl TransactionManager {
         );
 
         // Finalize: update LSN, record metrics, delete file
-        Self::finalize_transaction_file(
+        self.finalize_transaction_file(
             pending_tx,
-            file_manager,
             lsn_tracker,
             metrics_collector,
             total_commands,
@@ -1683,8 +1678,8 @@ impl TransactionManager {
     /// It updates confirmed_flush_lsn and sends ACK to PostgreSQL.
     /// This ensures we never ACK a transaction that hasn't been successfully applied.
     async fn finalize_transaction_file(
+        self: &Arc<Self>,
         pending_tx: &PendingTransactionFile,
-        file_manager: Arc<TransactionManager>,
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         total_commands: usize,
@@ -1741,10 +1736,7 @@ impl TransactionManager {
         );
 
         // Delete the file after successful processing
-        if let Err(e) = file_manager
-            .delete_pending_transaction(&pending_tx.file_path)
-            .await
-        {
+        if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
             error!(
                 "Failed to delete processed transaction file {}: {}",
                 pending_tx.file_path.display(),
@@ -1752,12 +1744,11 @@ impl TransactionManager {
             );
         }
 
-        file_manager
-            .clear_staged_pending_progress(&pending_tx.file_path)
+        self.clear_staged_pending_progress(&pending_tx.file_path)
             .await;
 
         if pending_tx.metadata.commit_lsn.is_some() {
-            let pending_count = file_manager.list_pending_transactions().await?.len();
+            let pending_count = self.list_pending_transactions().await?.len();
             lsn_tracker.update_consumer_state(
                 tx_id,
                 pending_tx.metadata.commit_timestamp,

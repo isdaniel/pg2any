@@ -886,17 +886,18 @@ impl CdcClient {
             );
 
             // Call the core processing logic directly
-            if let Err(e) = TransactionManager::process_transaction_file(
-                file_mgr.clone(),
-                pending_tx,
-                destination,
-                cancellation_token,
-                lsn_tracker,
-                metrics_collector,
-                batch_size,
-                shared_lsn_feedback,
-            )
-            .await
+            if let Err(e) = file_mgr
+                .clone()
+                .process_transaction_file(
+                    pending_tx,
+                    destination,
+                    cancellation_token,
+                    lsn_tracker,
+                    metrics_collector,
+                    batch_size,
+                    shared_lsn_feedback,
+                )
+                .await
             {
                 error!(
                     "Failed to process pending transaction file {}: {}",
@@ -989,16 +990,19 @@ impl CdcClient {
                             next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
                         );
 
-                        if let Err(e) = TransactionManager::process_transaction_file(
-                            transaction_file_manager.clone(),
-                            &next_tx,
-                            &mut destination_handler,
-                            &cancellation_token,
-                            &lsn_tracker,
-                            &metrics_collector,
-                            batch_size,
-                            &shared_lsn_feedback,
-                        ).await {
+                        if let Err(e) = transaction_file_manager
+                            .clone()
+                            .process_transaction_file(
+                                &next_tx,
+                                &mut destination_handler,
+                                &cancellation_token,
+                                &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
+                                &shared_lsn_feedback,
+                            )
+                            .await
+                        {
                             error!(
                                 "Failed to process transaction {} after producer shutdown: {}",
                                 next_tx.metadata.transaction_id, e
@@ -1050,16 +1054,19 @@ impl CdcClient {
                                 );
 
                                 // Process the transaction - THIS IS WHERE APPLY HAPPENS
-                                if let Err(e) = TransactionManager::process_transaction_file(
-                                    transaction_file_manager.clone(),
-                                    &next_tx,
-                                    &mut destination_handler,
-                                    &cancellation_token,
-                                    &lsn_tracker,
-                                    &metrics_collector,
-                                    batch_size,
-                                    &shared_lsn_feedback,  // ACK is sent inside process_transaction_file
-                                ).await {
+                                if let Err(e) = transaction_file_manager
+                                    .clone()
+                                    .process_transaction_file(
+                                        &next_tx,
+                                        &mut destination_handler,
+                                        &cancellation_token,
+                                        &lsn_tracker,
+                                        &metrics_collector,
+                                        batch_size,
+                                        &shared_lsn_feedback,  // ACK is sent inside process_transaction_file
+                                    )
+                                    .await
+                                {
                                     error!(
                                         "Failed to process transaction {} from file {:?}: {}",
                                         next_tx.metadata.transaction_id, next_tx.file_path, e
@@ -1082,16 +1089,19 @@ impl CdcClient {
                             // Process all remaining transactions in queue
                             info!("Consumer: Processing {} remaining transactions in queue", commit_queue.len());
                             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-                                if let Err(e) = TransactionManager::process_transaction_file(
-                                    transaction_file_manager.clone(),
-                                    &next_tx,
-                                    &mut destination_handler,
-                                    &cancellation_token,
-                                    &lsn_tracker,
-                                    &metrics_collector,
-                                    batch_size,
-                                    &shared_lsn_feedback,
-                                ).await {
+                                if let Err(e) = transaction_file_manager
+                                    .clone()
+                                    .process_transaction_file(
+                                        &next_tx,
+                                        &mut destination_handler,
+                                        &cancellation_token,
+                                        &lsn_tracker,
+                                        &metrics_collector,
+                                        batch_size,
+                                        &shared_lsn_feedback,
+                                    )
+                                    .await
+                                {
                                     error!(
                                         "Failed to process transaction {}: {}",
                                         next_tx.metadata.transaction_id, e
@@ -1159,17 +1169,18 @@ impl CdcClient {
                         pending_tx.file_path, pending_tx.metadata.transaction_id
                     );
 
-                    match TransactionManager::process_transaction_file(
-                        transaction_file_manager.clone(),
-                        &pending_tx,
-                        destination_handler,
-                        cancellation_token,
-                        lsn_tracker,
-                        metrics_collector,
-                        batch_size,
-                        shared_lsn_feedback,
-                    )
-                    .await
+                    match transaction_file_manager
+                        .clone()
+                        .process_transaction_file(
+                            &pending_tx,
+                            destination_handler,
+                            cancellation_token,
+                            lsn_tracker,
+                            metrics_collector,
+                            batch_size,
+                            shared_lsn_feedback,
+                        )
+                        .await
                     {
                         Ok(()) => {}
                         Err(e) => {

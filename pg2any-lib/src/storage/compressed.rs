@@ -250,6 +250,24 @@ impl TransactionStorage for CompressedStorage {
         let mut current_offset: u64 = 0;
         let mut current_chunk: Vec<String> = Vec::with_capacity(SYNC_POINT_INTERVAL);
 
+        fn add_statement(
+            stmt: String,
+            current_chunk: &mut Vec<String>,
+            index: &mut CompressionIndex,
+            total_statements: &mut usize,
+            current_offset: u64,
+        ) {
+            if current_chunk.is_empty() {
+                index.sync_points.push(StatementOffset {
+                    statement_index: *total_statements,
+                    compressed_offset: current_offset,
+                });
+            }
+
+            current_chunk.push(stmt);
+            *total_statements += 1;
+        }
+
         let buf_reader = BufReader::with_capacity(65536, source_file);
         let mut lines = buf_reader.lines();
 
@@ -260,15 +278,13 @@ impl TransactionStorage for CompressedStorage {
         {
             let statements = parser.parse_line(&line)?;
             for stmt in statements {
-                if current_chunk.is_empty() {
-                    index.sync_points.push(StatementOffset {
-                        statement_index: total_statements,
-                        compressed_offset: current_offset,
-                    });
-                }
-
-                current_chunk.push(stmt);
-                total_statements += 1;
+                add_statement(
+                    stmt,
+                    &mut current_chunk,
+                    &mut index,
+                    &mut total_statements,
+                    current_offset,
+                );
 
                 if current_chunk.len() >= SYNC_POINT_INTERVAL {
                     let compressed = Self::compress_chunk(&current_chunk).await?;
@@ -283,15 +299,13 @@ impl TransactionStorage for CompressedStorage {
         }
 
         if let Some(stmt) = parser.finish_statement() {
-            if current_chunk.is_empty() {
-                index.sync_points.push(StatementOffset {
-                    statement_index: total_statements,
-                    compressed_offset: current_offset,
-                });
-            }
-
-            current_chunk.push(stmt);
-            total_statements += 1;
+            add_statement(
+                stmt,
+                &mut current_chunk,
+                &mut index,
+                &mut total_statements,
+                current_offset,
+            );
         }
 
         if !current_chunk.is_empty() {

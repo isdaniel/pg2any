@@ -68,7 +68,6 @@ impl TransactionStorage for UncompressedStorage {
     }
 
     async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        let parser = SqlStreamParser::new();
         let file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;

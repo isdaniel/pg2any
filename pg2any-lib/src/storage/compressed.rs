@@ -317,7 +317,12 @@ impl TransactionStorage for CompressedStorage {
         }
 
         if total_statements == 0 {
-            let _ = fs::remove_file(&compressed_path).await;
+            if let Err(e) = fs::remove_file(&compressed_path).await {
+                info!(
+                    "Failed to remove empty compressed file {:?}: {}",
+                    compressed_path, e
+                );
+            }
             return Err(CdcError::generic("No statements to compress"));
         }
 

@@ -577,37 +577,23 @@ impl TransactionManager {
 
         let mut final_segments: Vec<TransactionSegment> = Vec::new();
 
-        if self.storage.file_extension() == "sql" {
-            for segment_path in segment_paths.iter() {
-                let (final_data_path, statement_count) = self
-                    .storage
-                    .write_transaction_from_file(segment_path)
-                    .await?;
+        for segment_path in segment_paths.iter() {
+            let (final_data_path, statement_count) = self
+                .storage
+                .write_transaction_from_file(segment_path)
+                .await?;
 
-                final_segments.push(TransactionSegment {
-                    path: final_data_path,
-                    statement_count,
-                });
+            if final_data_path.as_path() != segment_path.as_path() {
+                fs::remove_file(segment_path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+                })?;
+                debug!("Removed original uncompressed file: {:?}", segment_path);
             }
-        } else {
-            for segment_path in segment_paths.iter() {
-                let (final_data_path, statement_count) = self
-                    .storage
-                    .write_transaction_from_file(segment_path)
-                    .await?;
 
-                if final_data_path.as_path() != segment_path.as_path() {
-                    fs::remove_file(segment_path).await.map_err(|e| {
-                        CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-                    })?;
-                    debug!("Removed original uncompressed file: {:?}", segment_path);
-                }
-
-                final_segments.push(TransactionSegment {
-                    path: final_data_path,
-                    statement_count,
-                });
-            }
+            final_segments.push(TransactionSegment {
+                path: final_data_path,
+                statement_count,
+            });
         }
 
         metadata.segments = final_segments;

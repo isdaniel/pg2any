@@ -20,6 +20,13 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+struct StatementProcessingState<'a> {
+    batch: &'a mut Vec<String>,
+    current_command_index: &'a mut usize,
+    processed_count: &'a mut usize,
+    batch_count: &'a mut usize,
+}
+
 /// Main CDC client for coordinating replication and destination writes
 ///
 /// # File-Based Transaction Processing Architecture
@@ -1276,10 +1283,7 @@ impl CdcClient {
         cancellation_token: &CancellationToken,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
-        batch: &mut Vec<String>,
-        current_command_index: &mut usize,
-        processed_count: &mut usize,
-        batch_count: &mut usize,
+        state: &mut StatementProcessingState<'_>,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin,
@@ -1298,34 +1302,34 @@ impl CdcClient {
             let statements = parser.parse_line(&line)?;
             for stmt in statements {
                 if statement_index >= start_index {
-                    batch.push(stmt);
+                    state.batch.push(stmt);
 
-                    if batch.len() >= batch_size {
+                    if state.batch.len() >= batch_size {
                         if cancellation_token.is_cancelled() {
                             return Err(CdcError::cancelled(
                                 "Transaction file processing cancelled by shutdown signal",
                             ));
                         }
 
-                        let batch_len = batch.len();
-                        let next_command_index = *current_command_index + batch_len;
+                        let batch_len = state.batch.len();
+                        let next_command_index = *state.current_command_index + batch_len;
                         let last_executed_index = next_command_index - 1;
-                        *batch_count += 1;
+                        *state.batch_count += 1;
 
                         Self::execute_sql_batch(
                             destination_handler,
                             file_manager.clone(),
                             &pending_tx.file_path,
-                            batch,
+                            state.batch,
                             last_executed_index,
-                            *batch_count,
+                            *state.batch_count,
                             metrics_collector,
                         )
                         .await?;
 
-                        *current_command_index = next_command_index;
-                        *processed_count += batch_len;
-                        batch.clear();
+                        *state.current_command_index = next_command_index;
+                        *state.processed_count += batch_len;
+                        state.batch.clear();
                     }
                 }
 
@@ -1335,7 +1339,7 @@ impl CdcClient {
 
         if let Some(stmt) = parser.finish_statement() {
             if statement_index >= start_index {
-                batch.push(stmt);
+                state.batch.push(stmt);
             }
         }
 
@@ -1351,10 +1355,7 @@ impl CdcClient {
         cancellation_token: &CancellationToken,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
-        batch: &mut Vec<String>,
-        current_command_index: &mut usize,
-        processed_count: &mut usize,
-        batch_count: &mut usize,
+        state: &mut StatementProcessingState<'_>,
     ) -> Result<()> {
         let is_compressed = segment_path
             .extension()
@@ -1377,10 +1378,7 @@ impl CdcClient {
                 cancellation_token,
                 metrics_collector,
                 batch_size,
-                batch,
-                current_command_index,
-                processed_count,
-                batch_count,
+                state,
             )
             .await;
         }
@@ -1428,10 +1426,7 @@ impl CdcClient {
             cancellation_token,
             metrics_collector,
             batch_size,
-            batch,
-            current_command_index,
-            processed_count,
-            batch_count,
+            state,
         )
         .await
     }
@@ -1517,6 +1512,13 @@ impl CdcClient {
         let mut current_command_index = start_index;
         let mut remaining_start_index = start_index;
 
+        let mut state = StatementProcessingState {
+            batch: &mut batch,
+            current_command_index: &mut current_command_index,
+            processed_count: &mut processed_count,
+            batch_count: &mut batch_count,
+        };
+
         for segment in segments.drain(..) {
             if remaining_start_index > 0 && segment.statement_count > 0 {
                 if remaining_start_index >= segment.statement_count {
@@ -1537,10 +1539,7 @@ impl CdcClient {
                 cancellation_token,
                 metrics_collector,
                 batch_size,
-                &mut batch,
-                &mut current_command_index,
-                &mut processed_count,
-                &mut batch_count,
+                &mut state,
             )
             .await;
 

@@ -403,14 +403,7 @@ impl CompressedStorage {
     async fn compress_chunk(chunk: &[String]) -> Result<Vec<u8>> {
         let chunk_data = chunk
             .iter()
-            .map(|stmt| {
-                let trimmed = stmt.trim();
-                if trimmed.ends_with(';') {
-                    trimmed.to_string()
-                } else {
-                    format!("{};", trimmed)
-                }
-            })
+            .map(|stmt| format!("{};", stmt))
             .collect::<Vec<_>>()
             .join("\n");
 

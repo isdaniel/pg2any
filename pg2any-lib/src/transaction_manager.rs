@@ -548,14 +548,11 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Move metadata from sql_received_tx to sql_pending_tx
-    /// Flushes any pending buffered events before marking transaction as committed
-    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
-        let received_metadata_path = self.get_received_tx_path(tx_id);
-        let pending_metadata_path = self.get_pending_tx_path(tx_id);
-
-        // Read existing metadata from sql_received_tx/
-        let metadata_content = fs::read_to_string(&received_metadata_path)
+    async fn read_received_metadata(
+        &self,
+        received_metadata_path: &Path,
+    ) -> Result<TransactionFileMetadata> {
+        let metadata_content = fs::read_to_string(received_metadata_path)
             .await
             .map_err(|e| {
                 CdcError::generic(format!(
@@ -563,15 +560,19 @@ impl TransactionManager {
                 ))
             })?;
 
-        let mut metadata: TransactionFileMetadata = serde_json::from_str(&metadata_content)
-            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))?;
+        serde_json::from_str(&metadata_content)
+            .map_err(|e| CdcError::generic(format!("Failed to parse metadata: {e}")))
+    }
 
+    async fn take_and_flush_active_transaction(
+        &self,
+        tx_id: u32,
+    ) -> Result<Option<ActiveTransactionState>> {
         let mut tx_state = {
             let mut transactions = self.active_transactions.lock().await;
             transactions.remove(&tx_id)
         };
 
-        // CRITICAL: Flush any pending buffered events before committing
         if let Some(state) = tx_state.as_mut() {
             let buffered_bytes = state.writer.buffer_size();
             state.writer.flush().await?;
@@ -583,57 +584,60 @@ impl TransactionManager {
             }
         }
 
-        let (segment_paths, segment_counts) =
-            self.get_final_segment_info(tx_id, &metadata, tx_state.as_ref());
+        Ok(tx_state)
+    }
 
-        if segment_paths.is_empty() {
-            return Err(CdcError::generic(format!(
-                "No transaction segments found for tx {}",
-                tx_id
-            )));
+    async fn build_final_segments(
+        &self,
+        segment_paths: &[PathBuf],
+        segment_counts: &[usize],
+    ) -> Result<Vec<TransactionSegment>> {
+        let mut final_segments = Vec::new();
+
+        for (idx, segment_path) in segment_paths.iter().enumerate() {
+            let (final_data_path, statement_count) = self
+                .storage
+                .write_transaction_from_file(segment_path)
+                .await?;
+
+            let fallback_count = segment_counts.get(idx).copied().unwrap_or(0);
+            let final_count = if statement_count == 0 {
+                fallback_count
+            } else {
+                statement_count
+            };
+
+            final_segments.push(TransactionSegment {
+                path: final_data_path,
+                statement_count: final_count,
+            });
         }
 
-        let mut final_segments: Vec<TransactionSegment> = Vec::new();
+        Ok(final_segments)
+    }
 
-        if self.storage.file_extension() == "sql" {
-            for (idx, segment_path) in segment_paths.iter().enumerate() {
-                let statement_count = segment_counts.get(idx).copied().unwrap_or(0);
-                final_segments.push(TransactionSegment {
-                    path: segment_path.clone(),
-                    statement_count,
-                });
-            }
-        } else {
-            for segment_path in segment_paths.iter() {
-                let (final_data_path, statement_count) = self
-                    .storage
-                    .write_transaction_from_file(segment_path)
-                    .await?;
-
-                if final_data_path.as_path() != segment_path.as_path() {
-                    fs::remove_file(segment_path).await.map_err(|e| {
-                        CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-                    })?;
-                    debug!("Removed original uncompressed file: {:?}", segment_path);
-                }
-
-                final_segments.push(TransactionSegment {
-                    path: final_data_path,
-                    statement_count,
-                });
-            }
-        }
-
+    fn apply_commit_metadata(
+        &self,
+        metadata: &mut TransactionFileMetadata,
+        final_segments: Vec<TransactionSegment>,
+        commit_lsn: Option<Lsn>,
+    ) {
         metadata.segments = final_segments;
         metadata.current_segment_index = 0;
         metadata.last_executed_command_index = None;
         metadata.last_update_timestamp = None;
         metadata.commit_lsn = commit_lsn;
+    }
 
-        let updated_json = serde_json::to_string_pretty(&metadata)
+    async fn write_pending_metadata_file(
+        &self,
+        pending_metadata_path: &Path,
+        metadata: &TransactionFileMetadata,
+    ) -> Result<()> {
+        let updated_json = serde_json::to_string_pretty(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
-        let mut pending_file = File::create(&pending_metadata_path).await.map_err(|e| {
+        let mut pending_file = File::create(pending_metadata_path).await.map_err(|e| {
             CdcError::generic(format!(
                 "Failed to create pending metadata {pending_metadata_path:?}: {e}"
             ))
@@ -649,13 +653,45 @@ impl TransactionManager {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to flush metadata: {e}")))?;
 
-        fs::remove_file(&received_metadata_path)
-            .await
-            .map_err(|e| {
-                CdcError::generic(format!(
-                    "Failed to remove received metadata {received_metadata_path:?}: {e}"
-                ))
-            })?;
+        Ok(())
+    }
+
+    async fn remove_received_metadata(&self, received_metadata_path: &Path) -> Result<()> {
+        fs::remove_file(received_metadata_path).await.map_err(|e| {
+            CdcError::generic(format!(
+                "Failed to remove received metadata {received_metadata_path:?}: {e}"
+            ))
+        })
+    }
+
+    /// Move metadata from sql_received_tx to sql_pending_tx
+    /// Flushes any pending buffered events before marking transaction as committed
+    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
+        let received_metadata_path = self.get_received_tx_path(tx_id);
+        let pending_metadata_path = self.get_pending_tx_path(tx_id);
+
+        let mut metadata = self.read_received_metadata(&received_metadata_path).await?;
+        let tx_state = self.take_and_flush_active_transaction(tx_id).await?;
+
+        let (segment_paths, segment_counts) =
+            self.get_final_segment_info(tx_id, &metadata, tx_state.as_ref());
+
+        if segment_paths.is_empty() {
+            return Err(CdcError::generic(format!(
+                "No transaction segments found for tx {}",
+                tx_id
+            )));
+        }
+
+        let final_segments = self
+            .build_final_segments(&segment_paths, &segment_counts)
+            .await?;
+
+        self.apply_commit_metadata(&mut metadata, final_segments, commit_lsn);
+        self.write_pending_metadata_file(&pending_metadata_path, &metadata)
+            .await?;
+        self.remove_received_metadata(&received_metadata_path)
+            .await?;
 
         info!(
             "Committed transaction {}: moved metadata to sql_pending_tx/ (LSN: {:?}), data stays in sql_data_tx/",

@@ -555,26 +555,17 @@ impl TransactionManager {
             }
         }
 
-        let (segment_paths, segment_counts) =
+        let segment_paths =
             if let Some(state) = tx_state.as_ref().filter(|state| !state.segments.is_empty()) {
-                (
-                    state.segments.clone(),
-                    state.segment_statement_counts.clone(),
-                )
+                state.segments.clone()
             } else if !metadata.segments.is_empty() {
-                let paths = metadata
+                metadata
                     .segments
                     .iter()
                     .map(|seg| seg.path.clone())
-                    .collect::<Vec<_>>();
-                let counts = metadata
-                    .segments
-                    .iter()
-                    .map(|seg| seg.statement_count)
-                    .collect::<Vec<_>>();
-                (paths, counts)
+                    .collect::<Vec<_>>()
             } else {
-                (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+                vec![self.get_segment_data_file_path(tx_id, 0)]
             };
 
         if segment_paths.is_empty() {
@@ -586,33 +577,23 @@ impl TransactionManager {
 
         let mut final_segments: Vec<TransactionSegment> = Vec::new();
 
-        if self.storage.file_extension() == "sql" {
-            for (idx, segment_path) in segment_paths.iter().enumerate() {
-                let statement_count = segment_counts.get(idx).copied().unwrap_or(0);
-                final_segments.push(TransactionSegment {
-                    path: segment_path.clone(),
-                    statement_count,
-                });
-            }
-        } else {
-            for segment_path in segment_paths.iter() {
-                let (final_data_path, statement_count) = self
-                    .storage
-                    .write_transaction_from_file(segment_path)
-                    .await?;
+        for segment_path in segment_paths.iter() {
+            let (final_data_path, statement_count) = self
+                .storage
+                .write_transaction_from_file(segment_path)
+                .await?;
 
-                if final_data_path.as_path() != segment_path.as_path() {
-                    fs::remove_file(segment_path).await.map_err(|e| {
-                        CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
-                    })?;
-                    debug!("Removed original uncompressed file: {:?}", segment_path);
-                }
-
-                final_segments.push(TransactionSegment {
-                    path: final_data_path,
-                    statement_count,
-                });
+            if final_data_path.as_path() != segment_path.as_path() {
+                fs::remove_file(segment_path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to remove uncompressed file: {e}"))
+                })?;
+                debug!("Removed original uncompressed file: {:?}", segment_path);
             }
+
+            final_segments.push(TransactionSegment {
+                path: final_data_path,
+                statement_count,
+            });
         }
 
         metadata.segments = final_segments;
@@ -1346,7 +1327,7 @@ impl TransactionManager {
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
         state: &mut StatementProcessingState<'_>,
-    ) -> Result<()>
+    ) -> Result<usize>
     where
         R: AsyncRead + Unpin,
     {
@@ -1403,9 +1384,10 @@ impl TransactionManager {
             if statement_index >= start_index {
                 state.batch.push(stmt);
             }
+            statement_index += 1;
         }
 
-        Ok(())
+        Ok(statement_index.saturating_sub(initial_statement_index))
     }
 
     async fn process_segment_statements(
@@ -1418,7 +1400,7 @@ impl TransactionManager {
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
         state: &mut StatementProcessingState<'_>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let is_compressed = segment_path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1590,9 +1572,8 @@ impl TransactionManager {
             }
 
             let segment_start_index = remaining_start_index;
-            remaining_start_index = 0;
 
-            let stream_result = Self::process_segment_statements(
+            let segment_statement_count = match Self::process_segment_statements(
                 &segment.path,
                 segment_start_index,
                 pending_tx,
@@ -1603,19 +1584,30 @@ impl TransactionManager {
                 batch_size,
                 &mut state,
             )
-            .await;
+            .await
+            {
+                Ok(count) => count,
+                Err(e) => {
+                    if e.is_cancelled() {
+                        warn!(
+                            "Transaction file processing cancelled by shutdown signal (tx_id: {})",
+                            tx_id
+                        );
+                        return Ok(());
+                    }
 
-            if let Err(e) = stream_result {
-                if e.is_cancelled() {
-                    warn!(
-                        "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                        tx_id
-                    );
-                    return Ok(());
+                    return Err(e);
                 }
-
-                return Err(e);
+            };
+            if segment_start_index > 0 {
+                if segment_start_index >= segment_statement_count {
+                    remaining_start_index =
+                        segment_start_index.saturating_sub(segment_statement_count);
+                    continue;
+                }
             }
+
+            remaining_start_index = 0;
         }
 
         if !batch.is_empty() {

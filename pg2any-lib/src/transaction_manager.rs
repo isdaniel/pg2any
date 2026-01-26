@@ -344,6 +344,34 @@ impl TransactionManager {
         self.base_path.join(DATA_TX_DIR).join(filename)
     }
 
+    fn get_final_segment_info(
+        &self,
+        tx_id: u32,
+        metadata: &TransactionFileMetadata,
+        tx_state: Option<&ActiveTransactionState>,
+    ) -> (Vec<PathBuf>, Vec<usize>) {
+        if let Some(state) = tx_state.filter(|state| !state.segments.is_empty()) {
+            (
+                state.segments.clone(),
+                state.segment_statement_counts.clone(),
+            )
+        } else if !metadata.segments.is_empty() {
+            let paths = metadata
+                .segments
+                .iter()
+                .map(|seg| seg.path.clone())
+                .collect::<Vec<_>>();
+            let counts = metadata
+                .segments
+                .iter()
+                .map(|seg| seg.statement_count)
+                .collect::<Vec<_>>();
+            (paths, counts)
+        } else {
+            (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
+        }
+    }
+
     /// Create a new transaction: data file in sql_data_tx/ and metadata in sql_received_tx/
     pub async fn begin_transaction(
         &self,
@@ -556,26 +584,7 @@ impl TransactionManager {
         }
 
         let (segment_paths, segment_counts) =
-            if let Some(state) = tx_state.as_ref().filter(|state| !state.segments.is_empty()) {
-                (
-                    state.segments.clone(),
-                    state.segment_statement_counts.clone(),
-                )
-            } else if !metadata.segments.is_empty() {
-                let paths = metadata
-                    .segments
-                    .iter()
-                    .map(|seg| seg.path.clone())
-                    .collect::<Vec<_>>();
-                let counts = metadata
-                    .segments
-                    .iter()
-                    .map(|seg| seg.statement_count)
-                    .collect::<Vec<_>>();
-                (paths, counts)
-            } else {
-                (vec![self.get_segment_data_file_path(tx_id, 0)], vec![0])
-            };
+            self.get_final_segment_info(tx_id, &metadata, tx_state.as_ref());
 
         if segment_paths.is_empty() {
             return Err(CdcError::generic(format!(
@@ -1538,34 +1547,6 @@ impl TransactionManager {
                 "No transaction segments found for tx {}",
                 tx_id
             )));
-        }
-
-        let total_known_commands = if segments.iter().all(|seg| seg.statement_count > 0) {
-            Some(
-                segments
-                    .iter()
-                    .map(|seg| seg.statement_count)
-                    .sum::<usize>(),
-            )
-        } else {
-            None
-        };
-
-        let remaining_known = total_known_commands.map(|total| total.saturating_sub(start_index));
-
-        match remaining_known {
-            Some(remaining) => info!(
-                "Executing {} remaining SQL command(s) from file in batches of {} (total: {}, skipped: {})",
-                remaining,
-                batch_size,
-                total_known_commands.unwrap_or(0),
-                start_index
-            ),
-            None => info!(
-                "Executing remaining SQL commands from file in batches of {} (skipped: {})",
-                batch_size,
-                start_index
-            ),
         }
 
         let mut batch: Vec<String> = Vec::with_capacity(batch_size);

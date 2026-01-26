@@ -127,7 +127,7 @@ impl TransactionStorage for CompressedStorage {
         let total_statements = data.len();
 
         if total_statements == 0 {
-            return Err(CdcError::generic("No statements to compress"));
+            return Ok(compressed_path);
         }
 
         // Add semicolons back to statements
@@ -250,24 +250,6 @@ impl TransactionStorage for CompressedStorage {
         let mut current_offset: u64 = 0;
         let mut current_chunk: Vec<String> = Vec::with_capacity(SYNC_POINT_INTERVAL);
 
-        fn add_statement(
-            stmt: String,
-            current_chunk: &mut Vec<String>,
-            index: &mut CompressionIndex,
-            total_statements: &mut usize,
-            current_offset: u64,
-        ) {
-            if current_chunk.is_empty() {
-                index.sync_points.push(StatementOffset {
-                    statement_index: *total_statements,
-                    compressed_offset: current_offset,
-                });
-            }
-
-            current_chunk.push(stmt);
-            *total_statements += 1;
-        }
-
         let buf_reader = BufReader::with_capacity(65536, source_file);
         let mut lines = buf_reader.lines();
 
@@ -278,7 +260,7 @@ impl TransactionStorage for CompressedStorage {
         {
             let statements = parser.parse_line(&line)?;
             for stmt in statements {
-                add_statement(
+                Self::add_statement(
                     stmt,
                     &mut current_chunk,
                     &mut index,
@@ -299,7 +281,7 @@ impl TransactionStorage for CompressedStorage {
         }
 
         if let Some(stmt) = parser.finish_statement() {
-            add_statement(
+            Self::add_statement(
                 stmt,
                 &mut current_chunk,
                 &mut index,
@@ -323,7 +305,7 @@ impl TransactionStorage for CompressedStorage {
                     compressed_path, e
                 );
             }
-            return Err(CdcError::generic("No statements to compress"));
+            return Ok((compressed_path, 0));
         }
 
         dest_file
@@ -419,6 +401,24 @@ impl TransactionStorage for CompressedStorage {
 }
 
 impl CompressedStorage {
+    fn add_statement(
+        stmt: String,
+        current_chunk: &mut Vec<String>,
+        index: &mut CompressionIndex,
+        total_statements: &mut usize,
+        current_offset: u64,
+    ) {
+        if current_chunk.is_empty() {
+            index.sync_points.push(StatementOffset {
+                statement_index: *total_statements,
+                compressed_offset: current_offset,
+            });
+        }
+
+        current_chunk.push(stmt);
+        *total_statements += 1;
+    }
+
     async fn compress_chunk(chunk: &[String]) -> Result<Vec<u8>> {
         let chunk_data = chunk
             .iter()

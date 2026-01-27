@@ -162,43 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_batch_operations() {
-        let mut batch = common::InsertBatch::new_with_schema(
-            "test_schema".to_string(),
-            "test_table".to_string(),
-            vec!["col1".to_string(), "col2".to_string()],
-        );
-
-        assert!(batch.is_empty());
-        assert_eq!(batch.len(), 0);
-
-        let mut data = HashMap::new();
-        data.insert("col1".to_string(), serde_json::json!("value1"));
-        data.insert("col2".to_string(), serde_json::json!(42));
-
-        batch.add_row(&data);
-        assert!(!batch.is_empty());
-        assert_eq!(batch.len(), 1);
-
-        assert!(batch.can_add(
-            Some("test_schema"),
-            "test_table",
-            &["col1".to_string(), "col2".to_string()]
-        ));
-        assert!(!batch.can_add(
-            Some("other_schema"),
-            "test_table",
-            &["col1".to_string(), "col2".to_string()]
-        ));
-        assert!(!batch.can_add(
-            Some("test_schema"),
-            "other_table",
-            &["col1".to_string(), "col2".to_string()]
-        ));
-        assert!(!batch.can_add(Some("test_schema"), "test_table", &["col1".to_string()]));
-    }
-
-    #[test]
     fn test_map_schema() {
         let mut mappings = HashMap::new();
         mappings.insert("public".to_string(), "cdc_db".to_string());

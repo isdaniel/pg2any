@@ -514,11 +514,17 @@ impl TableMapping {
 /// Convert from CDC config to replication stream config
 impl From<&Config> for pg_walstream::ReplicationStreamConfig {
     fn from(config: &Config) -> Self {
+        let streaming_mode = if config.streaming {
+            pg_walstream::StreamingMode::On
+        } else {
+            pg_walstream::StreamingMode::Off
+        };
+
         pg_walstream::ReplicationStreamConfig::new(
             config.replication_slot_name.clone(),
             config.publication_name.clone(),
             config.protocol_version,
-            config.streaming,
+            streaming_mode,
             config.heartbeat_interval,
             config.connection_timeout,
             Duration::from_secs(30), // Health check interval

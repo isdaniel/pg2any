@@ -4,10 +4,10 @@ use pg2any_lib::{
     types::{ChangeEvent, DestinationType, EventType, ReplicaIdentity},
     Transaction,
 };
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 
 /// Helper function to wrap a single event in a transaction for testing
@@ -32,8 +32,12 @@ fn transaction_to_sql_commands(tx: &Transaction) -> Vec<String> {
 fn event_to_sql(event: &ChangeEvent) -> Option<String> {
     match &event.event_type {
         EventType::Insert { table, data, .. } => {
-            let columns: Vec<String> = data.keys().cloned().collect();
-            let values: Vec<String> = columns.iter().map(|col| format_value(&data[col])).collect();
+            let data_map = data.clone().into_hash_map();
+            let columns: Vec<String> = data_map.keys().cloned().collect();
+            let values: Vec<String> = columns
+                .iter()
+                .map(|col| format_value(&data_map[col]))
+                .collect();
             Some(format!(
                 "INSERT INTO \"{}\" ({}) VALUES ({});",
                 table,
@@ -53,7 +57,8 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
             replica_identity,
             ..
         } => {
-            let set_clause: Vec<String> = new_data
+            let new_data_map = new_data.clone().into_hash_map();
+            let set_clause: Vec<String> = new_data_map
                 .iter()
                 .map(|(col, val)| format!("\"{}\" = {}", col, format_value(val)))
                 .collect();
@@ -63,10 +68,10 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
                 if key_columns.is_empty() && matches!(replica_identity, ReplicaIdentity::Full) {
                     old_data
                         .as_ref()
-                        .map(|d| d.keys().cloned().collect())
+                        .map(|d| d.clone().into_hash_map().into_keys().collect())
                         .unwrap_or_default()
                 } else {
-                    key_columns.clone()
+                    key_columns.iter().map(|k| k.to_string()).collect()
                 };
 
             let where_clause = if !actual_key_cols.is_empty() {
@@ -75,8 +80,8 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
                     .filter_map(|col| {
                         old_data
                             .as_ref()
-                            .and_then(|d| d.get(col))
-                            .or_else(|| new_data.get(col))
+                            .and_then(|d| d.get(col.as_str()))
+                            .or_else(|| new_data.get(col.as_str()))
                             .map(|val| format!("\"{}\" = {}", col, format_value(val)))
                     })
                     .collect();
@@ -106,7 +111,7 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
                     .iter()
                     .filter_map(|col| {
                         old_data
-                            .get(col)
+                            .get(col.as_ref())
                             .map(|val| format!("\"{}\" = {}", col, format_value(val)))
                     })
                     .collect();
@@ -126,7 +131,7 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
             }
             // SQLite doesn't have TRUNCATE, use DELETE
             // Handle schema.table format
-            let table_name = &tables[0];
+            let table_name: &str = tables[0].as_ref();
             if table_name.contains('.') {
                 let parts: Vec<&str> = table_name.splitn(2, '.').collect();
                 Some(format!("DELETE FROM \"{}\".\"{}\"", parts[0], parts[1]))
@@ -191,27 +196,27 @@ impl Drop for TempDatabase {
 }
 
 /// Helper function to create test data
-fn create_test_data() -> HashMap<String, serde_json::Value> {
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("John Doe"));
-    data.insert("age".to_string(), json!(30));
-    data.insert("email".to_string(), json!("john@example.com"));
-    data.insert("active".to_string(), json!(true));
-    data.insert("salary".to_string(), json!(50000.50));
-    data
+fn create_test_data() -> RowData {
+    RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Doe")),
+        ("age", json!(30)),
+        ("email", json!("john@example.com")),
+        ("active", json!(true)),
+        ("salary", json!(50000.50)),
+    ])
 }
 
 /// Helper function to create updated test data
-fn create_updated_test_data() -> HashMap<String, serde_json::Value> {
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("John Smith"));
-    data.insert("age".to_string(), json!(31));
-    data.insert("email".to_string(), json!("john.smith@example.com"));
-    data.insert("active".to_string(), json!(true));
-    data.insert("salary".to_string(), json!(55000.75));
-    data
+fn create_updated_test_data() -> RowData {
+    RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Smith")),
+        ("age", json!(31)),
+        ("email", json!("john.smith@example.com")),
+        ("active", json!(true)),
+        ("salary", json!(55000.75)),
+    ])
 }
 
 #[cfg(feature = "sqlite")]
@@ -328,13 +333,7 @@ async fn test_sqlite_destination_process_insert_event() {
 
     // Create INSERT event
     let data = create_test_data();
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "users".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "users", 123, data, Lsn::from(100));
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
@@ -380,11 +379,11 @@ async fn test_sqlite_destination_process_update_event() {
     // Create UPDATE event
     let old_data = create_test_data();
     let new_data = create_updated_test_data();
-    let key_columns = vec!["id".to_string()];
+    let key_columns = vec![Arc::from("id")];
 
     let event = ChangeEvent::update(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         123,
         Some(old_data),
         new_data,
@@ -446,11 +445,11 @@ async fn test_sqlite_destination_process_delete_event() {
 
     // Create DELETE event
     let old_data = create_test_data();
-    let key_columns = vec!["id".to_string()];
+    let key_columns = vec![Arc::from("id")];
 
     let event = ChangeEvent::delete(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         123,
         old_data,
         ReplicaIdentity::Default,
@@ -518,11 +517,7 @@ async fn test_sqlite_destination_process_truncate_event() {
     assert_eq!(count, 3);
 
     // Create TRUNCATE event
-    let event = ChangeEvent {
-        event_type: EventType::Truncate(vec!["main.users".to_string()]),
-        lsn: Lsn::from(400),
-        metadata: None,
-    };
+    let event = ChangeEvent::truncate(vec![Arc::from("main.users")], Lsn::from(400));
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);
@@ -579,19 +574,21 @@ async fn test_sqlite_destination_replica_identity_full() {
     .unwrap();
 
     // Create UPDATE event with REPLICA IDENTITY FULL
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), json!(1));
-    old_data.insert("name".to_string(), json!("John Doe"));
-    old_data.insert("email".to_string(), json!("john@example.com"));
+    let old_data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Doe")),
+        ("email", json!("john@example.com")),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), json!(1));
-    new_data.insert("name".to_string(), json!("John Smith"));
-    new_data.insert("email".to_string(), json!("john.smith@example.com"));
+    let new_data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Smith")),
+        ("email", json!("john.smith@example.com")),
+    ]);
 
     let event = ChangeEvent::update(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         123,
         Some(old_data),
         new_data,
@@ -634,8 +631,8 @@ async fn test_sqlite_destination_replica_identity_nothing_error() {
     let old_data = create_test_data();
 
     let event = ChangeEvent::delete(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         123,
         old_data,
         ReplicaIdentity::Nothing,
@@ -683,22 +680,17 @@ async fn test_sqlite_destination_complex_data_types() {
     .unwrap();
 
     // Create INSERT event with complex data types
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("json_array".to_string(), json!([1, 2, 3, "test"]));
-    data.insert(
-        "json_object".to_string(),
-        json!({"key": "value", "nested": {"number": 42}}),
-    );
-    data.insert("null_value".to_string(), json!(null));
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("json_array", json!([1, 2, 3, "test"])),
+        (
+            "json_object",
+            json!({"key": "value", "nested": {"number": 42}}),
+        ),
+        ("null_value", json!(null)),
+    ]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "complex_data".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "complex_data", 123, data, Lsn::from(100));
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);

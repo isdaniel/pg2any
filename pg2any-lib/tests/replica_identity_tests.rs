@@ -1,26 +1,28 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_replica_identity_default_with_primary_key() {
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::String("123".to_string()));
-    new_data.insert("name".to_string(), Value::String("John".to_string()));
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("John".to_string())),
+    ]);
 
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::String("123".to_string()));
-    old_data.insert("name".to_string(), Value::String("Jane".to_string()));
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("Jane".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         Some(old_data),
         new_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()], // Primary key column
+        vec![Arc::from("id")], // Primary key column
         Lsn::from(300),
     );
 
@@ -30,38 +32,34 @@ async fn test_replica_identity_default_with_primary_key() {
 
         // Should only use primary key column from key_columns
         assert_eq!(key_columns.len(), 1);
-        assert_eq!(key_columns[0], "id");
-        assert!(old_data.contains_key("id"));
-        assert!(old_data.contains_key("name")); // old_data has both, but key_columns should only have id
+        assert_eq!(key_columns[0].as_ref(), "id");
+        assert!(old_data.get("id").is_some());
+        assert!(old_data.get("name").is_some()); // old_data has both, but key_columns should only have id
     }
 }
 
 #[tokio::test]
 async fn test_replica_identity_full() {
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::String("123".to_string()));
-    new_data.insert("name".to_string(), Value::String("John".to_string()));
-    new_data.insert(
-        "email".to_string(),
-        Value::String("john@example.com".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("John".to_string())),
+        ("email", Value::String("john@example.com".to_string())),
+    ]);
 
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::String("123".to_string()));
-    old_data.insert("name".to_string(), Value::String("Jane".to_string()));
-    old_data.insert(
-        "email".to_string(),
-        Value::String("jane@example.com".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("Jane".to_string())),
+        ("email", Value::String("jane@example.com".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         Some(old_data),
         new_data,
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "name".to_string(), "email".to_string()], // All columns
+        vec![Arc::from("id"), Arc::from("name"), Arc::from("email")], // All columns
         Lsn::from(300),
     );
 
@@ -70,36 +68,32 @@ async fn test_replica_identity_full() {
 
     // Should use all columns for FULL replica identity
     assert_eq!(key_columns.len(), 3);
-    assert!(key_columns.contains(&"id".to_string()));
-    assert!(key_columns.contains(&"name".to_string()));
-    assert!(key_columns.contains(&"email".to_string()));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "id"));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "name"));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "email"));
 }
 
 #[tokio::test]
 async fn test_replica_identity_index() {
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::String("123".to_string()));
-    new_data.insert("name".to_string(), Value::String("John".to_string()));
-    new_data.insert(
-        "email".to_string(),
-        Value::String("john@example.com".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("John".to_string())),
+        ("email", Value::String("john@example.com".to_string())),
+    ]);
 
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::String("123".to_string()));
-    old_data.insert(
-        "email".to_string(),
-        Value::String("jane@example.com".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("email", Value::String("jane@example.com".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         Some(old_data),
         new_data,
         ReplicaIdentity::Index,
-        vec!["id".to_string(), "email".to_string()], // Index columns
+        vec![Arc::from("id"), Arc::from("email")], // Index columns
         Lsn::from(300),
     );
 
@@ -108,20 +102,21 @@ async fn test_replica_identity_index() {
 
     // Should use only index columns
     assert_eq!(key_columns.len(), 2);
-    assert!(key_columns.contains(&"id".to_string()));
-    assert!(key_columns.contains(&"email".to_string()));
-    assert!(!key_columns.contains(&"name".to_string()));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "id"));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "email"));
+    assert!(!key_columns.iter().any(|k| k.as_ref() == "name"));
 }
 
 #[tokio::test]
 async fn test_replica_identity_nothing() {
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::String("123".to_string()));
-    new_data.insert("name".to_string(), Value::String("John".to_string()));
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("John".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         None,  // No old data for NOTHING replica identity
         new_data,
@@ -140,60 +135,59 @@ async fn test_replica_identity_nothing() {
 
 #[tokio::test]
 async fn test_delete_with_replica_identity_default() {
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::String("123".to_string()));
-    old_data.insert("name".to_string(), Value::String("Jane".to_string()));
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("Jane".to_string())),
+    ]);
 
     let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         old_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()], // Primary key
+        vec![Arc::from("id")], // Primary key
         Lsn::from(200),
     );
 
     // Test DELETE event structure
     let key_columns = event.get_key_columns().unwrap();
     assert_eq!(key_columns.len(), 1);
-    assert_eq!(key_columns[0], "id");
+    assert_eq!(key_columns[0].as_ref(), "id");
 
     if let Some(old_data) = get_old_data(&event) {
-        assert!(old_data.contains_key("id"));
-        assert!(old_data.contains_key("name"));
+        assert!(old_data.get("id").is_some());
+        assert!(old_data.get("name").is_some());
     }
 }
 
 #[tokio::test]
 async fn test_delete_with_replica_identity_full() {
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::String("123".to_string()));
-    old_data.insert("name".to_string(), Value::String("Jane".to_string()));
-    old_data.insert(
-        "email".to_string(),
-        Value::String("jane@example.com".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::String("123".to_string())),
+        ("name", Value::String("Jane".to_string())),
+        ("email", Value::String("jane@example.com".to_string())),
+    ]);
 
     let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345, // relation_oid
         old_data,
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "name".to_string(), "email".to_string()], // All columns
+        vec![Arc::from("id"), Arc::from("name"), Arc::from("email")], // All columns
         Lsn::from(200),
     );
 
     // Test DELETE with FULL replica identity
     let key_columns = event.get_key_columns().unwrap();
     assert_eq!(key_columns.len(), 3);
-    assert!(key_columns.contains(&"id".to_string()));
-    assert!(key_columns.contains(&"name".to_string()));
-    assert!(key_columns.contains(&"email".to_string()));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "id"));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "name"));
+    assert!(key_columns.iter().any(|k| k.as_ref() == "email"));
 }
 
-fn get_old_data(event: &ChangeEvent) -> Option<HashMap<String, serde_json::Value>> {
+fn get_old_data(event: &ChangeEvent) -> Option<RowData> {
     match &event.event_type {
         EventType::Update { old_data, .. } => old_data.clone(),
         EventType::Delete { old_data, .. } => Some(old_data.clone()),

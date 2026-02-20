@@ -2,45 +2,32 @@
 /// These tests verify the critical bug fix where UPDATE/DELETE operations
 /// now correctly use old_data when available, falling back to new_data when needed
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 #[test]
 fn test_update_uses_old_data_for_where_clause() {
     // This test verifies the core fix: UPDATE should use old_data for WHERE clause
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        Value::Number(serde_json::Number::from(42)),
-    );
-    old_data.insert(
-        "version".to_string(),
-        Value::Number(serde_json::Number::from(1)),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(42))),
+        ("version", Value::Number(serde_json::Number::from(1))),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        Value::Number(serde_json::Number::from(42)),
-    );
-    new_data.insert(
-        "version".to_string(),
-        Value::Number(serde_json::Number::from(2)),
-    ); // Version incremented
-    new_data.insert(
-        "name".to_string(),
-        Value::String("Updated Name".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(42))),
+        ("version", Value::Number(serde_json::Number::from(2))), // Version incremented
+        ("name", Value::String("Updated Name".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "versioned_table".to_string(),
+        "public",
+        "versioned_table",
         16384,
         Some(old_data.clone()),
         new_data.clone(),
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     );
 
@@ -60,7 +47,7 @@ fn test_update_uses_old_data_for_where_clause() {
                 data_source.get("version"),
                 Some(&Value::Number(serde_json::Number::from(1)))
             );
-            assert!(data_source.contains_key("id"));
+            assert!(data_source.get("id").is_some());
 
             // WHERE clause should use version=1 (old), not version=2 (new)
             // This ensures we update the correct row
@@ -72,16 +59,14 @@ fn test_update_uses_old_data_for_where_clause() {
 #[test]
 fn test_update_fallback_to_new_data_when_old_data_none() {
     // Test the fallback behavior when old_data is None
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        Value::Number(serde_json::Number::from(100)),
-    );
-    new_data.insert("status".to_string(), Value::String("active".to_string()));
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(100))),
+        ("status", Value::String("active".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "status_table".to_string(),
+        "public",
+        "status_table",
         16384,
         None, // No old_data (NOTHING replica identity)
         new_data.clone(),
@@ -117,23 +102,18 @@ fn test_update_fallback_to_new_data_when_old_data_none() {
 #[test]
 fn test_delete_always_uses_old_data() {
     // DELETE operations should always have old_data available
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        Value::Number(serde_json::Number::from(999)),
-    );
-    old_data.insert(
-        "email".to_string(),
-        Value::String("delete@example.com".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(999))),
+        ("email", Value::String("delete@example.com".to_string())),
+    ]);
 
     let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         16384,
         old_data.clone(),
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "email".to_string()],
+        vec![Arc::from("id"), Arc::from("email")],
         Lsn::from(200),
     );
 
@@ -156,42 +136,26 @@ fn test_delete_always_uses_old_data() {
 #[test]
 fn test_composite_key_data_source_selection() {
     // Test with composite primary key
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "tenant_id".to_string(),
-        Value::String("tenant_1".to_string()),
-    );
-    old_data.insert(
-        "user_id".to_string(),
-        Value::Number(serde_json::Number::from(42)),
-    );
-    old_data.insert(
-        "balance".to_string(),
-        Value::Number(serde_json::Number::from(100)),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("tenant_id", Value::String("tenant_1".to_string())),
+        ("user_id", Value::Number(serde_json::Number::from(42))),
+        ("balance", Value::Number(serde_json::Number::from(100))),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "tenant_id".to_string(),
-        Value::String("tenant_1".to_string()),
-    );
-    new_data.insert(
-        "user_id".to_string(),
-        Value::Number(serde_json::Number::from(42)),
-    );
-    new_data.insert(
-        "balance".to_string(),
-        Value::Number(serde_json::Number::from(150)),
-    ); // Updated
+    let new_data = RowData::from_pairs(vec![
+        ("tenant_id", Value::String("tenant_1".to_string())),
+        ("user_id", Value::Number(serde_json::Number::from(42))),
+        ("balance", Value::Number(serde_json::Number::from(150))), // Updated
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "account_balances".to_string(),
+        "public",
+        "account_balances",
         16384,
         Some(old_data.clone()),
         new_data.clone(),
         ReplicaIdentity::Default,
-        vec!["tenant_id".to_string(), "user_id".to_string()], // Composite key
+        vec![Arc::from("tenant_id"), Arc::from("user_id")], // Composite key
         Lsn::from(300),
     );
 
@@ -224,30 +188,26 @@ fn test_composite_key_data_source_selection() {
 #[test]
 fn test_replica_identity_full_uses_all_columns() {
     // Test FULL replica identity with all columns in WHERE clause
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-    old_data.insert("name".to_string(), Value::String("John".to_string()));
-    old_data.insert(
-        "age".to_string(),
-        Value::Number(serde_json::Number::from(25)),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(1))),
+        ("name", Value::String("John".to_string())),
+        ("age", Value::Number(serde_json::Number::from(25))),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-    new_data.insert("name".to_string(), Value::String("Johnny".to_string())); // Changed
-    new_data.insert(
-        "age".to_string(),
-        Value::Number(serde_json::Number::from(26)),
-    ); // Changed
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(1))),
+        ("name", Value::String("Johnny".to_string())), // Changed
+        ("age", Value::Number(serde_json::Number::from(26))), // Changed
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "people".to_string(),
+        "public",
+        "people",
         16384,
         Some(old_data.clone()),
         new_data.clone(),
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "name".to_string(), "age".to_string()],
+        vec![Arc::from("id"), Arc::from("name"), Arc::from("age")],
         Lsn::from(300),
     );
 
@@ -275,25 +235,24 @@ fn test_replica_identity_full_uses_all_columns() {
 #[test]
 fn test_json_null_values_in_replica_identity() {
     // Test handling of JSON null values
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-    old_data.insert("optional_field".to_string(), Value::Null);
+    let old_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(1))),
+        ("optional_field", Value::Null),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-    new_data.insert(
-        "optional_field".to_string(),
-        Value::String("now has value".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(1))),
+        ("optional_field", Value::String("now has value".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "test_table".to_string(),
+        "public",
+        "test_table",
         16384,
         Some(old_data.clone()),
         new_data.clone(),
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "optional_field".to_string()],
+        vec![Arc::from("id"), Arc::from("optional_field")],
         Lsn::from(300),
     );
 
@@ -313,47 +272,48 @@ fn test_json_null_values_in_replica_identity() {
 #[test]
 fn test_key_columns_availability() {
     // Test that key columns are correctly accessible
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-    data.insert("name".to_string(), Value::String("Test".to_string()));
+    let data = RowData::from_pairs(vec![
+        ("id", Value::Number(serde_json::Number::from(1))),
+        ("name", Value::String("Test".to_string())),
+    ]);
 
     // Test DEFAULT replica identity (primary key only)
     let event_default = ChangeEvent::update(
-        "public".to_string(),
-        "table1".to_string(),
+        "public",
+        "table1",
         16384,
         Some(data.clone()),
         data.clone(),
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     );
 
     let key_columns = event_default.get_key_columns().unwrap();
     assert_eq!(key_columns.len(), 1);
-    assert_eq!(key_columns[0], "id");
+    assert_eq!(key_columns[0].as_ref(), "id");
 
     // Test FULL replica identity (all columns)
     let event_full = ChangeEvent::update(
-        "public".to_string(),
-        "table2".to_string(),
+        "public",
+        "table2",
         16384,
         Some(data.clone()),
         data.clone(),
         ReplicaIdentity::Full,
-        vec!["id".to_string(), "name".to_string()],
+        vec![Arc::from("id"), Arc::from("name")],
         Lsn::from(300),
     );
 
     let key_columns_full = event_full.get_key_columns().unwrap();
     assert_eq!(key_columns_full.len(), 2);
-    assert!(key_columns_full.contains(&"id".to_string()));
-    assert!(key_columns_full.contains(&"name".to_string()));
+    assert!(key_columns_full.iter().any(|k| k.as_ref() == "id"));
+    assert!(key_columns_full.iter().any(|k| k.as_ref() == "name"));
 
     // Test NOTHING replica identity (no key columns)
     let event_nothing = ChangeEvent::update(
-        "public".to_string(),
-        "table3".to_string(),
+        "public",
+        "table3",
         16384,
         None,
         data,

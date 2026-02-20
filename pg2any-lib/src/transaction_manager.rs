@@ -41,7 +41,7 @@ use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, TransactionStorage};
-use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity};
+use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity, RowData};
 use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1024,7 +1024,7 @@ impl TransactionManager {
                 schema,
                 table,
                 new_data,
-                old_data,
+                old_data.as_ref(),
                 replica_identity,
                 key_columns,
             ),
@@ -1045,18 +1045,17 @@ impl TransactionManager {
     }
 
     /// Generate INSERT SQL command
-    fn generate_insert_sql(
-        &self,
-        schema: &str,
-        table: &str,
-        new_data: &HashMap<String, serde_json::Value>,
-    ) -> Result<String> {
+    ///
+    /// Accepts `&RowData` directly. Converts to HashMap internally because
+    /// column iteration is required (RowData does not yet expose `iter()`).
+    fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let columns: Vec<String> = new_data.keys().cloned().collect();
+        let data_map = new_data.clone().into_hash_map();
+        let columns: Vec<String> = data_map.keys().cloned().collect();
         let values: Vec<String> = columns
             .iter()
-            .map(|col| self.format_value(&new_data[col]))
+            .map(|col| self.format_value(&data_map[col]))
             .collect();
 
         let sql = match self.destination_type {
@@ -1108,14 +1107,16 @@ impl TransactionManager {
         &self,
         schema: &str,
         table: &str,
-        new_data: &HashMap<String, serde_json::Value>,
-        old_data: &Option<HashMap<String, serde_json::Value>>,
+        new_data: &RowData,
+        old_data: Option<&RowData>,
         replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
+        key_columns: &[Arc<str>],
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let set_clause: Vec<String> = new_data
+        // Convert to HashMap for SET clause iteration (RowData lacks iter())
+        let new_data_map = new_data.clone().into_hash_map();
+        let set_clause: Vec<String> = new_data_map
             .iter()
             .map(|(col, val)| {
                 let formatted_col = match self.destination_type {
@@ -1127,7 +1128,7 @@ impl TransactionManager {
             })
             .collect();
 
-        // Build WHERE clause based on replica identity
+        // Build WHERE clause — uses RowData::get() directly for Default/Index identity
         let where_clause =
             self.build_where_clause(replica_identity, key_columns, old_data, new_data)?;
 
@@ -1164,22 +1165,22 @@ impl TransactionManager {
     }
 
     /// Generate DELETE SQL command
+    ///
+    /// Accepts `&RowData` directly. For Default/Index replica identity (the most
+    /// common case), this avoids cloning RowData entirely — only `RowData::get()`
+    /// lookups are performed, with zero allocations.
     fn generate_delete_sql(
         &self,
         schema: &str,
         table: &str,
-        old_data: &HashMap<String, serde_json::Value>,
+        old_data: &RowData,
         replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
+        key_columns: &[Arc<str>],
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let where_clause = self.build_where_clause(
-            replica_identity,
-            key_columns,
-            &Some(old_data.clone()),
-            old_data,
-        )?;
+        let where_clause =
+            self.build_where_clause(replica_identity, key_columns, Some(old_data), old_data)?;
 
         let sql = match self.destination_type {
             DestinationType::MySQL => {
@@ -1197,17 +1198,18 @@ impl TransactionManager {
     }
 
     /// Generate TRUNCATE SQL command
-    fn generate_truncate_sql(&self, tables: &[String]) -> Result<String> {
+    fn generate_truncate_sql(&self, tables: &[Arc<str>]) -> Result<String> {
         // For simplicity, generate a TRUNCATE statement for each table
         let mut sqls = Vec::new();
 
         for table_spec in tables {
+            let table_spec: &str = table_spec;
             // table_spec might include schema, parse it
             let parts: Vec<&str> = table_spec.split('.').collect();
             let (schema, table) = if parts.len() == 2 {
                 (self.map_schema(Some(parts[0])), parts[1])
             } else {
-                (self.map_schema(Some("public")), table_spec.as_str())
+                (self.map_schema(Some("public")), table_spec)
             };
 
             let sql = match self.destination_type {
@@ -1232,18 +1234,19 @@ impl TransactionManager {
     fn build_where_clause(
         &self,
         replica_identity: &ReplicaIdentity,
-        key_columns: &[String],
-        old_data: &Option<HashMap<String, serde_json::Value>>,
-        new_data: &HashMap<String, serde_json::Value>,
+        key_columns: &[Arc<str>],
+        old_data: Option<&RowData>,
+        new_data: &RowData,
     ) -> Result<String> {
         let conditions: Vec<String> = match replica_identity {
             ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                // Use key columns
-                let data = old_data.as_ref().unwrap_or(new_data);
+                // Use key columns with direct RowData::get() — no HashMap needed
+                let data = old_data.unwrap_or(new_data);
                 key_columns
                     .iter()
                     .map(|col| {
-                        let val = data.get(col).ok_or_else(|| {
+                        let col_str: &str = col;
+                        let val = data.get(col_str).ok_or_else(|| {
                             CdcError::Generic(format!("Key column {col} not found"))
                         })?;
                         let formatted_col = match self.destination_type {
@@ -1256,11 +1259,13 @@ impl TransactionManager {
                     .collect::<Result<Vec<_>>>()?
             }
             ReplicaIdentity::Full => {
-                // Use all columns from old data
-                let data = old_data.as_ref().ok_or_else(|| {
+                // Use all columns from old data — must convert to HashMap for iteration
+                let data = old_data.ok_or_else(|| {
                     CdcError::Generic("FULL replica identity requires old data".to_string())
                 })?;
-                data.iter()
+                let data_map = data.clone().into_hash_map();
+                data_map
+                    .iter()
                     .map(|(col, val)| {
                         let formatted_col = match self.destination_type {
                             DestinationType::MySQL => format!("`{col}`"),

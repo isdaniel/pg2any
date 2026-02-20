@@ -11,88 +11,66 @@ use pg2any_lib::monitoring::{
 };
 use pg2any_lib::types::{ChangeEvent, ReplicaIdentity};
 use pg_walstream::Lsn;
-use std::collections::HashMap;
+use pg_walstream::RowData;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Helper function to create test change events
 fn create_test_insert_event() -> ChangeEvent {
-    let mut data = HashMap::new();
-    data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    data.insert(
-        "name".to_string(),
-        serde_json::Value::String("test".to_string()),
-    );
+    let data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("test".to_string())),
+    ]);
 
-    ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        12345,
-        data,
-        Lsn::from(100),
-    )
+    ChangeEvent::insert("public", "users", 12345, data, Lsn::from(100))
 }
 
 fn create_test_update_event() -> ChangeEvent {
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    old_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("old_name".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("old_name".to_string())),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    new_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("new_name".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("new_name".to_string())),
+    ]);
 
     ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345,
         Some(old_data),
         new_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     )
 }
 
 fn create_test_delete_event() -> ChangeEvent {
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    old_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("deleted_name".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        (
+            "name",
+            serde_json::Value::String("deleted_name".to_string()),
+        ),
+    ]);
 
     ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         12345,
         old_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(200),
     )
 }
 
 fn create_test_truncate_event() -> ChangeEvent {
     ChangeEvent::truncate(
-        vec!["users".to_string(), "orders".to_string()],
+        vec![Arc::from("users"), Arc::from("orders")],
         Lsn::from(400),
     )
 }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 // Re-export types from pg_walstream for convenience
-pub use pg_walstream::{ChangeEvent, EventType, Lsn, ReplicaIdentity};
+pub use pg_walstream::{ChangeEvent, EventType, Lsn, ReplicaIdentity, RowData};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestinationType {

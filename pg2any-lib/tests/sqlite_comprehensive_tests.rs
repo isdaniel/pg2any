@@ -4,10 +4,10 @@ use pg2any_lib::{
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
     Transaction,
 };
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
 
@@ -27,8 +27,9 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
     use pg2any_lib::types::EventType;
     match &event.event_type {
         EventType::Insert { table, data, .. } => {
-            let cols: Vec<_> = data.keys().cloned().collect();
-            let vals: Vec<_> = cols.iter().map(|c| format_value(&data[c])).collect();
+            let data_map = data.clone().into_hash_map();
+            let cols: Vec<_> = data_map.keys().cloned().collect();
+            let vals: Vec<_> = cols.iter().map(|c| format_value(&data_map[c])).collect();
             Some(format!(
                 "INSERT INTO \"{}\" ({}) VALUES ({});",
                 table,
@@ -46,7 +47,8 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
             key_columns,
             ..
         } => {
-            let set: Vec<_> = new_data
+            let new_data_map = new_data.clone().into_hash_map();
+            let set: Vec<_> = new_data_map
                 .iter()
                 .map(|(k, v)| format!("\"{}\" = {}", k, format_value(v)))
                 .collect();
@@ -55,8 +57,8 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
                 .filter_map(|k| {
                     old_data
                         .as_ref()
-                        .and_then(|d| d.get(k))
-                        .or_else(|| new_data.get(k))
+                        .and_then(|d| d.get(k.as_ref()))
+                        .or_else(|| new_data.get(k.as_ref()))
                         .map(|v| format!("\"{}\" = {}", k, format_value(v)))
                 })
                 .collect();
@@ -80,7 +82,7 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
                 .iter()
                 .filter_map(|k| {
                     old_data
-                        .get(k)
+                        .get(k.as_ref())
                         .map(|v| format!("\"{}\" = {}", k, format_value(v)))
                 })
                 .collect();
@@ -215,18 +217,13 @@ async fn test_sqlite_empty_string_handling() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Test empty string insertion
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("text_field".to_string(), json!(""));
-    data.insert("nullable_field".to_string(), json!(""));
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("text_field", json!("")),
+        ("nullable_field", json!("")),
+    ]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
     let result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -265,20 +262,15 @@ async fn test_sqlite_null_value_handling() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Test null value insertion
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("text_field".to_string(), json!("test"));
-    data.insert("nullable_field".to_string(), json!(null));
-    data.insert("int_field".to_string(), json!(null));
-    data.insert("real_field".to_string(), json!(null));
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("text_field", json!("test")),
+        ("nullable_field", json!(null)),
+        ("int_field", json!(null)),
+        ("real_field", json!(null)),
+    ]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
     let result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -322,24 +314,19 @@ async fn test_sqlite_unicode_and_special_characters() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Test unicode and special character insertion
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert(
-        "text_field".to_string(),
-        json!("🚀 Hello 世界! Special chars: áéíóú ñüç"),
-    );
-    data.insert(
-        "json_field".to_string(),
-        json!("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"),
-    );
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        (
+            "text_field",
+            json!("🚀 Hello 世界! Special chars: áéíóú ñüç"),
+        ),
+        (
+            "json_field",
+            json!("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"),
+        ),
+    ]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
     let result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -390,18 +377,13 @@ async fn test_sqlite_large_data_handling() {
         }
     });
 
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("text_field".to_string(), json!(large_text));
-    data.insert("json_field".to_string(), large_json);
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("text_field", json!(large_text)),
+        ("json_field", large_json),
+    ]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
     let result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -450,17 +432,9 @@ async fn test_sqlite_numeric_precision() {
     ];
 
     for (id, value) in test_cases {
-        let mut data = HashMap::new();
-        data.insert("id".to_string(), json!(id));
-        data.insert("real_field".to_string(), value.clone());
+        let data = RowData::from_pairs(vec![("id", json!(id)), ("real_field", value.clone())]);
 
-        let event = ChangeEvent::insert(
-            "main".to_string(),
-            "comprehensive_test".to_string(),
-            123,
-            data,
-            Lsn::from(100),
-        );
+        let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
         let result = destination
             .execute_sql_batch_with_hook(
                 &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -521,17 +495,12 @@ async fn test_sqlite_constraint_violations() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Insert initial data
-    let mut data1 = HashMap::new();
-    data1.insert("id".to_string(), json!(1));
-    data1.insert("unique_field".to_string(), json!("unique_value"));
+    let data1 = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("unique_field", json!("unique_value")),
+    ]);
 
-    let event1 = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        123,
-        data1,
-        Lsn::from(100),
-    );
+    let event1 = ChangeEvent::insert("main", "comprehensive_test", 123, data1, Lsn::from(100));
     let result1 = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event1)),
@@ -541,17 +510,12 @@ async fn test_sqlite_constraint_violations() {
     assert!(result1.is_ok());
 
     // Try to insert duplicate unique value - should fail
-    let mut data2 = HashMap::new();
-    data2.insert("id".to_string(), json!(2));
-    data2.insert("unique_field".to_string(), json!("unique_value"));
+    let data2 = RowData::from_pairs(vec![
+        ("id", json!(2)),
+        ("unique_field", json!("unique_value")),
+    ]);
 
-    let event2 = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
-        124,
-        data2,
-        Lsn::from(100),
-    );
+    let event2 = ChangeEvent::insert("main", "comprehensive_test", 124, data2, Lsn::from(100));
     let result2 = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event2)),
@@ -582,13 +546,11 @@ async fn test_sqlite_missing_key_columns_error() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Insert initial data
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("text_field".to_string(), json!("test"));
+    let data = RowData::from_pairs(vec![("id", json!(1)), ("text_field", json!("test"))]);
 
     let event = ChangeEvent::insert(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
+        "main",
+        "comprehensive_test",
         123,
         data.clone(),
         Lsn::from(100),
@@ -603,8 +565,8 @@ async fn test_sqlite_missing_key_columns_error() {
 
     // Try UPDATE with empty key columns - should fail
     let update_event = ChangeEvent::update(
-        "main".to_string(),
-        "comprehensive_test".to_string(),
+        "main",
+        "comprehensive_test",
         124,
         Some(data.clone()),
         data,
@@ -650,21 +612,16 @@ async fn test_sqlite_bulk_operations_performance() {
 
     // Bulk INSERT operations
     for i in 0..batch_size {
-        let mut data = HashMap::new();
-        data.insert("id".to_string(), json!(i));
-        data.insert("name".to_string(), json!(format!("User {}", i)));
-        data.insert("age".to_string(), json!(20 + (i % 50)));
-        data.insert("email".to_string(), json!(format!("user{}@example.com", i)));
-        data.insert("active".to_string(), json!(true));
-        data.insert("salary".to_string(), json!(50000.0 + (i as f64 * 10.0)));
+        let data = RowData::from_pairs(vec![
+            ("id", json!(i)),
+            ("name", json!(format!("User {}", i))),
+            ("age", json!(20 + (i % 50))),
+            ("email", json!(format!("user{}@example.com", i))),
+            ("active", json!(true)),
+            ("salary", json!(50000.0 + (i as f64 * 10.0))),
+        ]);
 
-        let event = ChangeEvent::insert(
-            "main".to_string(),
-            "users".to_string(),
-            123 + i as u32,
-            data,
-            Lsn::from(100),
-        );
+        let event = ChangeEvent::insert("main", "users", 123 + i as u32, data, Lsn::from(100));
         let result = destination
             .execute_sql_batch_with_hook(
                 &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -691,28 +648,25 @@ async fn test_sqlite_bulk_operations_performance() {
     // Bulk UPDATE operations
     let update_start = Instant::now();
     for i in 0..batch_size / 2 {
-        let mut old_data = HashMap::new();
-        old_data.insert("id".to_string(), json!(i));
+        let old_data = RowData::from_pairs(vec![("id", json!(i))]);
 
-        let mut new_data = HashMap::new();
-        new_data.insert("id".to_string(), json!(i));
-        new_data.insert("name".to_string(), json!(format!("Updated User {}", i)));
-        new_data.insert("age".to_string(), json!(25 + (i % 50)));
-        new_data.insert(
-            "email".to_string(),
-            json!(format!("updated_user{}@example.com", i)),
-        );
-        new_data.insert("active".to_string(), json!(true));
-        new_data.insert("salary".to_string(), json!(60000.0 + (i as f64 * 15.0)));
+        let new_data = RowData::from_pairs(vec![
+            ("id", json!(i)),
+            ("name", json!(format!("Updated User {}", i))),
+            ("age", json!(25 + (i % 50))),
+            ("email", json!(format!("updated_user{}@example.com", i))),
+            ("active", json!(true)),
+            ("salary", json!(60000.0 + (i as f64 * 15.0))),
+        ]);
 
         let event = ChangeEvent::update(
-            "main".to_string(),
-            "users".to_string(),
+            "main",
+            "users",
             200 + i as u32,
             Some(old_data),
             new_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::from(300),
         );
 
@@ -773,25 +727,21 @@ async fn test_sqlite_concurrent_operations() {
         // Each session inserts 15 records
         for i in 0..15 {
             let record_id = session_id * 1000 + i;
-            let mut data = HashMap::new();
-            data.insert("id".to_string(), json!(record_id));
-            data.insert(
-                "name".to_string(),
-                json!(format!("Session {} Record {}", session_id, i)),
-            );
-            data.insert("age".to_string(), json!(25 + i % 30));
-            data.insert(
-                "email".to_string(),
-                json!(format!("session{}record{}@example.com", session_id, i)),
-            );
+            let data = RowData::from_pairs(vec![
+                ("id", json!(record_id)),
+                (
+                    "name",
+                    json!(format!("Session {} Record {}", session_id, i)),
+                ),
+                ("age", json!(25 + i % 30)),
+                (
+                    "email",
+                    json!(format!("session{}record{}@example.com", session_id, i)),
+                ),
+            ]);
 
-            let event = ChangeEvent::insert(
-                "main".to_string(),
-                "users".to_string(),
-                record_id as u32,
-                data,
-                Lsn::from(100),
-            );
+            let event =
+                ChangeEvent::insert("main", "users", record_id as u32, data, Lsn::from(100));
             let result = destination
                 .execute_sql_batch_with_hook(
                     &transaction_to_sql_commands(&wrap_in_transaction(event)),
@@ -864,18 +814,13 @@ async fn test_sqlite_transaction_events() {
     assert!(begin_result.is_ok());
 
     // Insert some data between transaction events
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("Transaction Test"));
-    data.insert("email".to_string(), json!("txn@example.com"));
+    let data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("Transaction Test")),
+        ("email", json!("txn@example.com")),
+    ]);
 
-    let insert_event = ChangeEvent::insert(
-        "main".to_string(),
-        "users".to_string(),
-        105,
-        data,
-        Lsn::from(100),
-    );
+    let insert_event = ChangeEvent::insert("main", "users", 105, data, Lsn::from(100));
     let insert_result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(insert_event)),
@@ -956,16 +901,8 @@ async fn test_sqlite_connection_recovery() {
         .unwrap();
     create_users_table(&pool).await.unwrap();
 
-    let mut values = HashMap::new();
-    values.insert("id".to_string(), json!(1));
-    values.insert("name".to_string(), json!("Alice"));
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        1,
-        values,
-        Lsn::from(100),
-    );
+    let values = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("Alice"))]);
+    let event = ChangeEvent::insert("public", "users", 1, values, Lsn::from(100));
     let transaction = wrap_in_transaction(event);
     let process_result = destination
         .execute_sql_batch_with_hook(&transaction_to_sql_commands(&transaction), None)
@@ -981,16 +918,8 @@ async fn test_sqlite_connection_recovery() {
     assert!(reconnect_result.is_ok());
 
     // Verify connection works again
-    let mut values2 = HashMap::new();
-    values2.insert("id".to_string(), json!(2));
-    values2.insert("name".to_string(), json!("Bob"));
-    let event2 = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        2,
-        values2,
-        Lsn::from(100),
-    );
+    let values2 = RowData::from_pairs(vec![("id", json!(2)), ("name", json!("Bob"))]);
+    let event2 = ChangeEvent::insert("public", "users", 2, values2, Lsn::from(100));
     let transaction2 = wrap_in_transaction(event2);
     let process_result2 = destination
         .execute_sql_batch_with_hook(&transaction_to_sql_commands(&transaction2), None)
@@ -1077,21 +1006,16 @@ async fn test_sqlite_complete_crud_cycle() {
     create_users_table(&pool).await.unwrap();
 
     // 1. CREATE (INSERT)
-    let mut create_data = HashMap::new();
-    create_data.insert("id".to_string(), json!(1));
-    create_data.insert("name".to_string(), json!("John Doe"));
-    create_data.insert("age".to_string(), json!(30));
-    create_data.insert("email".to_string(), json!("john@example.com"));
-    create_data.insert("active".to_string(), json!(true));
-    create_data.insert("salary".to_string(), json!(50000.0));
+    let create_data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Doe")),
+        ("age", json!(30)),
+        ("email", json!("john@example.com")),
+        ("active", json!(true)),
+        ("salary", json!(50000.0)),
+    ]);
 
-    let create_event = ChangeEvent::insert(
-        "main".to_string(),
-        "users".to_string(),
-        1,
-        create_data.clone(),
-        Lsn::from(100),
-    );
+    let create_event = ChangeEvent::insert("main", "users", 1, create_data.clone(), Lsn::from(100));
     let create_result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(create_event)),
@@ -1119,22 +1043,23 @@ async fn test_sqlite_complete_crud_cycle() {
     assert_eq!(row.get::<String, _>("email"), "john@example.com");
 
     // 3. UPDATE
-    let mut update_data = HashMap::new();
-    update_data.insert("id".to_string(), json!(1));
-    update_data.insert("name".to_string(), json!("John Smith"));
-    update_data.insert("age".to_string(), json!(31));
-    update_data.insert("email".to_string(), json!("john.smith@example.com"));
-    update_data.insert("active".to_string(), json!(true));
-    update_data.insert("salary".to_string(), json!(55000.0));
+    let update_data = RowData::from_pairs(vec![
+        ("id", json!(1)),
+        ("name", json!("John Smith")),
+        ("age", json!(31)),
+        ("email", json!("john.smith@example.com")),
+        ("active", json!(true)),
+        ("salary", json!(55000.0)),
+    ]);
 
     let update_event = ChangeEvent::update(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         2,
         Some(create_data),
         update_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     );
 
@@ -1161,16 +1086,15 @@ async fn test_sqlite_complete_crud_cycle() {
     assert_eq!(updated_row.get::<f64, _>("salary"), 55000.0);
 
     // 4. DELETE
-    let mut delete_data = HashMap::new();
-    delete_data.insert("id".to_string(), json!(1));
+    let delete_data = RowData::from_pairs(vec![("id", json!(1))]);
 
     let delete_event = ChangeEvent::delete(
-        "main".to_string(),
-        "users".to_string(),
+        "main",
+        "users",
         3,
         delete_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(200),
     );
 
@@ -1213,17 +1137,9 @@ async fn test_sqlite_destination_factory_integration() {
         .unwrap();
     create_users_table(&pool).await.unwrap();
 
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("Factory Test"));
+    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("Factory Test"))]);
 
-    let event = ChangeEvent::insert(
-        "main".to_string(),
-        "users".to_string(),
-        1,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("main", "users", 1, data, Lsn::from(100));
     let process_result = destination
         .execute_sql_batch_with_hook(
             &transaction_to_sql_commands(&wrap_in_transaction(event)),

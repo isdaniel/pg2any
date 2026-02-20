@@ -70,7 +70,9 @@ impl ReplicationStream {
             .await
             .map_err(|e| crate::error::CdcError::Replication(e))?;
 
-        self.logical_stream.state.update_lsn(event.lsn.value());
+        self.logical_stream
+            .state
+            .update_applied_lsn(event.lsn.value());
 
         Ok(event)
     }

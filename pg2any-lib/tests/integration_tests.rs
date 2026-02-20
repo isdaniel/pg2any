@@ -56,7 +56,7 @@ fn test_replication_data_structures() {
     // Test column info
     let col_info = ColumnInfo::new(1, "id".to_string(), 23, -1);
     assert!(col_info.is_key());
-    assert_eq!(col_info.name, "id");
+    assert_eq!(col_info.name.as_ref(), "id");
 
     // Test tuple data
     let tuple = TupleData::new(vec![

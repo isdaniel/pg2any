@@ -1,48 +1,50 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::Lsn;
-use std::collections::HashMap;
+use pg_walstream::{Lsn, RowData};
+use std::sync::Arc;
 
 /// Test to demonstrate the fix for UPDATE WHERE clause issue
 #[test]
 fn test_update_where_clause_uses_old_data() {
     // Create test event simulating PostgreSQL logical replication UPDATE
     // with replica identity containing old key values
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(42)),
-    );
-    old_data.insert(
-        "email".to_string(),
-        serde_json::Value::String("old.email@example.com".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        (
+            "id",
+            serde_json::Value::Number(serde_json::Number::from(42)),
+        ),
+        (
+            "email",
+            serde_json::Value::String("old.email@example.com".to_string()),
+        ),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(42)),
-    );
-    new_data.insert(
-        "email".to_string(),
-        serde_json::Value::String("new.email@example.com".to_string()),
-    );
-    new_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("Updated Name".to_string()),
-    );
-    new_data.insert(
-        "age".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(30)),
-    );
+    let new_data = RowData::from_pairs(vec![
+        (
+            "id",
+            serde_json::Value::Number(serde_json::Number::from(42)),
+        ),
+        (
+            "email",
+            serde_json::Value::String("new.email@example.com".to_string()),
+        ),
+        (
+            "name",
+            serde_json::Value::String("Updated Name".to_string()),
+        ),
+        (
+            "age",
+            serde_json::Value::Number(serde_json::Number::from(30)),
+        ),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         16384,
         Some(old_data),
         new_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     );
 
@@ -54,8 +56,8 @@ fn test_update_where_clause_uses_old_data() {
             old_data, new_data, ..
         } => {
             let old_data = old_data.as_ref().unwrap();
-            assert!(old_data.contains_key("id"));
-            assert!(old_data.contains_key("email"));
+            assert!(old_data.get("id").is_some());
+            assert!(old_data.get("email").is_some());
             assert_eq!(
                 old_data.get("id").unwrap(),
                 &serde_json::Value::Number(serde_json::Number::from(42))
@@ -66,10 +68,10 @@ fn test_update_where_clause_uses_old_data() {
             );
 
             // 2. Verify new_data contains the updated values
-            assert!(new_data.contains_key("id"));
-            assert!(new_data.contains_key("email"));
-            assert!(new_data.contains_key("name"));
-            assert!(new_data.contains_key("age"));
+            assert!(new_data.get("id").is_some());
+            assert!(new_data.get("email").is_some());
+            assert!(new_data.get("name").is_some());
+            assert!(new_data.get("age").is_some());
             assert_eq!(
                 new_data.get("email").unwrap(),
                 &serde_json::Value::String("new.email@example.com".to_string())
@@ -79,8 +81,10 @@ fn test_update_where_clause_uses_old_data() {
             // - SET clause should use new_data keys/values
             // - WHERE clause should use old_data keys/values
 
-            let set_keys: Vec<&String> = new_data.keys().collect();
-            let where_keys: Vec<&String> = old_data.keys().collect();
+            let set_map = new_data.clone().into_hash_map();
+            let where_map = old_data.clone().into_hash_map();
+            let set_keys: Vec<&String> = set_map.keys().collect();
+            let where_keys: Vec<&String> = where_map.keys().collect();
 
             // Verify SET clause would include all new columns
             assert!(set_keys.contains(&&"id".to_string()));
@@ -108,31 +112,32 @@ fn test_update_where_clause_uses_old_data() {
 /// Test DELETE operations use old_data for WHERE clause  
 #[test]
 fn test_delete_where_clause_uses_old_data() {
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(99)),
-    );
-    old_data.insert(
-        "username".to_string(),
-        serde_json::Value::String("user_to_delete".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        (
+            "id",
+            serde_json::Value::Number(serde_json::Number::from(99)),
+        ),
+        (
+            "username",
+            serde_json::Value::String("user_to_delete".to_string()),
+        ),
+    ]);
 
     let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         16384,
         old_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(200),
     );
 
     // Verify DELETE event structure
     match &event.event_type {
         EventType::Delete { old_data, .. } => {
-            assert!(old_data.contains_key("id"));
-            assert!(old_data.contains_key("username"));
+            assert!(old_data.get("id").is_some());
+            assert!(old_data.get("username").is_some());
 
             // The generated SQL should conceptually be:
             // DELETE FROM `public`.`users` WHERE `id` = ? AND `username` = ?
@@ -145,24 +150,22 @@ fn test_delete_where_clause_uses_old_data() {
 /// Test UPDATE without old_data (REPLICA IDENTITY NOTHING scenario)
 #[test]
 fn test_update_fallback_when_no_old_data() {
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(123)),
-    );
-    new_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("New Name".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        (
+            "id",
+            serde_json::Value::Number(serde_json::Number::from(123)),
+        ),
+        ("name", serde_json::Value::String("New Name".to_string())),
+    ]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "logs".to_string(),
+        "public",
+        "logs",
         16385,
         None, // Simulates REPLICA IDENTITY NOTHING
         new_data,
         ReplicaIdentity::Nothing,
-        vec!["id".to_string()], // fallback key columns
+        vec![Arc::from("id")], // fallback key columns
         Lsn::from(300),
     );
 
@@ -174,8 +177,8 @@ fn test_update_fallback_when_no_old_data() {
             assert!(old_data.is_none());
             assert!(!new_data.is_empty());
 
-            assert!(new_data.contains_key("id"));
-            assert!(new_data.contains_key("name"));
+            assert!(new_data.get("id").is_some());
+            assert!(new_data.get("name").is_some());
 
             // In our fixed implementation, this would fallback to using new_data for WHERE
             // (taking first column as a fallback), which is not ideal but better than WHERE 1=1

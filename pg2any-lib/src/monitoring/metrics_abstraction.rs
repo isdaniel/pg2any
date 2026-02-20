@@ -188,13 +188,17 @@ mod real_metrics {
             let table_name = match &event.event_type {
                 EventType::Insert { table, .. }
                 | EventType::Update { table, .. }
-                | EventType::Delete { table, .. } => table.as_str(),
-                EventType::Truncate(tables) => &tables.join(","),
-                _ => "unknown",
+                | EventType::Delete { table, .. } => table.to_string(),
+                EventType::Truncate(tables) => tables
+                    .iter()
+                    .map(|t| t.as_ref())
+                    .collect::<Vec<&str>>()
+                    .join(","),
+                _ => "unknown".to_string(),
             };
 
             EVENTS_BY_TYPE
-                .with_label_values(&[event_type, table_name])
+                .with_label_values(&[event_type, &table_name])
                 .inc();
 
             // Update LSN

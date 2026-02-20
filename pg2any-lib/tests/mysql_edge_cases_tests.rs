@@ -1,9 +1,9 @@
 /// Integration tests for MySQL destination error handling and edge cases
 /// These tests verify error conditions and edge cases in the WHERE clause generation
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Test scenarios that should result in errors when processed by MySQL destination
 #[cfg(test)]
@@ -13,18 +13,18 @@ mod mysql_error_scenarios {
     #[test]
     fn test_missing_key_column_scenario() {
         // Create event where key column is missing from data
-        let mut incomplete_data = HashMap::new();
-        incomplete_data.insert("name".to_string(), Value::String("test".to_string()));
+        let incomplete_data =
+            RowData::from_pairs(vec![("name", Value::String("test".to_string()))]);
         // Missing "id" which is specified as key column
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "users".to_string(),
+            "public",
+            "users",
             16384,
             Some(incomplete_data.clone()),
             incomplete_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()], // "id" not in data
+            vec![Arc::from("id")], // "id" not in data
             Lsn::from(300),
         );
 
@@ -32,8 +32,8 @@ mod mysql_error_scenarios {
         match &event.event_type {
             EventType::Update { old_data, .. } => {
                 let data_source = old_data.as_ref().unwrap();
-                assert!(!data_source.contains_key("id")); // Key column missing
-                assert!(data_source.contains_key("name")); // Non-key column present
+                assert!(data_source.get("id").is_none()); // Key column missing
+                assert!(data_source.get("name").is_some()); // Non-key column present
 
                 // Expected error: "Key column 'id' not found in data for Update on public.users"
             }
@@ -45,13 +45,13 @@ mod mysql_error_scenarios {
     fn test_empty_data_scenario() {
         // Test scenario with empty old_data and new_data
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "empty_table".to_string(),
+            "public",
+            "empty_table",
             16384,
-            Some(HashMap::new()), // Empty old_data
-            HashMap::new(),       // Empty new_data
+            Some(RowData::new()), // Empty old_data
+            RowData::new(),       // Empty new_data
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::from(300),
         );
 
@@ -73,13 +73,13 @@ mod mysql_error_scenarios {
     fn test_no_old_data_and_empty_new_data_scenario() {
         // Test fallback scenario where old_data is None and new_data is empty
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "test_table".to_string(),
+            "public",
+            "test_table",
             16384,
             None,           // No old_data
-            HashMap::new(), // Empty new_data
+            RowData::new(), // Empty new_data
             ReplicaIdentity::Nothing,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::from(300),
         );
 
@@ -100,12 +100,11 @@ mod mysql_error_scenarios {
     #[test]
     fn test_empty_key_columns_scenario() {
         // Test scenario with empty key columns (NOTHING replica identity)
-        let mut data = HashMap::new();
-        data.insert("some_data".to_string(), Value::String("value".to_string()));
+        let data = RowData::from_pairs(vec![("some_data", Value::String("value".to_string()))]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "no_keys_table".to_string(),
+            "public",
+            "no_keys_table",
             16384,
             None,
             data,
@@ -124,29 +123,26 @@ mod mysql_error_scenarios {
     #[test]
     fn test_partial_key_columns_missing() {
         // Test composite key where some key columns are missing
-        let mut incomplete_data = HashMap::new();
-        incomplete_data.insert(
-            "tenant_id".to_string(),
-            Value::String("tenant_1".to_string()),
-        );
+        let incomplete_data =
+            RowData::from_pairs(vec![("tenant_id", Value::String("tenant_1".to_string()))]);
         // Missing "user_id" which is part of composite key
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "user_accounts".to_string(),
+            "public",
+            "user_accounts",
             16384,
             Some(incomplete_data.clone()),
             incomplete_data,
             ReplicaIdentity::Default,
-            vec!["tenant_id".to_string(), "user_id".to_string()], // Composite key
+            vec![Arc::from("tenant_id"), Arc::from("user_id")], // Composite key
             Lsn::from(300),
         );
 
         match &event.event_type {
             EventType::Update { old_data, .. } => {
                 let data_source = old_data.as_ref().unwrap();
-                assert!(data_source.contains_key("tenant_id")); // Present
-                assert!(!data_source.contains_key("user_id")); // Missing
+                assert!(data_source.get("tenant_id").is_some()); // Present
+                assert!(data_source.get("user_id").is_none()); // Missing
 
                 // Expected error: "Key column 'user_id' not found in data for Update on public.user_accounts"
             }
@@ -163,22 +159,24 @@ mod data_source_selection_tests {
     #[test]
     fn test_data_source_priority_order() {
         // Test that old_data is always preferred over new_data when available
-        let mut old_data = HashMap::new();
-        old_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-        old_data.insert("value".to_string(), Value::String("old_value".to_string()));
+        let old_data = RowData::from_pairs(vec![
+            ("id", Value::Number(serde_json::Number::from(1))),
+            ("value", Value::String("old_value".to_string())),
+        ]);
 
-        let mut new_data = HashMap::new();
-        new_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-        new_data.insert("value".to_string(), Value::String("new_value".to_string()));
+        let new_data = RowData::from_pairs(vec![
+            ("id", Value::Number(serde_json::Number::from(1))),
+            ("value", Value::String("new_value".to_string())),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "priority_test".to_string(),
+            "public",
+            "priority_test",
             16384,
             Some(old_data.clone()),
             new_data.clone(),
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::from(300),
         );
 
@@ -209,16 +207,14 @@ mod data_source_selection_tests {
     #[test]
     fn test_fallback_only_when_old_data_none() {
         // Test that fallback to new_data only happens when old_data is None
-        let mut new_data = HashMap::new();
-        new_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-        new_data.insert(
-            "value".to_string(),
-            Value::String("fallback_value".to_string()),
-        );
+        let new_data = RowData::from_pairs(vec![
+            ("id", Value::Number(serde_json::Number::from(1))),
+            ("value", Value::String("fallback_value".to_string())),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "fallback_test".to_string(),
+            "public",
+            "fallback_test",
             16384,
             None, // old_data is None
             new_data.clone(),
@@ -266,22 +262,24 @@ mod complex_data_tests {
             )])),
         )]));
 
-        let mut old_data = HashMap::new();
-        old_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-        old_data.insert("json_data".to_string(), complex_json.clone());
+        let old_data = RowData::from_pairs(vec![
+            ("id", Value::Number(serde_json::Number::from(1))),
+            ("json_data", complex_json.clone()),
+        ]);
 
-        let mut new_data = HashMap::new();
-        new_data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
-        new_data.insert("json_data".to_string(), complex_json);
+        let new_data = RowData::from_pairs(vec![
+            ("id", Value::Number(serde_json::Number::from(1))),
+            ("json_data", complex_json),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "json_table".to_string(),
+            "public",
+            "json_table",
             16384,
             Some(old_data),
             new_data,
             ReplicaIdentity::Default,
-            vec!["id".to_string()],
+            vec![Arc::from("id")],
             Lsn::from(300),
         );
 
@@ -289,7 +287,7 @@ mod complex_data_tests {
         match &event.event_type {
             EventType::Update { old_data, .. } => {
                 let data_source = old_data.as_ref().unwrap();
-                assert!(data_source.contains_key("json_data"));
+                assert!(data_source.get("json_data").is_some());
                 assert!(matches!(
                     data_source.get("json_data"),
                     Some(Value::Object(_))
@@ -302,30 +300,25 @@ mod complex_data_tests {
     #[test]
     fn test_various_data_types_in_key_columns() {
         // Test with different PostgreSQL data types in key columns
-        let mut old_data = HashMap::new();
-        old_data.insert(
-            "string_key".to_string(),
-            Value::String("key_value".to_string()),
-        );
-        old_data.insert(
-            "int_key".to_string(),
-            Value::Number(serde_json::Number::from(42)),
-        );
-        old_data.insert("bool_key".to_string(), Value::Bool(true));
-        old_data.insert("null_key".to_string(), Value::Null);
+        let old_data = RowData::from_pairs(vec![
+            ("string_key", Value::String("key_value".to_string())),
+            ("int_key", Value::Number(serde_json::Number::from(42))),
+            ("bool_key", Value::Bool(true)),
+            ("null_key", Value::Null),
+        ]);
 
         let event = ChangeEvent::update(
-            "public".to_string(),
-            "mixed_types".to_string(),
+            "public",
+            "mixed_types",
             16384,
             Some(old_data.clone()),
             old_data,
             ReplicaIdentity::Index,
             vec![
-                "string_key".to_string(),
-                "int_key".to_string(),
-                "bool_key".to_string(),
-                "null_key".to_string(),
+                Arc::from("string_key"),
+                Arc::from("int_key"),
+                Arc::from("bool_key"),
+                Arc::from("null_key"),
             ],
             Lsn::from(300),
         );
@@ -372,8 +365,8 @@ mod schema_table_tests {
         ];
 
         for (schema, table) in test_cases {
-            let mut data = HashMap::new();
-            data.insert("id".to_string(), Value::Number(serde_json::Number::from(1)));
+            let data =
+                RowData::from_pairs(vec![("id", Value::Number(serde_json::Number::from(1)))]);
 
             let event = ChangeEvent::update(
                 schema.to_string(),
@@ -382,7 +375,7 @@ mod schema_table_tests {
                 Some(data.clone()),
                 data,
                 ReplicaIdentity::Default,
-                vec!["id".to_string()],
+                vec![Arc::from("id")],
                 Lsn::from(300),
             );
 
@@ -393,8 +386,8 @@ mod schema_table_tests {
                     table: event_table,
                     ..
                 } => {
-                    assert_eq!(event_schema, schema);
-                    assert_eq!(event_table, table);
+                    assert_eq!(event_schema.as_ref(), schema);
+                    assert_eq!(event_table.as_ref(), table);
                 }
                 _ => panic!("Expected Update event"),
             }

@@ -1,22 +1,14 @@
 use chrono::Utc;
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::Lsn;
+use pg_walstream::{Lsn, RowData};
 use serde_json::json;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 #[test]
 fn test_new_event_type_insert() {
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("test"));
+    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("test"))]);
 
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        123,
-        data.clone(),
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("public", "users", 123, data.clone(), Lsn::from(100));
 
     match event.event_type {
         EventType::Insert {
@@ -25,8 +17,8 @@ fn test_new_event_type_insert() {
             relation_oid,
             data: event_data,
         } => {
-            assert_eq!(schema, "public");
-            assert_eq!(table, "users");
+            assert_eq!(schema.as_ref(), "public");
+            assert_eq!(table.as_ref(), "users");
             assert_eq!(relation_oid, 123);
             assert_eq!(event_data, data);
         }
@@ -36,22 +28,18 @@ fn test_new_event_type_insert() {
 
 #[test]
 fn test_new_event_type_update() {
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), json!(1));
-    old_data.insert("name".to_string(), json!("old_name"));
+    let old_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("old_name"))]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert("id".to_string(), json!(1));
-    new_data.insert("name".to_string(), json!("new_name"));
+    let new_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("new_name"))]);
 
     let event = ChangeEvent::update(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         123,
         Some(old_data.clone()),
         new_data.clone(),
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     );
 
@@ -65,13 +53,14 @@ fn test_new_event_type_update() {
             replica_identity,
             key_columns,
         } => {
-            assert_eq!(schema, "public");
-            assert_eq!(table, "users");
+            assert_eq!(schema.as_ref(), "public");
+            assert_eq!(table.as_ref(), "users");
             assert_eq!(relation_oid, 123);
             assert_eq!(event_old_data, Some(old_data));
             assert_eq!(event_new_data, new_data);
             assert_eq!(replica_identity, ReplicaIdentity::Default);
-            assert_eq!(key_columns, vec!["id".to_string()]);
+            assert_eq!(key_columns.len(), 1);
+            assert_eq!(key_columns[0].as_ref(), "id");
         }
         _ => panic!("Expected Update variant"),
     }
@@ -79,17 +68,15 @@ fn test_new_event_type_update() {
 
 #[test]
 fn test_new_event_type_delete() {
-    let mut old_data = HashMap::new();
-    old_data.insert("id".to_string(), json!(1));
-    old_data.insert("name".to_string(), json!("deleted_name"));
+    let old_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("deleted_name"))]);
 
     let event = ChangeEvent::delete(
-        "public".to_string(),
-        "users".to_string(),
+        "public",
+        "users",
         123,
         old_data.clone(),
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(200),
     );
 
@@ -102,12 +89,13 @@ fn test_new_event_type_delete() {
             replica_identity,
             key_columns,
         } => {
-            assert_eq!(schema, "public");
-            assert_eq!(table, "users");
+            assert_eq!(schema.as_ref(), "public");
+            assert_eq!(table.as_ref(), "users");
             assert_eq!(relation_oid, 123);
             assert_eq!(event_old_data, old_data);
             assert_eq!(replica_identity, ReplicaIdentity::Default);
-            assert_eq!(key_columns, vec!["id".to_string()]);
+            assert_eq!(key_columns.len(), 1);
+            assert_eq!(key_columns[0].as_ref(), "id");
         }
         _ => panic!("Expected Delete variant"),
     }
@@ -144,7 +132,7 @@ fn test_new_event_type_begin_commit() {
 
 #[test]
 fn test_new_event_type_truncate() {
-    let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+    let tables: Vec<Arc<str>> = vec![Arc::from("public.users"), Arc::from("public.orders")];
 
     let event = ChangeEvent::truncate(tables.clone(), Lsn::from(400));
     match event.event_type {
@@ -157,17 +145,9 @@ fn test_new_event_type_truncate() {
 
 #[test]
 fn test_event_serialization() {
-    let mut data = HashMap::new();
-    data.insert("id".to_string(), json!(1));
-    data.insert("name".to_string(), json!("test"));
+    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("test"))]);
 
-    let event = ChangeEvent::insert(
-        "public".to_string(),
-        "users".to_string(),
-        123,
-        data,
-        Lsn::from(100),
-    );
+    let event = ChangeEvent::insert("public", "users", 123, data, Lsn::from(100));
 
     // Test that the event can be serialized and deserialized
     let serialized = serde_json::to_string(&event).expect("Failed to serialize event");

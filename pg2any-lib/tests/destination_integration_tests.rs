@@ -3,8 +3,8 @@ use pg2any_lib::{
     types::{ChangeEvent, EventType, ReplicaIdentity},
     DestinationType,
 };
-use pg_walstream::Lsn;
-use std::collections::HashMap;
+use pg_walstream::{Lsn, RowData};
+use std::sync::Arc;
 
 /// Test that destination handlers have consistent interfaces
 #[tokio::test]
@@ -102,100 +102,72 @@ fn test_unsupported_destination_types() {
 
 // Helper functions to create test events
 fn create_test_event() -> ChangeEvent {
-    let mut data = HashMap::new();
-    data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    data.insert(
-        "name".to_string(),
-        serde_json::Value::String("test".to_string()),
-    );
-    data.insert("active".to_string(), serde_json::Value::Bool(true));
+    let data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("test".to_string())),
+        ("active", serde_json::Value::Bool(true)),
+    ]);
 
-    ChangeEvent::insert(
-        "public".to_string(),
-        "test_table".to_string(),
-        456,
-        data,
-        Lsn::from(100),
-    )
+    ChangeEvent::insert("public", "test_table", 456, data, Lsn::from(100))
 }
 
 fn create_update_event() -> ChangeEvent {
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    old_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("old_name".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("old_name".to_string())),
+    ]);
 
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    new_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("new_name".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("new_name".to_string())),
+    ]);
 
     ChangeEvent::update(
-        "public".to_string(),
-        "test_table".to_string(),
+        "public",
+        "test_table",
         456,
         Some(old_data),
         new_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(300),
     )
 }
 
 fn create_delete_event() -> ChangeEvent {
-    let mut old_data = HashMap::new();
-    old_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    old_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("deleted_name".to_string()),
-    );
+    let old_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        (
+            "name",
+            serde_json::Value::String("deleted_name".to_string()),
+        ),
+    ]);
 
     ChangeEvent::delete(
-        "public".to_string(),
-        "test_table".to_string(),
+        "public",
+        "test_table",
         456,
         old_data,
         ReplicaIdentity::Default,
-        vec!["id".to_string()],
+        vec![Arc::from("id")],
         Lsn::from(200),
     )
 }
 
 fn create_update_event_without_old_data() -> ChangeEvent {
-    let mut new_data = HashMap::new();
-    new_data.insert(
-        "id".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(1)),
-    );
-    new_data.insert(
-        "name".to_string(),
-        serde_json::Value::String("new_name".to_string()),
-    );
+    let new_data = RowData::from_pairs(vec![
+        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
+        ("name", serde_json::Value::String("new_name".to_string())),
+    ]);
 
     ChangeEvent::update(
-        "public".to_string(),
-        "test_table".to_string(),
+        "public",
+        "test_table",
         456,
         None, // This simulates REPLICA IDENTITY NOTHING
         new_data,
         ReplicaIdentity::Nothing,
-        vec!["id".to_string()], // fallback key columns
+        vec![Arc::from("id")], // fallback key columns
         Lsn::from(300),
     )
 }
@@ -225,15 +197,15 @@ fn test_mysql_destination_update_with_old_data() {
         let old_data = old_data.as_ref().unwrap();
 
         // Verify that old_data contains key information for WHERE clause
-        assert!(old_data.contains_key("id"));
+        assert!(old_data.get("id").is_some());
         assert_eq!(
             old_data.get("id").unwrap(),
             &serde_json::Value::Number(serde_json::Number::from(1))
         );
 
         // Verify that new_data contains updated information
-        assert!(new_data.contains_key("id"));
-        assert!(new_data.contains_key("name"));
+        assert!(new_data.get("id").is_some());
+        assert!(new_data.get("name").is_some());
         assert_eq!(
             new_data.get("name").unwrap(),
             &serde_json::Value::String("new_name".to_string())
@@ -257,8 +229,8 @@ fn test_mysql_destination_update_without_old_data() {
             assert!(!new_data.is_empty());
 
             // This tests the fallback behavior when old_data is not available
-            assert!(new_data.contains_key("id"));
-            assert!(new_data.contains_key("name"));
+            assert!(new_data.get("id").is_some());
+            assert!(new_data.get("name").is_some());
         }
         _ => panic!("Expected Update event"),
     }
@@ -281,15 +253,15 @@ fn test_sqlserver_destination_update_with_old_data() {
             let old_data = old_data.as_ref().unwrap();
 
             // Verify that old_data contains key information for WHERE clause
-            assert!(old_data.contains_key("id"));
+            assert!(old_data.get("id").is_some());
             assert_eq!(
                 old_data.get("id").unwrap(),
                 &serde_json::Value::Number(serde_json::Number::from(1))
             );
 
             // Verify that new_data contains updated information
-            assert!(new_data.contains_key("id"));
-            assert!(new_data.contains_key("name"));
+            assert!(new_data.get("id").is_some());
+            assert!(new_data.get("name").is_some());
             assert_eq!(
                 new_data.get("name").unwrap(),
                 &serde_json::Value::String("new_name".to_string())
@@ -307,8 +279,8 @@ fn test_delete_event_uses_old_data() {
     // DELETE operations should have old_data for WHERE clause
     match &delete_event.event_type {
         EventType::Delete { old_data, .. } => {
-            assert!(old_data.contains_key("id"));
-            assert!(old_data.contains_key("name"));
+            assert!(old_data.get("id").is_some());
+            assert!(old_data.get("name").is_some());
             assert_eq!(
                 old_data.get("name").unwrap(),
                 &serde_json::Value::String("deleted_name".to_string())

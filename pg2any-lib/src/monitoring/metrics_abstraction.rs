@@ -135,6 +135,7 @@ mod real_metrics {
     use super::*;
     use crate::monitoring::metrics::*; // Import the static metrics
     use crate::types::EventType;
+    use std::borrow::Cow;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
     use tracing::{debug, warn};
@@ -185,16 +186,18 @@ mod real_metrics {
             // Track by event type and table
             let event_type = event.event_type_str();
             // Extract table name from event type
-            let table_name = match &event.event_type {
+            let table_name: Cow<'_, str> = match &event.event_type {
                 EventType::Insert { table, .. }
                 | EventType::Update { table, .. }
-                | EventType::Delete { table, .. } => table.to_string(),
-                EventType::Truncate(tables) => tables
-                    .iter()
-                    .map(|t| t.as_ref())
-                    .collect::<Vec<&str>>()
-                    .join(","),
-                _ => "unknown".to_string(),
+                | EventType::Delete { table, .. } => Cow::Borrowed(table.as_ref()),
+                EventType::Truncate(tables) => Cow::Owned(
+                    tables
+                        .iter()
+                        .map(|t| t.as_ref())
+                        .collect::<Vec<&str>>()
+                        .join(","),
+                ),
+                _ => Cow::Borrowed("unknown"),
             };
 
             EVENTS_BY_TYPE

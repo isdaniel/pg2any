@@ -1051,12 +1051,12 @@ impl TransactionManager {
     fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let data_map = new_data.clone().into_hash_map();
-        let columns: Vec<String> = data_map.keys().cloned().collect();
-        let values: Vec<String> = columns
-            .iter()
-            .map(|col| self.format_value(&data_map[col]))
-            .collect();
+        let (columns, values): (Vec<String>, Vec<String>) = new_data
+            .clone()
+            .into_hash_map()
+            .into_iter()
+            .map(|(k, v)| (k, self.format_value(&v)))
+            .unzip();
 
         let sql = match self.destination_type {
             DestinationType::MySQL => {

@@ -494,7 +494,7 @@ impl TransactionManager {
             ))
         })?;
 
-        let sql_bytes = sql.as_bytes().len() + 1; // include newline
+        let sql_bytes = sql.len() + 1; // include newline
         let estimated_size =
             tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
 
@@ -1602,11 +1602,12 @@ impl TransactionManager {
         };
 
         for segment in segments.drain(..) {
-            if remaining_start_index > 0 && segment.statement_count > 0 {
-                if remaining_start_index >= segment.statement_count {
-                    remaining_start_index -= segment.statement_count;
-                    continue;
-                }
+            if remaining_start_index > 0
+                && segment.statement_count > 0
+                && remaining_start_index >= segment.statement_count
+            {
+                remaining_start_index -= segment.statement_count;
+                continue;
             }
 
             let segment_start_index = remaining_start_index;

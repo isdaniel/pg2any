@@ -82,58 +82,7 @@ impl DestinationHandler for MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
 
-        // Begin a transaction
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| CdcError::generic(format!("MySQL BEGIN transaction failed: {e}")))?;
-
-        // Execute all commands in the transaction
-        for (idx, sql) in commands.iter().enumerate() {
-            if let Err(e) = sqlx::query(sql).execute(&mut *tx).await {
-                // Rollback on error
-                if let Err(rollback_err) = tx.rollback().await {
-                    tracing::error!(
-                        "MySQL ROLLBACK failed after execution error: {}",
-                        rollback_err
-                    );
-                }
-                return Err(CdcError::generic(format!(
-                    "MySQL execute_sql_batch failed at command {}/{}: {}",
-                    idx + 1,
-                    commands.len(),
-                    e
-                )));
-            }
-        }
-
-        // CRITICAL: Execute pre-commit hook BEFORE transaction COMMIT
-        // This ensures checkpoint updates are atomic with data changes:
-        // - If hook fails: transaction rolls back, checkpoint not updated
-        // - If COMMIT fails: transaction rolls back, checkpoint not persisted
-        // - If crash before COMMIT: transaction rolls back, checkpoint file not written
-        // - If crash after COMMIT: both data and checkpoint are durable
-        if let Some(hook) = pre_commit_hook {
-            if let Err(e) = hook().await {
-                // Rollback transaction if hook fails
-                if let Err(rollback_err) = tx.rollback().await {
-                    tracing::error!(
-                        "MySQL ROLLBACK failed after pre-commit hook error: {}",
-                        rollback_err
-                    );
-                }
-                return Err(CdcError::generic(format!(
-                    "MySQL pre-commit hook failed, transaction rolled back: {}",
-                    e
-                )));
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {e}")))?;
-
-        Ok(())
+        super::common::execute_sqlx_batch_with_hook(pool, commands, pre_commit_hook, "MySQL").await
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -152,21 +101,11 @@ impl DestinationHandler for MySQLDestination {
 
 #[cfg(test)]
 mod tests {
-    use super::super::common;
     use super::*;
 
     #[test]
     fn test_mysql_destination_creation() {
         let destination = MySQLDestination::new();
         assert!(destination.pool.is_none());
-    }
-
-    #[test]
-    fn test_map_schema() {
-        let mut mappings = HashMap::new();
-        mappings.insert("public".to_string(), "cdc_db".to_string());
-
-        assert_eq!(common::map_schema(&mappings, "public"), "cdc_db");
-        assert_eq!(common::map_schema(&mappings, "other"), "other");
     }
 }

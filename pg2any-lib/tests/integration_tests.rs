@@ -2,8 +2,7 @@
 //!
 //! These tests verify the basic functionality of the libpq-sys integration
 
-use pg2any_lib::pg_replication::{format_lsn, parse_lsn};
-use pg2any_lib::{ColumnData, ColumnInfo, TupleData};
+use pg2any_lib::{format_lsn, parse_lsn, ColumnData, ColumnInfo, TupleData};
 use pg_walstream::buffer::{BufferReader, BufferWriter};
 
 #[test]

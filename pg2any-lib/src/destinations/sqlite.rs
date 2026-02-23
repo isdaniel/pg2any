@@ -113,54 +113,7 @@ impl DestinationHandler for SQLiteDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("SQLite pool not initialized"))?;
 
-        // Begin a transaction
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| CdcError::generic(format!("SQLite BEGIN transaction failed: {e}")))?;
-
-        // Execute all commands in the transaction
-        for (idx, sql) in commands.iter().enumerate() {
-            if let Err(e) = sqlx::query(sql).execute(&mut *tx).await {
-                // Rollback on error
-                if let Err(rollback_err) = tx.rollback().await {
-                    tracing::error!(
-                        "SQLite ROLLBACK failed after execution error: {}",
-                        rollback_err
-                    );
-                }
-                return Err(CdcError::generic(format!(
-                    "SQLite execute_sql_batch failed at command {}/{}: {}",
-                    idx + 1,
-                    commands.len(),
-                    e
-                )));
-            }
-        }
-
-        // Execute pre-commit hook BEFORE transaction COMMIT
-        if let Some(hook) = pre_commit_hook {
-            if let Err(e) = hook().await {
-                // Rollback transaction if hook fails
-                if let Err(rollback_err) = tx.rollback().await {
-                    tracing::error!(
-                        "SQLite ROLLBACK failed after pre-commit hook error: {}",
-                        rollback_err
-                    );
-                }
-                return Err(CdcError::generic(format!(
-                    "SQLite pre-commit hook failed, transaction rolled back: {}",
-                    e
-                )));
-            }
-        }
-
-        // Commit the transaction
-        tx.commit()
-            .await
-            .map_err(|e| CdcError::generic(format!("SQLite COMMIT transaction failed: {e}")))?;
-
-        Ok(())
+        super::common::execute_sqlx_batch_with_hook(pool, commands, pre_commit_hook, "SQLite").await
     }
 
     async fn close(&mut self) -> Result<()> {

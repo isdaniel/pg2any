@@ -225,13 +225,11 @@ impl LsnTracker {
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = std::path::Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if tokio::fs::metadata(parent).await.is_err() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        warn!("Failed to create directory for LSN file {}: {}", path, e);
-                    } else {
-                        info!("Created directory for LSN metadata: {:?}", parent);
-                    }
+            if !parent.as_os_str().is_empty() && tokio::fs::metadata(parent).await.is_err() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    warn!("Failed to create directory for LSN file {}: {}", path, e);
+                } else {
+                    info!("Created directory for LSN metadata: {:?}", parent);
                 }
             }
         }

@@ -3,12 +3,12 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
-use crate::pg_replication::{ReplicationManager, ReplicationStream};
 use crate::transaction_manager::{
     PendingTransactionFile, TransactionFileMetadata, TransactionManager,
 };
 use crate::types::{EventType, Lsn};
 use chrono::{DateTime, Utc};
+use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -78,7 +78,7 @@ pub struct CdcClient {
     /// Transaction file manager for file-based workflow
     transaction_file_manager: Arc<TransactionManager>,
     /// Replication stream for PostgreSQL connection
-    replication_stream: Arc<Mutex<ReplicationStream>>,
+    replication_stream: Arc<Mutex<LogicalReplicationStream>>,
 }
 
 impl CdcClient {
@@ -124,8 +124,9 @@ impl CdcClient {
 
         // Create replication stream
         info!("Creating replication stream");
-        let replication_manager = ReplicationManager::new(config.clone());
-        let replication_stream = replication_manager.create_stream_async().await?;
+        let stream_config = ReplicationStreamConfig::from(&config);
+        let replication_stream =
+            LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
 
         let client = Self {
             config,
@@ -173,10 +174,11 @@ impl CdcClient {
 
         // Start the replication stream
         {
+            let start_xlog = start_lsn.map(|lsn| lsn.0);
             self.replication_stream
                 .lock()
                 .await
-                .start(start_lsn)
+                .start(start_xlog)
                 .await?;
         }
 
@@ -209,7 +211,7 @@ impl CdcClient {
         // Get shared_lsn_feedback from stored replication_stream
         let shared_lsn_feedback = {
             let stream_guard = self.replication_stream.as_ref().lock().await;
-            stream_guard.shared_lsn_feedback().clone()
+            stream_guard.shared_lsn_feedback.clone()
         };
 
         if let Some(ref mut handler) = self.destination_handler {
@@ -456,9 +458,9 @@ impl CdcClient {
     /// ## Shutdown Coordination
     ///
     /// During graceful shutdown, the producer simply exits gracefully without transferring
-    /// ownership. The ReplicationStream remains stored in CdcClient. The main thread's stop()
+    /// ownership. The LogicalReplicationStream remains stored in CdcClient. The main thread's stop()
     /// function waits for both producer and consumer to complete, ensuring all transactions
-    /// are committed, then calls stop() on the stored ReplicationStream to send final ACK.
+    /// are committed, then calls stop() on the stored LogicalReplicationStream to send final ACK.
     /// This ensures the ACK includes all transactions successfully applied by the consumer,
     /// preventing re-download of already applied transactions on restart.
     ///
@@ -470,7 +472,7 @@ impl CdcClient {
     /// 3. Consumer receives None from mpsc (channel closed) and processes remaining queue
     /// 4. Consumer then exits after draining all pending transactions
     async fn run_producer(
-        replication_stream: Arc<Mutex<ReplicationStream>>,
+        replication_stream: Arc<Mutex<LogicalReplicationStream>>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
@@ -538,7 +540,7 @@ impl CdcClient {
             // Get the next event from the replication stream (lock for the duration of the call)
             let event_result = {
                 let mut stream = replication_stream.lock().await;
-                stream.next_event(&cancellation_token).await
+                stream.next_event_with_retry(&cancellation_token).await
             };
 
             match event_result {
@@ -677,7 +679,7 @@ impl CdcClient {
                             info!("Producer: StreamCommit for transaction {}", transaction_id);
 
                             // Move streaming transaction file to pending and notify consumer
-                            if let Some(_) = streaming_txs.remove(transaction_id) {
+                            if streaming_txs.remove(transaction_id).is_some() {
                                 // Use helper function to handle commit logic
                                 if let Err(e) = Self::handle_transaction_commit(
                                     *transaction_id,
@@ -1231,12 +1233,23 @@ impl CdcClient {
             info!("Sending final ACK to PostgreSQL before shutdown");
             let mut stream = self.replication_stream.as_ref().lock().await;
             stream
-                .shared_lsn_feedback()
+                .shared_lsn_feedback
                 .log_state("Final shutdown - LSN state before ACK");
+
+            if let Err(e) = stream.send_feedback() {
+                warn!("Failed to send final feedback: {}", e);
+            }
+
+            info!(
+                "Stopping logical replication stream (last received LSN: {})",
+                pg_walstream::format_lsn(stream.current_lsn())
+            );
+
             if let Err(e) = stream.stop().await {
                 error!("Failed to stop replication stream: {}", e);
-                return Err(e);
+                return Err(CdcError::from(e));
             }
+
             info!("Final ACK sent successfully to PostgreSQL");
         }
 

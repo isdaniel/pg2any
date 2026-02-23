@@ -64,9 +64,6 @@ pub mod error;
 // Destination handlers
 pub mod types;
 
-// Low-level PostgreSQL replication using libpq-sys
-pub mod pg_replication;
-
 pub mod lsn_tracker;
 
 // High-level client interface
@@ -88,7 +85,6 @@ pub use config::{Config, ConfigBuilder};
 pub use env::load_config_from_env;
 pub use error::CdcError;
 pub use lsn_tracker::{create_lsn_tracker_with_load, LsnTracker};
-pub use pg_replication::{PgReplicationConnection, ReplicationConnectionRetry, RetryConfig};
 pub type CdcResult<T> = Result<T, CdcError>;
 
 pub mod destinations;
@@ -129,9 +125,6 @@ pub use pg_walstream::{
     INVALID_XLOG_REC_PTR,
     PG_EPOCH_OFFSET_SECS,
 };
-
-// Re-export PgResult from pg_replication (pg2any-lib's version with libpq)
-pub use pg_replication::PgResult;
 
 // Re-export SharedLsnFeedback from lsn_tracker (pg2any-lib's version with log_status method)
 pub use lsn_tracker::SharedLsnFeedback;

@@ -75,26 +75,6 @@ impl Transaction {
         }
     }
 
-    /// Create a new transaction batch (can be used for both normal and streaming)
-    pub fn new_batch(transaction_id: u32, commit_timestamp: DateTime<Utc>, is_final: bool) -> Self {
-        Self {
-            transaction_id,
-            commit_timestamp,
-            commit_lsn: None,
-            events: Vec::new(),
-            is_final_batch: is_final,
-        }
-    }
-
-    /// Create a new streaming transaction batch (alias for new_batch for compatibility)
-    pub fn new_streaming(
-        transaction_id: u32,
-        commit_timestamp: DateTime<Utc>,
-        is_final: bool,
-    ) -> Self {
-        Self::new_batch(transaction_id, commit_timestamp, is_final)
-    }
-
     /// Add an event to this transaction
     pub fn add_event(&mut self, event: ChangeEvent) {
         self.events.push(event);

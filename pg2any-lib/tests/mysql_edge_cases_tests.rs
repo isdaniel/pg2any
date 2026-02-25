@@ -1,8 +1,7 @@
 /// Integration tests for MySQL destination error handling and edge cases
 /// These tests verify error conditions and edge cases in the WHERE clause generation
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::{Lsn, RowData};
-use serde_json::Value;
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 /// Test scenarios that should result in errors when processed by MySQL destination
@@ -13,8 +12,7 @@ mod mysql_error_scenarios {
     #[test]
     fn test_missing_key_column_scenario() {
         // Create event where key column is missing from data
-        let incomplete_data =
-            RowData::from_pairs(vec![("name", Value::String("test".to_string()))]);
+        let incomplete_data = RowData::from_pairs(vec![("name", ColumnValue::text("test"))]);
         // Missing "id" which is specified as key column
 
         let event = ChangeEvent::update(
@@ -100,7 +98,7 @@ mod mysql_error_scenarios {
     #[test]
     fn test_empty_key_columns_scenario() {
         // Test scenario with empty key columns (NOTHING replica identity)
-        let data = RowData::from_pairs(vec![("some_data", Value::String("value".to_string()))]);
+        let data = RowData::from_pairs(vec![("some_data", ColumnValue::text("value"))]);
 
         let event = ChangeEvent::update(
             "public",
@@ -124,7 +122,7 @@ mod mysql_error_scenarios {
     fn test_partial_key_columns_missing() {
         // Test composite key where some key columns are missing
         let incomplete_data =
-            RowData::from_pairs(vec![("tenant_id", Value::String("tenant_1".to_string()))]);
+            RowData::from_pairs(vec![("tenant_id", ColumnValue::text("tenant_1"))]);
         // Missing "user_id" which is part of composite key
 
         let event = ChangeEvent::update(
@@ -160,13 +158,13 @@ mod data_source_selection_tests {
     fn test_data_source_priority_order() {
         // Test that old_data is always preferred over new_data when available
         let old_data = RowData::from_pairs(vec![
-            ("id", Value::Number(serde_json::Number::from(1))),
-            ("value", Value::String("old_value".to_string())),
+            ("id", ColumnValue::text("1")),
+            ("value", ColumnValue::text("old_value")),
         ]);
 
         let new_data = RowData::from_pairs(vec![
-            ("id", Value::Number(serde_json::Number::from(1))),
-            ("value", Value::String("new_value".to_string())),
+            ("id", ColumnValue::text("1")),
+            ("value", ColumnValue::text("new_value")),
         ]);
 
         let event = ChangeEvent::update(
@@ -193,11 +191,11 @@ mod data_source_selection_tests {
                 // Verify old_data is selected despite new_data being available
                 assert_eq!(
                     data_source.get("value"),
-                    Some(&Value::String("old_value".to_string()))
+                    Some(&ColumnValue::text("old_value"))
                 );
                 assert_ne!(
                     data_source.get("value"),
-                    Some(&Value::String("new_value".to_string()))
+                    Some(&ColumnValue::text("new_value"))
                 );
             }
             _ => panic!("Expected Update event"),
@@ -208,8 +206,8 @@ mod data_source_selection_tests {
     fn test_fallback_only_when_old_data_none() {
         // Test that fallback to new_data only happens when old_data is None
         let new_data = RowData::from_pairs(vec![
-            ("id", Value::Number(serde_json::Number::from(1))),
-            ("value", Value::String("fallback_value".to_string())),
+            ("id", ColumnValue::text("1")),
+            ("value", ColumnValue::text("fallback_value")),
         ]);
 
         let event = ChangeEvent::update(
@@ -235,7 +233,7 @@ mod data_source_selection_tests {
                 // Verify new_data is used when old_data is None
                 assert_eq!(
                     data_source.get("value"),
-                    Some(&Value::String("fallback_value".to_string()))
+                    Some(&ColumnValue::text("fallback_value"))
                 );
             }
             _ => panic!("Expected Update event"),
@@ -251,25 +249,16 @@ mod complex_data_tests {
     #[test]
     fn test_complex_json_data_in_where_clause() {
         // Test with complex JSON data structures
-        let complex_json = Value::Object(serde_json::Map::from_iter([(
-            "nested".to_string(),
-            Value::Object(serde_json::Map::from_iter([(
-                "array".to_string(),
-                Value::Array(vec![
-                    Value::Number(serde_json::Number::from(1)),
-                    Value::String("text".to_string()),
-                ]),
-            )])),
-        )]));
+        let complex_json_str = r#"{"nested":{"array":[1,"text"]}}"#;
 
         let old_data = RowData::from_pairs(vec![
-            ("id", Value::Number(serde_json::Number::from(1))),
-            ("json_data", complex_json.clone()),
+            ("id", ColumnValue::text("1")),
+            ("json_data", ColumnValue::text(complex_json_str)),
         ]);
 
         let new_data = RowData::from_pairs(vec![
-            ("id", Value::Number(serde_json::Number::from(1))),
-            ("json_data", complex_json),
+            ("id", ColumnValue::text("1")),
+            ("json_data", ColumnValue::text(complex_json_str)),
         ]);
 
         let event = ChangeEvent::update(
@@ -290,7 +279,7 @@ mod complex_data_tests {
                 assert!(data_source.get("json_data").is_some());
                 assert!(matches!(
                     data_source.get("json_data"),
-                    Some(Value::Object(_))
+                    Some(ColumnValue::Text(_))
                 ));
             }
             _ => panic!("Expected Update event"),
@@ -301,10 +290,10 @@ mod complex_data_tests {
     fn test_various_data_types_in_key_columns() {
         // Test with different PostgreSQL data types in key columns
         let old_data = RowData::from_pairs(vec![
-            ("string_key", Value::String("key_value".to_string())),
-            ("int_key", Value::Number(serde_json::Number::from(42))),
-            ("bool_key", Value::Bool(true)),
-            ("null_key", Value::Null),
+            ("string_key", ColumnValue::text("key_value")),
+            ("int_key", ColumnValue::text("42")),
+            ("bool_key", ColumnValue::text("true")),
+            ("null_key", ColumnValue::Null),
         ]);
 
         let event = ChangeEvent::update(
@@ -330,14 +319,20 @@ mod complex_data_tests {
                 // Verify all data types are preserved
                 assert!(matches!(
                     data_source.get("string_key"),
-                    Some(Value::String(_))
+                    Some(ColumnValue::Text(_))
                 ));
-                assert!(matches!(data_source.get("int_key"), Some(Value::Number(_))));
+                assert!(matches!(
+                    data_source.get("int_key"),
+                    Some(ColumnValue::Text(_))
+                ));
                 assert!(matches!(
                     data_source.get("bool_key"),
-                    Some(Value::Bool(true))
+                    Some(ColumnValue::Text(_))
                 ));
-                assert!(matches!(data_source.get("null_key"), Some(Value::Null)));
+                assert!(matches!(
+                    data_source.get("null_key"),
+                    Some(ColumnValue::Null)
+                ));
             }
             _ => panic!("Expected Update event"),
         }
@@ -365,8 +360,7 @@ mod schema_table_tests {
         ];
 
         for (schema, table) in test_cases {
-            let data =
-                RowData::from_pairs(vec![("id", Value::Number(serde_json::Number::from(1)))]);
+            let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
 
             let event = ChangeEvent::update(
                 schema.to_string(),

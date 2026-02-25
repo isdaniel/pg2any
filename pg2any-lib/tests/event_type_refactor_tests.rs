@@ -1,12 +1,14 @@
 use chrono::Utc;
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::{Lsn, RowData};
-use serde_json::json;
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 #[test]
 fn test_new_event_type_insert() {
-    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("test"))]);
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("test")),
+    ]);
 
     let event = ChangeEvent::insert("public", "users", 123, data.clone(), Lsn::from(100));
 
@@ -28,9 +30,15 @@ fn test_new_event_type_insert() {
 
 #[test]
 fn test_new_event_type_update() {
-    let old_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("old_name"))]);
+    let old_data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("old_name")),
+    ]);
 
-    let new_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("new_name"))]);
+    let new_data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("new_name")),
+    ]);
 
     let event = ChangeEvent::update(
         "public",
@@ -68,7 +76,10 @@ fn test_new_event_type_update() {
 
 #[test]
 fn test_new_event_type_delete() {
-    let old_data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("deleted_name"))]);
+    let old_data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("deleted_name")),
+    ]);
 
     let event = ChangeEvent::delete(
         "public",
@@ -145,7 +156,10 @@ fn test_new_event_type_truncate() {
 
 #[test]
 fn test_event_serialization() {
-    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("test"))]);
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("test")),
+    ]);
 
     let event = ChangeEvent::insert("public", "users", 123, data, Lsn::from(100));
 

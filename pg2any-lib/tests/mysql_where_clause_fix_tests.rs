@@ -2,22 +2,21 @@
 /// These tests verify the critical bug fix where UPDATE/DELETE operations
 /// now correctly use old_data when available, falling back to new_data when needed
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::{Lsn, RowData};
-use serde_json::Value;
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 #[test]
 fn test_update_uses_old_data_for_where_clause() {
     // This test verifies the core fix: UPDATE should use old_data for WHERE clause
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(42))),
-        ("version", Value::Number(serde_json::Number::from(1))),
+        ("id", ColumnValue::text("42")),
+        ("version", ColumnValue::text("1")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(42))),
-        ("version", Value::Number(serde_json::Number::from(2))), // Version incremented
-        ("name", Value::String("Updated Name".to_string())),
+        ("id", ColumnValue::text("42")),
+        ("version", ColumnValue::text("2")), // Version incremented
+        ("name", ColumnValue::text("Updated Name")),
     ]);
 
     let event = ChangeEvent::update(
@@ -43,10 +42,7 @@ fn test_update_uses_old_data_for_where_clause() {
             };
 
             // Verify old_data is selected and contains replica identity values
-            assert_eq!(
-                data_source.get("version"),
-                Some(&Value::Number(serde_json::Number::from(1)))
-            );
+            assert_eq!(data_source.get("version"), Some(&ColumnValue::text("1")));
             assert!(data_source.get("id").is_some());
 
             // WHERE clause should use version=1 (old), not version=2 (new)
@@ -60,8 +56,8 @@ fn test_update_uses_old_data_for_where_clause() {
 fn test_update_fallback_to_new_data_when_old_data_none() {
     // Test the fallback behavior when old_data is None
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(100))),
-        ("status", Value::String("active".to_string())),
+        ("id", ColumnValue::text("100")),
+        ("status", ColumnValue::text("active")),
     ]);
 
     let event = ChangeEvent::update(
@@ -86,13 +82,10 @@ fn test_update_fallback_to_new_data_when_old_data_none() {
             };
 
             // Verify fallback works
-            assert_eq!(
-                data_source.get("id"),
-                Some(&Value::Number(serde_json::Number::from(100)))
-            );
+            assert_eq!(data_source.get("id"), Some(&ColumnValue::text("100")));
             assert_eq!(
                 data_source.get("status"),
-                Some(&Value::String("active".to_string()))
+                Some(&ColumnValue::text("active"))
             );
         }
         _ => panic!("Expected Update event"),
@@ -103,8 +96,8 @@ fn test_update_fallback_to_new_data_when_old_data_none() {
 fn test_delete_always_uses_old_data() {
     // DELETE operations should always have old_data available
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(999))),
-        ("email", Value::String("delete@example.com".to_string())),
+        ("id", ColumnValue::text("999")),
+        ("email", ColumnValue::text("delete@example.com")),
     ]);
 
     let event = ChangeEvent::delete(
@@ -120,13 +113,10 @@ fn test_delete_always_uses_old_data() {
     // For DELETE, old_data should always be available
     match &event.event_type {
         EventType::Delete { old_data, .. } => {
-            assert_eq!(
-                old_data.get("id"),
-                Some(&Value::Number(serde_json::Number::from(999)))
-            );
+            assert_eq!(old_data.get("id"), Some(&ColumnValue::text("999")));
             assert_eq!(
                 old_data.get("email"),
-                Some(&Value::String("delete@example.com".to_string()))
+                Some(&ColumnValue::text("delete@example.com"))
             );
         }
         _ => panic!("Expected Delete event"),
@@ -137,15 +127,15 @@ fn test_delete_always_uses_old_data() {
 fn test_composite_key_data_source_selection() {
     // Test with composite primary key
     let old_data = RowData::from_pairs(vec![
-        ("tenant_id", Value::String("tenant_1".to_string())),
-        ("user_id", Value::Number(serde_json::Number::from(42))),
-        ("balance", Value::Number(serde_json::Number::from(100))),
+        ("tenant_id", ColumnValue::text("tenant_1")),
+        ("user_id", ColumnValue::text("42")),
+        ("balance", ColumnValue::text("100")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("tenant_id", Value::String("tenant_1".to_string())),
-        ("user_id", Value::Number(serde_json::Number::from(42))),
-        ("balance", Value::Number(serde_json::Number::from(150))), // Updated
+        ("tenant_id", ColumnValue::text("tenant_1")),
+        ("user_id", ColumnValue::text("42")),
+        ("balance", ColumnValue::text("150")), // Updated
     ]);
 
     let event = ChangeEvent::update(
@@ -172,12 +162,9 @@ fn test_composite_key_data_source_selection() {
             // Both key columns should be available in old_data
             assert_eq!(
                 data_source.get("tenant_id"),
-                Some(&Value::String("tenant_1".to_string()))
+                Some(&ColumnValue::text("tenant_1"))
             );
-            assert_eq!(
-                data_source.get("user_id"),
-                Some(&Value::Number(serde_json::Number::from(42)))
-            );
+            assert_eq!(data_source.get("user_id"), Some(&ColumnValue::text("42")));
 
             // WHERE clause: WHERE tenant_id='tenant_1' AND user_id=42
         }
@@ -189,15 +176,15 @@ fn test_composite_key_data_source_selection() {
 fn test_replica_identity_full_uses_all_columns() {
     // Test FULL replica identity with all columns in WHERE clause
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(1))),
-        ("name", Value::String("John".to_string())),
-        ("age", Value::Number(serde_json::Number::from(25))),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("John")),
+        ("age", ColumnValue::text("25")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(1))),
-        ("name", Value::String("Johnny".to_string())), // Changed
-        ("age", Value::Number(serde_json::Number::from(26))), // Changed
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("Johnny")), // Changed
+        ("age", ColumnValue::text("26")),      // Changed
     ]);
 
     let event = ChangeEvent::update(
@@ -216,14 +203,8 @@ fn test_replica_identity_full_uses_all_columns() {
             let data_source = old_data.as_ref().unwrap();
 
             // All columns available in old_data for FULL replica identity
-            assert_eq!(
-                data_source.get("name"),
-                Some(&Value::String("John".to_string()))
-            );
-            assert_eq!(
-                data_source.get("age"),
-                Some(&Value::Number(serde_json::Number::from(25)))
-            );
+            assert_eq!(data_source.get("name"), Some(&ColumnValue::text("John")));
+            assert_eq!(data_source.get("age"), Some(&ColumnValue::text("25")));
 
             // WHERE: WHERE id=1 AND name='John' AND age=25 (old values)
             // SET: SET id=1, name='Johnny', age=26 (new values)
@@ -234,15 +215,15 @@ fn test_replica_identity_full_uses_all_columns() {
 
 #[test]
 fn test_json_null_values_in_replica_identity() {
-    // Test handling of JSON null values
+    // Test handling of null values
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(1))),
-        ("optional_field", Value::Null),
+        ("id", ColumnValue::text("1")),
+        ("optional_field", ColumnValue::Null),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(1))),
-        ("optional_field", Value::String("now has value".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("optional_field", ColumnValue::text("now has value")),
     ]);
 
     let event = ChangeEvent::update(
@@ -261,7 +242,7 @@ fn test_json_null_values_in_replica_identity() {
             let data_source = old_data.as_ref().unwrap();
 
             // Null values should be preserved in old_data
-            assert_eq!(data_source.get("optional_field"), Some(&Value::Null));
+            assert_eq!(data_source.get("optional_field"), Some(&ColumnValue::Null));
 
             // WHERE clause should handle: WHERE id=1 AND optional_field IS NULL
         }
@@ -273,8 +254,8 @@ fn test_json_null_values_in_replica_identity() {
 fn test_key_columns_availability() {
     // Test that key columns are correctly accessible
     let data = RowData::from_pairs(vec![
-        ("id", Value::Number(serde_json::Number::from(1))),
-        ("name", Value::String("Test".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("Test")),
     ]);
 
     // Test DEFAULT replica identity (primary key only)

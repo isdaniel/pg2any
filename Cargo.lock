@@ -295,9 +295,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chrono"
-version = "0.4.43"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118"
+checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -1506,15 +1506,14 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.4.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6af2b7580eba9cde84a0a7e539fd5eeac7f1c726ab7d9ed5181b49f4bc3f38a7"
+checksum = "c6227c83c13542bbfa8936e5a9f8f48c94c256cc6304b67decac921c4e645fab"
 dependencies = [
  "bytes",
  "chrono",
  "libpq-sys",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

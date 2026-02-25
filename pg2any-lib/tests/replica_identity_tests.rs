@@ -1,18 +1,17 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::{Lsn, RowData};
-use serde_json::Value;
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_replica_identity_default_with_primary_key() {
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("John".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("John")),
     ]);
 
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("Jane".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("Jane")),
     ]);
 
     let event = ChangeEvent::update(
@@ -41,15 +40,15 @@ async fn test_replica_identity_default_with_primary_key() {
 #[tokio::test]
 async fn test_replica_identity_full() {
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("John".to_string())),
-        ("email", Value::String("john@example.com".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("John")),
+        ("email", ColumnValue::text("john@example.com")),
     ]);
 
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("Jane".to_string())),
-        ("email", Value::String("jane@example.com".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("Jane")),
+        ("email", ColumnValue::text("jane@example.com")),
     ]);
 
     let event = ChangeEvent::update(
@@ -76,14 +75,14 @@ async fn test_replica_identity_full() {
 #[tokio::test]
 async fn test_replica_identity_index() {
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("John".to_string())),
-        ("email", Value::String("john@example.com".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("John")),
+        ("email", ColumnValue::text("john@example.com")),
     ]);
 
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("email", Value::String("jane@example.com".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("email", ColumnValue::text("jane@example.com")),
     ]);
 
     let event = ChangeEvent::update(
@@ -110,8 +109,8 @@ async fn test_replica_identity_index() {
 #[tokio::test]
 async fn test_replica_identity_nothing() {
     let new_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("John".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("John")),
     ]);
 
     let event = ChangeEvent::update(
@@ -136,8 +135,8 @@ async fn test_replica_identity_nothing() {
 #[tokio::test]
 async fn test_delete_with_replica_identity_default() {
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("Jane".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("Jane")),
     ]);
 
     let event = ChangeEvent::delete(
@@ -164,9 +163,9 @@ async fn test_delete_with_replica_identity_default() {
 #[tokio::test]
 async fn test_delete_with_replica_identity_full() {
     let old_data = RowData::from_pairs(vec![
-        ("id", Value::String("123".to_string())),
-        ("name", Value::String("Jane".to_string())),
-        ("email", Value::String("jane@example.com".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("Jane")),
+        ("email", ColumnValue::text("jane@example.com")),
     ]);
 
     let event = ChangeEvent::delete(

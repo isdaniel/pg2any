@@ -1,5 +1,5 @@
 use pg2any_lib::types::{ChangeEvent, EventType, ReplicaIdentity};
-use pg_walstream::{Lsn, RowData};
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 /// Test to demonstrate the fix for UPDATE WHERE clause issue
@@ -8,33 +8,15 @@ fn test_update_where_clause_uses_old_data() {
     // Create test event simulating PostgreSQL logical replication UPDATE
     // with replica identity containing old key values
     let old_data = RowData::from_pairs(vec![
-        (
-            "id",
-            serde_json::Value::Number(serde_json::Number::from(42)),
-        ),
-        (
-            "email",
-            serde_json::Value::String("old.email@example.com".to_string()),
-        ),
+        ("id", ColumnValue::text("42")),
+        ("email", ColumnValue::text("old.email@example.com")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        (
-            "id",
-            serde_json::Value::Number(serde_json::Number::from(42)),
-        ),
-        (
-            "email",
-            serde_json::Value::String("new.email@example.com".to_string()),
-        ),
-        (
-            "name",
-            serde_json::Value::String("Updated Name".to_string()),
-        ),
-        (
-            "age",
-            serde_json::Value::Number(serde_json::Number::from(30)),
-        ),
+        ("id", ColumnValue::text("42")),
+        ("email", ColumnValue::text("new.email@example.com")),
+        ("name", ColumnValue::text("Updated Name")),
+        ("age", ColumnValue::text("30")),
     ]);
 
     let event = ChangeEvent::update(
@@ -58,43 +40,32 @@ fn test_update_where_clause_uses_old_data() {
             let old_data = old_data.as_ref().unwrap();
             assert!(old_data.get("id").is_some());
             assert!(old_data.get("email").is_some());
-            assert_eq!(
-                old_data.get("id").unwrap(),
-                &serde_json::Value::Number(serde_json::Number::from(42))
-            );
-            assert_eq!(
-                old_data.get("email").unwrap(),
-                &serde_json::Value::String("old.email@example.com".to_string())
-            );
+            assert_eq!(old_data.get("id").unwrap(), "42");
+            assert_eq!(old_data.get("email").unwrap(), "old.email@example.com");
 
             // 2. Verify new_data contains the updated values
             assert!(new_data.get("id").is_some());
             assert!(new_data.get("email").is_some());
             assert!(new_data.get("name").is_some());
             assert!(new_data.get("age").is_some());
-            assert_eq!(
-                new_data.get("email").unwrap(),
-                &serde_json::Value::String("new.email@example.com".to_string())
-            );
+            assert_eq!(new_data.get("email").unwrap(), "new.email@example.com");
 
             // 3. Simulate the logic our fixed code should use:
             // - SET clause should use new_data keys/values
             // - WHERE clause should use old_data keys/values
 
-            let set_map = new_data.clone().into_hash_map();
-            let where_map = old_data.clone().into_hash_map();
-            let set_keys: Vec<&String> = set_map.keys().collect();
-            let where_keys: Vec<&String> = where_map.keys().collect();
+            let set_keys: Vec<&str> = new_data.iter().map(|(k, _)| k.as_ref()).collect();
+            let where_keys: Vec<&str> = old_data.iter().map(|(k, _)| k.as_ref()).collect();
 
             // Verify SET clause would include all new columns
-            assert!(set_keys.contains(&&"id".to_string()));
-            assert!(set_keys.contains(&&"email".to_string()));
-            assert!(set_keys.contains(&&"name".to_string()));
-            assert!(set_keys.contains(&&"age".to_string()));
+            assert!(set_keys.contains(&"id"));
+            assert!(set_keys.contains(&"email"));
+            assert!(set_keys.contains(&"name"));
+            assert!(set_keys.contains(&"age"));
 
             // Verify WHERE clause would use replica identity (old_data)
-            assert!(where_keys.contains(&&"id".to_string()));
-            assert!(where_keys.contains(&&"email".to_string()));
+            assert!(where_keys.contains(&"id"));
+            assert!(where_keys.contains(&"email"));
 
             // The generated SQL should conceptually be:
             // UPDATE `public`.`users`
@@ -113,14 +84,8 @@ fn test_update_where_clause_uses_old_data() {
 #[test]
 fn test_delete_where_clause_uses_old_data() {
     let old_data = RowData::from_pairs(vec![
-        (
-            "id",
-            serde_json::Value::Number(serde_json::Number::from(99)),
-        ),
-        (
-            "username",
-            serde_json::Value::String("user_to_delete".to_string()),
-        ),
+        ("id", ColumnValue::text("99")),
+        ("username", ColumnValue::text("user_to_delete")),
     ]);
 
     let event = ChangeEvent::delete(
@@ -151,11 +116,8 @@ fn test_delete_where_clause_uses_old_data() {
 #[test]
 fn test_update_fallback_when_no_old_data() {
     let new_data = RowData::from_pairs(vec![
-        (
-            "id",
-            serde_json::Value::Number(serde_json::Number::from(123)),
-        ),
-        ("name", serde_json::Value::String("New Name".to_string())),
+        ("id", ColumnValue::text("123")),
+        ("name", ColumnValue::text("New Name")),
     ]);
 
     let event = ChangeEvent::update(

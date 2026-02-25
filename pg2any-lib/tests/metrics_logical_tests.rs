@@ -10,6 +10,7 @@ use pg2any_lib::monitoring::{
     ProcessingTimerTrait,
 };
 use pg2any_lib::types::{ChangeEvent, ReplicaIdentity};
+use pg_walstream::ColumnValue;
 use pg_walstream::Lsn;
 use pg_walstream::RowData;
 use std::sync::Arc;
@@ -18,8 +19,8 @@ use std::time::Duration;
 /// Helper function to create test change events
 fn create_test_insert_event() -> ChangeEvent {
     let data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("test".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("test")),
     ]);
 
     ChangeEvent::insert("public", "users", 12345, data, Lsn::from(100))
@@ -27,13 +28,13 @@ fn create_test_insert_event() -> ChangeEvent {
 
 fn create_test_update_event() -> ChangeEvent {
     let old_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("old_name".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("old_name")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("new_name".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("new_name")),
     ]);
 
     ChangeEvent::update(
@@ -50,11 +51,8 @@ fn create_test_update_event() -> ChangeEvent {
 
 fn create_test_delete_event() -> ChangeEvent {
     let old_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        (
-            "name",
-            serde_json::Value::String("deleted_name".to_string()),
-        ),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("deleted_name")),
     ]);
 
     ChangeEvent::delete(

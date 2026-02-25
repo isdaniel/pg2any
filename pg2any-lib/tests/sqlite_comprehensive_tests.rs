@@ -4,8 +4,7 @@ use pg2any_lib::{
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
     Transaction,
 };
-use pg_walstream::{Lsn, RowData};
-use serde_json::json;
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,9 +26,8 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
     use pg2any_lib::types::EventType;
     match &event.event_type {
         EventType::Insert { table, data, .. } => {
-            let data_map = data.clone().into_hash_map();
-            let cols: Vec<_> = data_map.keys().cloned().collect();
-            let vals: Vec<_> = cols.iter().map(|c| format_value(&data_map[c])).collect();
+            let cols: Vec<String> = data.iter().map(|(k, _)| k.to_string()).collect();
+            let vals: Vec<String> = data.iter().map(|(_, v)| format_column_value(v)).collect();
             Some(format!(
                 "INSERT INTO \"{}\" ({}) VALUES ({});",
                 table,
@@ -47,19 +45,18 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
             key_columns,
             ..
         } => {
-            let new_data_map = new_data.clone().into_hash_map();
-            let set: Vec<_> = new_data_map
+            let set: Vec<String> = new_data
                 .iter()
-                .map(|(k, v)| format!("\"{}\" = {}", k, format_value(v)))
+                .map(|(k, v)| format!("\"{}\" = {}", k, format_column_value(v)))
                 .collect();
-            let cond: Vec<_> = key_columns
+            let cond: Vec<String> = key_columns
                 .iter()
                 .filter_map(|k| {
                     old_data
                         .as_ref()
                         .and_then(|d| d.get(k.as_ref()))
                         .or_else(|| new_data.get(k.as_ref()))
-                        .map(|v| format!("\"{}\" = {}", k, format_value(v)))
+                        .map(|v| format!("\"{}\" = {}", k, format_column_value(v)))
                 })
                 .collect();
             if cond.is_empty() {
@@ -78,12 +75,12 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
             key_columns,
             ..
         } => {
-            let cond: Vec<_> = key_columns
+            let cond: Vec<String> = key_columns
                 .iter()
                 .filter_map(|k| {
                     old_data
                         .get(k.as_ref())
-                        .map(|v| format!("\"{}\" = {}", k, format_value(v)))
+                        .map(|v| format!("\"{}\" = {}", k, format_column_value(v)))
                 })
                 .collect();
             if cond.is_empty() {
@@ -99,13 +96,31 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
     }
 }
 
-fn format_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Null => "NULL".to_string(),
-        serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => format!("'{}'", s.replace("'", "''")),
-        _ => format!("'{}'", v.to_string().replace("'", "''")),
+fn format_column_value(value: &ColumnValue) -> String {
+    match value {
+        ColumnValue::Null => "NULL".to_string(),
+        ColumnValue::Text(b) => match std::str::from_utf8(b) {
+            Ok(s) => {
+                if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                    s.to_string()
+                } else if s == "true" {
+                    "1".to_string()
+                } else if s == "false" {
+                    "0".to_string()
+                } else {
+                    format!("'{}'", s.replace('\'', "''"))
+                }
+            }
+            Err(_) => "NULL".to_string(),
+        },
+        ColumnValue::Binary(b) => {
+            format!(
+                "X'{}'",
+                b.iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<String>()
+            )
+        }
     }
 }
 
@@ -218,9 +233,9 @@ async fn test_sqlite_empty_string_handling() {
 
     // Test empty string insertion
     let data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("text_field", json!("")),
-        ("nullable_field", json!("")),
+        ("id", ColumnValue::text("1")),
+        ("text_field", ColumnValue::text("")),
+        ("nullable_field", ColumnValue::text("")),
     ]);
 
     let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
@@ -263,11 +278,11 @@ async fn test_sqlite_null_value_handling() {
 
     // Test null value insertion
     let data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("text_field", json!("test")),
-        ("nullable_field", json!(null)),
-        ("int_field", json!(null)),
-        ("real_field", json!(null)),
+        ("id", ColumnValue::text("1")),
+        ("text_field", ColumnValue::text("test")),
+        ("nullable_field", ColumnValue::Null),
+        ("int_field", ColumnValue::Null),
+        ("real_field", ColumnValue::Null),
     ]);
 
     let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
@@ -315,14 +330,14 @@ async fn test_sqlite_unicode_and_special_characters() {
 
     // Test unicode and special character insertion
     let data = RowData::from_pairs(vec![
-        ("id", json!(1)),
+        ("id", ColumnValue::text("1")),
         (
             "text_field",
-            json!("🚀 Hello 世界! Special chars: áéíóú ñüç"),
+            ColumnValue::text("🚀 Hello 世界! Special chars: áéíóú ñüç"),
         ),
         (
             "json_field",
-            json!("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"),
+            ColumnValue::text("{\"emoji\": \"😀\", \"chinese\": \"你好\"}"),
         ),
     ]);
 
@@ -370,17 +385,16 @@ async fn test_sqlite_large_data_handling() {
 
     // Create large text data (1MB)
     let large_text = "A".repeat(1024 * 1024);
-    let large_json = json!({
-        "data": "B".repeat(500000),
-        "nested": {
-            "more_data": "C".repeat(500000)
-        }
-    });
+    let large_json = format!(
+        "{{\"data\": \"{}\", \"nested\": {{\"more_data\": \"{}\"}}}}",
+        "B".repeat(500000),
+        "C".repeat(500000)
+    );
 
     let data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("text_field", json!(large_text)),
-        ("json_field", large_json),
+        ("id", ColumnValue::text("1")),
+        ("text_field", ColumnValue::text(&large_text)),
+        ("json_field", ColumnValue::text(&large_json)),
     ]);
 
     let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
@@ -423,16 +437,19 @@ async fn test_sqlite_numeric_precision() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Test various numeric types and precision
-    let test_cases = vec![
-        (1, json!(9223372036854775807i64)),  // i64 max
-        (2, json!(-9223372036854775808i64)), // i64 min
-        (3, json!(3.141592653589793)),       // High precision float
-        (4, json!(1.7976931348623157e308)),  // Large float
-        (5, json!(2.2250738585072014e-308)), // Small float
+    let test_cases: Vec<(i32, ColumnValue)> = vec![
+        (1, ColumnValue::text("9223372036854775807")), // i64 max
+        (2, ColumnValue::text("-9223372036854775808")), // i64 min
+        (3, ColumnValue::text("3.141592653589793")),   // High precision float
+        (4, ColumnValue::text("1.7976931348623157e308")), // Large float
+        (5, ColumnValue::text("2.2250738585072014e-308")), // Small float
     ];
 
-    for (id, value) in test_cases {
-        let data = RowData::from_pairs(vec![("id", json!(id)), ("real_field", value.clone())]);
+    for (id, value) in &test_cases {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text(&id.to_string())),
+            ("real_field", value.clone()),
+        ]);
 
         let event = ChangeEvent::insert("main", "comprehensive_test", 123, data, Lsn::from(100));
         let result = destination
@@ -496,8 +513,8 @@ async fn test_sqlite_constraint_violations() {
 
     // Insert initial data
     let data1 = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("unique_field", json!("unique_value")),
+        ("id", ColumnValue::text("1")),
+        ("unique_field", ColumnValue::text("unique_value")),
     ]);
 
     let event1 = ChangeEvent::insert("main", "comprehensive_test", 123, data1, Lsn::from(100));
@@ -511,8 +528,8 @@ async fn test_sqlite_constraint_violations() {
 
     // Try to insert duplicate unique value - should fail
     let data2 = RowData::from_pairs(vec![
-        ("id", json!(2)),
-        ("unique_field", json!("unique_value")),
+        ("id", ColumnValue::text("2")),
+        ("unique_field", ColumnValue::text("unique_value")),
     ]);
 
     let event2 = ChangeEvent::insert("main", "comprehensive_test", 124, data2, Lsn::from(100));
@@ -546,7 +563,10 @@ async fn test_sqlite_missing_key_columns_error() {
     create_comprehensive_test_table(&pool).await.unwrap();
 
     // Insert initial data
-    let data = RowData::from_pairs(vec![("id", json!(1)), ("text_field", json!("test"))]);
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("text_field", ColumnValue::text("test")),
+    ]);
 
     let event = ChangeEvent::insert(
         "main",
@@ -613,12 +633,18 @@ async fn test_sqlite_bulk_operations_performance() {
     // Bulk INSERT operations
     for i in 0..batch_size {
         let data = RowData::from_pairs(vec![
-            ("id", json!(i)),
-            ("name", json!(format!("User {}", i))),
-            ("age", json!(20 + (i % 50))),
-            ("email", json!(format!("user{}@example.com", i))),
-            ("active", json!(true)),
-            ("salary", json!(50000.0 + (i as f64 * 10.0))),
+            ("id", ColumnValue::text(&i.to_string())),
+            ("name", ColumnValue::text(&format!("User {}", i))),
+            ("age", ColumnValue::text(&(20 + (i % 50)).to_string())),
+            (
+                "email",
+                ColumnValue::text(&format!("user{}@example.com", i)),
+            ),
+            ("active", ColumnValue::text("true")),
+            (
+                "salary",
+                ColumnValue::text(&format!("{}", 50000.0 + (i as f64 * 10.0))),
+            ),
         ]);
 
         let event = ChangeEvent::insert("main", "users", 123 + i as u32, data, Lsn::from(100));
@@ -648,15 +674,21 @@ async fn test_sqlite_bulk_operations_performance() {
     // Bulk UPDATE operations
     let update_start = Instant::now();
     for i in 0..batch_size / 2 {
-        let old_data = RowData::from_pairs(vec![("id", json!(i))]);
+        let old_data = RowData::from_pairs(vec![("id", ColumnValue::text(&i.to_string()))]);
 
         let new_data = RowData::from_pairs(vec![
-            ("id", json!(i)),
-            ("name", json!(format!("Updated User {}", i))),
-            ("age", json!(25 + (i % 50))),
-            ("email", json!(format!("updated_user{}@example.com", i))),
-            ("active", json!(true)),
-            ("salary", json!(60000.0 + (i as f64 * 15.0))),
+            ("id", ColumnValue::text(&i.to_string())),
+            ("name", ColumnValue::text(&format!("Updated User {}", i))),
+            ("age", ColumnValue::text(&(25 + (i % 50)).to_string())),
+            (
+                "email",
+                ColumnValue::text(&format!("updated_user{}@example.com", i)),
+            ),
+            ("active", ColumnValue::text("true")),
+            (
+                "salary",
+                ColumnValue::text(&format!("{}", 60000.0 + (i as f64 * 15.0))),
+            ),
         ]);
 
         let event = ChangeEvent::update(
@@ -728,15 +760,15 @@ async fn test_sqlite_concurrent_operations() {
         for i in 0..15 {
             let record_id = session_id * 1000 + i;
             let data = RowData::from_pairs(vec![
-                ("id", json!(record_id)),
+                ("id", ColumnValue::text(&record_id.to_string())),
                 (
                     "name",
-                    json!(format!("Session {} Record {}", session_id, i)),
+                    ColumnValue::text(&format!("Session {} Record {}", session_id, i)),
                 ),
-                ("age", json!(25 + i % 30)),
+                ("age", ColumnValue::text(&(25 + i % 30).to_string())),
                 (
                     "email",
-                    json!(format!("session{}record{}@example.com", session_id, i)),
+                    ColumnValue::text(&format!("session{}record{}@example.com", session_id, i)),
                 ),
             ]);
 
@@ -815,9 +847,9 @@ async fn test_sqlite_transaction_events() {
 
     // Insert some data between transaction events
     let data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("name", json!("Transaction Test")),
-        ("email", json!("txn@example.com")),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("Transaction Test")),
+        ("email", ColumnValue::text("txn@example.com")),
     ]);
 
     let insert_event = ChangeEvent::insert("main", "users", 105, data, Lsn::from(100));
@@ -901,7 +933,10 @@ async fn test_sqlite_connection_recovery() {
         .unwrap();
     create_users_table(&pool).await.unwrap();
 
-    let values = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("Alice"))]);
+    let values = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("Alice")),
+    ]);
     let event = ChangeEvent::insert("public", "users", 1, values, Lsn::from(100));
     let transaction = wrap_in_transaction(event);
     let process_result = destination
@@ -918,7 +953,10 @@ async fn test_sqlite_connection_recovery() {
     assert!(reconnect_result.is_ok());
 
     // Verify connection works again
-    let values2 = RowData::from_pairs(vec![("id", json!(2)), ("name", json!("Bob"))]);
+    let values2 = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("2")),
+        ("name", ColumnValue::text("Bob")),
+    ]);
     let event2 = ChangeEvent::insert("public", "users", 2, values2, Lsn::from(100));
     let transaction2 = wrap_in_transaction(event2);
     let process_result2 = destination
@@ -1007,12 +1045,12 @@ async fn test_sqlite_complete_crud_cycle() {
 
     // 1. CREATE (INSERT)
     let create_data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("name", json!("John Doe")),
-        ("age", json!(30)),
-        ("email", json!("john@example.com")),
-        ("active", json!(true)),
-        ("salary", json!(50000.0)),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("John Doe")),
+        ("age", ColumnValue::text("30")),
+        ("email", ColumnValue::text("john@example.com")),
+        ("active", ColumnValue::text("true")),
+        ("salary", ColumnValue::text("50000")),
     ]);
 
     let create_event = ChangeEvent::insert("main", "users", 1, create_data.clone(), Lsn::from(100));
@@ -1044,12 +1082,12 @@ async fn test_sqlite_complete_crud_cycle() {
 
     // 3. UPDATE
     let update_data = RowData::from_pairs(vec![
-        ("id", json!(1)),
-        ("name", json!("John Smith")),
-        ("age", json!(31)),
-        ("email", json!("john.smith@example.com")),
-        ("active", json!(true)),
-        ("salary", json!(55000.0)),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("John Smith")),
+        ("age", ColumnValue::text("31")),
+        ("email", ColumnValue::text("john.smith@example.com")),
+        ("active", ColumnValue::text("true")),
+        ("salary", ColumnValue::text("55000")),
     ]);
 
     let update_event = ChangeEvent::update(
@@ -1086,7 +1124,7 @@ async fn test_sqlite_complete_crud_cycle() {
     assert_eq!(updated_row.get::<f64, _>("salary"), 55000.0);
 
     // 4. DELETE
-    let delete_data = RowData::from_pairs(vec![("id", json!(1))]);
+    let delete_data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
 
     let delete_event = ChangeEvent::delete(
         "main",
@@ -1137,7 +1175,10 @@ async fn test_sqlite_destination_factory_integration() {
         .unwrap();
     create_users_table(&pool).await.unwrap();
 
-    let data = RowData::from_pairs(vec![("id", json!(1)), ("name", json!("Factory Test"))]);
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("Factory Test")),
+    ]);
 
     let event = ChangeEvent::insert("main", "users", 1, data, Lsn::from(100));
     let process_result = destination

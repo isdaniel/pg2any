@@ -3,7 +3,7 @@ use pg2any_lib::{
     types::{ChangeEvent, EventType, ReplicaIdentity},
     DestinationType,
 };
-use pg_walstream::{Lsn, RowData};
+use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
 
 /// Test that destination handlers have consistent interfaces
@@ -103,9 +103,9 @@ fn test_unsupported_destination_types() {
 // Helper functions to create test events
 fn create_test_event() -> ChangeEvent {
     let data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("test".to_string())),
-        ("active", serde_json::Value::Bool(true)),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("test")),
+        ("active", ColumnValue::text("t")),
     ]);
 
     ChangeEvent::insert("public", "test_table", 456, data, Lsn::from(100))
@@ -113,13 +113,13 @@ fn create_test_event() -> ChangeEvent {
 
 fn create_update_event() -> ChangeEvent {
     let old_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("old_name".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("old_name")),
     ]);
 
     let new_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("new_name".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("new_name")),
     ]);
 
     ChangeEvent::update(
@@ -136,11 +136,8 @@ fn create_update_event() -> ChangeEvent {
 
 fn create_delete_event() -> ChangeEvent {
     let old_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        (
-            "name",
-            serde_json::Value::String("deleted_name".to_string()),
-        ),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("deleted_name")),
     ]);
 
     ChangeEvent::delete(
@@ -156,8 +153,8 @@ fn create_delete_event() -> ChangeEvent {
 
 fn create_update_event_without_old_data() -> ChangeEvent {
     let new_data = RowData::from_pairs(vec![
-        ("id", serde_json::Value::Number(serde_json::Number::from(1))),
-        ("name", serde_json::Value::String("new_name".to_string())),
+        ("id", ColumnValue::text("1")),
+        ("name", ColumnValue::text("new_name")),
     ]);
 
     ChangeEvent::update(
@@ -198,18 +195,12 @@ fn test_mysql_destination_update_with_old_data() {
 
         // Verify that old_data contains key information for WHERE clause
         assert!(old_data.get("id").is_some());
-        assert_eq!(
-            old_data.get("id").unwrap(),
-            &serde_json::Value::Number(serde_json::Number::from(1))
-        );
+        assert_eq!(old_data.get("id").unwrap(), "1");
 
         // Verify that new_data contains updated information
         assert!(new_data.get("id").is_some());
         assert!(new_data.get("name").is_some());
-        assert_eq!(
-            new_data.get("name").unwrap(),
-            &serde_json::Value::String("new_name".to_string())
-        );
+        assert_eq!(new_data.get("name").unwrap(), "new_name");
     } else {
         panic!("Expected Update event");
     }
@@ -254,18 +245,12 @@ fn test_sqlserver_destination_update_with_old_data() {
 
             // Verify that old_data contains key information for WHERE clause
             assert!(old_data.get("id").is_some());
-            assert_eq!(
-                old_data.get("id").unwrap(),
-                &serde_json::Value::Number(serde_json::Number::from(1))
-            );
+            assert_eq!(old_data.get("id").unwrap(), "1");
 
             // Verify that new_data contains updated information
             assert!(new_data.get("id").is_some());
             assert!(new_data.get("name").is_some());
-            assert_eq!(
-                new_data.get("name").unwrap(),
-                &serde_json::Value::String("new_name".to_string())
-            );
+            assert_eq!(new_data.get("name").unwrap(), "new_name");
         }
         _ => panic!("Expected Update event"),
     }
@@ -281,10 +266,7 @@ fn test_delete_event_uses_old_data() {
         EventType::Delete { old_data, .. } => {
             assert!(old_data.get("id").is_some());
             assert!(old_data.get("name").is_some());
-            assert_eq!(
-                old_data.get("name").unwrap(),
-                &serde_json::Value::String("deleted_name".to_string())
-            );
+            assert_eq!(old_data.get("name").unwrap(), "deleted_name");
         }
         _ => panic!("Expected Delete event"),
     }

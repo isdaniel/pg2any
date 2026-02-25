@@ -66,6 +66,9 @@ pub mod types;
 
 pub mod lsn_tracker;
 
+// Actor-based replication stream wrapper (Send + Sync safe)
+pub mod replication_actor;
+
 // High-level client interface
 pub mod client;
 
@@ -92,7 +95,6 @@ pub mod destinations;
 pub use pg_walstream::{
     // Type aliases and utilities
     format_lsn,
-    format_postgres_timestamp,
     // Protocol types
     message_types,
     parse_lsn,

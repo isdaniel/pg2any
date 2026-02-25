@@ -28,7 +28,7 @@ thiserror = "2.0.12"
 lazy_static = "1.5"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-pg_walstream = "0.4.1"
+pg_walstream = "0.5.0"
 tiberius = { version = "0.12.3", features = ["tds73", "sql-browser-tokio", "bigdecimal", "rust_decimal", "time", "chrono"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "sqlite", "chrono", "uuid"] }
 flate2 = "1.1.5"

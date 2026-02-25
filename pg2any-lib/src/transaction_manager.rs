@@ -44,6 +44,7 @@ use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, Transact
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity, RowData};
 use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
+use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1046,16 +1047,13 @@ impl TransactionManager {
 
     /// Generate INSERT SQL command
     ///
-    /// Accepts `&RowData` directly. Converts to HashMap internally because
-    /// column iteration is required (RowData does not yet expose `iter()`).
+    /// Accepts `&RowData` directly. Uses `iter()` for column iteration.
     fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
         let (columns, values): (Vec<String>, Vec<String>) = new_data
-            .clone()
-            .into_hash_map()
-            .into_iter()
-            .map(|(k, v)| (k, self.format_value(&v)))
+            .iter()
+            .map(|(k, v)| (k.to_string(), self.format_value(v)))
             .unzip();
 
         let sql = match self.destination_type {
@@ -1114,9 +1112,7 @@ impl TransactionManager {
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        // Convert to HashMap for SET clause iteration (RowData lacks iter())
-        let new_data_map = new_data.clone().into_hash_map();
-        let set_clause: Vec<String> = new_data_map
+        let set_clause: Vec<String> = new_data
             .iter()
             .map(|(col, val)| {
                 let formatted_col = match self.destination_type {
@@ -1259,13 +1255,11 @@ impl TransactionManager {
                     .collect::<Result<Vec<_>>>()?
             }
             ReplicaIdentity::Full => {
-                // Use all columns from old data — must convert to HashMap for iteration
+                // Use all columns from old data
                 let data = old_data.ok_or_else(|| {
                     CdcError::Generic("FULL replica identity requires old data".to_string())
                 })?;
-                let data_map = data.clone().into_hash_map();
-                data_map
-                    .iter()
+                data.iter()
                     .map(|(col, val)| {
                         let formatted_col = match self.destination_type {
                             DestinationType::MySQL => format!("`{col}`"),
@@ -1290,27 +1284,27 @@ impl TransactionManager {
         Ok(conditions.join(" AND "))
     }
 
-    /// Format a JSON value as SQL literal
-    fn format_value(&self, value: &serde_json::Value) -> String {
+    /// Format a `ColumnValue` as a SQL literal
+    fn format_value(&self, value: &ColumnValue) -> String {
         match value {
-            serde_json::Value::Null => "NULL".to_string(),
-            serde_json::Value::Bool(b) => {
-                if *b {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
+            ColumnValue::Null => "NULL".to_string(),
+            ColumnValue::Text(b) => {
+                match std::str::from_utf8(b) {
+                    Ok(s) => {
+                        // Escape single quotes by doubling them (SQL standard)
+                        let escaped = s.replace('\'', "''");
+                        format!("'{escaped}'")
+                    }
+                    Err(_) => {
+                        // Non-UTF-8 text: hex-encode as binary literal
+                        let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+                        format!("X'{hex}'")
+                    }
                 }
             }
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => {
-                // Escape single quotes by doubling them (SQL standard)
-                let escaped = s.replace('\'', "''");
-                format!("'{escaped}'")
-            }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                // For complex types, serialize as JSON string
-                let json_str = value.to_string().replace('\'', "''");
-                format!("'{json_str}'")
+            ColumnValue::Binary(b) => {
+                let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!("X'{hex}'")
             }
         }
     }

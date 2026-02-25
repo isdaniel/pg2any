@@ -44,6 +44,7 @@ use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, Transact
 use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity, RowData};
 use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
+use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1046,16 +1047,13 @@ impl TransactionManager {
 
     /// Generate INSERT SQL command
     ///
-    /// Accepts `&RowData` directly. Converts to HashMap internally because
-    /// column iteration is required (RowData does not yet expose `iter()`).
+    /// Accepts `&RowData` directly. Uses `iter()` for column iteration.
     fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
         let (columns, values): (Vec<String>, Vec<String>) = new_data
-            .clone()
-            .into_hash_map()
-            .into_iter()
-            .map(|(k, v)| (k, self.format_value(&v)))
+            .iter()
+            .map(|(k, v)| (k.to_string(), self.format_value(v)))
             .unzip();
 
         let sql = match self.destination_type {
@@ -1114,9 +1112,7 @@ impl TransactionManager {
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        // Convert to HashMap for SET clause iteration (RowData lacks iter())
-        let new_data_map = new_data.clone().into_hash_map();
-        let set_clause: Vec<String> = new_data_map
+        let set_clause: Vec<String> = new_data
             .iter()
             .map(|(col, val)| {
                 let formatted_col = match self.destination_type {
@@ -1259,13 +1255,11 @@ impl TransactionManager {
                     .collect::<Result<Vec<_>>>()?
             }
             ReplicaIdentity::Full => {
-                // Use all columns from old data — must convert to HashMap for iteration
+                // Use all columns from old data
                 let data = old_data.ok_or_else(|| {
                     CdcError::Generic("FULL replica identity requires old data".to_string())
                 })?;
-                let data_map = data.clone().into_hash_map();
-                data_map
-                    .iter()
+                data.iter()
                     .map(|(col, val)| {
                         let formatted_col = match self.destination_type {
                             DestinationType::MySQL => format!("`{col}`"),
@@ -1290,28 +1284,59 @@ impl TransactionManager {
         Ok(conditions.join(" AND "))
     }
 
-    /// Format a JSON value as SQL literal
-    fn format_value(&self, value: &serde_json::Value) -> String {
+    /// Format raw bytes as a hex-encoded SQL literal appropriate for the destination.
+    ///
+    /// - MySQL / SQLite use the SQL-standard `X'deadbeef'` syntax.
+    /// - SQL Server uses the T-SQL `0xdeadbeef` syntax (no quotes).
+    fn format_hex_literal(&self, bytes: &[u8]) -> String {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        match self.destination_type {
+            DestinationType::SqlServer => format!("0x{hex}"),
+            DestinationType::MySQL | DestinationType::SQLite => format!("X'{hex}'"),
+        }
+    }
+
+    /// Format a `ColumnValue` as a SQL literal.
+    ///
+    /// Handles the three upstream variants correctly:
+    /// - `Null`   → SQL `NULL`
+    /// - `Text`   → UTF-8 string with heuristic type detection (numbers and
+    ///              booleans are emitted unquoted); falls back to a hex literal
+    ///              when the payload is not valid UTF-8.
+    /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
+    fn format_value(&self, value: &ColumnValue) -> String {
         match value {
-            serde_json::Value::Null => "NULL".to_string(),
-            serde_json::Value::Bool(b) => {
-                if *b {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
+            ColumnValue::Null => "NULL".to_string(),
+            ColumnValue::Text(_) => {
+                match value.as_str() {
+                    Some(s) => {
+                        // Heuristic: numeric strings emitted unquoted
+                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                            return s.to_string();
+                        }
+                        // Booleans → 1 / 0 (all destinations)
+                        if s.eq_ignore_ascii_case("true") {
+                            return "1".to_string();
+                        }
+                        if s.eq_ignore_ascii_case("false") {
+                            return "0".to_string();
+                        }
+
+                        // Regular string – escape per destination
+                        let escaped = if matches!(self.destination_type, DestinationType::MySQL) {
+                            s.replace('\\', "\\\\").replace('\'', "''")
+                        } else {
+                            s.replace('\'', "''")
+                        };
+                        format!("'{escaped}'")
+                    }
+                    None => {
+                        // Non-UTF-8 text: hex-encode as binary literal
+                        self.format_hex_literal(value.as_bytes())
+                    }
                 }
             }
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => {
-                // Escape single quotes by doubling them (SQL standard)
-                let escaped = s.replace('\'', "''");
-                format!("'{escaped}'")
-            }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                // For complex types, serialize as JSON string
-                let json_str = value.to_string().replace('\'', "''");
-                format!("'{json_str}'")
-            }
+            ColumnValue::Binary(_) => self.format_hex_literal(value.as_bytes()),
         }
     }
 
@@ -1804,5 +1829,186 @@ impl TransactionManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use pg_walstream::ColumnValue;
+
+    /// Create a minimal `TransactionManager` for unit-testing `format_value`
+    /// and SQL generation helpers without filesystem side-effects.
+    async fn test_manager(dest: DestinationType) -> TransactionManager {
+        let dir = std::env::temp_dir().join(format!(
+            "pg2any_format_value_test_{}_{}",
+            dest,
+            std::process::id()
+        ));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        TransactionManager::new(&dir, dest, 10 * 1024 * 1024)
+            .await
+            .expect("test manager creation should succeed")
+    }
+
+    // ── SQL injection prevention ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_mysql_backslash_injection_is_escaped() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+
+        // Classic MySQL backslash injection: foo\' should NOT escape the quote
+        let val = ColumnValue::text(r"foo\'; DROP TABLE users; --");
+        let formatted = mgr.format_value(&val);
+        // Backslash doubled, then single quote doubled: foo\\''  ; DROP TABLE users; --
+        assert_eq!(formatted, r"'foo\\''; DROP TABLE users; --'");
+        // The result is a safely quoted string literal — no breakout possible.
+    }
+
+    #[tokio::test]
+    async fn test_mysql_backslash_at_end_of_string() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+
+        let val = ColumnValue::text(r"trailing\");
+        let formatted = mgr.format_value(&val);
+        assert_eq!(formatted, r"'trailing\\'");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_does_not_double_escape_backslashes() {
+        let mgr = test_manager(DestinationType::SQLite).await;
+
+        // SQLite does NOT treat backslashes as escape characters
+        let val = ColumnValue::text(r"path\to\file");
+        let formatted = mgr.format_value(&val);
+        assert_eq!(formatted, r"'path\to\file'");
+    }
+
+    #[tokio::test]
+    async fn test_sqlserver_does_not_double_escape_backslashes() {
+        let mgr = test_manager(DestinationType::SqlServer).await;
+
+        let val = ColumnValue::text(r"path\to\file");
+        let formatted = mgr.format_value(&val);
+        assert_eq!(formatted, r"'path\to\file'");
+    }
+
+    // ── Heuristic type detection ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_integer_text_emitted_unquoted() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::text("42")), "42");
+        assert_eq!(mgr.format_value(&ColumnValue::text("-1")), "-1");
+        assert_eq!(mgr.format_value(&ColumnValue::text("0")), "0");
+    }
+
+    #[tokio::test]
+    async fn test_float_text_emitted_unquoted() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::text("3.14")), "3.14");
+        assert_eq!(mgr.format_value(&ColumnValue::text("-0.5")), "-0.5");
+    }
+
+    #[tokio::test]
+    async fn test_boolean_true_emitted_as_1() {
+        for dest in [
+            DestinationType::MySQL,
+            DestinationType::SQLite,
+            DestinationType::SqlServer,
+        ] {
+            let mgr = test_manager(dest.clone()).await;
+            assert_eq!(mgr.format_value(&ColumnValue::text("true")), "1");
+            assert_eq!(mgr.format_value(&ColumnValue::text("TRUE")), "1");
+            assert_eq!(mgr.format_value(&ColumnValue::text("True")), "1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_boolean_false_emitted_as_0() {
+        for dest in [
+            DestinationType::MySQL,
+            DestinationType::SQLite,
+            DestinationType::SqlServer,
+        ] {
+            let mgr = test_manager(dest.clone()).await;
+            assert_eq!(mgr.format_value(&ColumnValue::text("false")), "0");
+            assert_eq!(mgr.format_value(&ColumnValue::text("FALSE")), "0");
+            assert_eq!(mgr.format_value(&ColumnValue::text("False")), "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_regular_string_is_quoted() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::text("hello")), "'hello'");
+    }
+
+    #[tokio::test]
+    async fn test_string_with_single_quote_is_escaped() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(
+            mgr.format_value(&ColumnValue::text("it's here")),
+            "'it''s here'"
+        );
+    }
+
+    // ── Null and binary ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_null_value() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::Null), "NULL");
+    }
+
+    #[tokio::test]
+    async fn test_binary_value_hex_encoded_mysql_sqlite() {
+        for dest in [DestinationType::MySQL, DestinationType::SQLite] {
+            let mgr = test_manager(dest).await;
+            let val = ColumnValue::Binary(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]));
+            assert_eq!(mgr.format_value(&val), "X'deadbeef'");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_value_hex_encoded_sqlserver() {
+        let mgr = test_manager(DestinationType::SqlServer).await;
+        let val = ColumnValue::Binary(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(mgr.format_value(&val), "0xdeadbeef");
+    }
+
+    #[tokio::test]
+    async fn test_binary_empty_bytes() {
+        let mgr_mysql = test_manager(DestinationType::MySQL).await;
+        let mgr_sqlserver = test_manager(DestinationType::SqlServer).await;
+        let val = ColumnValue::Binary(Bytes::from_static(&[]));
+        assert_eq!(mgr_mysql.format_value(&val), "X''");
+        assert_eq!(mgr_sqlserver.format_value(&val), "0x");
+    }
+
+    #[tokio::test]
+    async fn test_non_utf8_text_falls_back_to_hex_literal() {
+        // Non-UTF-8 bytes in a Text variant → treated as binary literal
+        let mgr_mysql = test_manager(DestinationType::MySQL).await;
+        let mgr_sqlserver = test_manager(DestinationType::SqlServer).await;
+        let val = ColumnValue::Text(Bytes::from_static(&[0x80, 0xFF, 0x01]));
+        assert_eq!(mgr_mysql.format_value(&val), "X'80ff01'");
+        assert_eq!(mgr_sqlserver.format_value(&val), "0x80ff01");
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_numeric_looking_but_not_valid_is_quoted() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        // "12abc" is not a valid number
+        assert_eq!(mgr.format_value(&ColumnValue::text("12abc")), "'12abc'");
+    }
+
+    #[tokio::test]
+    async fn test_empty_string_is_quoted() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::text("")), "''");
     }
 }

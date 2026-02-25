@@ -92,7 +92,6 @@ pub mod destinations;
 pub use pg_walstream::{
     // Type aliases and utilities
     format_lsn,
-    format_postgres_timestamp,
     // Protocol types
     message_types,
     parse_lsn,

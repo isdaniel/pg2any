@@ -1236,15 +1236,6 @@ impl CdcClient {
                 .shared_lsn_feedback
                 .log_state("Final shutdown - LSN state before ACK");
 
-            if let Err(e) = stream.send_feedback() {
-                warn!("Failed to send final feedback: {}", e);
-            }
-
-            info!(
-                "Stopping logical replication stream (last received LSN: {})",
-                pg_walstream::format_lsn(stream.current_lsn())
-            );
-
             if let Err(e) = stream.stop().await {
                 error!("Failed to stop replication stream: {}", e);
                 return Err(CdcError::from(e));

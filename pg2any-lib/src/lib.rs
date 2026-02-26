@@ -66,9 +66,6 @@ pub mod types;
 
 pub mod lsn_tracker;
 
-// Actor-based replication stream wrapper (Send + Sync safe)
-pub mod replication_actor;
-
 // High-level client interface
 pub mod client;
 

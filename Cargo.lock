@@ -1506,9 +1506,9 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ada0907d94f64d9107377b397f5467d2af4e03a631bb9c25a9e0c33c0c5cdb5"
+checksum = "c6227c83c13542bbfa8936e5a9f8f48c94c256cc6304b67decac921c4e645fab"
 dependencies = [
  "bytes",
  "chrono",

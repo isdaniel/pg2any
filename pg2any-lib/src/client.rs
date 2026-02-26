@@ -3,7 +3,6 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
-use crate::replication_actor::{ActorCommand, ReplicationActorHandle};
 use crate::transaction_manager::{
     PendingTransactionFile, TransactionFileMetadata, TransactionManager,
 };
@@ -12,7 +11,7 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -78,8 +77,8 @@ pub struct CdcClient {
     lsn_tracker: Arc<LsnTracker>,
     /// Transaction file manager for file-based workflow
     transaction_file_manager: Arc<TransactionManager>,
-    /// Actor handle for the replication stream (Send + Sync safe)
-    replication_actor: ReplicationActorHandle,
+    /// Replication stream for PostgreSQL connection
+    replication_stream: Arc<Mutex<LogicalReplicationStream>>,
 }
 
 impl CdcClient {
@@ -128,7 +127,6 @@ impl CdcClient {
         let stream_config = ReplicationStreamConfig::from(&config);
         let replication_stream =
             LogicalReplicationStream::new(&config.source_connection_string, stream_config).await?;
-        let replication_actor = ReplicationActorHandle::spawn(replication_stream);
 
         let client = Self {
             config,
@@ -139,7 +137,7 @@ impl CdcClient {
             metrics_collector: Arc::new(MetricsCollector::new()),
             lsn_tracker,
             transaction_file_manager: Arc::new(manager),
-            replication_actor,
+            replication_stream: Arc::new(Mutex::new(replication_stream)),
         };
 
         Ok((client, start_lsn))
@@ -177,7 +175,11 @@ impl CdcClient {
         // Start the replication stream
         {
             let start_xlog = start_lsn.map(|lsn| lsn.0);
-            self.replication_actor.start(start_xlog).await?;
+            self.replication_stream
+                .lock()
+                .await
+                .start(start_xlog)
+                .await?;
         }
 
         // Start file-based workflow
@@ -206,8 +208,11 @@ impl CdcClient {
         let (producer_shutdown_tx, producer_shutdown_rx) = oneshot::channel::<()>();
         info!("Created producer shutdown notification channel");
 
-        // Get shared_lsn_feedback from actor handle
-        let shared_lsn_feedback = self.replication_actor.shared_lsn_feedback.clone();
+        // Get shared_lsn_feedback from stored replication_stream
+        let shared_lsn_feedback = {
+            let stream_guard = self.replication_stream.as_ref().lock().await;
+            stream_guard.shared_lsn_feedback.clone()
+        };
 
         if let Some(ref mut handler) = self.destination_handler {
             info!("Processing pending transaction files from previous run (recovery)...");
@@ -230,8 +235,8 @@ impl CdcClient {
             }
         }
 
-        // Clone the actor command sender for the producer
-        let actor_cmd_tx = self.replication_actor.cmd_tx.clone();
+        // Clone Arc of replication_stream for the producer
+        let replication_stream = self.replication_stream.clone();
 
         // Start producer (writes to files only)
         let producer_handle = {
@@ -242,7 +247,7 @@ impl CdcClient {
             let lsn_feedback = shared_lsn_feedback.clone();
 
             tokio::spawn(Self::run_producer(
-                actor_cmd_tx,
+                replication_stream,
                 token,
                 start_lsn,
                 metrics,
@@ -467,7 +472,7 @@ impl CdcClient {
     /// 3. Consumer receives None from mpsc (channel closed) and processes remaining queue
     /// 4. Consumer then exits after draining all pending transactions
     async fn run_producer(
-        actor_cmd_tx: mpsc::Sender<ActorCommand>,
+        replication_stream: Arc<Mutex<LogicalReplicationStream>>,
         cancellation_token: CancellationToken,
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
@@ -532,27 +537,10 @@ impl CdcClient {
         }
 
         while !cancellation_token.is_cancelled() {
-            // Get the next event from the replication actor
+            // Get the next event from the replication stream (lock for the duration of the call)
             let event_result = {
-                let (tx, rx) = oneshot::channel();
-                if actor_cmd_tx
-                    .send(ActorCommand::NextEvent {
-                        cancel: cancellation_token.clone(),
-                        reply: tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    error!("Replication actor has shut down");
-                    break;
-                }
-                match rx.await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        error!("Replication actor dropped reply");
-                        break;
-                    }
-                }
+                let mut stream = replication_stream.lock().await;
+                stream.next_event_with_retry(&cancellation_token).await
             };
 
             match event_result {
@@ -1243,25 +1231,14 @@ impl CdcClient {
         info!("Both producer and consumer completed gracefully");
         {
             info!("Sending final ACK to PostgreSQL before shutdown");
-            self.replication_actor
+            let mut stream = self.replication_stream.as_ref().lock().await;
+            stream
                 .shared_lsn_feedback
                 .log_state("Final shutdown - LSN state before ACK");
 
-            if let Err(e) = self.replication_actor.send_feedback().await {
-                warn!("Failed to send final feedback: {}", e);
-            }
-
-            match self.replication_actor.current_lsn().await {
-                Ok(lsn) => info!(
-                    "Stopping logical replication stream (last received LSN: {})",
-                    pg_walstream::format_lsn(lsn)
-                ),
-                Err(e) => warn!("Could not get current LSN: {}", e),
-            }
-
-            if let Err(e) = self.replication_actor.stop().await {
+            if let Err(e) = stream.stop().await {
                 error!("Failed to stop replication stream: {}", e);
-                return Err(e);
+                return Err(CdcError::from(e));
             }
 
             info!("Final ACK sent successfully to PostgreSQL");

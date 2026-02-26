@@ -13,29 +13,22 @@ pub fn wrap_in_transaction(event: ChangeEvent) -> Transaction {
     tx
 }
 
-/// Format a `ColumnValue` as a SQL literal with heuristic type detection.
+/// Format a `ColumnValue` as a SQL literal for SQLite-targeted tests.
 ///
-/// This mirrors the production `format_value` logic for SQLite-targeted tests:
-/// - Numeric strings are emitted unquoted (e.g., `42`, `3.14`)
-/// - Boolean strings are converted to `1`/`0`
-/// - Other strings are single-quote escaped
+/// This mirrors the production `format_value` logic:
+/// - PostgreSQL pgoutput booleans (`"t"` / `"f"`) are converted to `1`/`0`
+/// - All other text values are always single-quote escaped (no numeric heuristics)
 /// - NULL and binary values are handled appropriately
 pub fn format_column_value(value: &ColumnValue) -> String {
     match value {
         ColumnValue::Null => "NULL".to_string(),
-        ColumnValue::Text(b) => match std::str::from_utf8(b) {
-            Ok(s) => {
-                if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                    s.to_string()
-                } else if s == "true" {
-                    "1".to_string()
-                } else if s == "false" {
-                    "0".to_string()
-                } else {
-                    format!("'{}'", s.replace('\'', "''"))
-                }
+        ColumnValue::Text(_) => match value.as_str() {
+            Some("t") => "1".to_string(),
+            Some("f") => "0".to_string(),
+            Some(s) => {
+                format!("'{}'", s.replace('\'', "''"))
             }
-            Err(_) => "NULL".to_string(),
+            None => "NULL".to_string(),
         },
         ColumnValue::Binary(b) => {
             format!(

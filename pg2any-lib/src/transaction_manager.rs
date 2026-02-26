@@ -1053,49 +1053,26 @@ impl TransactionManager {
 
         let (columns, values): (Vec<String>, Vec<String>) = new_data
             .iter()
-            .map(|(k, v)| (k.to_string(), self.format_value(v)))
+            .map(|(k, v)| (self.quote_identifier(k), self.format_value(v)))
             .unzip();
 
-        let sql = match self.destination_type {
-            DestinationType::MySQL => {
+        let qualified_table = match self.destination_type {
+            DestinationType::MySQL | DestinationType::SqlServer => {
                 format!(
-                    "INSERT INTO `{}`.`{}` ({}) VALUES ({});",
-                    schema,
-                    table,
-                    columns
-                        .iter()
-                        .map(|c| format!("`{c}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    values.join(", ")
+                    "{}.{}",
+                    self.quote_identifier(&schema),
+                    self.quote_identifier(table)
                 )
             }
-            DestinationType::SqlServer => {
-                format!(
-                    "INSERT INTO [{}].[{}] ({}) VALUES ({});",
-                    schema,
-                    table,
-                    columns
-                        .iter()
-                        .map(|c| format!("[{c}]"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    values.join(", ")
-                )
-            }
-            DestinationType::SQLite => {
-                format!(
-                    "INSERT INTO \"{}\" ({}) VALUES ({});",
-                    table,
-                    columns
-                        .iter()
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    values.join(", ")
-                )
-            }
+            DestinationType::SQLite => self.quote_identifier(table),
         };
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({});",
+            qualified_table,
+            columns.join(", "),
+            values.join(", ")
+        );
 
         Ok(sql)
     }
@@ -1115,12 +1092,11 @@ impl TransactionManager {
         let set_clause: Vec<String> = new_data
             .iter()
             .map(|(col, val)| {
-                let formatted_col = match self.destination_type {
-                    DestinationType::MySQL => format!("`{col}`"),
-                    DestinationType::SqlServer => format!("[{col}]"),
-                    DestinationType::SQLite => format!("\"{col}\""),
-                };
-                format!("{} = {}", formatted_col, self.format_value(val))
+                format!(
+                    "{} = {}",
+                    self.quote_identifier(col),
+                    self.format_value(val)
+                )
             })
             .collect();
 
@@ -1128,34 +1104,23 @@ impl TransactionManager {
         let where_clause =
             self.build_where_clause(replica_identity, key_columns, old_data, new_data)?;
 
-        let sql = match self.destination_type {
-            DestinationType::MySQL => {
+        let qualified_table = match self.destination_type {
+            DestinationType::MySQL | DestinationType::SqlServer => {
                 format!(
-                    "UPDATE `{}`.`{}` SET {} WHERE {};",
-                    schema,
-                    table,
-                    set_clause.join(", "),
-                    where_clause
+                    "{}.{}",
+                    self.quote_identifier(&schema),
+                    self.quote_identifier(table)
                 )
             }
-            DestinationType::SqlServer => {
-                format!(
-                    "UPDATE [{}].[{}] SET {} WHERE {};",
-                    schema,
-                    table,
-                    set_clause.join(", "),
-                    where_clause
-                )
-            }
-            DestinationType::SQLite => {
-                format!(
-                    "UPDATE \"{}\" SET {} WHERE {};",
-                    table,
-                    set_clause.join(", "),
-                    where_clause
-                )
-            }
+            DestinationType::SQLite => self.quote_identifier(table),
         };
+
+        let sql = format!(
+            "UPDATE {} SET {} WHERE {};",
+            qualified_table,
+            set_clause.join(", "),
+            where_clause
+        );
 
         Ok(sql)
     }
@@ -1178,17 +1143,18 @@ impl TransactionManager {
         let where_clause =
             self.build_where_clause(replica_identity, key_columns, Some(old_data), old_data)?;
 
-        let sql = match self.destination_type {
-            DestinationType::MySQL => {
-                format!("DELETE FROM `{schema}`.`{table}` WHERE {where_clause};")
+        let qualified_table = match self.destination_type {
+            DestinationType::MySQL | DestinationType::SqlServer => {
+                format!(
+                    "{}.{}",
+                    self.quote_identifier(&schema),
+                    self.quote_identifier(table)
+                )
             }
-            DestinationType::SqlServer => {
-                format!("DELETE FROM [{schema}].[{table}] WHERE {where_clause};")
-            }
-            DestinationType::SQLite => {
-                format!("DELETE FROM \"{table}\" WHERE {where_clause};")
-            }
+            DestinationType::SQLite => self.quote_identifier(table),
         };
+
+        let sql = format!("DELETE FROM {qualified_table} WHERE {where_clause};");
 
         Ok(sql)
     }
@@ -1209,15 +1175,16 @@ impl TransactionManager {
             };
 
             let sql = match self.destination_type {
-                DestinationType::MySQL => {
-                    format!("TRUNCATE TABLE `{schema}`.`{table}`;")
-                }
-                DestinationType::SqlServer => {
-                    format!("TRUNCATE TABLE [{schema}].[{table}];")
+                DestinationType::MySQL | DestinationType::SqlServer => {
+                    format!(
+                        "TRUNCATE TABLE {}.{};",
+                        self.quote_identifier(&schema),
+                        self.quote_identifier(table)
+                    )
                 }
                 DestinationType::SQLite => {
                     // SQLite doesn't have TRUNCATE, use DELETE
-                    format!("DELETE FROM \"{table}\";")
+                    format!("DELETE FROM {};", self.quote_identifier(table))
                 }
             };
             sqls.push(sql);
@@ -1245,12 +1212,8 @@ impl TransactionManager {
                         let val = data.get(col_str).ok_or_else(|| {
                             CdcError::Generic(format!("Key column {col} not found"))
                         })?;
-                        let formatted_col = match self.destination_type {
-                            DestinationType::MySQL => format!("`{col}`"),
-                            DestinationType::SqlServer => format!("[{col}]"),
-                            DestinationType::SQLite => format!("\"{col}\""),
-                        };
-                        Ok(format!("{} = {}", formatted_col, self.format_value(val)))
+                        let quoted = self.quote_identifier(col);
+                        Ok(format!("{} = {}", quoted, self.format_value(val)))
                     })
                     .collect::<Result<Vec<_>>>()?
             }
@@ -1261,15 +1224,11 @@ impl TransactionManager {
                 })?;
                 data.iter()
                     .map(|(col, val)| {
-                        let formatted_col = match self.destination_type {
-                            DestinationType::MySQL => format!("`{col}`"),
-                            DestinationType::SqlServer => format!("[{col}]"),
-                            DestinationType::SQLite => format!("\"{col}\""),
-                        };
+                        let quoted = self.quote_identifier(col);
                         if val.is_null() {
-                            format!("{formatted_col} IS NULL")
+                            format!("{quoted} IS NULL")
                         } else {
-                            format!("{} = {}", formatted_col, self.format_value(val))
+                            format!("{} = {}", quoted, self.format_value(val))
                         }
                     })
                     .collect()
@@ -1282,6 +1241,26 @@ impl TransactionManager {
         };
 
         Ok(conditions.join(" AND "))
+    }
+
+    /// Escape a database identifier (schema, table, or column name) for safe
+    /// inclusion in generated SQL, preventing SQL injection via malicious names.
+    ///
+    /// - MySQL:      wraps in backticks, doubling any embedded backticks.
+    /// - SQL Server: wraps in brackets, doubling any embedded closing brackets.
+    /// - SQLite:     wraps in double quotes, doubling any embedded double quotes.
+    fn quote_identifier(&self, name: &str) -> String {
+        match self.destination_type {
+            DestinationType::MySQL => {
+                format!("`{}`", name.replace('`', "``"))
+            }
+            DestinationType::SqlServer => {
+                format!("[{}]", name.replace(']', "]]"))
+            }
+            DestinationType::SQLite => {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+        }
     }
 
     /// Format raw bytes as a hex-encoded SQL literal appropriate for the destination.
@@ -1300,9 +1279,10 @@ impl TransactionManager {
     ///
     /// Handles the three upstream variants correctly:
     /// - `Null`   → SQL `NULL`
-    /// - `Text`   → UTF-8 string with heuristic type detection (numbers and
-    ///              booleans are emitted unquoted); falls back to a hex literal
-    ///              when the payload is not valid UTF-8.
+    /// - `Text`   → UTF-8 string; PostgreSQL pgoutput booleans (`"t"` / `"f"`)
+    ///              are converted to `1` / `0`. All other text is always quoted
+    ///              to preserve values like leading-zero strings (e.g. zip codes).
+    ///              Falls back to a hex literal when the payload is not valid UTF-8.
     /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
     fn format_value(&self, value: &ColumnValue) -> String {
         match value {
@@ -1310,19 +1290,15 @@ impl TransactionManager {
             ColumnValue::Text(_) => {
                 match value.as_str() {
                     Some(s) => {
-                        // Heuristic: numeric strings emitted unquoted
-                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                            return s.to_string();
-                        }
-                        // Booleans → 1 / 0 (all destinations)
-                        if s.eq_ignore_ascii_case("true") {
+                        // PostgreSQL pgoutput encodes booleans as "t" / "f"
+                        if s == "t" {
                             return "1".to_string();
                         }
-                        if s.eq_ignore_ascii_case("false") {
+                        if s == "f" {
                             return "0".to_string();
                         }
 
-                        // Regular string – escape per destination
+                        // All other text is quoted to preserve exact string values
                         let escaped = if matches!(self.destination_type, DestinationType::MySQL) {
                             s.replace('\\', "\\\\").replace('\'', "''")
                         } else {
@@ -1894,49 +1870,54 @@ mod tests {
         assert_eq!(formatted, r"'path\to\file'");
     }
 
-    // ── Heuristic type detection ──────────────────────────────────────
+    // ── Boolean & text value formatting ─────────────────────────────
 
     #[tokio::test]
-    async fn test_integer_text_emitted_unquoted() {
+    async fn test_numeric_text_is_always_quoted() {
+        // Numeric-looking strings must be quoted to preserve values like
+        // leading-zero zip codes and large numeric identifiers.
         let mgr = test_manager(DestinationType::MySQL).await;
-        assert_eq!(mgr.format_value(&ColumnValue::text("42")), "42");
-        assert_eq!(mgr.format_value(&ColumnValue::text("-1")), "-1");
-        assert_eq!(mgr.format_value(&ColumnValue::text("0")), "0");
+        assert_eq!(mgr.format_value(&ColumnValue::text("42")), "'42'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("-1")), "'-1'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("0")), "'0'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("3.14")), "'3.14'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("01234")), "'01234'");
     }
 
     #[tokio::test]
-    async fn test_float_text_emitted_unquoted() {
-        let mgr = test_manager(DestinationType::MySQL).await;
-        assert_eq!(mgr.format_value(&ColumnValue::text("3.14")), "3.14");
-        assert_eq!(mgr.format_value(&ColumnValue::text("-0.5")), "-0.5");
-    }
-
-    #[tokio::test]
-    async fn test_boolean_true_emitted_as_1() {
+    async fn test_pgoutput_boolean_true() {
+        // PostgreSQL pgoutput encodes boolean true as "t"
         for dest in [
             DestinationType::MySQL,
             DestinationType::SQLite,
             DestinationType::SqlServer,
         ] {
             let mgr = test_manager(dest.clone()).await;
-            assert_eq!(mgr.format_value(&ColumnValue::text("true")), "1");
-            assert_eq!(mgr.format_value(&ColumnValue::text("TRUE")), "1");
-            assert_eq!(mgr.format_value(&ColumnValue::text("True")), "1");
+            assert_eq!(mgr.format_value(&ColumnValue::text("t")), "1");
         }
     }
 
     #[tokio::test]
-    async fn test_boolean_false_emitted_as_0() {
+    async fn test_pgoutput_boolean_false() {
+        // PostgreSQL pgoutput encodes boolean false as "f"
         for dest in [
             DestinationType::MySQL,
             DestinationType::SQLite,
             DestinationType::SqlServer,
         ] {
             let mgr = test_manager(dest.clone()).await;
-            assert_eq!(mgr.format_value(&ColumnValue::text("false")), "0");
-            assert_eq!(mgr.format_value(&ColumnValue::text("FALSE")), "0");
-            assert_eq!(mgr.format_value(&ColumnValue::text("False")), "0");
+            assert_eq!(mgr.format_value(&ColumnValue::text("f")), "0");
         }
+    }
+
+    #[tokio::test]
+    async fn test_full_word_true_false_is_quoted() {
+        // "true" and "false" (full words) are NOT boolean in pgoutput — they
+        // should be treated as regular strings.
+        let mgr = test_manager(DestinationType::MySQL).await;
+        assert_eq!(mgr.format_value(&ColumnValue::text("true")), "'true'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("false")), "'false'");
+        assert_eq!(mgr.format_value(&ColumnValue::text("TRUE")), "'TRUE'");
     }
 
     #[tokio::test]
@@ -1997,14 +1978,31 @@ mod tests {
         assert_eq!(mgr_sqlserver.format_value(&val), "0x80ff01");
     }
 
-    // ── Edge cases ────────────────────────────────────────────────────
+    // ── Identifier escaping ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_numeric_looking_but_not_valid_is_quoted() {
+    async fn test_mysql_identifier_escapes_backticks() {
         let mgr = test_manager(DestinationType::MySQL).await;
-        // "12abc" is not a valid number
-        assert_eq!(mgr.format_value(&ColumnValue::text("12abc")), "'12abc'");
+        assert_eq!(mgr.quote_identifier("normal"), "`normal`");
+        assert_eq!(mgr.quote_identifier("ta`ble"), "`ta``ble`");
+        assert_eq!(mgr.quote_identifier("`inject`"), "```inject```");
     }
+
+    #[tokio::test]
+    async fn test_sqlserver_identifier_escapes_brackets() {
+        let mgr = test_manager(DestinationType::SqlServer).await;
+        assert_eq!(mgr.quote_identifier("normal"), "[normal]");
+        assert_eq!(mgr.quote_identifier("ta]ble"), "[ta]]ble]");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_identifier_escapes_double_quotes() {
+        let mgr = test_manager(DestinationType::SQLite).await;
+        assert_eq!(mgr.quote_identifier("normal"), "\"normal\"");
+        assert_eq!(mgr.quote_identifier("ta\"ble"), "\"ta\"\"ble\"");
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_empty_string_is_quoted() {

@@ -1,3 +1,4 @@
+pub mod coalescing;
 pub mod common;
 
 /// MySQL destination implementation

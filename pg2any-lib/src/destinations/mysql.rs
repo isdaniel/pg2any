@@ -5,6 +5,8 @@ use sqlx::MySqlPool;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+use super::coalescing::{coalesce_commands, QuoteStyle};
+
 // ============================================================================
 // MySQL Destination Implementation
 // ============================================================================
@@ -82,7 +84,23 @@ impl DestinationHandler for MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
 
-        super::common::execute_sqlx_batch_with_hook(pool, commands, pre_commit_hook, "MySQL").await
+        // Coalesce consecutive DML statements before executing:
+        // - INSERTs → multi-value INSERT
+        // - UPDATEs → CASE-WHEN batch UPDATE
+        // - DELETEs → OR-combined WHERE clause
+        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick);
+
+        if coalesced.len() < commands.len() {
+            debug!(
+                "Coalesced {} commands into {} statements (reduction: {:.1}%)",
+                commands.len(),
+                coalesced.len(),
+                (1.0 - coalesced.len() as f64 / commands.len() as f64) * 100.0
+            );
+        }
+
+        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "MySQL")
+            .await
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -94,10 +112,6 @@ impl DestinationHandler for MySQLDestination {
         Ok(())
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

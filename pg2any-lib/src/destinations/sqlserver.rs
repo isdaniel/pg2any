@@ -1,3 +1,4 @@
+use super::coalescing::{coalesce_commands, QuoteStyle};
 use super::destination_factory::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
@@ -70,20 +71,35 @@ impl DestinationHandler for SqlServerDestination {
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server client not initialized"))?;
 
+        // Coalesce consecutive DML statements before executing:
+        // - INSERTs → multi-value INSERT
+        // - UPDATEs → CASE-WHEN batch UPDATE
+        // - DELETEs → OR-combined WHERE clause
+        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket);
+
+        if coalesced.len() < commands.len() {
+            debug!(
+                "Coalesced {} commands into {} statements (reduction: {:.1}%)",
+                commands.len(),
+                coalesced.len(),
+                (1.0 - coalesced.len() as f64 / commands.len() as f64) * 100.0
+            );
+        }
+
         // Begin a transaction
         client
             .simple_query("BEGIN TRANSACTION")
             .await
             .map_err(|e| CdcError::generic(format!("SQL Server BEGIN TRANSACTION failed: {e}")))?;
 
-        // Execute all commands in the transaction
+        // Execute all coalesced commands in the transaction
         let mut execution_result = Ok(());
-        for (idx, sql) in commands.iter().enumerate() {
+        for (idx, sql) in coalesced.iter().enumerate() {
             if let Err(e) = client.simple_query(sql).await {
                 execution_result = Err(CdcError::generic(format!(
                     "SQL Server execute_sql_batch failed at command {}/{}: {}",
                     idx + 1,
-                    commands.len(),
+                    coalesced.len(),
                     e
                 )));
                 break;

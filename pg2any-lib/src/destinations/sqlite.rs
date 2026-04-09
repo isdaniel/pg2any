@@ -1,3 +1,4 @@
+use super::coalescing::{coalesce_commands, QuoteStyle};
 use super::destination_factory::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
@@ -5,7 +6,7 @@ use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{debug, info};
 
 // ============================================================================
 // SQLite Destination Implementation
@@ -113,7 +114,23 @@ impl DestinationHandler for SQLiteDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("SQLite pool not initialized"))?;
 
-        super::common::execute_sqlx_batch_with_hook(pool, commands, pre_commit_hook, "SQLite").await
+        // Coalesce consecutive DML statements before executing:
+        // - INSERT → multi-value INSERT
+        // - UPDATE → CASE-WHEN batch UPDATE
+        // - DELETE → OR-combined WHERE clause
+        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::DoubleQuote);
+
+        if coalesced.len() < commands.len() {
+            debug!(
+                "Coalesced {} commands into {} statements (reduction: {:.1}%)",
+                commands.len(),
+                coalesced.len(),
+                (1.0 - coalesced.len() as f64 / commands.len() as f64) * 100.0
+            );
+        }
+
+        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite")
+            .await
     }
 
     async fn close(&mut self) -> Result<()> {

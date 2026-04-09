@@ -291,7 +291,10 @@ fn parse_delete_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedDelete
     let prefix = &trimmed[..prefix_end];
 
     let where_clause = trimmed[prefix_end..].trim();
-    let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+    let where_clause = where_clause
+        .strip_suffix(';')
+        .unwrap_or(where_clause)
+        .trim();
 
     if where_clause.is_empty() {
         return None;
@@ -357,7 +360,10 @@ fn parse_update_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedUpdate
     let set_clause = &rest[..where_in_rest];
     let where_start = where_in_rest + 7; // " WHERE " is 7 chars
     let where_clause = rest[where_start..].trim();
-    let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+    let where_clause = where_clause
+        .strip_suffix(';')
+        .unwrap_or(where_clause)
+        .trim();
 
     if set_clause.is_empty() || where_clause.is_empty() {
         return None;
@@ -648,9 +654,7 @@ mod tests {
     #[test]
     fn test_find_keyword_inside_double_quote_is_skipped() {
         let sql = r#"INSERT INTO "my SET table" ("a") VALUES (1);"#;
-        assert!(
-            find_keyword_outside_quotes(sql, " SET ", QuoteStyle::DoubleQuote).is_none()
-        );
+        assert!(find_keyword_outside_quotes(sql, " SET ", QuoteStyle::DoubleQuote).is_none());
     }
 
     #[test]
@@ -747,8 +751,10 @@ mod tests {
 
     #[test]
     fn test_parse_set_pairs_with_backslash_escapes() {
-        let pairs =
-            parse_set_pairs(r"`path` = 'C:\\Users\\test', `id` = 1", QuoteStyle::Backtick);
+        let pairs = parse_set_pairs(
+            r"`path` = 'C:\\Users\\test', `id` = 1",
+            QuoteStyle::Backtick,
+        );
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("`path`", r"'C:\\Users\\test'"));
         assert_eq!(pairs[1], ("`id`", "1"));
@@ -760,10 +766,7 @@ mod tests {
 
     #[test]
     fn test_parse_set_pairs_double_quote_basic() {
-        let pairs = parse_set_pairs(
-            r#""id" = 1, "name" = 'hello'"#,
-            QuoteStyle::DoubleQuote,
-        );
+        let pairs = parse_set_pairs(r#""id" = 1, "name" = 'hello'"#, QuoteStyle::DoubleQuote);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], (r#""id""#, "1"));
         assert_eq!(pairs[1], (r#""name""#, "'hello'"));
@@ -858,8 +861,7 @@ mod tests {
     #[test]
     fn test_parse_insert_parts_with_special_values() {
         // NULL
-        let (_, v) =
-            parse_insert_parts("INSERT INTO `t` (`a`, `b`) VALUES (1, NULL);").unwrap();
+        let (_, v) = parse_insert_parts("INSERT INTO `t` (`a`, `b`) VALUES (1, NULL);").unwrap();
         assert_eq!(v, "(1, NULL)");
 
         // Hex literal
@@ -868,8 +870,7 @@ mod tests {
         assert_eq!(v, "(1, X'deadbeef')");
 
         // Escaped quotes
-        let (_, v) =
-            parse_insert_parts("INSERT INTO `t` (`a`) VALUES ('it''s here');").unwrap();
+        let (_, v) = parse_insert_parts("INSERT INTO `t` (`a`) VALUES ('it''s here');").unwrap();
         assert_eq!(v, "('it''s here')");
 
         // Backslash escapes
@@ -939,9 +940,7 @@ mod tests {
             QuoteStyle::Backtick
         )
         .is_none());
-        assert!(
-            parse_delete_parts("INSERT INTO `t` VALUES (1);", QuoteStyle::Backtick).is_none()
-        );
+        assert!(parse_delete_parts("INSERT INTO `t` VALUES (1);", QuoteStyle::Backtick).is_none());
         assert!(parse_delete_parts("", QuoteStyle::Backtick).is_none());
     }
 
@@ -988,9 +987,8 @@ mod tests {
 
     #[test]
     fn test_parse_delete_parts_bracket() {
-        let d =
-            parse_delete_parts("DELETE FROM [db].[t] WHERE [id] = 1;", QuoteStyle::Bracket)
-                .unwrap();
+        let d = parse_delete_parts("DELETE FROM [db].[t] WHERE [id] = 1;", QuoteStyle::Bracket)
+            .unwrap();
         assert_eq!(d.prefix, "DELETE FROM [db].[t] WHERE ");
         assert_eq!(d.where_clause, "[id] = 1");
     }
@@ -1025,14 +1023,10 @@ mod tests {
 
     #[test]
     fn test_parse_update_parts_non_update() {
-        assert!(parse_update_parts(
-            "DELETE FROM `t` WHERE `id` = 1;",
-            QuoteStyle::Backtick
-        )
-        .is_none());
         assert!(
-            parse_update_parts("INSERT INTO `t` VALUES (1);", QuoteStyle::Backtick).is_none()
+            parse_update_parts("DELETE FROM `t` WHERE `id` = 1;", QuoteStyle::Backtick).is_none()
         );
+        assert!(parse_update_parts("INSERT INTO `t` VALUES (1);", QuoteStyle::Backtick).is_none());
         assert!(parse_update_parts("", QuoteStyle::Backtick).is_none());
     }
 
@@ -1152,8 +1146,7 @@ mod tests {
 
     #[test]
     fn test_coalesce_single_insert() {
-        let commands =
-            vec!["INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'hello');".to_string()];
+        let commands = vec!["INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'hello');".to_string()];
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1335,9 +1328,8 @@ mod tests {
 
     #[test]
     fn test_coalesce_single_update() {
-        let commands = vec![
-            "UPDATE `db`.`t` SET `name` = 'hello', `age` = 30 WHERE `id` = 1;".to_string(),
-        ];
+        let commands =
+            vec!["UPDATE `db`.`t` SET `name` = 'hello', `age` = 30 WHERE `id` = 1;".to_string()];
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1403,8 +1395,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("WHEN `k1` = 1 AND `k2` = 'a' THEN 'x'"));
         assert!(result[0].contains("WHEN `k1` = 2 AND `k2` = 'b' THEN 'y'"));
-        assert!(result[0]
-            .contains("(`k1` = 1 AND `k2` = 'a') OR (`k1` = 2 AND `k2` = 'b')"));
+        assert!(result[0].contains("(`k1` = 1 AND `k2` = 'a') OR (`k1` = 2 AND `k2` = 'b')"));
     }
 
     #[test]

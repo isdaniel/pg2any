@@ -72,9 +72,9 @@ impl DestinationHandler for SqlServerDestination {
             .ok_or_else(|| CdcError::generic("SQL Server client not initialized"))?;
 
         // Coalesce consecutive DML statements before executing:
-        // - INSERTs → multi-value INSERT
-        // - UPDATEs → CASE-WHEN batch UPDATE
-        // - DELETEs → OR-combined WHERE clause
+        // - INSERT → multi-value INSERT
+        // - UPDATE → CASE-WHEN batch UPDATE
+        // - DELETE → OR-combined WHERE clause
         let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket);
 
         if coalesced.len() < commands.len() {

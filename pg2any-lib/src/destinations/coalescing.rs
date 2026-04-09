@@ -5,9 +5,9 @@
 // Pure string transformations that merge consecutive DML statements into
 // batch operations. Used by MySQL, SQLite, and SQL Server destinations.
 //
-// - **INSERTs** → multi-value INSERT: `INSERT INTO t VALUES (1), (2), (3);`
-// - **UPDATEs** → CASE-WHEN batch:    `UPDATE t SET col = CASE WHEN ... END WHERE ... OR ...;`
-// - **DELETEs** → OR-combined WHERE:  `DELETE FROM t WHERE (...) OR (...);`
+// - INSERT batching → multi-value:   `INSERT INTO t VALUES (1), (2), (3);`
+// - UPDATE batching → CASE-WHEN:     `UPDATE t SET col = CASE WHEN ... END WHERE ... OR ...;`
+// - DELETE batching → OR-combined:   `DELETE FROM t WHERE (...) OR (...);`
 
 /// Identifier quoting style used by the target database.
 ///
@@ -109,9 +109,9 @@ pub(crate) fn find_keyword_outside_quotes(
             continue;
         }
 
-        // Try keyword match at this position
+        // Try keyword match at this position (byte-level to avoid UTF-8 boundary panics)
         if pos + keyword_len <= bytes.len()
-            && sql[pos..pos + keyword_len].eq_ignore_ascii_case(keyword)
+            && bytes[pos..pos + keyword_len].eq_ignore_ascii_case(keyword.as_bytes())
         {
             return Some(pos);
         }
@@ -138,7 +138,7 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
 
     while pos < bytes.len() {
         // Skip whitespace
-        while pos < bytes.len() && bytes[pos] == b' ' {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
             pos += 1;
         }
         if pos >= bytes.len() {
@@ -169,12 +169,13 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
         let col = &set_clause[col_start..pos];
 
         // Skip " = "
-        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'=') {
+        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b'=') {
             pos += 1;
         }
 
-        // Parse value — find end (comma outside quotes, or end of string)
+        // Parse value — find end (comma outside quotes/parens, or end of string)
         let val_start = pos;
+        let mut paren_depth = 0u32;
         while pos < bytes.len() {
             let ch = bytes[pos];
 
@@ -197,7 +198,19 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
                 continue;
             }
 
-            if ch == b',' {
+            if ch == b'(' {
+                paren_depth += 1;
+                pos += 1;
+                continue;
+            }
+
+            if ch == b')' {
+                paren_depth = paren_depth.saturating_sub(1);
+                pos += 1;
+                continue;
+            }
+
+            if ch == b',' && paren_depth == 0 {
                 break; // value separator
             }
 
@@ -217,7 +230,7 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
 }
 
 /// Extract column signature from SET pairs for grouping.
-/// Two UPDATEs can be coalesced if they have the same table and column signature.
+/// Two UPDATE statements can be coalesced if they have the same table and column signature.
 fn column_signature(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
@@ -234,7 +247,7 @@ fn column_signature(pairs: &[(&str, &str)]) -> String {
 ///
 /// Given: `` INSERT INTO `db`.`t` (`c1`, `c2`) VALUES (1, 'hello'); ``
 /// Returns: `Some(("INSERT INTO `db`.`t` (`c1`, `c2`) VALUES ", "(1, 'hello')"))`
-fn parse_insert_parts(sql: &str) -> Option<(&str, &str)> {
+fn parse_insert_parts(sql: &str, quote_style: QuoteStyle) -> Option<(&str, &str)> {
     let trimmed = sql.trim();
 
     if !trimmed
@@ -245,8 +258,7 @@ fn parse_insert_parts(sql: &str) -> Option<(&str, &str)> {
         return None;
     }
 
-    let upper = trimmed.to_ascii_uppercase();
-    let values_keyword_pos = upper.find(" VALUES ")?;
+    let values_keyword_pos = find_keyword_outside_quotes(trimmed, " VALUES ", quote_style)?;
 
     let prefix_end = values_keyword_pos + 8;
     let prefix = &trimmed[..prefix_end];
@@ -306,7 +318,7 @@ fn parse_delete_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedDelete
     })
 }
 
-/// Build a coalesced DELETE from multiple parsed DELETEs.
+/// Build a coalesced DELETE from multiple parsed delete statements.
 fn build_coalesced_delete(deletes: &[ParsedDelete<'_>]) -> String {
     debug_assert!(!deletes.is_empty());
 
@@ -381,7 +393,7 @@ fn parse_update_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedUpdate
     })
 }
 
-/// Build a coalesced UPDATE using CASE-WHEN from multiple parsed UPDATEs.
+/// Build a coalesced UPDATE using CASE-WHEN from multiple parsed update statements.
 ///
 /// Produces:
 /// ```sql
@@ -448,9 +460,9 @@ fn build_coalesced_update(updates: &[ParsedUpdate<'_>]) -> String {
 
 /// Coalesce consecutive DML statements targeting the same table into batch operations:
 ///
-/// - **INSERTs** → multi-value INSERT: `INSERT INTO t VALUES (1), (2), (3);`
-/// - **UPDATEs** → CASE-WHEN batch: `UPDATE t SET col = CASE WHEN ... END WHERE ... OR ...;`
-/// - **DELETEs** → OR-combined WHERE: `DELETE FROM t WHERE (...) OR (...);`
+/// - INSERT batching → multi-value: `INSERT INTO t VALUES (1), (2), (3);`
+/// - UPDATE batching → CASE-WHEN:   `UPDATE t SET col = CASE WHEN ... END WHERE ... OR ...;`
+/// - DELETE batching → OR-combined: `DELETE FROM t WHERE (...) OR (...);`
 ///
 /// Non-DML statements (TRUNCATE, etc.) pass through unchanged.
 /// Coalescing only merges **consecutive** statements of the same type targeting the same table.
@@ -464,19 +476,25 @@ pub(crate) fn coalesce_commands(
         return Vec::new();
     }
 
-    let safety_limit = ((max_packet_size as f64 * 0.8) as usize).max(1024);
+    let safety_limit = if max_packet_size >= (usize::MAX as u64) {
+        usize::MAX
+    } else {
+        ((max_packet_size as f64 * 0.8) as usize).max(1024)
+    };
     let mut result = Vec::with_capacity(commands.len());
     let mut i = 0;
 
     while i < commands.len() {
         // ── Try INSERT coalescing ────────────────────────────────────
-        if let Some((prefix, values)) = parse_insert_parts(&commands[i]) {
+        if let Some((prefix, values)) = parse_insert_parts(&commands[i], quote_style) {
             let mut group_values: Vec<&str> = vec![values];
             let mut group_size = prefix.len() + values.len() + 1;
             i += 1;
 
             while i < commands.len() {
-                if let Some((next_prefix, next_values)) = parse_insert_parts(&commands[i]) {
+                if let Some((next_prefix, next_values)) =
+                    parse_insert_parts(&commands[i], quote_style)
+                {
                     if next_prefix == prefix {
                         let additional_size = 2 + next_values.len();
                         if group_size + additional_size <= safety_limit {
@@ -830,13 +848,13 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // parse_insert_parts (quote-style-independent)
+    // parse_insert_parts
     // ════════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_parse_insert_parts_basic() {
         let sql = "INSERT INTO `cdc_db`.`t1` (`id`, `name`) VALUES (1, 'hello');";
-        let (prefix, values) = parse_insert_parts(sql).expect("should parse");
+        let (prefix, values) = parse_insert_parts(sql, QuoteStyle::Backtick).expect("should parse");
         assert_eq!(prefix, "INSERT INTO `cdc_db`.`t1` (`id`, `name`) VALUES ");
         assert_eq!(values, "(1, 'hello')");
     }
@@ -844,51 +862,72 @@ mod tests {
     #[test]
     fn test_parse_insert_parts_no_semicolon() {
         let sql = "INSERT INTO `t` (`id`) VALUES (1)";
-        let (prefix, values) = parse_insert_parts(sql).expect("should parse");
+        let (prefix, values) = parse_insert_parts(sql, QuoteStyle::Backtick).expect("should parse");
         assert_eq!(prefix, "INSERT INTO `t` (`id`) VALUES ");
         assert_eq!(values, "(1)");
     }
 
     #[test]
     fn test_parse_insert_parts_non_insert() {
-        assert!(parse_insert_parts("UPDATE `t` SET `name` = 'x' WHERE `id` = 1;").is_none());
-        assert!(parse_insert_parts("DELETE FROM `t` WHERE `id` = 1;").is_none());
-        assert!(parse_insert_parts("TRUNCATE TABLE `t`;").is_none());
-        assert!(parse_insert_parts("").is_none());
-        assert!(parse_insert_parts("INSERT").is_none());
+        assert!(parse_insert_parts(
+            "UPDATE `t` SET `name` = 'x' WHERE `id` = 1;",
+            QuoteStyle::Backtick
+        )
+        .is_none());
+        assert!(
+            parse_insert_parts("DELETE FROM `t` WHERE `id` = 1;", QuoteStyle::Backtick).is_none()
+        );
+        assert!(parse_insert_parts("TRUNCATE TABLE `t`;", QuoteStyle::Backtick).is_none());
+        assert!(parse_insert_parts("", QuoteStyle::Backtick).is_none());
+        assert!(parse_insert_parts("INSERT", QuoteStyle::Backtick).is_none());
     }
 
     #[test]
     fn test_parse_insert_parts_with_special_values() {
         // NULL
-        let (_, v) = parse_insert_parts("INSERT INTO `t` (`a`, `b`) VALUES (1, NULL);").unwrap();
+        let (_, v) = parse_insert_parts(
+            "INSERT INTO `t` (`a`, `b`) VALUES (1, NULL);",
+            QuoteStyle::Backtick,
+        )
+        .unwrap();
         assert_eq!(v, "(1, NULL)");
 
         // Hex literal
-        let (_, v) =
-            parse_insert_parts("INSERT INTO `t` (`a`, `b`) VALUES (1, X'deadbeef');").unwrap();
+        let (_, v) = parse_insert_parts(
+            "INSERT INTO `t` (`a`, `b`) VALUES (1, X'deadbeef');",
+            QuoteStyle::Backtick,
+        )
+        .unwrap();
         assert_eq!(v, "(1, X'deadbeef')");
 
         // Escaped quotes
-        let (_, v) = parse_insert_parts("INSERT INTO `t` (`a`) VALUES ('it''s here');").unwrap();
+        let (_, v) = parse_insert_parts(
+            "INSERT INTO `t` (`a`) VALUES ('it''s here');",
+            QuoteStyle::Backtick,
+        )
+        .unwrap();
         assert_eq!(v, "('it''s here')");
 
         // Backslash escapes
-        let (_, v) =
-            parse_insert_parts(r"INSERT INTO `t` (`a`) VALUES ('C:\\Users\\test');").unwrap();
+        let (_, v) = parse_insert_parts(
+            r"INSERT INTO `t` (`a`) VALUES ('C:\\Users\\test');",
+            QuoteStyle::Backtick,
+        )
+        .unwrap();
         assert_eq!(v, r"('C:\\Users\\test')");
     }
 
     #[test]
     fn test_parse_insert_parts_case_insensitive() {
-        let result = parse_insert_parts("insert into `t` (`id`) values (1);");
+        let result = parse_insert_parts("insert into `t` (`id`) values (1);", QuoteStyle::Backtick);
         assert!(result.is_some());
     }
 
     #[test]
     fn test_parse_insert_parts_double_quote() {
         let sql = r#"INSERT INTO "t" ("id", "name") VALUES (1, 'hello');"#;
-        let (prefix, values) = parse_insert_parts(sql).expect("should parse");
+        let (prefix, values) =
+            parse_insert_parts(sql, QuoteStyle::DoubleQuote).expect("should parse");
         assert_eq!(prefix, r#"INSERT INTO "t" ("id", "name") VALUES "#);
         assert_eq!(values, "(1, 'hello')");
     }
@@ -896,7 +935,7 @@ mod tests {
     #[test]
     fn test_parse_insert_parts_bracket() {
         let sql = "INSERT INTO [db].[t] ([id], [name]) VALUES (1, 'hello');";
-        let (prefix, values) = parse_insert_parts(sql).expect("should parse");
+        let (prefix, values) = parse_insert_parts(sql, QuoteStyle::Bracket).expect("should parse");
         assert_eq!(prefix, "INSERT INTO [db].[t] ([id], [name]) VALUES ");
         assert_eq!(values, "(1, 'hello')");
     }
@@ -1447,15 +1486,15 @@ mod tests {
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 3);
 
-        // 2 INSERTs coalesced
+        // 2 INSERT statements coalesced
         assert!(result[0].starts_with("INSERT INTO"));
         assert!(result[0].contains("), ("));
 
-        // 2 UPDATEs coalesced into CASE-WHEN
+        // 2 UPDATE statements coalesced into CASE-WHEN
         assert!(result[1].starts_with("UPDATE"));
         assert!(result[1].contains("CASE"));
 
-        // 2 DELETEs coalesced with OR
+        // 2 DELETE statements coalesced with OR
         assert!(result[2].starts_with("DELETE"));
         assert!(result[2].contains(" OR "));
     }
@@ -1488,14 +1527,14 @@ mod tests {
     #[test]
     fn test_coalesce_all_types_consecutive_groups() {
         let commands = vec![
-            // Group 1: 3 INSERTs
+            // Group 1: 3 INSERT statements
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'a');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (2, 'b');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (3, 'c');".to_string(),
-            // Group 2: 2 UPDATEs
+            // Group 2: 2 UPDATE statements
             "UPDATE `db`.`t` SET `name` = 'x', `age` = 1 WHERE `id` = 10;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'y', `age` = 2 WHERE `id` = 11;".to_string(),
-            // Group 3: 2 DELETEs
+            // Group 3: 2 DELETE statements
             "DELETE FROM `db`.`t` WHERE `id` = 99;".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 100;".to_string(),
         ];

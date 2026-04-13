@@ -860,10 +860,23 @@ async fn test_sqlite_metadata_events() {
 
     // Test various metadata events that should be safely ignored
     let metadata_events = vec![
-        ChangeEvent::relation(Lsn::from(0)),
-        ChangeEvent::type_event(Lsn::from(0)),
-        ChangeEvent::origin(Lsn::from(0)),
-        ChangeEvent::message(Lsn::from(0)),
+        ChangeEvent::relation(
+            0,
+            "public",
+            "test_table",
+            ReplicaIdentity::Default,
+            vec![],
+            Lsn::from(0),
+        ),
+        ChangeEvent::type_event(0, "public", "test_type", Lsn::from(0)),
+        ChangeEvent::origin(Lsn::from(0), "test_origin", Lsn::from(0)),
+        ChangeEvent::message(
+            0,
+            Lsn::from(0),
+            "test_prefix",
+            bytes::Bytes::new(),
+            Lsn::from(0),
+        ),
     ];
 
     for event in metadata_events {

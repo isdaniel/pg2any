@@ -144,7 +144,7 @@ impl SqlStreamParser {
                         self.state = ParseState::Bracket;
                     }
                     b';' => {
-                        if let Some(stmt) = self.take_trimmed_statement()? {
+                        if let Some(stmt) = self.take_trimmed_statement() {
                             statements.push(stmt);
                         }
                         self.statement_buffer.clear();
@@ -208,23 +208,39 @@ impl SqlStreamParser {
             return None;
         }
 
-        let stmt = self.take_trimmed_statement().ok().flatten();
+        let stmt = self.take_trimmed_statement();
         self.statement_buffer.clear();
         stmt
     }
 
-    /// Trim whitespace from the current statement buffer and return it as a
-    /// `String` (cleared of surrounding whitespace). Returns Ok(None) when the
-    /// trimmed contents are empty. The internal buffer is left as-is; callers
-    /// clear it after.
-    fn take_trimmed_statement(&self) -> Result<Option<String>> {
-        let s = std::str::from_utf8(&self.statement_buffer)
-            .map_err(|e| CdcError::generic(format!("Invalid UTF-8 in SQL stream: {e}")))?;
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_string()))
+    /// Trim whitespace from the current statement buffer and return it as an
+    /// owned `String`. Returns `None` when the trimmed contents are empty.
+    ///
+    /// Fast path: valid UTF-8 uses a single `std::str::from_utf8` validation
+    /// with no additional copying of the borrowed slice until the owned
+    /// `String` is produced. Invalid UTF-8 falls back to `from_utf8_lossy`
+    /// to preserve the pre-refactor behavior (never drop statements on
+    /// encoding errors — data loss would be worse than a lossy character).
+    /// The internal buffer is left as-is; callers clear it after.
+    fn take_trimmed_statement(&self) -> Option<String> {
+        match std::str::from_utf8(&self.statement_buffer) {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(_) => {
+                let s = String::from_utf8_lossy(&self.statement_buffer);
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
         }
     }
 

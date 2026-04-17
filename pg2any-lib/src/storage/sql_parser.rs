@@ -124,30 +124,28 @@ impl SqlStreamParser {
 
         while i < bytes.len() {
             let byte = bytes[i];
-            let ch = byte as char;
 
             match self.state {
-                ParseState::Normal => match ch {
-                    '\'' => {
+                ParseState::Normal => match byte {
+                    b'\'' => {
                         self.statement_buffer.push(byte);
                         self.state = ParseState::SingleQuote;
                     }
-                    '"' => {
+                    b'"' => {
                         self.statement_buffer.push(byte);
                         self.state = ParseState::DoubleQuote;
                     }
-                    '`' => {
+                    b'`' => {
                         self.statement_buffer.push(byte);
                         self.state = ParseState::Backtick;
                     }
-                    '[' => {
+                    b'[' => {
                         self.statement_buffer.push(byte);
                         self.state = ParseState::Bracket;
                     }
-                    ';' => {
-                        let stmt_bytes = self.trim_statement_buffer();
-                        if !stmt_bytes.is_empty() {
-                            statements.push(String::from_utf8_lossy(&stmt_bytes).into_owned());
+                    b';' => {
+                        if let Some(stmt) = self.take_trimmed_statement()? {
+                            statements.push(stmt);
                         }
                         self.statement_buffer.clear();
                     }
@@ -157,7 +155,7 @@ impl SqlStreamParser {
                 },
                 ParseState::SingleQuote => {
                     self.statement_buffer.push(byte);
-                    if ch == '\'' {
+                    if byte == b'\'' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                             i += 1;
                             self.statement_buffer.push(bytes[i]);
@@ -168,7 +166,7 @@ impl SqlStreamParser {
                 }
                 ParseState::DoubleQuote => {
                     self.statement_buffer.push(byte);
-                    if ch == '"' {
+                    if byte == b'"' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
                             i += 1;
                             self.statement_buffer.push(bytes[i]);
@@ -179,7 +177,7 @@ impl SqlStreamParser {
                 }
                 ParseState::Backtick => {
                     self.statement_buffer.push(byte);
-                    if ch == '`' {
+                    if byte == b'`' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
                             i += 1;
                             self.statement_buffer.push(bytes[i]);
@@ -190,7 +188,7 @@ impl SqlStreamParser {
                 }
                 ParseState::Bracket => {
                     self.statement_buffer.push(byte);
-                    if ch == ']' {
+                    if byte == b']' {
                         self.state = ParseState::Normal;
                     }
                 }
@@ -210,21 +208,36 @@ impl SqlStreamParser {
             return None;
         }
 
-        let stmt_bytes = self.trim_statement_buffer();
+        let stmt = self.take_trimmed_statement().ok().flatten();
         self.statement_buffer.clear();
+        stmt
+    }
 
-        if stmt_bytes.is_empty() {
-            None
+    /// Trim whitespace from the current statement buffer and return it as a
+    /// `String` (cleared of surrounding whitespace). Returns Ok(None) when the
+    /// trimmed contents are empty. The internal buffer is left as-is; callers
+    /// clear it after.
+    fn take_trimmed_statement(&self) -> Result<Option<String>> {
+        let s = std::str::from_utf8(&self.statement_buffer)
+            .map_err(|e| CdcError::generic(format!("Invalid UTF-8 in SQL stream: {e}")))?;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            Ok(None)
         } else {
-            Some(String::from_utf8_lossy(&stmt_bytes).into_owned())
+            Ok(Some(trimmed.to_string()))
         }
     }
 
-    /// Trim whitespace from statement buffer and return a copy
+    /// Trim whitespace from statement buffer and return a copy (legacy)
+    #[cfg(test)]
     fn trim_statement_buffer(&self) -> Vec<u8> {
-        let stmt_str = String::from_utf8_lossy(&self.statement_buffer);
-        let trimmed = stmt_str.trim();
-        trimmed.as_bytes().to_vec()
+        match std::str::from_utf8(&self.statement_buffer) {
+            Ok(s) => s.trim().as_bytes().to_vec(),
+            Err(_) => String::from_utf8_lossy(&self.statement_buffer)
+                .trim()
+                .as_bytes()
+                .to_vec(),
+        }
     }
 }
 

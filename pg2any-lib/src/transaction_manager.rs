@@ -71,6 +71,9 @@ struct BufferedEventWriter {
     buffer: String,
     /// Maximum buffer size before forced flush
     max_buffer_size: usize,
+    /// Persistent writer opened lazily on first flush. Reusing the handle
+    /// across flushes avoids an open() syscall per 8MB of WAL.
+    writer: Option<BufWriter<File>>,
 }
 
 impl BufferedEventWriter {
@@ -80,12 +83,14 @@ impl BufferedEventWriter {
             file_path,
             buffer: String::with_capacity(max_buffer_size),
             max_buffer_size,
+            writer: None,
         }
     }
 
     /// Append SQL statement to the buffer
     /// Returns true if buffer should be flushed (reached capacity)
     fn append(&mut self, sql: &str) -> bool {
+        self.buffer.reserve(sql.len() + 1);
         self.buffer.push_str(sql);
         self.buffer.push('\n');
 
@@ -101,12 +106,15 @@ impl BufferedEventWriter {
         }
 
         // Always write uncompressed to avoid multiple gzip stream problem
-        let file = fs::OpenOptions::new()
-            .append(true)
-            .open(&self.file_path)
-            .await?;
+        if self.writer.is_none() {
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(&self.file_path)
+                .await?;
+            self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+        }
 
-        let mut writer = BufWriter::new(file);
+        let writer = self.writer.as_mut().unwrap();
         writer.write_all(self.buffer.as_bytes()).await?;
         writer.flush().await?;
 
@@ -1051,28 +1059,25 @@ impl TransactionManager {
     fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let (columns, values): (Vec<String>, Vec<String>) = new_data
-            .iter()
-            .map(|(k, v)| (self.quote_identifier(k), self.format_value(v)))
-            .unzip();
-
-        let qualified_table = match self.destination_type {
-            DestinationType::MySQL | DestinationType::SqlServer => {
-                format!(
-                    "{}.{}",
-                    self.quote_identifier(&schema),
-                    self.quote_identifier(table)
-                )
+        // Pre-size: assume ~32 bytes per (column, value) pair + overhead
+        let mut sql = String::with_capacity(64 + new_data.len() * 48);
+        sql.push_str("INSERT INTO ");
+        self.append_qualified_table(&mut sql, &schema, table);
+        sql.push_str(" (");
+        for (i, (k, _)) in new_data.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
             }
-            DestinationType::SQLite => self.quote_identifier(table),
-        };
-
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({});",
-            qualified_table,
-            columns.join(", "),
-            values.join(", ")
-        );
+            self.append_quoted_identifier(&mut sql, k);
+        }
+        sql.push_str(") VALUES (");
+        for (i, (_, v)) in new_data.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            self.append_value(&mut sql, v);
+        }
+        sql.push_str(");");
 
         Ok(sql)
     }
@@ -1089,38 +1094,21 @@ impl TransactionManager {
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let set_clause: Vec<String> = new_data
-            .iter()
-            .map(|(col, val)| {
-                format!(
-                    "{} = {}",
-                    self.quote_identifier(col),
-                    self.format_value(val)
-                )
-            })
-            .collect();
-
-        // Build WHERE clause — uses RowData::get() directly for Default/Index identity
-        let where_clause =
-            self.build_where_clause(replica_identity, key_columns, old_data, new_data)?;
-
-        let qualified_table = match self.destination_type {
-            DestinationType::MySQL | DestinationType::SqlServer => {
-                format!(
-                    "{}.{}",
-                    self.quote_identifier(&schema),
-                    self.quote_identifier(table)
-                )
+        let mut sql = String::with_capacity(64 + new_data.len() * 64);
+        sql.push_str("UPDATE ");
+        self.append_qualified_table(&mut sql, &schema, table);
+        sql.push_str(" SET ");
+        for (i, (col, val)) in new_data.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
             }
-            DestinationType::SQLite => self.quote_identifier(table),
-        };
-
-        let sql = format!(
-            "UPDATE {} SET {} WHERE {};",
-            qualified_table,
-            set_clause.join(", "),
-            where_clause
-        );
+            self.append_quoted_identifier(&mut sql, col);
+            sql.push_str(" = ");
+            self.append_value(&mut sql, val);
+        }
+        sql.push_str(" WHERE ");
+        self.append_where_clause(&mut sql, replica_identity, key_columns, old_data, new_data)?;
+        sql.push(';');
 
         Ok(sql)
     }
@@ -1140,21 +1128,18 @@ impl TransactionManager {
     ) -> Result<String> {
         let schema = self.map_schema(Some(schema));
 
-        let where_clause =
-            self.build_where_clause(replica_identity, key_columns, Some(old_data), old_data)?;
-
-        let qualified_table = match self.destination_type {
-            DestinationType::MySQL | DestinationType::SqlServer => {
-                format!(
-                    "{}.{}",
-                    self.quote_identifier(&schema),
-                    self.quote_identifier(table)
-                )
-            }
-            DestinationType::SQLite => self.quote_identifier(table),
-        };
-
-        let sql = format!("DELETE FROM {qualified_table} WHERE {where_clause};");
+        let mut sql = String::with_capacity(64 + key_columns.len() * 32);
+        sql.push_str("DELETE FROM ");
+        self.append_qualified_table(&mut sql, &schema, table);
+        sql.push_str(" WHERE ");
+        self.append_where_clause(
+            &mut sql,
+            replica_identity,
+            key_columns,
+            Some(old_data),
+            old_data,
+        )?;
+        sql.push(';');
 
         Ok(sql)
     }
@@ -1162,7 +1147,7 @@ impl TransactionManager {
     /// Generate TRUNCATE SQL command
     fn generate_truncate_sql(&self, tables: &[Arc<str>]) -> Result<String> {
         // For simplicity, generate a TRUNCATE statement for each table
-        let mut sqls = Vec::new();
+        let mut sqls = Vec::with_capacity(tables.len());
 
         for table_spec in tables {
             let table_spec: &str = table_spec;
@@ -1174,19 +1159,21 @@ impl TransactionManager {
                 (self.map_schema(Some("public")), table_spec)
             };
 
-            let sql = match self.destination_type {
+            let mut sql = String::with_capacity(32 + table.len() + schema.len());
+            match self.destination_type {
                 DestinationType::MySQL | DestinationType::SqlServer => {
-                    format!(
-                        "TRUNCATE TABLE {}.{};",
-                        self.quote_identifier(&schema),
-                        self.quote_identifier(table)
-                    )
+                    sql.push_str("TRUNCATE TABLE ");
+                    self.append_quoted_identifier(&mut sql, &schema);
+                    sql.push('.');
+                    self.append_quoted_identifier(&mut sql, table);
+                    sql.push(';');
                 }
                 DestinationType::SQLite => {
-                    // SQLite doesn't have TRUNCATE, use DELETE
-                    format!("DELETE FROM {};", self.quote_identifier(table))
+                    sql.push_str("DELETE FROM ");
+                    self.append_quoted_identifier(&mut sql, table);
+                    sql.push(';');
                 }
-            };
+            }
             sqls.push(sql);
         }
 
@@ -1194,6 +1181,7 @@ impl TransactionManager {
     }
 
     /// Build WHERE clause for UPDATE/DELETE based on replica identity
+    #[allow(dead_code)]
     fn build_where_clause(
         &self,
         replica_identity: &ReplicaIdentity,
@@ -1201,46 +1189,99 @@ impl TransactionManager {
         old_data: Option<&RowData>,
         new_data: &RowData,
     ) -> Result<String> {
-        let conditions: Vec<String> = match replica_identity {
+        let mut out = String::new();
+        self.append_where_clause(&mut out, replica_identity, key_columns, old_data, new_data)?;
+        Ok(out)
+    }
+
+    /// Append WHERE clause conditions directly into the provided buffer
+    fn append_where_clause(
+        &self,
+        out: &mut String,
+        replica_identity: &ReplicaIdentity,
+        key_columns: &[Arc<str>],
+        old_data: Option<&RowData>,
+        new_data: &RowData,
+    ) -> Result<()> {
+        match replica_identity {
             ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                // Use key columns with direct RowData::get() — no HashMap needed
                 let data = old_data.unwrap_or(new_data);
-                key_columns
-                    .iter()
-                    .map(|col| {
-                        let col_str: &str = col;
-                        let val = data.get(col_str).ok_or_else(|| {
-                            CdcError::Generic(format!("Key column {col} not found"))
-                        })?;
-                        let quoted = self.quote_identifier(col);
-                        Ok(format!("{} = {}", quoted, self.format_value(val)))
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                for (i, col) in key_columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" AND ");
+                    }
+                    let col_str: &str = col;
+                    let val = data.get(col_str).ok_or_else(|| {
+                        CdcError::Generic(format!("Key column {col_str} not found"))
+                    })?;
+                    self.append_quoted_identifier(out, col_str);
+                    out.push_str(" = ");
+                    self.append_value(out, val);
+                }
             }
             ReplicaIdentity::Full => {
-                // Use all columns from old data
                 let data = old_data.ok_or_else(|| {
                     CdcError::Generic("FULL replica identity requires old data".to_string())
                 })?;
-                data.iter()
-                    .map(|(col, val)| {
-                        let quoted = self.quote_identifier(col);
-                        if val.is_null() {
-                            format!("{quoted} IS NULL")
-                        } else {
-                            format!("{} = {}", quoted, self.format_value(val))
-                        }
-                    })
-                    .collect()
+                for (i, (col, val)) in data.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" AND ");
+                    }
+                    self.append_quoted_identifier(out, col);
+                    if val.is_null() {
+                        out.push_str(" IS NULL");
+                    } else {
+                        out.push_str(" = ");
+                        self.append_value(out, val);
+                    }
+                }
             }
             ReplicaIdentity::Nothing => {
                 return Err(CdcError::Generic(
                     "Cannot generate WHERE clause with NOTHING replica identity".to_string(),
                 ));
             }
-        };
+        }
+        Ok(())
+    }
 
-        Ok(conditions.join(" AND "))
+    /// Append a quoted qualified table `schema.table` (or just table for SQLite) to `out`.
+    #[inline]
+    fn append_qualified_table(&self, out: &mut String, schema: &str, table: &str) {
+        match self.destination_type {
+            DestinationType::MySQL | DestinationType::SqlServer => {
+                self.append_quoted_identifier(out, schema);
+                out.push('.');
+                self.append_quoted_identifier(out, table);
+            }
+            DestinationType::SQLite => {
+                self.append_quoted_identifier(out, table);
+            }
+        }
+    }
+
+    /// Append a quoted identifier (schema/table/column) to `out`, performing
+    /// destination-specific escaping of embedded quote characters.
+    #[inline]
+    fn append_quoted_identifier(&self, out: &mut String, name: &str) {
+        let (open, close, escape_ch) = match self.destination_type {
+            DestinationType::MySQL => ('`', '`', '`'),
+            DestinationType::SqlServer => ('[', ']', ']'),
+            DestinationType::SQLite => ('"', '"', '"'),
+        };
+        out.reserve(name.len() + 2);
+        out.push(open);
+        if name.as_bytes().contains(&(escape_ch as u8)) {
+            for ch in name.chars() {
+                if ch == escape_ch {
+                    out.push(escape_ch);
+                }
+                out.push(ch);
+            }
+        } else {
+            out.push_str(name);
+        }
+        out.push(close);
     }
 
     /// Escape a database identifier (schema, table, or column name) for safe
@@ -1249,29 +1290,82 @@ impl TransactionManager {
     /// - MySQL:      wraps in backticks, doubling any embedded backticks.
     /// - SQL Server: wraps in brackets, doubling any embedded closing brackets.
     /// - SQLite:     wraps in double quotes, doubling any embedded double quotes.
+    #[allow(dead_code)]
     fn quote_identifier(&self, name: &str) -> String {
-        match self.destination_type {
-            DestinationType::MySQL => {
-                format!("`{}`", name.replace('`', "``"))
-            }
-            DestinationType::SqlServer => {
-                format!("[{}]", name.replace(']', "]]"))
-            }
-            DestinationType::SQLite => {
-                format!("\"{}\"", name.replace('"', "\"\""))
-            }
+        let mut out = String::with_capacity(name.len() + 2);
+        self.append_quoted_identifier(&mut out, name);
+        out
+    }
+
+    /// Append a hex literal for raw bytes directly into `out`.
+    fn append_hex_literal(&self, out: &mut String, bytes: &[u8]) {
+        static HEX: &[u8; 16] = b"0123456789abcdef";
+        let (prefix, suffix) = match self.destination_type {
+            DestinationType::SqlServer => ("0x", ""),
+            DestinationType::MySQL | DestinationType::SQLite => ("X'", "'"),
+        };
+        out.reserve(prefix.len() + bytes.len() * 2 + suffix.len());
+        out.push_str(prefix);
+        // Safety: we only push ASCII hex chars + prefix/suffix which are ASCII.
+        let buf = unsafe { out.as_mut_vec() };
+        for &b in bytes {
+            buf.push(HEX[(b >> 4) as usize]);
+            buf.push(HEX[(b & 0x0f) as usize]);
         }
+        out.push_str(suffix);
     }
 
     /// Format raw bytes as a hex-encoded SQL literal appropriate for the destination.
     ///
     /// - MySQL / SQLite use the SQL-standard `X'deadbeef'` syntax.
     /// - SQL Server uses the T-SQL `0xdeadbeef` syntax (no quotes).
+    #[allow(dead_code)]
     fn format_hex_literal(&self, bytes: &[u8]) -> String {
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        match self.destination_type {
-            DestinationType::SqlServer => format!("0x{hex}"),
-            DestinationType::MySQL | DestinationType::SQLite => format!("X'{hex}'"),
+        let mut out = String::new();
+        self.append_hex_literal(&mut out, bytes);
+        out
+    }
+
+    /// Append a `ColumnValue` literal directly into `out`.
+    fn append_value(&self, out: &mut String, value: &ColumnValue) {
+        match value {
+            ColumnValue::Null => out.push_str("NULL"),
+            ColumnValue::Text(_) => match value.as_str() {
+                Some(s) => {
+                    if s == "t" {
+                        out.push('1');
+                        return;
+                    }
+                    if s == "f" {
+                        out.push('0');
+                        return;
+                    }
+                    out.reserve(s.len() + 2);
+                    out.push('\'');
+                    let escape_backslash = matches!(self.destination_type, DestinationType::MySQL);
+                    let needs_escape = if escape_backslash {
+                        s.as_bytes().iter().any(|&b| b == b'\'' || b == b'\\')
+                    } else {
+                        s.as_bytes().contains(&b'\'')
+                    };
+                    if needs_escape {
+                        for ch in s.chars() {
+                            match ch {
+                                '\'' => out.push_str("''"),
+                                '\\' if escape_backslash => out.push_str("\\\\"),
+                                _ => out.push(ch),
+                            }
+                        }
+                    } else {
+                        out.push_str(s);
+                    }
+                    out.push('\'');
+                }
+                None => {
+                    self.append_hex_literal(out, value.as_bytes());
+                }
+            },
+            ColumnValue::Binary(_) => self.append_hex_literal(out, value.as_bytes()),
         }
     }
 
@@ -1284,36 +1378,11 @@ impl TransactionManager {
     ///              to preserve values like leading-zero strings (e.g. zip codes).
     ///              Falls back to a hex literal when the payload is not valid UTF-8.
     /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
+    #[allow(dead_code)]
     fn format_value(&self, value: &ColumnValue) -> String {
-        match value {
-            ColumnValue::Null => "NULL".to_string(),
-            ColumnValue::Text(_) => {
-                match value.as_str() {
-                    Some(s) => {
-                        // PostgreSQL pgoutput encodes booleans as "t" / "f"
-                        if s == "t" {
-                            return "1".to_string();
-                        }
-                        if s == "f" {
-                            return "0".to_string();
-                        }
-
-                        // All other text is quoted to preserve exact string values
-                        let escaped = if matches!(self.destination_type, DestinationType::MySQL) {
-                            s.replace('\\', "\\\\").replace('\'', "''")
-                        } else {
-                            s.replace('\'', "''")
-                        };
-                        format!("'{escaped}'")
-                    }
-                    None => {
-                        // Non-UTF-8 text: hex-encode as binary literal
-                        self.format_hex_literal(value.as_bytes())
-                    }
-                }
-            }
-            ColumnValue::Binary(_) => self.format_hex_literal(value.as_bytes()),
-        }
+        let mut out = String::new();
+        self.append_value(&mut out, value);
+        out
     }
 
     /// Map source schema to destination schema

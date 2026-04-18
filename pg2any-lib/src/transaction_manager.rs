@@ -932,7 +932,12 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Stage progress updates for a pending transaction (persisted on shutdown)
+    /// Stage progress updates for a pending transaction (persisted on shutdown).
+    ///
+    /// Currently unused on the hot path — `persist_pending_metadata_progress` writes
+    /// progress directly from the pre-commit hook so it is always durable. Kept as a
+    /// best-effort shutdown safety net for future code paths that want to defer writes.
+    #[allow(dead_code)]
     pub async fn stage_pending_metadata_progress(
         &self,
         metadata_file_path: &Path,
@@ -946,6 +951,28 @@ impl TransactionManager {
                 last_update_timestamp: Utc::now(),
             },
         );
+        Ok(())
+    }
+
+    /// Persist `last_executed_command_index` directly to the .meta file.
+    ///
+    /// Used as a pre-commit hook so progress is durable on disk atomically with the
+    /// destination batch COMMIT: hook writes .meta → destination COMMITs. If the
+    /// process is killed after COMMIT, restart reads the freshly-persisted index and
+    /// resumes from the next batch instead of replaying the whole transaction file.
+    pub async fn persist_pending_metadata_progress(
+        &self,
+        metadata_file_path: &Path,
+        last_executed_command_index: usize,
+    ) -> Result<()> {
+        let mut metadata = self.read_metadata(metadata_file_path).await?;
+        metadata.last_executed_command_index = Some(last_executed_command_index);
+        metadata.last_update_timestamp = Some(Utc::now());
+        self.write_pending_metadata(metadata_file_path, &metadata)
+            .await?;
+
+        let mut staged = self.staged_pending_progress.lock().await;
+        staged.remove(metadata_file_path);
         Ok(())
     }
 
@@ -1487,7 +1514,7 @@ impl TransactionManager {
         let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
             Box::pin(async move {
                 file_manager_for_hook
-                    .stage_pending_metadata_progress(&owned_path, staged_index)
+                    .persist_pending_metadata_progress(&owned_path, staged_index)
                     .await?;
                 Ok(())
             })

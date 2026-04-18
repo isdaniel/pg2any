@@ -730,7 +730,11 @@ impl CdcClient {
                                 if streaming_txs.contains_key(&streaming_txid) {
                                     Some(streaming_txid)
                                 } else {
-                                    debug_assert!(false, "active_streaming_dml_txid {} not in streaming_txs", streaming_txid);
+                                    debug_assert!(
+                                        false,
+                                        "active_streaming_dml_txid {} not in streaming_txs",
+                                        streaming_txid
+                                    );
                                     error!(
                                         "Active streaming DML txid {} not found in streaming_txs map",
                                         streaming_txid

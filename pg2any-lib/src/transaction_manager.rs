@@ -48,6 +48,7 @@ use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::{self, File};
@@ -90,7 +91,6 @@ impl BufferedEventWriter {
     /// Append SQL statement to the buffer
     /// Returns true if buffer should be flushed (reached capacity)
     fn append(&mut self, sql: &str) -> bool {
-        self.buffer.reserve(sql.len() + 1);
         self.buffer.push_str(sql);
         self.buffer.push('\n');
 
@@ -105,7 +105,6 @@ impl BufferedEventWriter {
             return Ok(());
         }
 
-        // Always write uncompressed to avoid multiple gzip stream problem
         if self.writer.is_none() {
             let file = fs::OpenOptions::new()
                 .append(true)
@@ -116,7 +115,6 @@ impl BufferedEventWriter {
 
         let writer = self.writer.as_mut().unwrap();
         writer.write_all(self.buffer.as_bytes()).await?;
-        writer.flush().await?;
 
         debug!(
             "Flushed {} bytes to {:?}",
@@ -124,8 +122,17 @@ impl BufferedEventWriter {
             self.file_path
         );
 
-        // Clear buffer after successful flush
         self.buffer.clear();
+        Ok(())
+    }
+
+    /// Flush buffer and sync the underlying BufWriter to disk.
+    /// Used during commit and shutdown to ensure all data is persisted.
+    async fn sync(&mut self) -> Result<()> {
+        self.flush().await?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush().await?;
+        }
         Ok(())
     }
 
@@ -261,6 +268,10 @@ pub struct TransactionManager {
     segment_size_bytes: usize,
     /// Storage implementation (compressed or uncompressed)
     storage: Arc<dyn TransactionStorage>,
+    /// Atomic counter for pending transaction files (avoids directory scans)
+    pending_count: AtomicUsize,
+    /// Pre-computed: whether to escape backslashes in string literals (MySQL only)
+    escape_backslash: bool,
 }
 
 impl TransactionManager {
@@ -284,12 +295,16 @@ impl TransactionManager {
         // Create storage based on environment variable
         let storage = StorageFactory::from_env();
 
+        // Count existing pending transactions for the atomic counter
+        let initial_pending_count = Self::count_pending_dir(&pending_tx_dir).await;
+
         info!(
-            "Transaction file manager initialized at {:?} for {:?}, segment_size_bytes={:?}",
-            base_path, destination_type, segment_size_bytes
+            "Transaction file manager initialized at {:?} for {:?}, segment_size_bytes={:?}, pending_count={}",
+            base_path, destination_type, segment_size_bytes, initial_pending_count
         );
 
         Ok(Self {
+            escape_backslash: matches!(destination_type, DestinationType::MySQL),
             base_path,
             destination_type,
             schema_mappings: HashMap::new(),
@@ -298,6 +313,7 @@ impl TransactionManager {
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
             storage,
+            pending_count: AtomicUsize::new(initial_pending_count),
         })
     }
 
@@ -317,7 +333,7 @@ impl TransactionManager {
         for (_, tx_state) in transactions.iter_mut() {
             let buffer_size = tx_state.writer.buffer_size();
             if buffer_size > 0 {
-                tx_state.writer.flush().await?;
+                tx_state.writer.sync().await?;
                 tx_state.current_segment_size_bytes += buffer_size;
                 flush_count += 1;
                 total_bytes += buffer_size;
@@ -412,7 +428,7 @@ impl TransactionManager {
             transaction_type: transaction_type.to_string(),
         };
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
+        let metadata_json = serde_json::to_string(&metadata)?;
         let mut metadata_file = File::create(&metadata_path).await?;
         metadata_file.write_all(metadata_json.as_bytes()).await?;
         metadata_file.flush().await?;
@@ -430,7 +446,7 @@ impl TransactionManager {
             },
         );
 
-        info!(
+        debug!(
             "Started transaction {}: data={:?}, metadata={:?}",
             tx_id, data_file_path, metadata_path
         );
@@ -468,7 +484,7 @@ impl TransactionManager {
             .collect();
         metadata.current_segment_index = current_segment_index;
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)
+        let metadata_json = serde_json::to_string(&metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut metadata_file = File::create(&received_metadata_path).await.map_err(|e| {
@@ -489,58 +505,86 @@ impl TransactionManager {
     pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
         let sql = self.generate_sql_for_event(event)?;
 
-        // Skip empty SQL (metadata events)
         if sql.is_empty() {
             return Ok(());
         }
 
-        let mut transactions = self.active_transactions.lock().await;
+        // Single lock: check rotation AND append in one scope.
+        // The common path (no rotation) completes entirely within this lock,
+        // cutting lock acquisitions from 2 to 1 per event.
+        {
+            let mut transactions = self.active_transactions.lock().await;
+            let tx_state = transactions.get_mut(&tx_id).ok_or_else(|| {
+                CdcError::generic(format!(
+                    "Active transaction {} not found for append_event",
+                    tx_id
+                ))
+            })?;
 
-        let tx_state = transactions.get_mut(&tx_id).ok_or_else(|| {
-            CdcError::generic(format!(
-                "Active transaction {} not found for append_event",
-                tx_id
-            ))
-        })?;
+            let sql_bytes = sql.len() + 1;
+            let estimated_size =
+                tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
+            let needs_rotation = estimated_size > self.segment_size_bytes
+                && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
 
-        let sql_bytes = sql.len() + 1; // include newline
-        let estimated_size =
-            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
-
-        let should_rotate = estimated_size > self.segment_size_bytes
-            && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
-
-        if should_rotate {
-            let buffered_bytes = tx_state.writer.buffer_size();
-            tx_state.writer.flush().await?;
-            tx_state.current_segment_size_bytes += buffered_bytes;
-
-            let next_segment_index = tx_state.current_segment_index + 1;
-            let next_segment_path = self.get_segment_data_file_path(tx_id, next_segment_index);
-
-            File::create(&next_segment_path).await?;
-
-            tx_state.segments.push(next_segment_path.clone());
-            tx_state.segment_statement_counts.push(0);
-            tx_state.current_segment_index = next_segment_index;
-            tx_state.current_segment_size_bytes = 0;
-            tx_state.writer = BufferedEventWriter::new(next_segment_path.clone(), self.buffer_size);
-
-            self.update_received_metadata_segments(
-                tx_id,
-                &tx_state.segments,
-                tx_state.current_segment_index,
-            )
-            .await?;
-
-            info!(
-                "Rotated transaction {} to new segment {:?} ({} segments total)",
-                tx_id,
-                next_segment_path,
-                tx_state.segments.len()
-            );
+            if !needs_rotation {
+                let should_flush = tx_state.writer.append(&sql);
+                if let Some(count) = tx_state
+                    .segment_statement_counts
+                    .get_mut(tx_state.current_segment_index)
+                {
+                    *count += 1;
+                }
+                if should_flush {
+                    let buffered_bytes = tx_state.writer.buffer_size();
+                    tx_state.writer.flush().await?;
+                    tx_state.current_segment_size_bytes += buffered_bytes;
+                }
+                return Ok(());
+            }
         }
 
+        // Rotation path (rare): take state out, do I/O unlocked, reinsert + append
+        let mut tx_state = {
+            let mut transactions = self.active_transactions.lock().await;
+            transactions.remove(&tx_id).ok_or_else(|| {
+                CdcError::generic(format!(
+                    "Active transaction {} not found for rotation",
+                    tx_id
+                ))
+            })?
+        };
+
+        let buffered_bytes = tx_state.writer.buffer_size();
+        tx_state.writer.sync().await?;
+        tx_state.current_segment_size_bytes += buffered_bytes;
+
+        let next_segment_index = tx_state.current_segment_index + 1;
+        let next_segment_path = self.get_segment_data_file_path(tx_id, next_segment_index);
+
+        File::create(&next_segment_path).await?;
+
+        tx_state.segments.push(next_segment_path.clone());
+        tx_state.segment_statement_counts.push(0);
+        tx_state.current_segment_index = next_segment_index;
+        tx_state.current_segment_size_bytes = 0;
+        tx_state.writer = BufferedEventWriter::new(next_segment_path.clone(), self.buffer_size);
+
+        self.update_received_metadata_segments(
+            tx_id,
+            &tx_state.segments,
+            tx_state.current_segment_index,
+        )
+        .await?;
+
+        info!(
+            "Rotated transaction {} to new segment {:?} ({} segments total)",
+            tx_id,
+            next_segment_path,
+            tx_state.segments.len()
+        );
+
+        // Append the SQL after rotation and reinsert state
         let should_flush = tx_state.writer.append(&sql);
         if let Some(count) = tx_state
             .segment_statement_counts
@@ -553,6 +597,9 @@ impl TransactionManager {
             tx_state.writer.flush().await?;
             tx_state.current_segment_size_bytes += buffered_bytes;
         }
+
+        let mut transactions = self.active_transactions.lock().await;
+        transactions.insert(tx_id, tx_state);
 
         Ok(())
     }
@@ -584,7 +631,7 @@ impl TransactionManager {
 
         if let Some(state) = tx_state.as_mut() {
             let buffered_bytes = state.writer.buffer_size();
-            state.writer.flush().await?;
+            state.writer.sync().await?;
             if buffered_bytes > 0 {
                 debug!(
                     "Flushed final buffer for transaction {} ({} bytes)",
@@ -643,7 +690,7 @@ impl TransactionManager {
         pending_metadata_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let updated_json = serde_json::to_string_pretty(metadata)
+        let updated_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut pending_file = File::create(pending_metadata_path).await.map_err(|e| {
@@ -675,7 +722,11 @@ impl TransactionManager {
 
     /// Move metadata from sql_received_tx to sql_pending_tx
     /// Flushes any pending buffered events before marking transaction as committed
-    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
+    pub async fn commit_transaction(
+        &self,
+        tx_id: u32,
+        commit_lsn: Option<Lsn>,
+    ) -> Result<(PathBuf, TransactionFileMetadata)> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
 
@@ -702,12 +753,14 @@ impl TransactionManager {
         self.remove_received_metadata(&received_metadata_path)
             .await?;
 
-        info!(
+        self.pending_count.fetch_add(1, Ordering::Release);
+
+        debug!(
             "Committed transaction {}: moved metadata to sql_pending_tx/ (LSN: {:?}), data stays in sql_data_tx/",
             tx_id, commit_lsn
         );
 
-        Ok(pending_metadata_path)
+        Ok((pending_metadata_path, metadata))
     }
 
     /// Delete transaction files (metadata and data) on abort
@@ -791,6 +844,23 @@ impl TransactionManager {
         Ok(files)
     }
 
+    fn count_pending_transactions(&self) -> usize {
+        self.pending_count.load(Ordering::Acquire)
+    }
+
+    async fn count_pending_dir(dir: &Path) -> usize {
+        let mut count = 0usize;
+        let Ok(mut entries) = fs::read_dir(dir).await else {
+            return 0;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("meta") {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Restore incomplete (received but not committed) transactions from sql_received_tx/
     ///
     /// Returns a list of metadata entries ordered by timestamp and seeds active writers
@@ -837,7 +907,7 @@ impl TransactionManager {
         metadata_file_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let metadata_json = serde_json::to_string_pretty(metadata)
+        let metadata_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let temp_path = metadata_file_path.with_extension("meta.tmp");
@@ -998,6 +1068,7 @@ impl TransactionManager {
         // Delete metadata file from sql_pending_tx/
         if tokio::fs::metadata(metadata_file_path).await.is_ok() {
             fs::remove_file(metadata_file_path).await?;
+            self.pending_count.fetch_sub(1, Ordering::Release);
         }
 
         // Delete data files using storage trait (handles both compressed and uncompressed)
@@ -1005,7 +1076,7 @@ impl TransactionManager {
             self.storage.delete_transaction(path).await?;
         }
 
-        info!(
+        debug!(
             "Deleted executed transaction files: metadata={:?}, data_files={:?}",
             metadata_file_path, data_file_paths
         );
@@ -1327,6 +1398,7 @@ impl TransactionManager {
     }
 
     /// Append a `ColumnValue` literal directly into `out`.
+    #[inline]
     fn append_value(&self, out: &mut String, value: &ColumnValue) {
         match value {
             ColumnValue::Null => out.push_str("NULL"),
@@ -1342,8 +1414,7 @@ impl TransactionManager {
                     }
                     out.reserve(s.len() + 2);
                     out.push('\'');
-                    let escape_backslash = matches!(self.destination_type, DestinationType::MySQL);
-                    let needs_escape = if escape_backslash {
+                    let needs_escape = if self.escape_backslash {
                         s.as_bytes().iter().any(|&b| b == b'\'' || b == b'\\')
                     } else {
                         s.as_bytes().contains(&b'\'')
@@ -1352,7 +1423,7 @@ impl TransactionManager {
                         for ch in s.chars() {
                             match ch {
                                 '\'' => out.push_str("''"),
-                                '\\' if escape_backslash => out.push_str("\\\\"),
+                                '\\' if self.escape_backslash => out.push_str("\\\\"),
                                 _ => out.push(ch),
                             }
                         }
@@ -1386,14 +1457,14 @@ impl TransactionManager {
     }
 
     /// Map source schema to destination schema
-    fn map_schema(&self, source_schema: Option<&str>) -> String {
+    fn map_schema<'a>(&'a self, source_schema: Option<&'a str>) -> &'a str {
         if let Some(schema) = source_schema {
             self.schema_mappings
                 .get(schema)
-                .cloned()
-                .unwrap_or_else(|| schema.to_string())
+                .map(|s| s.as_str())
+                .unwrap_or(schema)
         } else {
-            "public".to_string()
+            "public"
         }
     }
 }
@@ -1409,17 +1480,14 @@ impl TransactionManager {
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
         let batch_start_time = Instant::now();
-        let metadata_path = metadata_path.to_path_buf();
-        let metadata_path_for_log = metadata_path.clone();
+        let owned_path = metadata_path.to_path_buf();
         let file_manager_for_hook = self.clone();
         let staged_index = last_executed_index;
 
         let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-            let metadata_path = metadata_path.clone();
-            let file_manager_for_hook = file_manager_for_hook.clone();
             Box::pin(async move {
                 file_manager_for_hook
-                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                    .stage_pending_metadata_progress(&owned_path, staged_index)
                     .await?;
                 Ok(())
             })
@@ -1432,7 +1500,7 @@ impl TransactionManager {
             error!(
                 "Failed to execute SQL batch {} from file {}: {}",
                 batch_idx,
-                metadata_path_for_log.display(),
+                metadata_path.display(),
                 e
             );
             metrics_collector.record_error("transaction_file_execution_failed", "consumer");
@@ -1472,6 +1540,7 @@ impl TransactionManager {
     {
         let mut parser = SqlStreamParser::new();
         let mut statement_index = initial_statement_index;
+        let mut line_stmts: Vec<String> = Vec::new();
 
         let buf_reader = BufReader::new(reader);
         let mut lines = buf_reader.lines();
@@ -1481,8 +1550,8 @@ impl TransactionManager {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let statements = parser.parse_line(&line)?;
-            for stmt in statements {
+            parser.parse_line(&line, &mut line_stmts)?;
+            for stmt in line_stmts.drain(..) {
                 if statement_index >= start_index {
                     state.batch.push(stmt);
 
@@ -1619,7 +1688,7 @@ impl TransactionManager {
     ///
     /// Checks cancellation token between batches to support graceful shutdown.
     pub(crate) async fn process_transaction_file(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         pending_tx: &PendingTransactionFile,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
@@ -1637,7 +1706,7 @@ impl TransactionManager {
             .map(|idx| idx + 1)
             .unwrap_or(0);
 
-        info!(
+        debug!(
             "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
             pending_tx.file_path.display(),
             tx_id,
@@ -1760,7 +1829,7 @@ impl TransactionManager {
         }
 
         let duration = start_time.elapsed();
-        info!(
+        debug!(
             "Successfully executed {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
             processed_count,
             total_commands,
@@ -1801,19 +1870,13 @@ impl TransactionManager {
 
         // PROTOCOL COMPLIANCE: Update LSN and send ACK ONLY after successful apply
         if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            info!(
-                "Transaction {} successfully applied to destination, commit_lsn: {}",
-                tx_id, commit_lsn
-            );
+            debug!("Transaction {} applied, commit_lsn: {}", tx_id, commit_lsn);
 
-            // 1. Update confirmed_flush_lsn (last successfully applied LSN)
             lsn_tracker.commit_lsn(commit_lsn.0);
 
-            // 2. Update apply_lsn - transaction is now applied to destination
-            // (flush_lsn was already updated by producer when file was persisted)
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
 
-            info!(
+            debug!(
                 "Updated apply_lsn to {} (transaction {} applied to destination)",
                 commit_lsn, tx_id
             );
@@ -1860,7 +1923,7 @@ impl TransactionManager {
             .await;
 
         if pending_tx.metadata.commit_lsn.is_some() {
-            let pending_count = self.list_pending_transactions().await?.len();
+            let pending_count = self.count_pending_transactions();
             lsn_tracker.update_consumer_state(
                 tx_id,
                 pending_tx.metadata.commit_timestamp,
@@ -2077,5 +2140,175 @@ mod tests {
     async fn test_empty_string_is_quoted() {
         let mgr = test_manager(DestinationType::MySQL).await;
         assert_eq!(mgr.format_value(&ColumnValue::text("")), "''");
+    }
+
+    // ── Performance benchmarks (run with `cargo test --lib bench_ -- --nocapture`) ──
+
+    fn make_row_data(num_cols: usize) -> RowData {
+        let mut row = RowData::with_capacity(num_cols);
+        for i in 0..num_cols {
+            row.push(
+                Arc::from(format!("col_{i}").as_str()),
+                ColumnValue::text(&format!("value_{i}_with_some_realistic_length_data")),
+            );
+        }
+        row
+    }
+
+    #[tokio::test]
+    async fn bench_generate_insert_sql() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        let row = make_row_data(10);
+        let iterations = 100_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let sql = mgr.generate_insert_sql("public", "users", &row).unwrap();
+            std::hint::black_box(&sql);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "generate_insert_sql (10 cols, MySQL): {iterations} iters in {:?} ({:.0} ns/iter)",
+            elapsed,
+            elapsed.as_nanos() as f64 / iterations as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn bench_generate_update_sql() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        let new_data = make_row_data(10);
+        let old_data = make_row_data(10);
+        let key_columns: Vec<Arc<str>> = vec![Arc::from("col_0")];
+        let iterations = 100_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let sql = mgr
+                .generate_update_sql(
+                    "public",
+                    "users",
+                    &new_data,
+                    Some(&old_data),
+                    &ReplicaIdentity::Default,
+                    &key_columns,
+                )
+                .unwrap();
+            std::hint::black_box(&sql);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "generate_update_sql (10 cols, MySQL): {iterations} iters in {:?} ({:.0} ns/iter)",
+            elapsed,
+            elapsed.as_nanos() as f64 / iterations as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn bench_generate_delete_sql() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        let old_data = make_row_data(10);
+        let key_columns: Vec<Arc<str>> = vec![Arc::from("col_0")];
+        let iterations = 100_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let sql = mgr
+                .generate_delete_sql(
+                    "public",
+                    "users",
+                    &old_data,
+                    &ReplicaIdentity::Default,
+                    &key_columns,
+                )
+                .unwrap();
+            std::hint::black_box(&sql);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "generate_delete_sql (10 cols, MySQL): {iterations} iters in {:?} ({:.0} ns/iter)",
+            elapsed,
+            elapsed.as_nanos() as f64 / iterations as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn bench_map_schema_hit_miss() {
+        let mut mgr = test_manager(DestinationType::MySQL).await;
+        mgr.schema_mappings
+            .insert("public".to_string(), "cdc_db".to_string());
+        let iterations = 1_000_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = mgr.map_schema(Some("public"));
+            std::hint::black_box(s);
+        }
+        let hit_elapsed = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = mgr.map_schema(Some("other_schema"));
+            std::hint::black_box(s);
+        }
+        let miss_elapsed = start.elapsed();
+
+        eprintln!(
+            "map_schema hit:  {iterations} iters in {:?} ({:.1} ns/iter)",
+            hit_elapsed,
+            hit_elapsed.as_nanos() as f64 / iterations as f64
+        );
+        eprintln!(
+            "map_schema miss: {iterations} iters in {:?} ({:.1} ns/iter)",
+            miss_elapsed,
+            miss_elapsed.as_nanos() as f64 / iterations as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn bench_format_value_various_types() {
+        let mgr = test_manager(DestinationType::MySQL).await;
+        let iterations = 100_000;
+
+        let text_val = ColumnValue::text("Hello, World! This is a test value with some length.");
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = mgr.format_value(&text_val);
+            std::hint::black_box(&s);
+        }
+        let text_elapsed = start.elapsed();
+
+        let null_val = ColumnValue::Null;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = mgr.format_value(&null_val);
+            std::hint::black_box(&s);
+        }
+        let null_elapsed = start.elapsed();
+
+        let binary_val =
+            ColumnValue::Binary(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]));
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let s = mgr.format_value(&binary_val);
+            std::hint::black_box(&s);
+        }
+        let binary_elapsed = start.elapsed();
+
+        eprintln!(
+            "format_value text:   {iterations} iters in {:?} ({:.0} ns/iter)",
+            text_elapsed,
+            text_elapsed.as_nanos() as f64 / iterations as f64
+        );
+        eprintln!(
+            "format_value null:   {iterations} iters in {:?} ({:.0} ns/iter)",
+            null_elapsed,
+            null_elapsed.as_nanos() as f64 / iterations as f64
+        );
+        eprintln!(
+            "format_value binary: {iterations} iters in {:?} ({:.0} ns/iter)",
+            binary_elapsed,
+            binary_elapsed.as_nanos() as f64 / iterations as f64
+        );
     }
 }

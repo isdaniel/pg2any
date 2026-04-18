@@ -246,12 +246,6 @@ struct StatementProcessingState<'a> {
     batch_count: &'a mut usize,
 }
 
-#[derive(Debug, Clone)]
-struct PendingProgress {
-    last_executed_command_index: usize,
-    last_update_timestamp: DateTime<Utc>,
-}
-
 /// Transaction File Manager for persisting and executing transactions
 pub struct TransactionManager {
     base_path: PathBuf,
@@ -260,8 +254,6 @@ pub struct TransactionManager {
     /// Active transactions and their current segment writers
     /// Key: transaction ID
     active_transactions: Arc<Mutex<HashMap<u32, ActiveTransactionState>>>,
-    /// Staged progress updates for pending metadata (persisted on shutdown)
-    staged_pending_progress: Arc<Mutex<HashMap<PathBuf, PendingProgress>>>,
     /// Maximum buffer size before forced flush
     buffer_size: usize,
     /// Maximum segment size before rotating to a new file
@@ -309,7 +301,6 @@ impl TransactionManager {
             destination_type,
             schema_mappings: HashMap::new(),
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
-            staged_pending_progress: Arc::new(Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
             storage,
@@ -544,16 +535,20 @@ impl TransactionManager {
             }
         }
 
-        // Rotation path (rare): take state out, do I/O unlocked, reinsert + append
-        let mut tx_state = {
-            let mut transactions = self.active_transactions.lock().await;
-            transactions.remove(&tx_id).ok_or_else(|| {
-                CdcError::generic(format!(
-                    "Active transaction {} not found for rotation",
-                    tx_id
-                ))
-            })?
-        };
+        // Rotation path (rare): hold the lock for the whole rotation so a fault during
+        // I/O cannot lose the transaction state. The producer is single-threaded, so
+        // holding the mutex through I/O does not introduce real contention; the upside
+        // is that any early return via `?` leaves the state in `active_transactions`
+        // (still pointing at the *old* writer/segment) instead of being silently
+        // dropped, which would cause every subsequent event for this tx to fail with
+        // "Active transaction not found".
+        let mut transactions = self.active_transactions.lock().await;
+        let tx_state = transactions.get_mut(&tx_id).ok_or_else(|| {
+            CdcError::generic(format!(
+                "Active transaction {} not found for rotation",
+                tx_id
+            ))
+        })?;
 
         let buffered_bytes = tx_state.writer.buffer_size();
         tx_state.writer.sync().await?;
@@ -584,7 +579,7 @@ impl TransactionManager {
             tx_state.segments.len()
         );
 
-        // Append the SQL after rotation and reinsert state
+        // Append the SQL after rotation
         let should_flush = tx_state.writer.append(&sql);
         if let Some(count) = tx_state
             .segment_statement_counts
@@ -597,9 +592,6 @@ impl TransactionManager {
             tx_state.writer.flush().await?;
             tx_state.current_segment_size_bytes += buffered_bytes;
         }
-
-        let mut transactions = self.active_transactions.lock().await;
-        transactions.insert(tx_id, tx_state);
 
         Ok(())
     }
@@ -932,28 +924,6 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Stage progress updates for a pending transaction (persisted on shutdown).
-    ///
-    /// Currently unused on the hot path — `persist_pending_metadata_progress` writes
-    /// progress directly from the pre-commit hook so it is always durable. Kept as a
-    /// best-effort shutdown safety net for future code paths that want to defer writes.
-    #[allow(dead_code)]
-    pub async fn stage_pending_metadata_progress(
-        &self,
-        metadata_file_path: &Path,
-        last_executed_command_index: usize,
-    ) -> Result<()> {
-        let mut staged = self.staged_pending_progress.lock().await;
-        staged.insert(
-            metadata_file_path.to_path_buf(),
-            PendingProgress {
-                last_executed_command_index,
-                last_update_timestamp: Utc::now(),
-            },
-        );
-        Ok(())
-    }
-
     /// Persist `last_executed_command_index` directly to the .meta file.
     ///
     /// Used as a pre-commit hook so progress is durable on disk atomically with the
@@ -970,56 +940,7 @@ impl TransactionManager {
         metadata.last_update_timestamp = Some(Utc::now());
         self.write_pending_metadata(metadata_file_path, &metadata)
             .await?;
-
-        let mut staged = self.staged_pending_progress.lock().await;
-        staged.remove(metadata_file_path);
         Ok(())
-    }
-
-    /// Flush any staged pending progress updates to disk
-    pub async fn flush_staged_pending_progress(&self) -> Result<()> {
-        let staged_entries = {
-            let mut staged = self.staged_pending_progress.lock().await;
-            if staged.is_empty() {
-                return Ok(());
-            }
-            staged.drain().collect::<Vec<_>>()
-        };
-
-        let mut last_error: Option<CdcError> = None;
-
-        for (metadata_path, progress) in staged_entries {
-            if fs::metadata(&metadata_path).await.is_err() {
-                continue;
-            }
-
-            match self.read_metadata(&metadata_path).await {
-                Ok(mut metadata) => {
-                    metadata.last_executed_command_index =
-                        Some(progress.last_executed_command_index);
-                    metadata.last_update_timestamp = Some(progress.last_update_timestamp);
-
-                    if let Err(e) = self.write_pending_metadata(&metadata_path, &metadata).await {
-                        last_error = Some(e);
-                    }
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        if let Some(err) = last_error {
-            return Err(err);
-        }
-
-        Ok(())
-    }
-
-    /// Remove any staged progress update for a pending transaction
-    pub async fn clear_staged_pending_progress(&self, metadata_file_path: &Path) {
-        let mut staged = self.staged_pending_progress.lock().await;
-        staged.remove(metadata_file_path);
     }
 
     /// Restore an active transaction writer from received metadata
@@ -1278,20 +1199,6 @@ impl TransactionManager {
         Ok(sqls.join("\n"))
     }
 
-    /// Build WHERE clause for UPDATE/DELETE based on replica identity
-    #[allow(dead_code)]
-    fn build_where_clause(
-        &self,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[Arc<str>],
-        old_data: Option<&RowData>,
-        new_data: &RowData,
-    ) -> Result<String> {
-        let mut out = String::new();
-        self.append_where_clause(&mut out, replica_identity, key_columns, old_data, new_data)?;
-        Ok(out)
-    }
-
     /// Append WHERE clause conditions directly into the provided buffer
     fn append_where_clause(
         &self,
@@ -1388,7 +1295,7 @@ impl TransactionManager {
     /// - MySQL:      wraps in backticks, doubling any embedded backticks.
     /// - SQL Server: wraps in brackets, doubling any embedded closing brackets.
     /// - SQLite:     wraps in double quotes, doubling any embedded double quotes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn quote_identifier(&self, name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 2);
         self.append_quoted_identifier(&mut out, name);
@@ -1411,17 +1318,6 @@ impl TransactionManager {
             buf.push(HEX[(b & 0x0f) as usize]);
         }
         out.push_str(suffix);
-    }
-
-    /// Format raw bytes as a hex-encoded SQL literal appropriate for the destination.
-    ///
-    /// - MySQL / SQLite use the SQL-standard `X'deadbeef'` syntax.
-    /// - SQL Server uses the T-SQL `0xdeadbeef` syntax (no quotes).
-    #[allow(dead_code)]
-    fn format_hex_literal(&self, bytes: &[u8]) -> String {
-        let mut out = String::new();
-        self.append_hex_literal(&mut out, bytes);
-        out
     }
 
     /// Append a `ColumnValue` literal directly into `out`.
@@ -1476,7 +1372,7 @@ impl TransactionManager {
     ///              to preserve values like leading-zero strings (e.g. zip codes).
     ///              Falls back to a hex literal when the payload is not valid UTF-8.
     /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn format_value(&self, value: &ColumnValue) -> String {
         let mut out = String::new();
         self.append_value(&mut out, value);
@@ -1945,9 +1841,6 @@ impl TransactionManager {
                 e
             );
         }
-
-        self.clear_staged_pending_progress(&pending_tx.file_path)
-            .await;
 
         if pending_tx.metadata.commit_lsn.is_some() {
             let pending_count = self.count_pending_transactions();

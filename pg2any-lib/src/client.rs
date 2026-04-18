@@ -1189,17 +1189,12 @@ impl CdcClient {
 
     #[inline]
     async fn flush_and_persist_on_shutdown(
-        transaction_file_manager: &Arc<TransactionManager>,
+        _transaction_file_manager: &Arc<TransactionManager>,
         lsn_tracker: &Arc<LsnTracker>,
     ) {
-        if let Err(e) = transaction_file_manager
-            .flush_staged_pending_progress()
-            .await
-        {
-            warn!("Failed to flush staged pending progress on shutdown: {}", e);
-        }
-
-        // Persist LSN after flushing staged progress
+        // Per-batch progress is now persisted to .meta files inside the pre-commit
+        // hook (see TransactionManager::persist_pending_metadata_progress), so there
+        // is nothing to flush at shutdown beyond the LSN tracker itself.
         if let Err(e) = lsn_tracker.persist_async().await {
             warn!("Failed to persist LSN on consumer shutdown: {}", e);
         }
@@ -1238,16 +1233,6 @@ impl CdcClient {
 
         // Shutdown LSN tracker to persist final state
         info!("Shutting down LSN tracker and persisting final state");
-        if let Err(e) = self
-            .transaction_file_manager
-            .flush_staged_pending_progress()
-            .await
-        {
-            warn!(
-                "Failed to flush staged pending progress during shutdown: {}",
-                e
-            );
-        }
 
         // Shutdown LSN tracker, which includes a final state persistence.
         self.lsn_tracker.shutdown_async().await;
@@ -1371,54 +1356,13 @@ impl Drop for CdcClient {
 mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
-    use crate::destinations::PreCommitHook;
     use crate::types::Transaction;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
-    // Mock destination handler for testing
-    #[allow(dead_code)]
-    pub struct MockDestinationHandler {
-        pub should_fail: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl DestinationHandler for MockDestinationHandler {
-        async fn connect(&mut self, _connection_string: &str) -> Result<()> {
-            Ok(())
-        }
-
-        fn set_schema_mappings(&mut self, _mappings: std::collections::HashMap<String, String>) {
-            // Mock implementation - no-op
-        }
-
-        async fn execute_sql_batch_with_hook(
-            &mut self,
-            commands: &[String],
-            pre_commit_hook: Option<PreCommitHook>,
-        ) -> Result<()> {
-            if self.should_fail {
-                return Err(CdcError::generic("Mock execute_sql_batch error"));
-            }
-            // Mock implementation - just count the commands
-            for _ in commands {
-                // No-op
-            }
-
-            // Execute pre-commit hook if provided
-            if let Some(hook) = pre_commit_hook {
-                hook().await?;
-            }
-
-            Ok(())
-        }
-
-        async fn close(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
+    // Mock destination handler removed: it was never instantiated.
 
     async fn cleanup_default_metadata_file() {
         let _ = tokio::fs::remove_file("./pg2any_last_lsn.metadata").await;

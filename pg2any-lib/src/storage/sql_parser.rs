@@ -38,10 +38,16 @@ enum ParseState {
 pub struct SqlStreamParser {
     /// Current parsing state
     state: ParseState,
-    /// Buffer for accumulating current statement
-    statement_buffer: Vec<u8>,
+    /// Buffer for accumulating current statement (String avoids UTF-8 re-validation)
+    statement_buffer: String,
     /// Total statements parsed
     statement_count: usize,
+}
+
+impl Default for SqlStreamParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqlStreamParser {
@@ -49,7 +55,7 @@ impl SqlStreamParser {
     pub fn new() -> Self {
         Self {
             state: ParseState::Normal,
-            statement_buffer: Vec::with_capacity(512),
+            statement_buffer: String::with_capacity(512),
             statement_count: 0,
         }
     }
@@ -85,6 +91,7 @@ impl SqlStreamParser {
         R: AsyncRead + Unpin,
     {
         let mut statements: Vec<String> = Vec::new();
+        let mut line_stmts: Vec<String> = Vec::new();
         let buf_reader = BufReader::new(reader);
         let mut lines = buf_reader.lines();
 
@@ -97,8 +104,8 @@ impl SqlStreamParser {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let line_statements = self.parse_line(&line)?;
-            for stmt in line_statements {
+            self.parse_line(&line, &mut line_stmts)?;
+            for stmt in line_stmts.drain(..) {
                 if self.statement_count >= start_index {
                     statements.push(stmt);
                 }
@@ -116,9 +123,8 @@ impl SqlStreamParser {
         Ok(statements)
     }
 
-    /// Parse a single line and return any completed statements
-    pub fn parse_line(&mut self, line: &str) -> Result<Vec<String>> {
-        let mut statements = Vec::new();
+    /// Parse a single line and append any completed statements to `out`
+    pub fn parse_line(&mut self, line: &str, out: &mut Vec<String>) -> Result<()> {
         let bytes = line.as_bytes();
         let mut i = 0;
 
@@ -126,68 +132,125 @@ impl SqlStreamParser {
             let byte = bytes[i];
 
             match self.state {
-                ParseState::Normal => match byte {
-                    b'\'' => {
-                        self.statement_buffer.push(byte);
-                        self.state = ParseState::SingleQuote;
-                    }
-                    b'"' => {
-                        self.statement_buffer.push(byte);
-                        self.state = ParseState::DoubleQuote;
-                    }
-                    b'`' => {
-                        self.statement_buffer.push(byte);
-                        self.state = ParseState::Backtick;
-                    }
-                    b'[' => {
-                        self.statement_buffer.push(byte);
-                        self.state = ParseState::Bracket;
-                    }
-                    b';' => {
-                        if let Some(stmt) = self.take_trimmed_statement() {
-                            statements.push(stmt);
+                ParseState::Normal => {
+                    // Fast-path: scan for next delimiter or non-ASCII byte
+                    let start = i;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b';' | b'\'' | b'"' | b'`' | b'[' => break,
+                            b if !b.is_ascii() => break,
+                            _ => i += 1,
                         }
-                        self.statement_buffer.clear();
                     }
-                    _ => {
-                        self.statement_buffer.push(byte);
+                    if i > start {
+                        // SAFETY: we verified all bytes in [start..i] are ASCII
+                        self.statement_buffer
+                            .push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
                     }
-                },
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    let byte = bytes[i];
+                    if !byte.is_ascii() {
+                        let rest = &line[i..];
+                        if let Some(ch) = rest.chars().next() {
+                            self.statement_buffer.push(ch);
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    match byte {
+                        b'\'' => {
+                            self.statement_buffer.push('\'');
+                            self.state = ParseState::SingleQuote;
+                        }
+                        b'"' => {
+                            self.statement_buffer.push('"');
+                            self.state = ParseState::DoubleQuote;
+                        }
+                        b'`' => {
+                            self.statement_buffer.push('`');
+                            self.state = ParseState::Backtick;
+                        }
+                        b'[' => {
+                            self.statement_buffer.push('[');
+                            self.state = ParseState::Bracket;
+                        }
+                        b';' => {
+                            if let Some(stmt) = self.take_trimmed_statement() {
+                                out.push(stmt);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 ParseState::SingleQuote => {
-                    self.statement_buffer.push(byte);
+                    if !byte.is_ascii() {
+                        let rest = &line[i..];
+                        if let Some(ch) = rest.chars().next() {
+                            self.statement_buffer.push(ch);
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    self.statement_buffer.push(byte as char);
                     if byte == b'\'' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                             i += 1;
-                            self.statement_buffer.push(bytes[i]);
+                            self.statement_buffer.push('\'');
                         } else {
                             self.state = ParseState::Normal;
                         }
                     }
                 }
                 ParseState::DoubleQuote => {
-                    self.statement_buffer.push(byte);
+                    if !byte.is_ascii() {
+                        let rest = &line[i..];
+                        if let Some(ch) = rest.chars().next() {
+                            self.statement_buffer.push(ch);
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    self.statement_buffer.push(byte as char);
                     if byte == b'"' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
                             i += 1;
-                            self.statement_buffer.push(bytes[i]);
+                            self.statement_buffer.push('"');
                         } else {
                             self.state = ParseState::Normal;
                         }
                     }
                 }
                 ParseState::Backtick => {
-                    self.statement_buffer.push(byte);
+                    if !byte.is_ascii() {
+                        let rest = &line[i..];
+                        if let Some(ch) = rest.chars().next() {
+                            self.statement_buffer.push(ch);
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    self.statement_buffer.push(byte as char);
                     if byte == b'`' {
                         if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
                             i += 1;
-                            self.statement_buffer.push(bytes[i]);
+                            self.statement_buffer.push('`');
                         } else {
                             self.state = ParseState::Normal;
                         }
                     }
                 }
                 ParseState::Bracket => {
-                    self.statement_buffer.push(byte);
+                    if !byte.is_ascii() {
+                        let rest = &line[i..];
+                        if let Some(ch) = rest.chars().next() {
+                            self.statement_buffer.push(ch);
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    self.statement_buffer.push(byte as char);
                     if byte == b']' {
                         self.state = ParseState::Normal;
                     }
@@ -197,9 +260,9 @@ impl SqlStreamParser {
             i += 1;
         }
 
-        self.statement_buffer.push(b'\n');
+        self.statement_buffer.push('\n');
 
-        Ok(statements)
+        Ok(())
     }
 
     /// Finalize parsing at EOF and return the remaining statement, if any
@@ -208,52 +271,22 @@ impl SqlStreamParser {
             return None;
         }
 
-        let stmt = self.take_trimmed_statement();
-        self.statement_buffer.clear();
-        stmt
+        self.take_trimmed_statement()
     }
 
     /// Trim whitespace from the current statement buffer and return it as an
     /// owned `String`. Returns `None` when the trimmed contents are empty.
     ///
-    /// Fast path: valid UTF-8 uses a single `std::str::from_utf8` validation
-    /// with no additional copying of the borrowed slice until the owned
-    /// `String` is produced. Invalid UTF-8 falls back to `from_utf8_lossy`
-    /// to preserve the pre-refactor behavior (never drop statements on
-    /// encoding errors — data loss would be worse than a lossy character).
-    /// The internal buffer is left as-is; callers clear it after.
-    fn take_trimmed_statement(&self) -> Option<String> {
-        match std::str::from_utf8(&self.statement_buffer) {
-            Ok(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
-            Err(_) => {
-                let s = String::from_utf8_lossy(&self.statement_buffer);
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
+    /// Since the buffer is already a `String`, no UTF-8 validation is needed.
+    fn take_trimmed_statement(&mut self) -> Option<String> {
+        let trimmed = self.statement_buffer.trim();
+        if trimmed.is_empty() {
+            self.statement_buffer.clear();
+            return None;
         }
-    }
-
-    /// Trim whitespace from statement buffer and return a copy (legacy)
-    #[cfg(test)]
-    fn trim_statement_buffer(&self) -> Vec<u8> {
-        match std::str::from_utf8(&self.statement_buffer) {
-            Ok(s) => s.trim().as_bytes().to_vec(),
-            Err(_) => String::from_utf8_lossy(&self.statement_buffer)
-                .trim()
-                .as_bytes()
-                .to_vec(),
-        }
+        let result = trimmed.to_string();
+        self.statement_buffer.clear();
+        Some(result)
     }
 }
 

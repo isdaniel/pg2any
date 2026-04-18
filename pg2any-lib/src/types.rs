@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 // Re-export types from pg_walstream for convenience
 pub use pg_walstream::{ChangeEvent, EventType, Lsn, ReplicaIdentity, RowData};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestinationType {
     MySQL,
     SqlServer,

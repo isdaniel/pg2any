@@ -202,6 +202,8 @@ impl CdcMetadata {
 pub struct LsnTracker {
     /// The comprehensive CDC metadata
     metadata: Arc<Mutex<CdcMetadata>>,
+    /// Atomic flush_lsn for lock-free reads/writes on the hot path
+    flush_lsn: AtomicU64,
     /// Last persisted replay LSN (to avoid unnecessary writes)
     last_persisted_lsn: AtomicU64,
     /// Flag indicating if metadata needs to be persisted
@@ -236,6 +238,7 @@ impl LsnTracker {
 
         Arc::new(Self {
             metadata: Arc::new(Mutex::new(CdcMetadata::default())),
+            flush_lsn: AtomicU64::new(0),
             last_persisted_lsn: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             lsn_file_path: path,
@@ -258,6 +261,7 @@ impl LsnTracker {
             drop(current_metadata);
 
             let flush_lsn = metadata.get_lsn();
+            tracker.flush_lsn.store(flush_lsn, Ordering::Release);
             tracker
                 .last_persisted_lsn
                 .store(flush_lsn, Ordering::Release);
@@ -355,10 +359,8 @@ impl LsnTracker {
             return;
         }
 
-        let mut metadata = self.metadata.lock().unwrap();
-        if lsn > metadata.lsn_tracking.flush_lsn {
-            metadata.update_flush_lsn(lsn);
-            drop(metadata);
+        let prev = self.flush_lsn.fetch_max(lsn, Ordering::AcqRel);
+        if lsn > prev {
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -384,8 +386,7 @@ impl LsnTracker {
     /// Get the current last committed LSN (flush_lsn)
     #[inline]
     pub fn get(&self) -> u64 {
-        let metadata = self.metadata.lock().unwrap();
-        metadata.get_lsn()
+        self.flush_lsn.load(Ordering::Acquire)
     }
 
     /// Get the current last committed LSN as `Option<Lsn>`
@@ -414,16 +415,22 @@ impl LsnTracker {
 
     /// Internal persist implementation
     async fn persist_internal(&self) -> std::io::Result<()> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let metadata = {
-            let m = self.metadata.lock().unwrap();
+            let mut m = self.metadata.lock().unwrap();
+            // Sync atomic flush_lsn into metadata before serializing
+            let current_flush = self.flush_lsn.load(Ordering::Acquire);
+            m.update_flush_lsn(current_flush);
             m.clone()
         };
 
         let flush_lsn = metadata.get_lsn();
 
         // Serialize metadata to JSON
-        let json_content =
-            serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
+        let json_content = serde_json::to_string(&metadata).map_err(std::io::Error::other)?;
 
         // Write to temp file first for atomic write
         let temp_path = format!("{}.tmp", self.lsn_file_path);
@@ -444,16 +451,21 @@ impl LsnTracker {
 
     /// Persist for use in Drop or non-async contexts via spawn_blocking
     fn persist_sync(&self) -> std::io::Result<()> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let metadata = {
-            let m = self.metadata.lock().unwrap();
+            let mut m = self.metadata.lock().unwrap();
+            let current_flush = self.flush_lsn.load(Ordering::Acquire);
+            m.update_flush_lsn(current_flush);
             m.clone()
         };
 
         let flush_lsn = metadata.get_lsn();
 
         // Serialize metadata to JSON
-        let json_content =
-            serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
+        let json_content = serde_json::to_string(&metadata).map_err(std::io::Error::other)?;
 
         // Write to temp file first for atomic write
         let temp_path = format!("{}.tmp", self.lsn_file_path);

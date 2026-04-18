@@ -16,7 +16,6 @@ mod where_clause_error_tests {
     #[test]
     fn test_error_message_content_expectations() {
         // Test the event structures that should generate specific error messages
-        // in the MySQL destination's build_where_clause method
 
         // Test Case 1: Missing key column in data
         let incomplete_data = RowData::from_pairs(vec![("name", ColumnValue::text("test"))]);

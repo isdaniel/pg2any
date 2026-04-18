@@ -9,7 +9,7 @@ use crate::storage::traits::TransactionStorage;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::debug;
 
 /// Uncompressed storage handler for transaction files
@@ -68,29 +68,14 @@ impl TransactionStorage for UncompressedStorage {
     }
 
     async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        let file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;
-
-        let reader = tokio::io::BufReader::new(file);
-        let mut lines = reader.lines();
+        // Uncompressed storage doesn't transform the file, but the trait contract
+        // requires returning the actual statement count so callers can populate
+        // segment metadata (used by recovery to skip already-applied segments).
+        // Returning 0 here was a regression that forced callers onto a fallback
+        // path and broke multi-segment skip during resume.
         let mut parser = SqlStreamParser::new();
-        let mut statement_count = 0usize;
-
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
-        {
-            let statements = parser.parse_line(&line)?;
-            statement_count += statements.len();
-        }
-
-        if parser.finish_statement().is_some() {
-            statement_count += 1;
-        }
-
-        Ok((file_path.to_path_buf(), statement_count))
+        let statements = parser.parse_file_from_index_collect(file_path, 0).await?;
+        Ok((file_path.to_path_buf(), statements.len()))
     }
 
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {

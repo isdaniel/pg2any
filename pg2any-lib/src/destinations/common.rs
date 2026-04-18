@@ -8,11 +8,14 @@
 use std::collections::HashMap;
 
 /// Map a source schema to destination schema using provided mappings
-pub fn map_schema(schema_mappings: &HashMap<String, String>, source_schema: &str) -> String {
+pub fn map_schema<'a>(
+    schema_mappings: &'a HashMap<String, String>,
+    source_schema: &'a str,
+) -> &'a str {
     schema_mappings
         .get(source_schema)
-        .cloned()
-        .unwrap_or_else(|| source_schema.to_string())
+        .map(|s| s.as_str())
+        .unwrap_or(source_schema)
 }
 
 /// Execute a batch of SQL commands within a single sqlx transaction with optional pre-commit hook.

@@ -59,7 +59,7 @@ impl CompressionIndex {
 
     /// Save index to a file
     pub async fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
+        let json = serde_json::to_string(self)
             .map_err(|e| CdcError::generic(format!("Failed to serialize index: {e}")))?;
 
         tokio::fs::write(path, json)
@@ -249,6 +249,7 @@ impl TransactionStorage for CompressedStorage {
         let mut total_statements: usize = 0;
         let mut current_offset: u64 = 0;
         let mut current_chunk: Vec<String> = Vec::with_capacity(SYNC_POINT_INTERVAL);
+        let mut line_stmts: Vec<String> = Vec::new();
 
         let buf_reader = BufReader::with_capacity(65536, source_file);
         let mut lines = buf_reader.lines();
@@ -258,8 +259,8 @@ impl TransactionStorage for CompressedStorage {
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let statements = parser.parse_line(&line)?;
-            for stmt in statements {
+            parser.parse_line(&line, &mut line_stmts)?;
+            for stmt in line_stmts.drain(..) {
                 self.add_statement_to_chunk(
                     stmt,
                     &mut current_chunk,

@@ -971,6 +971,11 @@ impl CdcClient {
                     }
                     info!("Consumer: Finished draining commit channel, {} transactions in queue", commit_queue.len());
 
+                    // Use a fresh, uncancelled token for the drain phase so already-committed
+                    // transactions are fully applied even though the main cancellation_token
+                    // has been cancelled to stop the producer.
+                    let drain_token = CancellationToken::new();
+
                     // Process all queued transactions in LSN order
                     while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
                         info!(
@@ -982,7 +987,7 @@ impl CdcClient {
                             .process_transaction_file(
                                 &next_tx,
                                 &mut destination_handler,
-                                &cancellation_token,
+                                &drain_token,
                                 &lsn_tracker,
                                 &metrics_collector,
                                 batch_size,
@@ -1005,7 +1010,7 @@ impl CdcClient {
                         &metrics_collector,
                         &lsn_tracker,
                         batch_size,
-                        &cancellation_token,
+                        &drain_token,
                         &shared_lsn_feedback,
                     ).await;
 
@@ -1072,6 +1077,11 @@ impl CdcClient {
                             // Wait for the oneshot signal (should already be ready)
                             let _ = producer_shutdown_rx.await;
 
+                            // Use a fresh, uncancelled token for the drain phase so already-committed
+                            // transactions are fully applied even though the main cancellation_token
+                            // has been cancelled to stop the producer.
+                            let drain_token = CancellationToken::new();
+
                             // Process all remaining transactions in queue
                             info!("Consumer: Processing {} remaining transactions in queue", commit_queue.len());
                             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
@@ -1079,7 +1089,7 @@ impl CdcClient {
                                     .process_transaction_file(
                                         &next_tx,
                                         &mut destination_handler,
-                                        &cancellation_token,
+                                        &drain_token,
                                         &lsn_tracker,
                                         &metrics_collector,
                                         batch_size,
@@ -1102,7 +1112,7 @@ impl CdcClient {
                                 &metrics_collector,
                                 &lsn_tracker,
                                 batch_size,
-                                &cancellation_token,
+                                &drain_token,
                                 &shared_lsn_feedback,
                             ).await;
 
@@ -1144,11 +1154,6 @@ impl CdcClient {
                     pending_files.len()
                 );
                 for pending_tx in pending_files {
-                    // Check for cancellation before processing each file during drain
-                    if cancellation_token.is_cancelled() {
-                        break;
-                    }
-
                     debug!(
                         "Consumer: Processing remaining file {:?} during shutdown (tx_id: {})",
                         pending_tx.file_path, pending_tx.metadata.transaction_id

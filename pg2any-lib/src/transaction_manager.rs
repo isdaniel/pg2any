@@ -917,10 +917,7 @@ impl TransactionManager {
         })?;
 
         metadata_file.write_all(metadata_json.as_bytes()).await?;
-        // fsync the temp file: without sync_all the kernel can lose these bytes if
-        // the process is killed before writeback. This file is the source of truth
-        // for `last_executed_command_index` on resume — losing it causes the whole
-        // transaction file to replay, double-applying non-idempotent INSERTs.
+        // fsync the temp file: without sync_all the kernel can lose these bytes if the process is killed before writeback. This file is the source of truth for `last_executed_command_index` on resume — losing it causes the whole transaction file to replay, double-applying non-idempotent INSERT.
         metadata_file.sync_all().await?;
         drop(metadata_file);
 
@@ -1814,7 +1811,7 @@ impl TransactionManager {
             debug!("Transaction {} applied, commit_lsn: {}", tx_id, commit_lsn);
 
             lsn_tracker.commit_lsn(commit_lsn.0);
-
+            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
 
             debug!(

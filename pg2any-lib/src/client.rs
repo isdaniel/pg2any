@@ -358,7 +358,6 @@ impl CdcClient {
     /// * `event_lsn` - LSN of the commit event (commit_lsn from PostgreSQL)
     /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
     /// * `transaction_file_manager` - File manager for moving transaction files
-    /// * `shared_lsn_feedback` - Shared LSN feedback for updating flush_lsn
     /// * `commit_notifier` - Channel sender for notifying consumer
     /// * `metrics_collector` - Metrics collector for error recording
     async fn handle_transaction_commit(
@@ -366,7 +365,6 @@ impl CdcClient {
         event_lsn: Option<Lsn>,
         transaction_type: &str,
         transaction_file_manager: &Arc<TransactionManager>,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         commit_notifier: &mpsc::Sender<PendingTransactionFile>,
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
@@ -380,14 +378,12 @@ impl CdcClient {
                     transaction_type, pending_path, event_lsn
                 );
 
-                // Update flush_lsn - transaction file is now durably persisted to disk
-                if let Some(lsn) = event_lsn {
-                    shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                    debug!(
-                        "Updated flush_lsn to {} for {} transaction {} (file persisted to sql_pending_tx/)",
-                        lsn, transaction_type, transaction_id
-                    );
-                }
+                // NOTE: We deliberately do NOT advance flushed_lsn here.
+                // PostgreSQL treats flushed_lsn as "safe to discard WAL up to". Advancing it
+                // before the destination has actually applied the data lets PG drop WAL we
+                // still need on a chaos restart, causing permanent data loss when the
+                // consumer dies mid-batch. flushed_lsn is now advanced by the consumer in
+                // finalize_transaction_file, atomically with applied_lsn.
 
                 // Notify consumer with transaction details for immediate processing
                 let notification = PendingTransactionFile {
@@ -459,7 +455,7 @@ impl CdcClient {
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
         transaction_file_manager: Arc<TransactionManager>,
-        shared_lsn_feedback: Arc<SharedLsnFeedback>,
+        _shared_lsn_feedback: Arc<SharedLsnFeedback>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
         producer_shutdown_signal: oneshot::Sender<()>,
     ) -> Result<()> {
@@ -589,7 +585,6 @@ impl CdcClient {
                                     Some(event.lsn),
                                     "normal",
                                     &transaction_file_manager,
-                                    &shared_lsn_feedback,
                                     &commit_notifier,
                                     &metrics_collector,
                                 )
@@ -670,7 +665,6 @@ impl CdcClient {
                                     Some(event.lsn),
                                     "streaming",
                                     &transaction_file_manager,
-                                    &shared_lsn_feedback,
                                     &commit_notifier,
                                     &metrics_collector,
                                 )

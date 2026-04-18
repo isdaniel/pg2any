@@ -727,12 +727,16 @@ impl CdcClient {
                             let target_tx_id = if let Some((tx_id, _)) = current_normal_tx {
                                 Some(tx_id)
                             } else if let Some(streaming_txid) = active_streaming_dml_txid {
-                                debug_assert!(
-                                    streaming_txs.contains_key(&streaming_txid),
-                                    "active_streaming_dml_txid {} not in streaming_txs",
-                                    streaming_txid
-                                );
-                                Some(streaming_txid)
+                                if streaming_txs.contains_key(&streaming_txid) {
+                                    Some(streaming_txid)
+                                } else {
+                                    debug_assert!(false, "active_streaming_dml_txid {} not in streaming_txs", streaming_txid);
+                                    error!(
+                                        "Active streaming DML txid {} not found in streaming_txs map",
+                                        streaming_txid
+                                    );
+                                    None
+                                }
                             } else {
                                 warn!(
                                     "Received DML event with no active transaction (normal or streaming): {:?}",

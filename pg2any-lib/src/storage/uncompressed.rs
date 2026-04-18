@@ -9,7 +9,7 @@ use crate::storage::traits::TransactionStorage;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::debug;
 
 /// Uncompressed storage handler for transaction files
@@ -68,29 +68,7 @@ impl TransactionStorage for UncompressedStorage {
     }
 
     async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        let file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;
-
-        let reader = tokio::io::BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut parser = SqlStreamParser::new();
-        let mut statement_count = 0usize;
-
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
-        {
-            let statements = parser.parse_line(&line)?;
-            statement_count += statements.len();
-        }
-
-        if parser.finish_statement().is_some() {
-            statement_count += 1;
-        }
-
-        Ok((file_path.to_path_buf(), statement_count))
+        Ok((file_path.to_path_buf(), 0))
     }
 
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {

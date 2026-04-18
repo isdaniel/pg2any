@@ -3,9 +3,7 @@ use crate::destinations::{DestinationFactory, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
-use crate::transaction_manager::{
-    PendingTransactionFile, TransactionFileMetadata, TransactionManager,
-};
+use crate::transaction_manager::{PendingTransactionFile, TransactionManager};
 use crate::types::{EventType, Lsn};
 use chrono::{DateTime, Utc};
 use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
@@ -376,8 +374,8 @@ impl CdcClient {
             .commit_transaction(transaction_id, event_lsn)
             .await
         {
-            Ok(pending_path) => {
-                info!(
+            Ok((pending_path, metadata)) => {
+                debug!(
                     "Committed {} transaction file to: {:?} (commit_lsn: {:?})",
                     transaction_type, pending_path, event_lsn
                 );
@@ -392,31 +390,15 @@ impl CdcClient {
                 }
 
                 // Notify consumer with transaction details for immediate processing
-                match tokio::fs::read_to_string(&pending_path).await {
-                    Ok(content) => {
-                        match serde_json::from_str::<TransactionFileMetadata>(&content) {
-                            Ok(metadata) => {
-                                let notification = PendingTransactionFile {
-                                    file_path: pending_path.clone(),
-                                    metadata,
-                                };
-                                if let Err(e) = commit_notifier.send(notification).await {
-                                    warn!(
-                                    "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
-                                    e
-                                );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse metadata from {:?}: {}", pending_path, e);
-                                metrics_collector.record_error("metadata_parse_failed", "producer");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read metadata from {:?}: {}", pending_path, e);
-                        metrics_collector.record_error("metadata_read_failed", "producer");
-                    }
+                let notification = PendingTransactionFile {
+                    file_path: pending_path.clone(),
+                    metadata,
+                };
+                if let Err(e) = commit_notifier.send(notification).await {
+                    warn!(
+                        "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
+                        e
+                    );
                 }
                 Ok(())
             }
@@ -536,12 +518,14 @@ impl CdcClient {
             }
         }
 
+        // Acquire the stream lock once for the entire event loop.
+        // The producer is the only task accessing the stream.
+        let mut stream_guard = replication_stream.lock().await;
+
         while !cancellation_token.is_cancelled() {
-            // Get the next event from the replication stream (lock for the duration of the call)
-            let event_result = {
-                let mut stream = replication_stream.lock().await;
-                stream.next_event_with_retry(&cancellation_token).await
-            };
+            let event_result = stream_guard
+                .next_event_with_retry(&cancellation_token)
+                .await;
 
             match event_result {
                 Ok(event) => {
@@ -597,7 +581,7 @@ impl CdcClient {
                             // Complete and commit the normal transaction file
                             // Commit event has NO xid, so we use current_normal_tx
                             if let Some((tx_id, _)) = current_normal_tx.take() {
-                                info!("Producer: Committing normal transaction {}", tx_id);
+                                debug!("Producer: Committing normal transaction {}", tx_id);
 
                                 // Use helper function to handle commit logic
                                 if let Err(e) = Self::handle_transaction_commit(
@@ -664,7 +648,7 @@ impl CdcClient {
                             // StreamStop marks the end of a segment in streaming transactions
                             // Clear the active streaming DML transaction
                             if let Some(txid) = active_streaming_dml_txid {
-                                info!("Producer: StreamStop for streaming transaction {}", txid);
+                                debug!("Producer: StreamStop for streaming transaction {}", txid);
                                 active_streaming_dml_txid = None;
                             } else {
                                 warn!("Producer: StreamStop received but no active streaming DML transaction");
@@ -676,7 +660,7 @@ impl CdcClient {
                             commit_timestamp: _,
                             ..
                         } => {
-                            info!("Producer: StreamCommit for transaction {}", transaction_id);
+                            debug!("Producer: StreamCommit for transaction {}", transaction_id);
 
                             // Move streaming transaction file to pending and notify consumer
                             if streaming_txs.remove(transaction_id).is_some() {
@@ -741,22 +725,14 @@ impl CdcClient {
                             // For DML events, we need to determine which transaction they belong to
 
                             let target_tx_id = if let Some((tx_id, _)) = current_normal_tx {
-                                debug!("Appending DML to normal transaction {}", tx_id);
                                 Some(tx_id)
                             } else if let Some(streaming_txid) = active_streaming_dml_txid {
-                                if streaming_txs.contains_key(&streaming_txid) {
-                                    debug!(
-                                        "Appending DML to streaming transaction {}",
-                                        streaming_txid
-                                    );
-                                    Some(streaming_txid)
-                                } else {
-                                    error!(
-                                        "Active streaming DML txid {} not found in streaming_txs map",
-                                        streaming_txid
-                                    );
-                                    None
-                                }
+                                debug_assert!(
+                                    streaming_txs.contains_key(&streaming_txid),
+                                    "active_streaming_dml_txid {} not in streaming_txs",
+                                    streaming_txid
+                                );
+                                Some(streaming_txid)
                             } else {
                                 warn!(
                                     "Received DML event with no active transaction (normal or streaming): {:?}",
@@ -792,6 +768,9 @@ impl CdcClient {
                 }
             }
         }
+
+        // Release the stream lock before shutdown coordination
+        drop(stream_guard);
 
         info!("File-based producer shutting down");
 
@@ -889,7 +868,6 @@ impl CdcClient {
 
             // Call the core processing logic directly
             if let Err(e) = file_mgr
-                .clone()
                 .process_transaction_file(
                     pending_tx,
                     destination,
@@ -993,7 +971,6 @@ impl CdcClient {
                         );
 
                         if let Err(e) = transaction_file_manager
-                            .clone()
                             .process_transaction_file(
                                 &next_tx,
                                 &mut destination_handler,
@@ -1050,14 +1027,13 @@ impl CdcClient {
 
                             // Process all transactions that are ready (in commit_lsn order)
                             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-                                info!(
+                                debug!(
                                     "Consumer processing transaction {} in commit_lsn order (LSN: {:?})",
                                     next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
                                 );
 
                                 // Process the transaction - THIS IS WHERE APPLY HAPPENS
                                 if let Err(e) = transaction_file_manager
-                                    .clone()
                                     .process_transaction_file(
                                         &next_tx,
                                         &mut destination_handler,
@@ -1092,7 +1068,6 @@ impl CdcClient {
                             info!("Consumer: Processing {} remaining transactions in queue", commit_queue.len());
                             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
                                 if let Err(e) = transaction_file_manager
-                                    .clone()
                                     .process_transaction_file(
                                         &next_tx,
                                         &mut destination_handler,
@@ -1172,7 +1147,6 @@ impl CdcClient {
                     );
 
                     match transaction_file_manager
-                        .clone()
                         .process_transaction_file(
                             &pending_tx,
                             destination_handler,

@@ -96,6 +96,32 @@ impl Default for CompressionIndex {
 #[derive(Debug, Clone)]
 pub struct CompressedStorage;
 
+/// Build the newline-joined, semicolon-terminated text for one gzip chunk
+/// using a single `String` allocation.
+fn build_chunk_text(chunk: &[String]) -> String {
+    let mut cap: usize = 0;
+    for stmt in chunk {
+        cap += stmt.len() + 2; // `;` + `\n`
+    }
+    let mut out = String::with_capacity(cap);
+    for stmt in chunk {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push_str(trimmed);
+        if !trimmed.ends_with(';') {
+            out.push(';');
+        }
+        out.push('\n');
+    }
+    // Drop the trailing newline so chunks are equivalent to the old `join("\n")`.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 impl CompressedStorage {
     /// Create a new compressed storage handler
     pub fn new() -> Self {
@@ -130,18 +156,6 @@ impl TransactionStorage for CompressedStorage {
             return Err(CdcError::generic("No statements to compress"));
         }
 
-        // Add semicolons back to statements
-        let statements_with_semicolons: Vec<String> = data
-            .iter()
-            .map(|stmt| {
-                if stmt.trim().ends_with(';') {
-                    stmt.clone()
-                } else {
-                    format!("{};", stmt.trim())
-                }
-            })
-            .collect();
-
         // Create destination file
         let mut dest_file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -155,11 +169,10 @@ impl TransactionStorage for CompressedStorage {
         let mut index = CompressionIndex::new();
         index.total_statements = total_statements;
 
-        // Process statements in chunks of SYNC_POINT_INTERVAL
-        for (chunk_idx, chunk) in statements_with_semicolons
-            .chunks(SYNC_POINT_INTERVAL)
-            .enumerate()
-        {
+        // Process statements in chunks of SYNC_POINT_INTERVAL, building one
+        // contiguous `String` per chunk (single allocation) and moving it
+        // into the blocking compression task.
+        for (chunk_idx, chunk) in data.chunks(SYNC_POINT_INTERVAL).enumerate() {
             let statement_index = chunk_idx * SYNC_POINT_INTERVAL;
 
             // Record sync point at start of this chunk
@@ -168,20 +181,16 @@ impl TransactionStorage for CompressedStorage {
                 compressed_offset: current_offset,
             });
 
-            // Compress this chunk as a separate gzip block
-            let chunk_data = chunk.join("\n");
+            let chunk_data = build_chunk_text(chunk);
 
-            let buffer = tokio::task::spawn_blocking({
-                let chunk_data = chunk_data.clone();
-                move || -> Result<Vec<u8>> {
-                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    encoder
-                        .write_all(chunk_data.as_bytes())
-                        .map_err(|e| CdcError::generic(format!("Compression write failed: {e}")))?;
-                    encoder
-                        .finish()
-                        .map_err(|e| CdcError::generic(format!("Compression finish failed: {e}")))
-                }
+            let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder
+                    .write_all(chunk_data.as_bytes())
+                    .map_err(|e| CdcError::generic(format!("Compression write failed: {e}")))?;
+                encoder
+                    .finish()
+                    .map_err(|e| CdcError::generic(format!("Compression finish failed: {e}")))
             })
             .await
             .map_err(|e| CdcError::generic(format!("Compression task failed: {e}")))?;
@@ -253,13 +262,15 @@ impl TransactionStorage for CompressedStorage {
         let buf_reader = BufReader::with_capacity(65536, source_file);
         let mut lines = buf_reader.lines();
 
+        let mut statements: Vec<String> = Vec::new();
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let statements = parser.parse_line(&line)?;
-            for stmt in statements {
+            statements.clear();
+            parser.parse_line(&line, &mut statements)?;
+            for stmt in statements.drain(..) {
                 self.add_statement_to_chunk(
                     stmt,
                     &mut current_chunk,
@@ -416,11 +427,7 @@ impl CompressedStorage {
     }
 
     async fn compress_chunk(chunk: &[String]) -> Result<Vec<u8>> {
-        let chunk_data = chunk
-            .iter()
-            .map(|stmt| format!("{};", stmt))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let chunk_data = build_chunk_text(chunk);
 
         let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

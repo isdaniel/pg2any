@@ -95,7 +95,7 @@ impl DestinationHandler for SqlServerDestination {
         // Execute all coalesced commands in the transaction
         let mut execution_result = Ok(());
         for (idx, sql) in coalesced.iter().enumerate() {
-            if let Err(e) = client.simple_query(sql).await {
+            if let Err(e) = client.simple_query(sql.as_ref()).await {
                 execution_result = Err(CdcError::generic(format!(
                     "SQL Server execute_sql_batch failed at command {}/{}: {}",
                     idx + 1,

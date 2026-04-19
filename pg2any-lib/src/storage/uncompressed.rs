@@ -76,13 +76,15 @@ impl TransactionStorage for UncompressedStorage {
         let mut lines = reader.lines();
         let mut parser = SqlStreamParser::new();
         let mut statement_count = 0usize;
+        let mut statements: Vec<String> = Vec::new();
 
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let statements = parser.parse_line(&line)?;
+            statements.clear();
+            parser.parse_line(&line, &mut statements)?;
             statement_count += statements.len();
         }
 

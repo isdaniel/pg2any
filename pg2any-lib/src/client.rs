@@ -1384,54 +1384,11 @@ impl Drop for CdcClient {
 mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
-    use crate::destinations::PreCommitHook;
     use crate::types::Transaction;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
-
-    // Mock destination handler for testing
-    #[allow(dead_code)]
-    pub struct MockDestinationHandler {
-        pub should_fail: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl DestinationHandler for MockDestinationHandler {
-        async fn connect(&mut self, _connection_string: &str) -> Result<()> {
-            Ok(())
-        }
-
-        fn set_schema_mappings(&mut self, _mappings: std::collections::HashMap<String, String>) {
-            // Mock implementation - no-op
-        }
-
-        async fn execute_sql_batch_with_hook(
-            &mut self,
-            commands: &[String],
-            pre_commit_hook: Option<PreCommitHook>,
-        ) -> Result<()> {
-            if self.should_fail {
-                return Err(CdcError::generic("Mock execute_sql_batch error"));
-            }
-            // Mock implementation - just count the commands
-            for _ in commands {
-                // No-op
-            }
-
-            // Execute pre-commit hook if provided
-            if let Some(hook) = pre_commit_hook {
-                hook().await?;
-            }
-
-            Ok(())
-        }
-
-        async fn close(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
 
     async fn cleanup_default_metadata_file() {
         let _ = tokio::fs::remove_file("./pg2any_last_lsn.metadata").await;

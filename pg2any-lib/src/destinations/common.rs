@@ -28,7 +28,7 @@ pub fn map_schema(schema_mappings: &HashMap<String, String>, source_schema: &str
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 pub(crate) async fn execute_sqlx_batch_with_hook<DB>(
     pool: &sqlx::Pool<DB>,
-    commands: &[String],
+    commands: &[std::borrow::Cow<'_, str>],
     pre_commit_hook: Option<super::destination_factory::PreCommitHook>,
     db_name: &str,
 ) -> crate::error::Result<()>
@@ -44,7 +44,7 @@ where
 
     // Execute all commands in the transaction
     for (idx, sql) in commands.iter().enumerate() {
-        if let Err(e) = sqlx::query(sql).execute(&mut *tx).await {
+        if let Err(e) = sqlx::query(sql.as_ref()).execute(&mut *tx).await {
             // Rollback on error
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(

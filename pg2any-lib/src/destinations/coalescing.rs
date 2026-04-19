@@ -9,6 +9,8 @@
 // - UPDATE batching → CASE-WHEN:     `UPDATE t SET col = CASE WHEN ... END WHERE ... OR ...;`
 // - DELETE batching → OR-combined:   `DELETE FROM t WHERE (...) OR (...);`
 
+use std::borrow::Cow;
+
 /// Identifier quoting style used by the target database.
 ///
 /// Each database uses a different character to quote identifiers (table/column names):
@@ -323,15 +325,27 @@ fn build_coalesced_delete(deletes: &[ParsedDelete<'_>]) -> String {
     debug_assert!(!deletes.is_empty());
 
     if deletes.len() == 1 {
-        return format!("{}{};", deletes[0].prefix, deletes[0].where_clause);
+        let d = &deletes[0];
+        let mut out = String::with_capacity(d.prefix.len() + d.where_clause.len() + 1);
+        out.push_str(d.prefix);
+        out.push_str(d.where_clause);
+        out.push(';');
+        return out;
     }
 
-    let where_combined: Vec<String> = deletes
-        .iter()
-        .map(|d| format!("({})", d.where_clause))
-        .collect();
-
-    format!("{}{};", deletes[0].prefix, where_combined.join(" OR "))
+    let where_total: usize = deletes.iter().map(|d| d.where_clause.len() + 6).sum();
+    let mut out = String::with_capacity(deletes[0].prefix.len() + where_total + 1);
+    out.push_str(deletes[0].prefix);
+    for (i, d) in deletes.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" OR ");
+        }
+        out.push('(');
+        out.push_str(d.where_clause);
+        out.push(')');
+    }
+    out.push(';');
+    out
 }
 
 // ============================================================================
@@ -407,51 +421,73 @@ fn build_coalesced_update(updates: &[ParsedUpdate<'_>]) -> String {
 
     if updates.len() == 1 {
         let u = &updates[0];
-        let set_str: Vec<String> = u
-            .set_pairs
-            .iter()
-            .map(|(col, val)| format!("{} = {}", col, val))
-            .collect();
-        return format!(
-            "{} SET {} WHERE {};",
-            u.table,
-            set_str.join(", "),
-            u.where_clause
-        );
+        let set_total: usize = u.set_pairs.iter().map(|(c, v)| c.len() + v.len() + 4).sum();
+        let mut out =
+            String::with_capacity(u.table.len() + 7 + set_total + 7 + u.where_clause.len() + 1);
+        out.push_str(u.table);
+        out.push_str(" SET ");
+        for (i, (col, val)) in u.set_pairs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(col);
+            out.push_str(" = ");
+            out.push_str(val);
+        }
+        out.push_str(" WHERE ");
+        out.push_str(u.where_clause);
+        out.push(';');
+        return out;
     }
 
     let num_cols = updates[0].set_pairs.len();
 
-    // Build CASE-WHEN for each column
-    let mut set_parts: Vec<String> = Vec::with_capacity(num_cols);
+    let mut case_size = 0usize;
     for col_idx in 0..num_cols {
         let col_name = updates[0].set_pairs[col_idx].0;
-
-        let mut case_expr = format!("{} = CASE", col_name);
+        case_size += col_name.len() * 2 + 16;
         for u in updates {
             if col_idx < u.set_pairs.len() {
-                case_expr.push_str(&format!(
-                    " WHEN {} THEN {}",
-                    u.where_clause, u.set_pairs[col_idx].1
-                ));
+                case_size += u.where_clause.len() + u.set_pairs[col_idx].1.len() + 10;
             }
         }
-        case_expr.push_str(&format!(" ELSE {} END", col_name));
-        set_parts.push(case_expr);
     }
+    let where_size: usize = updates.iter().map(|u| u.where_clause.len() + 6).sum();
+    let mut out =
+        String::with_capacity(updates[0].table.len() + 7 + case_size + 7 + where_size + 1);
 
-    // Build OR-combined WHERE clause
-    let where_combined: Vec<String> = updates
-        .iter()
-        .map(|u| format!("({})", u.where_clause))
-        .collect();
-
-    format!(
-        "{} SET {} WHERE {};",
-        updates[0].table,
-        set_parts.join(", "),
-        where_combined.join(" OR ")
-    )
+    out.push_str(updates[0].table);
+    out.push_str(" SET ");
+    for col_idx in 0..num_cols {
+        if col_idx > 0 {
+            out.push_str(", ");
+        }
+        let col_name = updates[0].set_pairs[col_idx].0;
+        out.push_str(col_name);
+        out.push_str(" = CASE");
+        for u in updates {
+            if col_idx < u.set_pairs.len() {
+                out.push_str(" WHEN ");
+                out.push_str(u.where_clause);
+                out.push_str(" THEN ");
+                out.push_str(u.set_pairs[col_idx].1);
+            }
+        }
+        out.push_str(" ELSE ");
+        out.push_str(col_name);
+        out.push_str(" END");
+    }
+    out.push_str(" WHERE ");
+    for (i, u) in updates.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" OR ");
+        }
+        out.push('(');
+        out.push_str(u.where_clause);
+        out.push(')');
+    }
+    out.push(';');
+    out
 }
 
 // ============================================================================
@@ -467,11 +503,11 @@ fn build_coalesced_update(updates: &[ParsedUpdate<'_>]) -> String {
 /// Non-DML statements (TRUNCATE, etc.) pass through unchanged.
 /// Coalescing only merges **consecutive** statements of the same type targeting the same table.
 /// All strategies respect `max_packet_size` with an 80% safety margin.
-pub(crate) fn coalesce_commands(
-    commands: &[String],
+pub(crate) fn coalesce_commands<'a>(
+    commands: &'a [String],
     max_packet_size: u64,
     quote_style: QuoteStyle,
-) -> Vec<String> {
+) -> Vec<Cow<'a, str>> {
     if commands.is_empty() {
         return Vec::new();
     }
@@ -481,10 +517,12 @@ pub(crate) fn coalesce_commands(
     } else {
         ((max_packet_size as f64 * 0.8) as usize).max(1024)
     };
-    let mut result = Vec::with_capacity(commands.len());
+    let mut result: Vec<Cow<'a, str>> = Vec::with_capacity(commands.len());
     let mut i = 0;
 
     while i < commands.len() {
+        let start_i = i;
+
         // ── Try INSERT coalescing ────────────────────────────────────
         if let Some((prefix, values)) = parse_insert_parts(&commands[i], quote_style) {
             let mut group_values: Vec<&str> = vec![values];
@@ -509,9 +547,15 @@ pub(crate) fn coalesce_commands(
             }
 
             if group_values.len() == 1 {
-                result.push(format!("{}{};", prefix, group_values[0]));
+                // Single-row group: the original statement is already a valid
+                // INSERT — borrow it instead of rebuilding a new `String`.
+                result.push(Cow::Borrowed(commands[start_i].as_str()));
             } else {
-                result.push(format!("{}{};", prefix, group_values.join(", ")));
+                result.push(Cow::Owned(format!(
+                    "{}{};",
+                    prefix,
+                    group_values.join(", ")
+                )));
             }
             continue;
         }
@@ -552,7 +596,11 @@ pub(crate) fn coalesce_commands(
                 break;
             }
 
-            result.push(build_coalesced_update(&group));
+            if group.len() == 1 {
+                result.push(Cow::Borrowed(commands[start_i].as_str()));
+            } else {
+                result.push(Cow::Owned(build_coalesced_update(&group)));
+            }
             continue;
         }
 
@@ -579,12 +627,16 @@ pub(crate) fn coalesce_commands(
                 break;
             }
 
-            result.push(build_coalesced_delete(&group));
+            if group.len() == 1 {
+                result.push(Cow::Borrowed(commands[start_i].as_str()));
+            } else {
+                result.push(Cow::Owned(build_coalesced_delete(&group)));
+            }
             continue;
         }
 
         // ── Non-DML statement — pass through ────────────────────────
-        result.push(commands[i].clone());
+        result.push(Cow::Borrowed(commands[i].as_str()));
         i += 1;
     }
 
@@ -1192,6 +1244,8 @@ mod tests {
             result[0],
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'hello');"
         );
+        // Single-row groups must be borrowed (no rebuild).
+        assert!(matches!(result[0], Cow::Borrowed(_)));
     }
 
     #[test]

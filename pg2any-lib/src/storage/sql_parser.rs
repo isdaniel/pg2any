@@ -92,13 +92,15 @@ impl SqlStreamParser {
         self.statement_buffer.clear();
         self.state = ParseState::Normal;
 
+        let mut line_statements: Vec<String> = Vec::new();
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let line_statements = self.parse_line(&line)?;
-            for stmt in line_statements {
+            line_statements.clear();
+            self.parse_line(&line, &mut line_statements)?;
+            for stmt in line_statements.drain(..) {
                 if self.statement_count >= start_index {
                     statements.push(stmt);
                 }
@@ -116,9 +118,8 @@ impl SqlStreamParser {
         Ok(statements)
     }
 
-    /// Parse a single line and return any completed statements
-    pub fn parse_line(&mut self, line: &str) -> Result<Vec<String>> {
-        let mut statements = Vec::new();
+    /// Parse a single line and push any completed statements into `out`.
+    pub fn parse_line(&mut self, line: &str, out: &mut Vec<String>) -> Result<()> {
         let bytes = line.as_bytes();
         let mut i = 0;
 
@@ -145,7 +146,7 @@ impl SqlStreamParser {
                     }
                     b';' => {
                         if let Some(stmt) = self.take_trimmed_statement() {
-                            statements.push(stmt);
+                            out.push(stmt);
                         }
                         self.statement_buffer.clear();
                     }
@@ -199,7 +200,7 @@ impl SqlStreamParser {
 
         self.statement_buffer.push(b'\n');
 
-        Ok(statements)
+        Ok(())
     }
 
     /// Finalize parsing at EOF and return the remaining statement, if any
@@ -216,31 +217,30 @@ impl SqlStreamParser {
     /// Trim whitespace from the current statement buffer and return it as an
     /// owned `String`. Returns `None` when the trimmed contents are empty.
     ///
-    /// Fast path: valid UTF-8 uses a single `std::str::from_utf8` validation
-    /// with no additional copying of the borrowed slice until the owned
-    /// `String` is produced. Invalid UTF-8 falls back to `from_utf8_lossy`
-    /// to preserve the pre-refactor behavior (never drop statements on
-    /// encoding errors — data loss would be worse than a lossy character).
-    /// The internal buffer is left as-is; callers clear it after.
-    fn take_trimmed_statement(&self) -> Option<String> {
-        match std::str::from_utf8(&self.statement_buffer) {
-            Ok(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
-            Err(_) => {
-                let s = String::from_utf8_lossy(&self.statement_buffer);
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
+    /// Takes ownership of the internal buffer via `mem::take` so the common
+    /// valid-UTF-8 path avoids copying the bytes — we just reinterpret the
+    /// `Vec<u8>` as a `String` and trim in place. Invalid UTF-8 falls back
+    /// to `from_utf8_lossy` to preserve prior semantics (never drop a
+    /// statement on an encoding error). The caller's subsequent `.clear()`
+    /// is a cheap no-op on the now-empty buffer.
+    fn take_trimmed_statement(&mut self) -> Option<String> {
+        let buf = std::mem::take(&mut self.statement_buffer);
+        let mut s = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+
+        let trimmed_end = s.trim_end().len();
+        s.truncate(trimmed_end);
+        let leading = s.len() - s.trim_start().len();
+        if leading > 0 {
+            s.drain(..leading);
+        }
+
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
         }
     }
 

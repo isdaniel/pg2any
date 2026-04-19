@@ -357,12 +357,12 @@ impl TransactionManager {
         &self,
         tx_id: u32,
         metadata: &TransactionFileMetadata,
-        tx_state: Option<&ActiveTransactionState>,
+        tx_state: Option<ActiveTransactionState>,
     ) -> (Vec<PathBuf>, Vec<usize>) {
-        if let Some(state) = tx_state.filter(|state| !state.segments.is_empty()) {
+        if let Some(mut state) = tx_state.filter(|state| !state.segments.is_empty()) {
             (
-                state.segments.clone(),
-                state.segment_statement_counts.clone(),
+                std::mem::take(&mut state.segments),
+                std::mem::take(&mut state.segment_statement_counts),
             )
         } else if !metadata.segments.is_empty() {
             let paths = metadata
@@ -683,7 +683,7 @@ impl TransactionManager {
         let tx_state = self.take_and_flush_active_transaction(tx_id).await?;
 
         let (segment_paths, segment_counts) =
-            self.get_final_segment_info(tx_id, &metadata, tx_state.as_ref());
+            self.get_final_segment_info(tx_id, &metadata, tx_state);
 
         if segment_paths.is_empty() {
             return Err(CdcError::generic(format!(
@@ -1146,20 +1146,20 @@ impl TransactionManager {
 
     /// Generate TRUNCATE SQL command
     fn generate_truncate_sql(&self, tables: &[Arc<str>]) -> Result<String> {
-        // For simplicity, generate a TRUNCATE statement for each table
-        let mut sqls = Vec::with_capacity(tables.len());
+        // Build all TRUNCATE statements into a single `String` — no intermediate Vec.
+        // Pre-size for ~48 bytes per table (keyword + identifiers + punctuation).
+        let mut sql = String::with_capacity(tables.len() * 48);
 
-        for table_spec in tables {
+        for (i, table_spec) in tables.iter().enumerate() {
             let table_spec: &str = table_spec;
-            // table_spec might include schema, parse it
-            let parts: Vec<&str> = table_spec.split('.').collect();
-            let (schema, table) = if parts.len() == 2 {
-                (self.map_schema(Some(parts[0])), parts[1])
-            } else {
-                (self.map_schema(Some("public")), table_spec)
+            let (schema, table) = match table_spec.split_once('.') {
+                Some((s, t)) if !t.contains('.') => (self.map_schema(Some(s)), t),
+                _ => (self.map_schema(Some("public")), table_spec),
             };
 
-            let mut sql = String::with_capacity(32 + table.len() + schema.len());
+            if i > 0 {
+                sql.push('\n');
+            }
             match self.destination_type {
                 DestinationType::MySQL | DestinationType::SqlServer => {
                     sql.push_str("TRUNCATE TABLE ");
@@ -1174,24 +1174,9 @@ impl TransactionManager {
                     sql.push(';');
                 }
             }
-            sqls.push(sql);
         }
 
-        Ok(sqls.join("\n"))
-    }
-
-    /// Build WHERE clause for UPDATE/DELETE based on replica identity
-    #[allow(dead_code)]
-    fn build_where_clause(
-        &self,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[Arc<str>],
-        old_data: Option<&RowData>,
-        new_data: &RowData,
-    ) -> Result<String> {
-        let mut out = String::new();
-        self.append_where_clause(&mut out, replica_identity, key_columns, old_data, new_data)?;
-        Ok(out)
+        Ok(sql)
     }
 
     /// Append WHERE clause conditions directly into the provided buffer
@@ -1290,7 +1275,7 @@ impl TransactionManager {
     /// - MySQL:      wraps in backticks, doubling any embedded backticks.
     /// - SQL Server: wraps in brackets, doubling any embedded closing brackets.
     /// - SQLite:     wraps in double quotes, doubling any embedded double quotes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn quote_identifier(&self, name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 2);
         self.append_quoted_identifier(&mut out, name);
@@ -1313,17 +1298,6 @@ impl TransactionManager {
             buf.push(HEX[(b & 0x0f) as usize]);
         }
         out.push_str(suffix);
-    }
-
-    /// Format raw bytes as a hex-encoded SQL literal appropriate for the destination.
-    ///
-    /// - MySQL / SQLite use the SQL-standard `X'deadbeef'` syntax.
-    /// - SQL Server uses the T-SQL `0xdeadbeef` syntax (no quotes).
-    #[allow(dead_code)]
-    fn format_hex_literal(&self, bytes: &[u8]) -> String {
-        let mut out = String::new();
-        self.append_hex_literal(&mut out, bytes);
-        out
     }
 
     /// Append a `ColumnValue` literal directly into `out`.
@@ -1378,22 +1352,25 @@ impl TransactionManager {
     ///              to preserve values like leading-zero strings (e.g. zip codes).
     ///              Falls back to a hex literal when the payload is not valid UTF-8.
     /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn format_value(&self, value: &ColumnValue) -> String {
         let mut out = String::new();
         self.append_value(&mut out, value);
         out
     }
 
-    /// Map source schema to destination schema
-    fn map_schema(&self, source_schema: Option<&str>) -> String {
-        if let Some(schema) = source_schema {
-            self.schema_mappings
+    /// Map source schema to destination schema.
+    ///
+    /// Returns a borrow from the mapping table, the caller's input, or the
+    /// `"public"` literal — no per-call allocation.
+    fn map_schema<'a>(&'a self, source_schema: Option<&'a str>) -> &'a str {
+        match source_schema {
+            Some(schema) => self
+                .schema_mappings
                 .get(schema)
-                .cloned()
-                .unwrap_or_else(|| schema.to_string())
-        } else {
-            "public".to_string()
+                .map(String::as_str)
+                .unwrap_or(schema),
+            None => "public",
         }
     }
 }
@@ -1476,13 +1453,15 @@ impl TransactionManager {
         let buf_reader = BufReader::new(reader);
         let mut lines = buf_reader.lines();
 
+        let mut statements: Vec<String> = Vec::new();
         while let Some(line) = lines
             .next_line()
             .await
             .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
         {
-            let statements = parser.parse_line(&line)?;
-            for stmt in statements {
+            statements.clear();
+            parser.parse_line(&line, &mut statements)?;
+            for stmt in statements.drain(..) {
                 if statement_index >= start_index {
                     state.batch.push(stmt);
 
@@ -1646,7 +1625,7 @@ impl TransactionManager {
         );
 
         let mut segments = if !latest_metadata.segments.is_empty() {
-            latest_metadata.segments.clone()
+            latest_metadata.segments
         } else {
             pending_tx.metadata.segments.clone()
         };

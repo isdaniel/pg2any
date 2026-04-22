@@ -75,8 +75,8 @@ fn find_keyword_outside_quotes(sql: &str, keyword: &str, quote_style: QuoteStyle
         if ch == b'\'' {
             pos += 1;
             while pos < bytes.len() {
-                if bytes[pos] == b'\\' {
-                    pos += 2; // backslash escape (MySQL default)
+                if quote_style == QuoteStyle::Backtick && bytes[pos] == b'\\' {
+                    pos += 2;
                     continue;
                 }
                 if bytes[pos] == b'\'' {
@@ -185,7 +185,7 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
                 // Skip single-quoted string
                 pos += 1;
                 while pos < bytes.len() {
-                    if bytes[pos] == b'\\' {
+                    if quote_style == QuoteStyle::Backtick && bytes[pos] == b'\\' {
                         pos += 2;
                         continue;
                     }
@@ -451,7 +451,7 @@ fn parse_where_equality_pairs<'a>(
         if ch == b'\'' {
             pos += 1;
             while pos < bytes.len() {
-                if bytes[pos] == b'\\' {
+                if quote_style == QuoteStyle::Backtick && bytes[pos] == b'\\' {
                     pos += 2;
                     continue;
                 }

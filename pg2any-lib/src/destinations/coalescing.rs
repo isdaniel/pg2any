@@ -61,11 +61,7 @@ impl QuoteStyle {
 /// - Case-insensitive keyword matching
 ///
 /// Returns the byte offset of the first match, or `None`.
-pub(crate) fn find_keyword_outside_quotes(
-    sql: &str,
-    keyword: &str,
-    quote_style: QuoteStyle,
-) -> Option<usize> {
+fn find_keyword_outside_quotes(sql: &str, keyword: &str, quote_style: QuoteStyle) -> Option<usize> {
     let bytes = sql.as_bytes();
     let keyword_len = keyword.len();
     let open = quote_style.open_char();
@@ -231,14 +227,18 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
     pairs
 }
 
-/// Extract column signature from SET pairs for grouping.
-/// Two UPDATE statements can be coalesced if they have the same table and column signature.
-fn column_signature(pairs: &[(&str, &str)]) -> String {
-    pairs
-        .iter()
-        .map(|(col, _)| *col)
-        .collect::<Vec<_>>()
-        .join(",")
+/// Zero-allocation check that two SET clauses target the same columns in the same order.
+///
+/// Two UPDATE statements can be coalesced only if they have an identical column signature;
+/// previously this was computed via `Vec<&str>::join(",")` per statement, which allocated a
+/// `String` for every comparison. Iterator equality on the column-name component is the same
+/// check without any heap allocation.
+#[inline]
+fn columns_match(a: &[(&str, &str)], b: &[(&str, &str)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|((col_a, _), (col_b, _))| col_a == col_b)
 }
 
 // ============================================================================
@@ -360,6 +360,11 @@ struct ParsedUpdate<'a> {
     set_pairs: Vec<(&'a str, &'a str)>,
     /// The WHERE conditions: `` "`id` = 1" ``
     where_clause: &'a str,
+    /// WHERE decomposed into (column, value) equality pairs.
+    /// `Some` only when the WHERE is `col1 = v1 AND col2 = v2 ...` with non-NULL RHS values —
+    /// the shape produced by CDC replica-identity emit and the precondition for the
+    /// VALUES-JOIN rewrite. Complex WHERE clauses yield `None` and fall back to CASE-WHEN.
+    where_pairs: Option<Vec<(&'a str, &'a str)>>,
 }
 
 /// Parse an UPDATE statement into table, SET pairs, and WHERE clause.
@@ -400,11 +405,145 @@ fn parse_update_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedUpdate
         return None;
     }
 
+    let where_pairs = parse_where_equality_pairs(where_clause, quote_style);
+
     Some(ParsedUpdate {
         table,
         set_pairs,
         where_clause,
+        where_pairs,
     })
+}
+
+/// Decompose a WHERE clause into (column, value) equality pairs.
+///
+/// Accepts only `<quoted-ident> = <value>` chunks joined by ` AND `. Rejects:
+/// - `IS NULL` / `IS NOT NULL` (can't JOIN on NULL equality)
+/// - `= NULL` literal (same reason — would never match in a JOIN)
+/// - Non-equality operators (`<`, `>`, `LIKE`, ...)
+/// - `OR` / parenthesised sub-expressions
+///
+/// These rejections are fallback signals; the caller re-uses the CASE-WHEN path,
+/// which works for any WHERE shape.
+fn parse_where_equality_pairs<'a>(
+    where_clause: &'a str,
+    quote_style: QuoteStyle,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    let bytes = where_clause.as_bytes();
+    let open = quote_style.open_char();
+    let close = quote_style.close_char();
+
+    // Split on ` AND ` outside quotes, rejecting ` OR ` and `(` entirely.
+    let mut chunks: Vec<&'a str> = Vec::new();
+    let mut pos = 0;
+    let mut chunk_start = 0;
+    while pos < bytes.len() {
+        let ch = bytes[pos];
+
+        if ch == b'\'' {
+            pos += 1;
+            while pos < bytes.len() {
+                if bytes[pos] == b'\'' {
+                    if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
+                        pos += 2;
+                        continue;
+                    }
+                    break;
+                }
+                pos += 1;
+            }
+            pos += 1;
+            continue;
+        }
+
+        if ch == open {
+            pos += 1;
+            while pos < bytes.len() {
+                if bytes[pos] == close {
+                    if pos + 1 < bytes.len() && bytes[pos + 1] == close {
+                        pos += 2;
+                        continue;
+                    }
+                    break;
+                }
+                pos += 1;
+            }
+            pos += 1;
+            continue;
+        }
+
+        // Reject parentheses and OR — these indicate a compound shape we can't rewrite.
+        if ch == b'(' || ch == b')' {
+            return None;
+        }
+        if pos + 4 <= bytes.len() && bytes[pos..pos + 4].eq_ignore_ascii_case(b" OR ") {
+            return None;
+        }
+
+        if pos + 5 <= bytes.len() && bytes[pos..pos + 5].eq_ignore_ascii_case(b" AND ") {
+            chunks.push(&where_clause[chunk_start..pos]);
+            pos += 5;
+            chunk_start = pos;
+            continue;
+        }
+
+        pos += 1;
+    }
+    if chunk_start < bytes.len() {
+        chunks.push(&where_clause[chunk_start..]);
+    }
+    if chunks.is_empty() {
+        return None;
+    }
+
+    let mut pairs = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        let cb = chunk.as_bytes();
+        if cb.is_empty() || cb[0] != open {
+            return None;
+        }
+        // Walk the quoted identifier
+        let mut p = 1;
+        while p < cb.len() {
+            if cb[p] == close {
+                if p + 1 < cb.len() && cb[p + 1] == close {
+                    p += 2;
+                    continue;
+                }
+                break;
+            }
+            p += 1;
+        }
+        if p >= cb.len() {
+            return None;
+        }
+        let col = &chunk[..p + 1];
+
+        let mut q = p + 1;
+        while q < cb.len() && cb[q].is_ascii_whitespace() {
+            q += 1;
+        }
+        // Must be `=` — reject `IS NULL`, `!=`, `<`, `>`, `LIKE`, etc.
+        if q >= cb.len() || cb[q] != b'=' {
+            return None;
+        }
+        q += 1;
+        // Reject `==`, `=>`, etc. — must be single `=` followed by whitespace or value.
+        if q < cb.len() && (cb[q] == b'=' || cb[q] == b'>' || cb[q] == b'<') {
+            return None;
+        }
+        while q < cb.len() && cb[q].is_ascii_whitespace() {
+            q += 1;
+        }
+        let val = chunk[q..].trim();
+        if val.is_empty() || val.eq_ignore_ascii_case("NULL") {
+            return None;
+        }
+        pairs.push((col, val));
+    }
+
+    Some(pairs)
 }
 
 /// Build a coalesced UPDATE using CASE-WHEN from multiple parsed update statements.
@@ -490,9 +629,267 @@ fn build_coalesced_update(updates: &[ParsedUpdate<'_>]) -> String {
     out
 }
 
+// ----------------------------------------------------------------------------
+// VALUES-JOIN UPDATE rewrite
+// ----------------------------------------------------------------------------
+//
+// For large groups, CASE-WHEN is O(rows × cols) server-side: every matched row
+// evaluates every WHEN in every column. VALUES-JOIN builds a derived table of
+// the new values and JOINs once on the key — the DB can hash/merge-join and
+// pay the SET cost only for matched rows.
+//
+// Output shape (portable `SELECT … UNION ALL …` derived table, works on
+// MySQL 5.7+, SQLite 3.33+, SQL Server 2008+):
+//
+// MySQL (Backtick):
+//   UPDATE `db`.`t` AS __pg2any_t JOIN (
+//     SELECT 1 AS `id`, 'a' AS `name`, 30 AS `age`
+//     UNION ALL SELECT 2, 'b', 31
+//   ) AS __pg2any_v ON __pg2any_t.`id` = __pg2any_v.`id`
+//   SET __pg2any_t.`name` = __pg2any_v.`name`,
+//       __pg2any_t.`age`  = __pg2any_v.`age`;
+//
+// SQLite (DoubleQuote):
+//   UPDATE "t" AS __pg2any_t
+//   SET "name" = __pg2any_v."name", "age" = __pg2any_v."age"
+//   FROM (SELECT 1 AS "id", 'a' AS "name", 30 AS "age"
+//         UNION ALL SELECT 2, 'b', 31) AS __pg2any_v
+//   WHERE __pg2any_t."id" = __pg2any_v."id";
+//
+// SQL Server (Bracket):
+//   UPDATE __pg2any_t
+//   SET __pg2any_t.[name] = __pg2any_v.[name],
+//       __pg2any_t.[age]  = __pg2any_v.[age]
+//   FROM [db].[t] AS __pg2any_t INNER JOIN (
+//     SELECT 1 AS [id], 'a' AS [name], 30 AS [age]
+//     UNION ALL SELECT 2, 'b', 31
+//   ) AS __pg2any_v ON __pg2any_t.[id] = __pg2any_v.[id];
+
+const T_ALIAS: &str = "__pg2any_t";
+const V_ALIAS: &str = "__pg2any_v";
+
+/// Strip the `UPDATE ` prefix from a parsed table reference.
+///
+/// `parse_update_parts` stores the whole `"UPDATE `db`.`t`"` slice as `table` so the
+/// CASE-WHEN path can emit it verbatim. VALUES-JOIN needs just the table reference.
+fn strip_update_prefix(table: &str) -> &str {
+    if table.len() >= 7 && table[..7].eq_ignore_ascii_case("UPDATE ") {
+        table[7..].trim_start()
+    } else {
+        table
+    }
+}
+
+/// Append the derived-table body: `SELECT v1 AS c1, ... UNION ALL SELECT v1, ...`.
+/// The first row carries column aliases (they propagate to later rows via UNION ALL).
+fn push_values_select_body(out: &mut String, group: &[ParsedUpdate<'_>]) {
+    let first_keys = group[0]
+        .where_pairs
+        .as_ref()
+        .expect("caller validated where_pairs");
+
+    out.push_str("SELECT ");
+    let mut first = true;
+    for (col, val) in first_keys {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(val);
+        out.push_str(" AS ");
+        out.push_str(col);
+    }
+    for (col, val) in &group[0].set_pairs {
+        out.push_str(", ");
+        out.push_str(val);
+        out.push_str(" AS ");
+        out.push_str(col);
+    }
+
+    for u in &group[1..] {
+        out.push_str(" UNION ALL SELECT ");
+        let keys = u.where_pairs.as_ref().expect("caller validated");
+        let mut first = true;
+        for (_, val) in keys {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(val);
+        }
+        for (_, val) in &u.set_pairs {
+            out.push_str(", ");
+            out.push_str(val);
+        }
+    }
+}
+
+/// Append `__pg2any_t.k1 = __pg2any_v.k1 AND __pg2any_t.k2 = __pg2any_v.k2 ...`
+fn push_join_on(out: &mut String, key_cols: &[(&str, &str)]) {
+    for (i, (col, _)) in key_cols.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" AND ");
+        }
+        out.push_str(T_ALIAS);
+        out.push('.');
+        out.push_str(col);
+        out.push_str(" = ");
+        out.push_str(V_ALIAS);
+        out.push('.');
+        out.push_str(col);
+    }
+}
+
+/// Append SET assignments. `qualify_target` controls whether the LHS is prefixed with
+/// the target alias (`__pg2any_t.col = __pg2any_v.col`) — needed by MySQL and SQL Server,
+/// omitted by SQLite where the UPDATE target is implicit in SET.
+fn push_set_assignments(out: &mut String, set_cols: &[(&str, &str)], qualify_target: bool) {
+    for (i, (col, _)) in set_cols.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        if qualify_target {
+            out.push_str(T_ALIAS);
+            out.push('.');
+        }
+        out.push_str(col);
+        out.push_str(" = ");
+        out.push_str(V_ALIAS);
+        out.push('.');
+        out.push_str(col);
+    }
+}
+
+/// Attempt to rewrite a coalesced UPDATE group into VALUES-JOIN form. Returns `None`
+/// when any precondition fails; caller then falls back to `build_coalesced_update`.
+fn build_values_join_update(group: &[ParsedUpdate<'_>], quote_style: QuoteStyle) -> Option<String> {
+    debug_assert!(group.len() >= 2);
+
+    // Precondition: every row's WHERE must decompose into equality pairs with matching columns.
+    let first_keys = group[0].where_pairs.as_ref()?;
+    if first_keys.is_empty() {
+        return None;
+    }
+    for u in &group[1..] {
+        let keys = u.where_pairs.as_ref()?;
+        if keys.len() != first_keys.len() {
+            return None;
+        }
+        for ((ka, _), (kb, _)) in first_keys.iter().zip(keys.iter()) {
+            if ka != kb {
+                return None;
+            }
+        }
+    }
+
+    // Precondition: SET columns and WHERE-key columns must be disjoint to avoid ambiguity
+    // in the derived-table column list (same name would collide in the UNION ALL aliases).
+    let set_cols = &group[0].set_pairs;
+    for (key_col, _) in first_keys {
+        for (set_col, _) in set_cols {
+            if key_col == set_col {
+                return None;
+            }
+        }
+    }
+
+    let table_ref = strip_update_prefix(group[0].table);
+
+    // Rough pre-allocation: sum of all values plus fixed overhead per row.
+    let mut cap = 128 + table_ref.len();
+    for u in group {
+        cap += u.where_clause.len() + 16;
+        for (c, v) in &u.set_pairs {
+            cap += c.len() + v.len() + 8;
+        }
+    }
+    let mut out = String::with_capacity(cap);
+
+    match quote_style {
+        QuoteStyle::Backtick => {
+            out.push_str("UPDATE ");
+            out.push_str(table_ref);
+            out.push_str(" AS ");
+            out.push_str(T_ALIAS);
+            out.push_str(" JOIN (");
+            push_values_select_body(&mut out, group);
+            out.push_str(") AS ");
+            out.push_str(V_ALIAS);
+            out.push_str(" ON ");
+            push_join_on(&mut out, first_keys);
+            out.push_str(" SET ");
+            push_set_assignments(&mut out, set_cols, true);
+            out.push(';');
+        }
+        QuoteStyle::DoubleQuote => {
+            out.push_str("UPDATE ");
+            out.push_str(table_ref);
+            out.push_str(" AS ");
+            out.push_str(T_ALIAS);
+            out.push_str(" SET ");
+            push_set_assignments(&mut out, set_cols, false);
+            out.push_str(" FROM (");
+            push_values_select_body(&mut out, group);
+            out.push_str(") AS ");
+            out.push_str(V_ALIAS);
+            out.push_str(" WHERE ");
+            push_join_on(&mut out, first_keys);
+            out.push(';');
+        }
+        QuoteStyle::Bracket => {
+            out.push_str("UPDATE ");
+            out.push_str(T_ALIAS);
+            out.push_str(" SET ");
+            push_set_assignments(&mut out, set_cols, true);
+            out.push_str(" FROM ");
+            out.push_str(table_ref);
+            out.push_str(" AS ");
+            out.push_str(T_ALIAS);
+            out.push_str(" INNER JOIN (");
+            push_values_select_body(&mut out, group);
+            out.push_str(") AS ");
+            out.push_str(V_ALIAS);
+            out.push_str(" ON ");
+            push_join_on(&mut out, first_keys);
+            out.push(';');
+        }
+    }
+
+    Some(out)
+}
+
 // ============================================================================
 // Unified Command Coalescing
 // ============================================================================
+
+/// A single classified statement. Each command in the input is parsed at most once
+/// per call to `coalesce_commands`: the group-lookahead loop consumes the parse when
+/// the statement joins the group, otherwise it's handed to the next outer iteration
+/// via the `pending` cache so we never pay for a second parse.
+enum ParsedCmd<'a> {
+    Insert {
+        prefix: &'a str,
+        values: &'a str,
+    },
+    Update(ParsedUpdate<'a>),
+    Delete(ParsedDelete<'a>),
+    /// Not a coalescable DML statement (TRUNCATE, DDL, comments, …).
+    Other,
+}
+
+#[inline]
+fn classify<'a>(sql: &'a str, quote_style: QuoteStyle) -> ParsedCmd<'a> {
+    if let Some((prefix, values)) = parse_insert_parts(sql, quote_style) {
+        return ParsedCmd::Insert { prefix, values };
+    }
+    if let Some(u) = parse_update_parts(sql, quote_style) {
+        return ParsedCmd::Update(u);
+    }
+    if let Some(d) = parse_delete_parts(sql, quote_style) {
+        return ParsedCmd::Delete(d);
+    }
+    ParsedCmd::Other
+}
 
 /// Coalesce consecutive DML statements targeting the same table into batch operations:
 ///
@@ -519,125 +916,147 @@ pub(crate) fn coalesce_commands<'a>(
     };
     let mut result: Vec<Cow<'a, str>> = Vec::with_capacity(commands.len());
     let mut i = 0;
+    // Carry-over from a group's lookahead: the statement at `i` has already been classified.
+    let mut pending: Option<ParsedCmd<'a>> = None;
 
     while i < commands.len() {
         let start_i = i;
+        let current = pending
+            .take()
+            .unwrap_or_else(|| classify(&commands[i], quote_style));
 
-        // ── Try INSERT coalescing ────────────────────────────────────
-        if let Some((prefix, values)) = parse_insert_parts(&commands[i], quote_style) {
-            let mut group_values: Vec<&str> = vec![values];
-            let mut group_size = prefix.len() + values.len() + 1;
-            i += 1;
+        match current {
+            // ── INSERT coalescing ───────────────────────────────────────
+            ParsedCmd::Insert { prefix, values } => {
+                let mut group_values: Vec<&str> = vec![values];
+                let mut group_size = prefix.len() + values.len() + 1;
+                i += 1;
 
-            while i < commands.len() {
-                if let Some((next_prefix, next_values)) =
-                    parse_insert_parts(&commands[i], quote_style)
-                {
-                    if next_prefix == prefix {
-                        let additional_size = 2 + next_values.len();
-                        if group_size + additional_size <= safety_limit {
-                            group_values.push(next_values);
-                            group_size += additional_size;
-                            i += 1;
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-
-            if group_values.len() == 1 {
-                // Single-row group: the original statement is already a valid
-                // INSERT — borrow it instead of rebuilding a new `String`.
-                result.push(Cow::Borrowed(commands[start_i].as_str()));
-            } else {
-                result.push(Cow::Owned(format!(
-                    "{}{};",
-                    prefix,
-                    group_values.join(", ")
-                )));
-            }
-            continue;
-        }
-
-        // ── Try UPDATE coalescing (CASE-WHEN) ───────────────────────
-        if let Some(first_update) = parse_update_parts(&commands[i], quote_style) {
-            let col_sig = column_signature(&first_update.set_pairs);
-            let table = first_update.table;
-            let mut group: Vec<ParsedUpdate<'_>> = vec![first_update];
-            let mut group_size = commands[i].len();
-            i += 1;
-
-            while i < commands.len() {
-                if let Some(next_update) = parse_update_parts(&commands[i], quote_style) {
-                    if next_update.table == table
-                        && column_signature(&next_update.set_pairs) == col_sig
+                while i < commands.len() {
+                    let next = classify(&commands[i], quote_style);
+                    if let ParsedCmd::Insert {
+                        prefix: np,
+                        values: nv,
+                    } = next
                     {
-                        // Estimate additional size: each new row adds WHEN clauses per column + OR in WHERE
-                        let num_cols = next_update.set_pairs.len();
-                        let avg_val_len: usize = next_update
-                            .set_pairs
-                            .iter()
-                            .map(|(_, v)| v.len())
-                            .sum::<usize>()
-                            / num_cols.max(1);
-                        let additional = num_cols
-                            * (6 + next_update.where_clause.len() + 6 + avg_val_len)
-                            + 6
-                            + next_update.where_clause.len();
-                        if group_size + additional <= safety_limit {
-                            group_size += additional;
-                            group.push(next_update);
-                            i += 1;
-                            continue;
+                        if np == prefix {
+                            let additional_size = 2 + nv.len();
+                            if group_size + additional_size <= safety_limit {
+                                group_values.push(nv);
+                                group_size += additional_size;
+                                i += 1;
+                                continue;
+                            }
                         }
+                        pending = Some(ParsedCmd::Insert {
+                            prefix: np,
+                            values: nv,
+                        });
+                    } else {
+                        pending = Some(next);
                     }
+                    break;
                 }
-                break;
+
+                if group_values.len() == 1 {
+                    // Single-row group: the original statement is already a valid
+                    // INSERT — borrow it instead of rebuilding a new `String`.
+                    result.push(Cow::Borrowed(commands[start_i].as_str()));
+                } else {
+                    result.push(Cow::Owned(format!(
+                        "{}{};",
+                        prefix,
+                        group_values.join(", ")
+                    )));
+                }
             }
 
-            if group.len() == 1 {
-                result.push(Cow::Borrowed(commands[start_i].as_str()));
-            } else {
-                result.push(Cow::Owned(build_coalesced_update(&group)));
-            }
-            continue;
-        }
+            // ── UPDATE coalescing (CASE-WHEN) ───────────────────────────
+            ParsedCmd::Update(first_update) => {
+                let table = first_update.table;
+                let mut group: Vec<ParsedUpdate<'a>> = vec![first_update];
+                let mut group_size = commands[start_i].len();
+                i += 1;
 
-        // ── Try DELETE coalescing (OR-combined WHERE) ────────────────
-        if let Some(first_delete) = parse_delete_parts(&commands[i], quote_style) {
-            let prefix = first_delete.prefix;
-            let mut group: Vec<ParsedDelete<'_>> = vec![first_delete];
-            let mut group_size = commands[i].len();
-            i += 1;
-
-            while i < commands.len() {
-                if let Some(next_delete) = parse_delete_parts(&commands[i], quote_style) {
-                    if next_delete.prefix == prefix {
-                        // Additional size: " OR (where_clause)"
-                        let additional = 5 + next_delete.where_clause.len() + 1; // " OR (" + where + ")"
-                        if group_size + additional <= safety_limit {
-                            group_size += additional;
-                            group.push(next_delete);
-                            i += 1;
-                            continue;
+                while i < commands.len() {
+                    let next = classify(&commands[i], quote_style);
+                    if let ParsedCmd::Update(nu) = next {
+                        if nu.table == table && columns_match(&group[0].set_pairs, &nu.set_pairs) {
+                            // Estimate additional size: new WHEN clauses per column + OR in WHERE.
+                            let num_cols = nu.set_pairs.len();
+                            let avg_val_len: usize =
+                                nu.set_pairs.iter().map(|(_, v)| v.len()).sum::<usize>()
+                                    / num_cols.max(1);
+                            let additional = num_cols
+                                * (6 + nu.where_clause.len() + 6 + avg_val_len)
+                                + 6
+                                + nu.where_clause.len();
+                            if group_size + additional <= safety_limit {
+                                group_size += additional;
+                                group.push(nu);
+                                i += 1;
+                                continue;
+                            }
                         }
+                        pending = Some(ParsedCmd::Update(nu));
+                    } else {
+                        pending = Some(next);
                     }
+                    break;
                 }
-                break;
+
+                if group.len() == 1 {
+                    result.push(Cow::Borrowed(commands[start_i].as_str()));
+                } else if let Some(sql) = build_values_join_update(&group, quote_style) {
+                    // VALUES-JOIN rewrite succeeded — cheaper server-side than CASE-WHEN
+                    // for the common CDC shape (equality WHERE on primary/replica-identity keys).
+                    result.push(Cow::Owned(sql));
+                } else {
+                    // WHERE wasn't pure equality, or keys overlapped SET columns — fall back.
+                    result.push(Cow::Owned(build_coalesced_update(&group)));
+                }
             }
 
-            if group.len() == 1 {
-                result.push(Cow::Borrowed(commands[start_i].as_str()));
-            } else {
-                result.push(Cow::Owned(build_coalesced_delete(&group)));
+            // ── DELETE coalescing (OR-combined WHERE) ───────────────────
+            ParsedCmd::Delete(first_delete) => {
+                let prefix = first_delete.prefix;
+                let mut group: Vec<ParsedDelete<'a>> = vec![first_delete];
+                let mut group_size = commands[start_i].len();
+                i += 1;
+
+                while i < commands.len() {
+                    let next = classify(&commands[i], quote_style);
+                    if let ParsedCmd::Delete(nd) = next {
+                        if nd.prefix == prefix {
+                            // Additional size: " OR (where_clause)"
+                            let additional = 5 + nd.where_clause.len() + 1;
+                            if group_size + additional <= safety_limit {
+                                group_size += additional;
+                                group.push(nd);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        pending = Some(ParsedCmd::Delete(nd));
+                    } else {
+                        pending = Some(next);
+                    }
+                    break;
+                }
+
+                if group.len() == 1 {
+                    result.push(Cow::Borrowed(commands[start_i].as_str()));
+                } else {
+                    result.push(Cow::Owned(build_coalesced_delete(&group)));
+                }
             }
-            continue;
+
+            // ── Non-DML statement — pass through ────────────────────────
+            ParsedCmd::Other => {
+                result.push(Cow::Borrowed(commands[i].as_str()));
+                i += 1;
+            }
         }
-
-        // ── Non-DML statement — pass through ────────────────────────
-        result.push(Cow::Borrowed(commands[i].as_str()));
-        i += 1;
     }
 
     result
@@ -1441,19 +1860,18 @@ mod tests {
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
 
-        // Verify CASE-WHEN structure
-        assert!(result[0].starts_with("UPDATE `db`.`t` SET "));
-        assert!(result[0].contains("`name` = CASE"));
-        assert!(result[0].contains("`age` = CASE"));
-        assert!(result[0].contains("WHEN `id` = 1 THEN 'a'"));
-        assert!(result[0].contains("WHEN `id` = 2 THEN 'b'"));
-        assert!(result[0].contains("WHEN `id` = 3 THEN 'c'"));
-        assert!(result[0].contains("WHEN `id` = 1 THEN 30"));
-        assert!(result[0].contains("WHEN `id` = 2 THEN 31"));
-        assert!(result[0].contains("WHEN `id` = 3 THEN 32"));
-        assert!(result[0].contains("ELSE `name` END"));
-        assert!(result[0].contains("ELSE `age` END"));
-        assert!(result[0].contains("(`id` = 1) OR (`id` = 2) OR (`id` = 3)"));
+        // Verify VALUES-JOIN shape (MySQL: UPDATE t AS __t JOIN (SELECT ...) AS __v ON ... SET ...)
+        assert!(result[0].starts_with("UPDATE `db`.`t` AS __pg2any_t JOIN ("));
+        // First row provides column aliases
+        assert!(result[0].contains("SELECT 1 AS `id`, 'a' AS `name`, 30 AS `age`"));
+        // Subsequent rows are plain value tuples
+        assert!(result[0].contains("UNION ALL SELECT 2, 'b', 31"));
+        assert!(result[0].contains("UNION ALL SELECT 3, 'c', 32"));
+        // Join on the WHERE key
+        assert!(result[0].contains("ON __pg2any_t.`id` = __pg2any_v.`id`"));
+        // SET assignments pull from derived table
+        assert!(result[0].contains("SET __pg2any_t.`name` = __pg2any_v.`name`"));
+        assert!(result[0].contains("__pg2any_t.`age` = __pg2any_v.`age`"));
         assert!(result[0].ends_with(';'));
     }
 
@@ -1486,13 +1904,18 @@ mod tests {
         ];
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains("WHEN `k1` = 1 AND `k2` = 'a' THEN 'x'"));
-        assert!(result[0].contains("WHEN `k1` = 2 AND `k2` = 'b' THEN 'y'"));
-        assert!(result[0].contains("(`k1` = 1 AND `k2` = 'a') OR (`k1` = 2 AND `k2` = 'b')"));
+        // Composite keys produce multi-column derived table and multi-condition JOIN
+        assert!(result[0].contains("SELECT 1 AS `k1`, 'a' AS `k2`, 'x' AS `val`"));
+        assert!(result[0].contains("UNION ALL SELECT 2, 'b', 'y'"));
+        assert!(result[0].contains(
+            "ON __pg2any_t.`k1` = __pg2any_v.`k1` AND __pg2any_t.`k2` = __pg2any_v.`k2`"
+        ));
+        assert!(result[0].contains("SET __pg2any_t.`val` = __pg2any_v.`val`"));
     }
 
     #[test]
-    fn test_coalesce_updates_preserves_else_clause() {
+    fn test_coalesce_updates_no_case_when_for_equality_where() {
+        // VALUES-JOIN rewrite is preferred — no CASE/ELSE in the output.
         let commands = vec![
             "UPDATE `db`.`t` SET `name` = 'a' WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'b' WHERE `id` = 2;".to_string(),
@@ -1500,10 +1923,12 @@ mod tests {
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(
-            result[0].contains("ELSE `name` END"),
-            "Should have ELSE clause for safety: {}",
+            !result[0].contains("CASE"),
+            "equality-only WHERE should use VALUES-JOIN, not CASE-WHEN: {}",
             result[0]
         );
+        assert!(result[0].contains("JOIN ("));
+        assert!(result[0].contains("UNION ALL"));
     }
 
     #[test]
@@ -1544,9 +1969,10 @@ mod tests {
         assert!(result[0].starts_with("INSERT INTO"));
         assert!(result[0].contains("), ("));
 
-        // 2 UPDATE statements coalesced into CASE-WHEN
+        // 2 UPDATE statements coalesced into VALUES-JOIN
         assert!(result[1].starts_with("UPDATE"));
-        assert!(result[1].contains("CASE"));
+        assert!(result[1].contains("JOIN ("));
+        assert!(result[1].contains("UNION ALL"));
 
         // 2 DELETE statements coalesced with OR
         assert!(result[2].starts_with("DELETE"));
@@ -1597,9 +2023,10 @@ mod tests {
 
         // Verify INSERT coalesced
         assert!(result[0].contains("(1, 'a'), (2, 'b'), (3, 'c')"));
-        // Verify UPDATE has CASE-WHEN
-        assert!(result[1].contains("CASE"));
-        assert!(result[1].contains("(`id` = 10) OR (`id` = 11)"));
+        // Verify UPDATE uses VALUES-JOIN
+        assert!(result[1].contains("JOIN ("));
+        assert!(result[1].contains("UNION ALL"));
+        assert!(result[1].contains("ON __pg2any_t.`id` = __pg2any_v.`id`"));
         // Verify DELETE has OR
         assert_eq!(
             result[2],
@@ -1657,16 +2084,17 @@ mod tests {
 
     #[test]
     fn test_coalesce_update_with_null_values() {
+        // NULL in SET is fine (JOIN matches via id, SET writes NULL); VALUES-JOIN still applies.
         let commands = vec![
             "UPDATE `db`.`t` SET `name` = 'a', `bio` = NULL WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'b', `bio` = NULL WHERE `id` = 2;".to_string(),
         ];
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains("WHEN `id` = 1 THEN 'a'"));
-        assert!(result[0].contains("WHEN `id` = 1 THEN NULL"));
-        assert!(result[0].contains("WHEN `id` = 2 THEN 'b'"));
-        assert!(result[0].contains("WHEN `id` = 2 THEN NULL"));
+        assert!(result[0].contains("SELECT 1 AS `id`, 'a' AS `name`, NULL AS `bio`"));
+        assert!(result[0].contains("UNION ALL SELECT 2, 'b', NULL"));
+        assert!(result[0].contains("SET __pg2any_t.`name` = __pg2any_v.`name`"));
+        assert!(result[0].contains("__pg2any_t.`bio` = __pg2any_v.`bio`"));
     }
 
     #[test]
@@ -1683,7 +2111,10 @@ mod tests {
             .collect();
         let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains("CASE"));
+        // Large batches use VALUES-JOIN — O(n) join vs O(n²) CASE-WHEN evaluation.
+        assert!(result[0].contains("JOIN ("));
+        assert!(result[0].contains("UNION ALL"));
+        assert!(!result[0].contains("CASE"));
     }
 
     #[test]
@@ -1736,13 +2167,13 @@ mod tests {
         ];
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains(r#""name" = CASE"#));
-        assert!(result[0].contains(r#""age" = CASE"#));
-        assert!(result[0].contains(r#"WHEN "id" = 1 THEN 'a'"#));
-        assert!(result[0].contains(r#"WHEN "id" = 2 THEN 'b'"#));
-        assert!(result[0].contains(r#"ELSE "name" END"#));
-        assert!(result[0].contains(r#"ELSE "age" END"#));
-        assert!(result[0].contains(r#"("id" = 1) OR ("id" = 2)"#));
+        // SQLite VALUES-JOIN shape: UPDATE t AS __t SET ... FROM (SELECT ...) AS __v WHERE __t.k = __v.k
+        assert!(result[0].starts_with(r#"UPDATE "t" AS __pg2any_t SET "#));
+        assert!(result[0].contains(r#""name" = __pg2any_v."name""#));
+        assert!(result[0].contains(r#""age" = __pg2any_v."age""#));
+        assert!(result[0].contains(r#"FROM (SELECT 1 AS "id", 'a' AS "name", 30 AS "age""#));
+        assert!(result[0].contains(r#"UNION ALL SELECT 2, 'b', 31"#));
+        assert!(result[0].contains(r#"WHERE __pg2any_t."id" = __pg2any_v."id""#));
     }
 
     #[test]
@@ -1758,7 +2189,8 @@ mod tests {
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 3);
         assert!(result[0].contains("), ("));
-        assert!(result[1].contains("CASE"));
+        assert!(result[1].contains("FROM (SELECT"));
+        assert!(result[1].contains("UNION ALL"));
         assert!(result[2].contains(" OR "));
     }
 
@@ -1801,13 +2233,14 @@ mod tests {
         ];
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains("[name] = CASE"));
-        assert!(result[0].contains("[age] = CASE"));
-        assert!(result[0].contains("WHEN [id] = 1 THEN 'a'"));
-        assert!(result[0].contains("WHEN [id] = 2 THEN 'b'"));
-        assert!(result[0].contains("ELSE [name] END"));
-        assert!(result[0].contains("ELSE [age] END"));
-        assert!(result[0].contains("([id] = 1) OR ([id] = 2)"));
+        // SQL Server VALUES-JOIN shape: UPDATE __t SET ... FROM tbl AS __t INNER JOIN (SELECT ...) AS __v ON ...
+        assert!(result[0].starts_with("UPDATE __pg2any_t SET "));
+        assert!(result[0].contains("__pg2any_t.[name] = __pg2any_v.[name]"));
+        assert!(result[0].contains("__pg2any_t.[age] = __pg2any_v.[age]"));
+        assert!(result[0].contains("FROM [db].[t] AS __pg2any_t INNER JOIN ("));
+        assert!(result[0].contains("SELECT 1 AS [id], 'a' AS [name], 30 AS [age]"));
+        assert!(result[0].contains("UNION ALL SELECT 2, 'b', 31"));
+        assert!(result[0].contains("ON __pg2any_t.[id] = __pg2any_v.[id]"));
     }
 
     #[test]
@@ -1823,7 +2256,8 @@ mod tests {
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 3);
         assert!(result[0].contains("), ("));
-        assert!(result[1].contains("CASE"));
+        assert!(result[1].contains("INNER JOIN ("));
+        assert!(result[1].contains("UNION ALL"));
         assert!(result[2].contains(" OR "));
     }
 
@@ -1854,8 +2288,9 @@ mod tests {
         ];
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains(r#""name" = CASE"#));
-        assert!(result[0].contains(r#"ELSE "name" END"#));
+        assert!(result[0].starts_with(r#"UPDATE "users" AS __pg2any_t SET "#));
+        assert!(result[0].contains(r#""name" = __pg2any_v."name""#));
+        assert!(result[0].contains(r#"WHERE __pg2any_t."id" = __pg2any_v."id""#));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -1871,5 +2306,112 @@ mod tests {
         let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("(1, 0xDEADBEEF), (2, 0xCAFE)"));
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_basic() {
+        let pairs = parse_where_equality_pairs("`id` = 1", QuoteStyle::Backtick).unwrap();
+        assert_eq!(pairs, vec![("`id`", "1")]);
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_composite() {
+        let pairs =
+            parse_where_equality_pairs("`k1` = 1 AND `k2` = 'a'", QuoteStyle::Backtick).unwrap();
+        assert_eq!(pairs, vec![("`k1`", "1"), ("`k2`", "'a'")]);
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_rejects_is_null() {
+        assert!(
+            parse_where_equality_pairs("`id` = 1 AND `n` IS NULL", QuoteStyle::Backtick).is_none()
+        );
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_rejects_null_rhs() {
+        // `col = NULL` literal never matches in a JOIN — reject so we fall back to CASE-WHEN.
+        assert!(parse_where_equality_pairs("`id` = NULL", QuoteStyle::Backtick).is_none());
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_rejects_or() {
+        assert!(parse_where_equality_pairs("`id` = 1 OR `id` = 2", QuoteStyle::Backtick).is_none());
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_rejects_parens() {
+        assert!(parse_where_equality_pairs("(`id` = 1)", QuoteStyle::Backtick).is_none());
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_rejects_non_equality() {
+        assert!(parse_where_equality_pairs("`id` > 1", QuoteStyle::Backtick).is_none());
+        assert!(parse_where_equality_pairs("`id` != 1", QuoteStyle::Backtick).is_none());
+    }
+
+    #[test]
+    fn test_parse_where_equality_pairs_and_inside_string() {
+        // The ` AND ` inside the quoted value must not split the clause.
+        let pairs =
+            parse_where_equality_pairs("`id` = 1 AND `name` = 'foo AND bar'", QuoteStyle::Backtick)
+                .unwrap();
+        assert_eq!(pairs, vec![("`id`", "1"), ("`name`", "'foo AND bar'")]);
+    }
+
+    #[test]
+    fn test_coalesce_updates_fallback_when_set_column_overlaps_where() {
+        // If a SET column is also a WHERE key, the derived-table alias would collide —
+        // rewrite declines, CASE-WHEN handles it.
+        let commands = vec![
+            "UPDATE `t` SET `id` = 10 WHERE `id` = 1;".to_string(),
+            "UPDATE `t` SET `id` = 20 WHERE `id` = 2;".to_string(),
+        ];
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].contains("CASE"),
+            "expected CASE fallback: {}",
+            result[0]
+        );
+        assert!(!result[0].contains("JOIN ("));
+    }
+
+    #[test]
+    fn test_coalesce_updates_fallback_when_where_has_is_null() {
+        // IS NULL can't become an equi-JOIN condition — fall back to CASE-WHEN.
+        let commands = vec![
+            "UPDATE `t` SET `val` = 'x' WHERE `id` = 1 AND `flag` IS NULL;".to_string(),
+            "UPDATE `t` SET `val` = 'y' WHERE `id` = 2 AND `flag` IS NULL;".to_string(),
+        ];
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("CASE"));
+        assert!(result[0].contains("IS NULL"));
+    }
+
+    #[test]
+    fn test_coalesce_updates_single_update_unchanged() {
+        // Single UPDATE should always pass through untouched (no JOIN rewrite).
+        let commands = vec!["UPDATE `t` SET `name` = 'a' WHERE `id` = 1;".to_string()];
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "UPDATE `t` SET `name` = 'a' WHERE `id` = 1;");
+    }
+
+    #[test]
+    fn test_coalesce_updates_fallback_mixed_where_shapes() {
+        // First row has parsable WHERE, second doesn't — still same column signature so
+        // the group forms, but VALUES-JOIN declines and CASE-WHEN takes over.
+        let commands = vec![
+            "UPDATE `t` SET `val` = 'x' WHERE `id` = 1;".to_string(),
+            "UPDATE `t` SET `val` = 'y' WHERE `id` = 2 AND `z` IS NULL;".to_string(),
+        ];
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
+        // Different WHERE shapes — they may or may not coalesce depending on column signature
+        // check. SET signatures match so they do coalesce, but WHERE shapes differ so
+        // VALUES-JOIN rejects → CASE-WHEN fallback.
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("CASE"));
     }
 }

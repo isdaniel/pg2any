@@ -75,6 +75,10 @@ fn find_keyword_outside_quotes(sql: &str, keyword: &str, quote_style: QuoteStyle
         if ch == b'\'' {
             pos += 1;
             while pos < bytes.len() {
+                if bytes[pos] == b'\\' {
+                    pos += 2; // backslash escape (MySQL default)
+                    continue;
+                }
                 if bytes[pos] == b'\'' {
                     // Check for escaped quote ''
                     if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
@@ -181,6 +185,10 @@ fn parse_set_pairs(set_clause: &str, quote_style: QuoteStyle) -> Vec<(&str, &str
                 // Skip single-quoted string
                 pos += 1;
                 while pos < bytes.len() {
+                    if bytes[pos] == b'\\' {
+                        pos += 2;
+                        continue;
+                    }
                     if bytes[pos] == b'\'' {
                         if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
                             pos += 2; // escaped quote
@@ -443,6 +451,10 @@ fn parse_where_equality_pairs<'a>(
         if ch == b'\'' {
             pos += 1;
             while pos < bytes.len() {
+                if bytes[pos] == b'\\' {
+                    pos += 2;
+                    continue;
+                }
                 if bytes[pos] == b'\'' {
                     if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
                         pos += 2;

@@ -243,18 +243,6 @@ impl SqlStreamParser {
             Some(s)
         }
     }
-
-    /// Trim whitespace from statement buffer and return a copy (legacy)
-    #[cfg(test)]
-    fn trim_statement_buffer(&self) -> Vec<u8> {
-        match std::str::from_utf8(&self.statement_buffer) {
-            Ok(s) => s.trim().as_bytes().to_vec(),
-            Err(_) => String::from_utf8_lossy(&self.statement_buffer)
-                .trim()
-                .as_bytes()
-                .to_vec(),
-        }
-    }
 }
 
 #[cfg(test)]

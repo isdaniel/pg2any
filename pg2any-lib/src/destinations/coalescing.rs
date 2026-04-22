@@ -1026,18 +1026,18 @@ pub(crate) fn coalesce_commands<'a>(
 
                 while i < commands.len() {
                     let next = classify(&commands[i], quote_style);
-                    if let ParsedCmd::Delete(nd) = next {
-                        if nd.prefix == prefix {
+                    if let ParsedCmd::Delete(next_del) = next {
+                        if next_del.prefix == prefix {
                             // Additional size: " OR (where_clause)"
-                            let additional = 5 + nd.where_clause.len() + 1;
+                            let additional = 5 + next_del.where_clause.len() + 1;
                             if group_size + additional <= safety_limit {
                                 group_size += additional;
-                                group.push(nd);
+                                group.push(next_del);
                                 i += 1;
                                 continue;
                             }
                         }
-                        pending = Some(ParsedCmd::Delete(nd));
+                        pending = Some(ParsedCmd::Delete(next_del));
                     } else {
                         pending = Some(next);
                     }

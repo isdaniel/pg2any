@@ -21,35 +21,33 @@ services:
       timeout: 5s
       retries: 5
     command: >
-      postgres 
-      -c wal_level=logical 
-      -c max_replication_slots=10 
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
       -c max_wal_senders=10
       -c max_connections=500
     networks:
       - chaos_test_network
 
-  mysql:
-    image: mysql:8.0
-    container_name: cdc_mysql
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: cdc_sqlserver
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: test.123 
-      MYSQL_DATABASE: cdc_db
-      MYSQL_USER: cdc_user
-      MYSQL_PASSWORD: test.123
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Test.123!"
+      MSSQL_PID: "Developer"
     ports:
-      - "3306:3306"
+      - "1433:1433"
     volumes:
-      - ./examples/scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init_mysql.sql:ro
-    command:
-      - --max_allowed_packet=536870912  # 512MB
-      - --innodb_buffer_pool_size=2GB   # Reduced for testing environment
+      - ./examples/scripts/init_sqlserver.sql:/init/init_sqlserver.sql:ro
+      - ./tests/chaos/scenarios/verify_sqlserver:/verify:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${SA_PASSWORD}\" -C -Q 'SELECT 1' -b || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$${SA_PASSWORD}\" -Q 'SELECT 1' -b) 2>/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
     networks:
       - chaos_test_network
 
@@ -57,23 +55,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DEST_FEATURES: sqlserver,metrics
     container_name: cdc_application
     depends_on:
       postgres:
         condition: service_healthy
-      mysql:
+      sqlserver:
         condition: service_healthy
     env_file:
-      - ./env/.env
+      - ./env/.env.sqlserver
     environment:
       RUST_LOG: info
       RUST_BACKTRACE: 1
       CDC_LAST_LSN_FILE: /app/data/pg2any_last_lsn.metadata
       CDC_TRANSACTION_FILE_BASE_PATH: /app/data
     ports:
-      - "8080:8080"  # Metrics endpoint
+      - "8080:8080"
     restart: unless-stopped
-    # Graceful shutdown timeout - critical for testing
     stop_grace_period: 300s
     stop_signal: SIGTERM
     healthcheck:

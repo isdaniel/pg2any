@@ -1,6 +1,9 @@
 # Use multi-stage build for smaller final image
 # Build stage
-FROM rust:1.88-slim as builder
+FROM rust:1.88-slim AS builder
+
+# Destination features to compile (default: mysql,metrics)
+ARG DEST_FEATURES=mysql,metrics
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -20,8 +23,8 @@ COPY pg2any-lib/ ./pg2any-lib/
 COPY examples/ ./examples/
 
 WORKDIR /app/examples
-# Build the application
-RUN cargo build --release
+# Build the application with selected destination features
+RUN cargo build --release --no-default-features --features "${DEST_FEATURES}"
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -31,9 +34,13 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     libpq-dev \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Create data directory for SQLite and other file-based destinations
+RUN mkdir -p /app/data && chown 1001:root /app/data
 
 # Create non-root user
 RUN useradd -r -u 1001 -g root pg2any_user

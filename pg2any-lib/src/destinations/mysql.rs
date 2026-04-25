@@ -88,7 +88,7 @@ impl DestinationHandler for MySQLDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick);
+        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick, usize::MAX);
 
         if coalesced.len() < commands.len() {
             debug!(

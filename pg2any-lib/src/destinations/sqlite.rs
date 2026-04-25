@@ -118,7 +118,7 @@ impl DestinationHandler for SQLiteDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::DoubleQuote);
+        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
 
         if coalesced.len() < commands.len() {
             debug!(

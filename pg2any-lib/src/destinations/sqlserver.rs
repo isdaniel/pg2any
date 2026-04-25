@@ -75,7 +75,7 @@ impl DestinationHandler for SqlServerDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket);
+        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket, 1000);
 
         if coalesced.len() < commands.len() {
             debug!(

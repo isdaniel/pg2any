@@ -7,16 +7,18 @@
 
 set -e
 
-# Load environment variables from .env file if it exists
+# Load safe environment variables from .env file if it exists
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/env/.env.sqlserver"
 
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    set -a
-    source "$ENV_FILE"
-    set +a
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        [[ "$value" == *" "* ]] && continue
+        export "$key=$value"
+    done < "$ENV_FILE"
 else
     echo "Warning: .env.sqlserver file not found at $ENV_FILE, using defaults"
 fi

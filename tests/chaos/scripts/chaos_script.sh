@@ -29,8 +29,8 @@ restart_container() {
     echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "========================================"
     
-    # Gracefully stop the container (respects stop_grace_period in docker-compose)
-    if docker stop "$container_id"; then
+    # Gracefully stop the container with 30s timeout for in-memory progress flush
+    if docker stop --time 30 "$container_id"; then
         echo "✓ Container stopped successfully."
     else
         echo "✗ Failed to stop container: $container_id"

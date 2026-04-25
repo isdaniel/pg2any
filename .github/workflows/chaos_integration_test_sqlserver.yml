@@ -1,0 +1,214 @@
+name: CDC Chaos Integration Test (SQL Server)
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  chaos-integration-test-sqlserver:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compression: ["true", "false"]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 480
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Compose
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+
+    - name: Install PostgreSQL client tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client-common postgresql-client
+
+    - name: Verify test structure
+      run: |
+        echo "Verifying chaos test structure..."
+        ls -la tests/chaos/
+        ls -la tests/chaos/scripts/
+        ls -la tests/chaos/scenarios/verify_sqlserver/
+
+    - name: Build CDC application image
+      run: |
+        echo "Building CDC application image..."
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
+      working-directory: .
+
+    - name: Start PostgreSQL and SQL Server
+      run: |
+        echo "Starting PostgreSQL and SQL Server..."
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d postgres sqlserver
+      working-directory: .
+
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for PostgreSQL to be ready..."
+        timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
+        echo "Waiting for SQL Server to be ready..."
+        timeout 180 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
+      working-directory: .
+
+    - name: Verify PostgreSQL is ready
+      run: |
+        echo "Verifying PostgreSQL connection..."
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
+
+    - name: Initialize SQL Server database
+      run: |
+        echo "Detecting sqlcmd path..."
+        if docker exec cdc_sqlserver test -x /opt/mssql-tools18/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools18/bin/sqlcmd
+        elif docker exec cdc_sqlserver test -x /opt/mssql-tools/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools/bin/sqlcmd
+        else
+          echo "sqlcmd not found!" && exit 1
+        fi
+        echo "Using sqlcmd: $SQLCMD"
+        echo "Initializing SQL Server database..."
+        docker exec cdc_sqlserver $SQLCMD -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+        echo "Verifying SQL Server table..."
+        docker exec cdc_sqlserver $SQLCMD -S localhost -U sa -P 'Test.123!' -C -d cdc_db -Q "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 't1';"
+
+    - name: Start CDC application
+      run: |
+        echo "Starting CDC application..."
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
+        echo "Waiting for CDC application to initialize..."
+        timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+      working-directory: .
+
+    - name: Verify CDC application is running
+      run: |
+        echo "Verifying CDC application..."
+        docker ps -a | grep cdc_application
+        docker logs cdc_application | tail -n 50
+
+    - name: Make scripts executable
+      run: |
+        chmod +x tests/chaos/scripts/*.sh
+        ls -la tests/chaos/scripts/
+
+    - name: Run chaos integration tests
+      run: |
+        echo "=========================================="
+        echo "Starting CDC Chaos Integration Tests (SQL Server)"
+        echo "=========================================="
+        echo "OS: ${{ matrix.os }}"
+        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
+        echo ""
+
+        cd tests/chaos/scripts
+        ./run_chaos_tests_sqlserver.sh
+      env:
+        CDC_POSTGRES_HOST: 127.0.0.1
+        CDC_POSTGRES_PORT: 5432
+        CDC_POSTGRES_USER: postgres
+        CDC_POSTGRES_PASSWORD: test.123
+        CDC_POSTGRES_DB: postgres
+        CDC_SQLSERVER_CONTAINER: cdc_sqlserver
+        CDC_SQLSERVER_PASSWORD: "Test.123!"
+        CDC_SQLSERVER_DB: cdc_db
+        CDC_CONTAINER_NAME: cdc_application
+        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
+
+    - name: Show PostgreSQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "PostgreSQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_postgres --tail 100
+
+    - name: Show SQL Server logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "SQL Server Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_sqlserver --tail 100
+
+    - name: Show container status on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Docker Container Status"
+        echo "=========================================="
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
+        docker ps -a
+
+    - name: Capture and upload CDC application logs
+      if: failure()
+      run: |
+        echo "Installing colorized-logs for log conversion..."
+        sudo apt-get update
+        sudo apt-get install -y colorized-logs || sudo apt-get install -y ansifilter
+        echo "Capturing full CDC application logs..."
+        if command -v ansi2txt &> /dev/null; then
+          docker logs cdc_application | ansi2txt > cdc_application_log.txt
+        elif command -v ansifilter &> /dev/null; then
+          docker logs cdc_application | ansifilter > cdc_application_log.txt
+        else
+          docker logs cdc_application > cdc_application_log.txt
+        fi
+        echo "Log file created: cdc_application_log.txt"
+        ls -lh cdc_application_log.txt
+
+    - name: Upload CDC application logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdc-sqlserver-chaos-logs-${{ matrix.os }}-${{ matrix.compression }}
+        path: cdc_application_log.txt
+        retention-days: 30
+
+    - name: Setup tmate session
+      if: failure()
+      uses: mxschmitt/action-tmate@v3
+
+    - name: Stop and remove containers
+      if: always()
+      run: |
+        echo "Cleaning up Docker containers..."
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml down -v
+        docker network rm chaos_test_network 2>/dev/null || true
+        docker system prune -f
+      working-directory: .
+
+    - name: Show disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df
+
+  notify:
+    needs: chaos-integration-test-sqlserver
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Test result summary
+      run: |
+        echo "=========================================="
+        echo "SQL Server Chaos Integration Test Summary"
+        echo "=========================================="
+        echo "Job status: ${{ needs.chaos-integration-test-sqlserver.result }}"
+        if [ "${{ needs.chaos-integration-test-sqlserver.result }}" = "success" ]; then
+          echo "All SQL Server chaos integration tests passed!"
+        else
+          echo "Some SQL Server chaos integration tests failed."
+        fi

@@ -912,13 +912,10 @@ fn classify<'a>(sql: &'a str, quote_style: QuoteStyle) -> ParsedCmd<'a> {
 /// Non-DML statements (TRUNCATE, etc.) pass through unchanged.
 /// Coalescing only merges **consecutive** statements of the same type targeting the same table.
 /// All strategies respect `max_packet_size` with an 80% safety margin.
-/// `max_values_per_insert` caps the number of row-value tuples in a single INSERT (SQL Server
-/// hard-limits this to 1000; pass `usize::MAX` for databases without such a limit).
 pub(crate) fn coalesce_commands<'a>(
     commands: &'a [String],
     max_packet_size: u64,
     quote_style: QuoteStyle,
-    max_values_per_insert: usize,
 ) -> Vec<Cow<'a, str>> {
     if commands.is_empty() {
         return Vec::new();
@@ -956,9 +953,7 @@ pub(crate) fn coalesce_commands<'a>(
                     {
                         if np == prefix {
                             let additional_size = 2 + nv.len();
-                            if group_size + additional_size <= safety_limit
-                                && group_values.len() < max_values_per_insert
-                            {
+                            if group_size + additional_size <= safety_limit {
                                 group_values.push(nv);
                                 group_size += additional_size;
                                 i += 1;
@@ -1667,14 +1662,14 @@ mod tests {
 
     #[test]
     fn test_coalesce_empty_commands() {
-        let result = coalesce_commands(&[], 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&[], 67108864, QuoteStyle::Backtick);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_coalesce_single_insert() {
         let commands = vec!["INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'hello');".to_string()];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -1691,7 +1686,7 @@ mod tests {
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (2, 'b');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (3, 'c');".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -1705,7 +1700,7 @@ mod tests {
             "INSERT INTO `db`.`t1` (`id`) VALUES (1);".to_string(),
             "INSERT INTO `db`.`t2` (`id`) VALUES (2);".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
     }
 
@@ -1715,7 +1710,7 @@ mod tests {
             "INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'a');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `age`) VALUES (2, 30);".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
     }
 
@@ -1729,7 +1724,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].starts_with("INSERT INTO `cdc_db`.`t1`"));
     }
@@ -1745,7 +1740,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = coalesce_commands(&commands, 2000, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 2000, QuoteStyle::Backtick);
         assert!(result.len() > 1);
         assert!(result.len() < 100);
     }
@@ -1767,7 +1762,7 @@ mod tests {
                 long_value
             ),
         ];
-        let result = coalesce_commands(&commands, 1375, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 1375, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
         assert!(result[0].contains("), ("));
         assert!(!result[1].contains("), ("));
@@ -1780,7 +1775,7 @@ mod tests {
     #[test]
     fn test_coalesce_single_delete() {
         let commands = vec!["DELETE FROM `db`.`t` WHERE `id` = 1;".to_string()];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "DELETE FROM `db`.`t` WHERE `id` = 1;");
     }
@@ -1792,7 +1787,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `id` = 2;".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 3;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -1806,7 +1801,7 @@ mod tests {
             "DELETE FROM `db`.`t1` WHERE `id` = 1;".to_string(),
             "DELETE FROM `db`.`t2` WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
     }
 
@@ -1816,7 +1811,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `k1` = 1 AND `k2` = 'a';".to_string(),
             "DELETE FROM `db`.`t` WHERE `k1` = 2 AND `k2` = 'b';".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -1830,7 +1825,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `id` = 1 AND `name` IS NULL;".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 2 AND `name` IS NULL;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("OR"));
     }
@@ -1846,7 +1841,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = coalesce_commands(&commands, 2000, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 2000, QuoteStyle::Backtick);
         assert!(result.len() > 1, "Should split: got {}", result.len());
         assert!(result.len() < 100, "Should coalesce: got {}", result.len());
     }
@@ -1859,7 +1854,7 @@ mod tests {
     fn test_coalesce_single_update() {
         let commands =
             vec!["UPDATE `db`.`t` SET `name` = 'hello', `age` = 30 WHERE `id` = 1;".to_string()];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -1874,7 +1869,7 @@ mod tests {
             "UPDATE `db`.`t` SET `name` = 'b', `age` = 31 WHERE `id` = 2;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'c', `age` = 32 WHERE `id` = 3;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
 
         // Verify VALUES-JOIN shape (MySQL: UPDATE t AS __t JOIN (SELECT ...) AS __v ON ... SET ...)
@@ -1898,7 +1893,7 @@ mod tests {
             "UPDATE `db`.`t1` SET `a` = 1 WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t2` SET `a` = 2 WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
     }
 
@@ -1908,7 +1903,7 @@ mod tests {
             "UPDATE `db`.`t` SET `name` = 'a' WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t` SET `age` = 30 WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         // Different SET columns → can't coalesce
         assert_eq!(result.len(), 2);
     }
@@ -1919,7 +1914,7 @@ mod tests {
             "UPDATE `db`.`t` SET `val` = 'x' WHERE `k1` = 1 AND `k2` = 'a';".to_string(),
             "UPDATE `db`.`t` SET `val` = 'y' WHERE `k1` = 2 AND `k2` = 'b';".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         // Composite keys produce multi-column derived table and multi-condition JOIN
         assert!(result[0].contains("SELECT 1 AS `k1`, 'a' AS `k2`, 'x' AS `val`"));
@@ -1937,7 +1932,7 @@ mod tests {
             "UPDATE `db`.`t` SET `name` = 'a' WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'b' WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(
             !result[0].contains("CASE"),
@@ -1960,7 +1955,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = coalesce_commands(&commands, 3000, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 3000, QuoteStyle::Backtick);
         assert!(result.len() > 1, "Should split: got {}", result.len());
         assert!(result.len() < 100, "Should coalesce: got {}", result.len());
     }
@@ -1979,7 +1974,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `id` = 99;".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 100;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 3);
 
         // 2 INSERT statements coalesced
@@ -2005,7 +2000,7 @@ mod tests {
             "INSERT INTO `db`.`t` (`id`) VALUES (2);".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 3;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         // No consecutive same-type statements → no coalescing
         assert_eq!(result.len(), 4);
     }
@@ -2016,7 +2011,7 @@ mod tests {
             "TRUNCATE TABLE `db`.`t`;".to_string(),
             "INSERT INTO `db`.`t` (`id`) VALUES (1);".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], "TRUNCATE TABLE `db`.`t`;");
     }
@@ -2035,7 +2030,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `id` = 99;".to_string(),
             "DELETE FROM `db`.`t` WHERE `id` = 100;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 3);
 
         // Verify INSERT coalesced
@@ -2058,7 +2053,7 @@ mod tests {
             "DELETE FROM `db`.`t` WHERE `id` = 2;".to_string(),
             "TRUNCATE TABLE `db`.`t`;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 3);
         // Each is a different type → no coalescing
         assert!(result[0].starts_with("UPDATE"));
@@ -2073,7 +2068,7 @@ mod tests {
             "INSERT INTO `db`.`t2` (`id`) VALUES (2);".to_string(),
             "INSERT INTO `db`.`t1` (`id`) VALUES (3);".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         // Alternating tables → no coalescing
         assert_eq!(result.len(), 3);
     }
@@ -2085,7 +2080,7 @@ mod tests {
             "INSERT INTO `db`.`t` (`id`, `d`) VALUES (1, 'has VALUES inside');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `d`) VALUES (2, 'normal');".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("'has VALUES inside'"));
 
@@ -2094,7 +2089,7 @@ mod tests {
             "INSERT INTO `db`.`t` (`id`, `d`) VALUES (1, 'foo(bar)baz');".to_string(),
             "INSERT INTO `db`.`t` (`id`, `d`) VALUES (2, 'hello');".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("'foo(bar)baz'), (2, 'hello')"));
     }
@@ -2106,7 +2101,7 @@ mod tests {
             "UPDATE `db`.`t` SET `name` = 'a', `bio` = NULL WHERE `id` = 1;".to_string(),
             "UPDATE `db`.`t` SET `name` = 'b', `bio` = NULL WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("SELECT 1 AS `id`, 'a' AS `name`, NULL AS `bio`"));
         assert!(result[0].contains("UNION ALL SELECT 2, 'b', NULL"));
@@ -2126,7 +2121,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         // Large batches use VALUES-JOIN — O(n) join vs O(n²) CASE-WHEN evaluation.
         assert!(result[0].contains("JOIN ("));
@@ -2139,7 +2134,7 @@ mod tests {
         let commands: Vec<String> = (0..100)
             .map(|i| format!("DELETE FROM `db`.`t` WHERE `id` = {};", i))
             .collect();
-        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, 67108864, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].starts_with("DELETE FROM `db`.`t` WHERE "));
         assert!(result[0].contains(" OR "));
@@ -2156,7 +2151,7 @@ mod tests {
             r#"INSERT INTO "t" ("id", "name") VALUES (2, 'b');"#.to_string(),
             r#"INSERT INTO "t" ("id", "name") VALUES (3, 'c');"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("(1, 'a'), (2, 'b'), (3, 'c')"));
     }
@@ -2168,7 +2163,7 @@ mod tests {
             r#"DELETE FROM "t" WHERE "id" = 2;"#.to_string(),
             r#"DELETE FROM "t" WHERE "id" = 3;"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -2182,7 +2177,7 @@ mod tests {
             r#"UPDATE "t" SET "name" = 'a', "age" = 30 WHERE "id" = 1;"#.to_string(),
             r#"UPDATE "t" SET "name" = 'b', "age" = 31 WHERE "id" = 2;"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
         // SQLite VALUES-JOIN shape: UPDATE t AS __t SET ... FROM (SELECT ...) AS __v WHERE __t.k = __v.k
         assert!(result[0].starts_with(r#"UPDATE "t" AS __pg2any_t SET "#));
@@ -2203,7 +2198,7 @@ mod tests {
             r#"DELETE FROM "t" WHERE "id" = 99;"#.to_string(),
             r#"DELETE FROM "t" WHERE "id" = 100;"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 3);
         assert!(result[0].contains("), ("));
         assert!(result[1].contains("FROM (SELECT"));
@@ -2222,7 +2217,7 @@ mod tests {
             "INSERT INTO [db].[t] ([id], [name]) VALUES (2, 'b');".to_string(),
             "INSERT INTO [db].[t] ([id], [name]) VALUES (3, 'c');".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("(1, 'a'), (2, 'b'), (3, 'c')"));
     }
@@ -2234,7 +2229,7 @@ mod tests {
             "DELETE FROM [db].[t] WHERE [id] = 2;".to_string(),
             "DELETE FROM [db].[t] WHERE [id] = 3;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -2248,7 +2243,7 @@ mod tests {
             "UPDATE [db].[t] SET [name] = 'a', [age] = 30 WHERE [id] = 1;".to_string(),
             "UPDATE [db].[t] SET [name] = 'b', [age] = 31 WHERE [id] = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
         // SQL Server VALUES-JOIN shape: UPDATE __t SET ... FROM tbl AS __t INNER JOIN (SELECT ...) AS __v ON ...
         assert!(result[0].starts_with("UPDATE __pg2any_t SET "));
@@ -2270,7 +2265,7 @@ mod tests {
             "DELETE FROM [db].[t] WHERE [id] = 99;".to_string(),
             "DELETE FROM [db].[t] WHERE [id] = 100;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 3);
         assert!(result[0].contains("), ("));
         assert!(result[1].contains("INNER JOIN ("));
@@ -2289,7 +2284,7 @@ mod tests {
             r#"DELETE FROM "users" WHERE "id" = 1;"#.to_string(),
             r#"DELETE FROM "users" WHERE "id" = 2;"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -2303,7 +2298,7 @@ mod tests {
             r#"UPDATE "users" SET "name" = 'a' WHERE "id" = 1;"#.to_string(),
             r#"UPDATE "users" SET "name" = 'b' WHERE "id" = 2;"#.to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::DoubleQuote);
         assert_eq!(result.len(), 1);
         assert!(result[0].starts_with(r#"UPDATE "users" AS __pg2any_t SET "#));
         assert!(result[0].contains(r#""name" = __pg2any_v."name""#));
@@ -2320,7 +2315,7 @@ mod tests {
             "INSERT INTO [db].[t] ([id], [data]) VALUES (1, 0xDEADBEEF);".to_string(),
             "INSERT INTO [db].[t] ([id], [data]) VALUES (2, 0xCAFE);".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Bracket);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("(1, 0xDEADBEEF), (2, 0xCAFE)"));
     }
@@ -2384,7 +2379,7 @@ mod tests {
             "UPDATE `t` SET `id` = 10 WHERE `id` = 1;".to_string(),
             "UPDATE `t` SET `id` = 20 WHERE `id` = 2;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(
             result[0].contains("CASE"),
@@ -2401,7 +2396,7 @@ mod tests {
             "UPDATE `t` SET `val` = 'x' WHERE `id` = 1 AND `flag` IS NULL;".to_string(),
             "UPDATE `t` SET `val` = 'y' WHERE `id` = 2 AND `flag` IS NULL;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("CASE"));
         assert!(result[0].contains("IS NULL"));
@@ -2411,7 +2406,7 @@ mod tests {
     fn test_coalesce_updates_single_update_unchanged() {
         // Single UPDATE should always pass through untouched (no JOIN rewrite).
         let commands = vec!["UPDATE `t` SET `name` = 'a' WHERE `id` = 1;".to_string()];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "UPDATE `t` SET `name` = 'a' WHERE `id` = 1;");
     }
@@ -2424,7 +2419,7 @@ mod tests {
             "UPDATE `t` SET `val` = 'x' WHERE `id` = 1;".to_string(),
             "UPDATE `t` SET `val` = 'y' WHERE `id` = 2 AND `z` IS NULL;".to_string(),
         ];
-        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick, usize::MAX);
+        let result = coalesce_commands(&commands, u64::MAX, QuoteStyle::Backtick);
         // Different WHERE shapes — they may or may not coalesce depending on column signature
         // check. SET signatures match so they do coalesce, but WHERE shapes differ so
         // VALUES-JOIN rejects → CASE-WHEN fallback.

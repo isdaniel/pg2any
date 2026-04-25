@@ -71,7 +71,7 @@ services:
       CDC_LAST_LSN_FILE: /app/pg2any_last_lsn.metadata
     ports:
       - "8080:8080"
-    restart: "no"
+    restart: unless-stopped
     stop_grace_period: 300s
     stop_signal: SIGTERM
     healthcheck:

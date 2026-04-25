@@ -12,11 +12,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/env/.env.sqlserver"
 
+load_env_file() {
+    local env_file="$1"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *=* ]] && continue
+        export "$line"
+    done < "$env_file"
+}
+
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    set -a
-    source "$ENV_FILE"
-    set +a
+    load_env_file "$ENV_FILE"
 else
     echo "Warning: .env.sqlserver file not found at $ENV_FILE, using defaults"
 fi
@@ -124,7 +131,8 @@ wait_for_container_running() {
         if docker ps --filter "name=^${container}$" --format "{{.Status}}" | grep -q "^Up"; then
             return 0
         fi
-        log_warning "Container '$container' is not running. Waiting... (${waited}s/${max_wait}s)"
+        log_warning "Container '$container' is not running. Attempting to start... (${waited}s/${max_wait}s)"
+        docker start "$container" 2>/dev/null || true
         sleep 5
         waited=$((waited + 5))
     done
@@ -301,6 +309,7 @@ start_chaos_testing() {
     chmod +x "$CHAOS_SCRIPT"
 
     log_info "Starting chaos script for container: $CONTAINER_NAME"
+    rm -f "$SCRIPT_DIR/pgbench_chaos_script.log"
     "$CHAOS_SCRIPT" "$CONTAINER_NAME" > "$SCRIPT_DIR/pgbench_chaos_script.log" 2>&1 &
     CHAOS_SCRIPT_PID=$!
 

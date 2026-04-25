@@ -51,7 +51,7 @@ services:
       - sqlite_data:/app/data
       - ./examples/scripts/init_sqlite.sql:/init/init_sqlite.sql:ro
       - ./tests/chaos/scenarios/verify_sqlite:/verify:ro
-    restart: "no"
+    restart: unless-stopped
     stop_grace_period: 300s
     stop_signal: SIGTERM
     healthcheck:

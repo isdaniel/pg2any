@@ -1,6 +1,6 @@
 # Use multi-stage build for smaller final image
 # Build stage
-FROM rust:1.88-slim as builder
+FROM rust:1.88-slim AS builder
 
 # Destination features to compile (default: mysql,metrics)
 ARG DEST_FEATURES=mysql,metrics
@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Create data directory for SQLite and other file-based destinations
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chown 1001:root /app/data
 
 # Create non-root user
 RUN useradd -r -u 1001 -g root pg2any_user

@@ -203,7 +203,7 @@ chaos-test-sqlserver-setup:
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
 
 chaos-test-sqlserver:
@@ -240,7 +240,7 @@ pgbench-test-sqlserver-setup:
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
 
 pgbench-test-sqlserver:
@@ -269,7 +269,7 @@ chaos-test-sqlite-setup:
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQLite database schema..."
 	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps
@@ -305,7 +305,7 @@ pgbench-test-sqlite-setup:
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQLite database schema..."
 	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps

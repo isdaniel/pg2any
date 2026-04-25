@@ -48,6 +48,19 @@ CHAOS_SCRIPT_PID=""
 SCENARIOS_DIR="$SCRIPT_DIR/../scenarios"
 CHAOS_SCRIPT="$SCRIPT_DIR/chaos_script.sh"
 
+# Detect sqlcmd path inside SQL Server container
+detect_sqlcmd() {
+    if docker exec "$SQLSERVER_CONTAINER" test -x /opt/mssql-tools18/bin/sqlcmd 2>/dev/null; then
+        echo "/opt/mssql-tools18/bin/sqlcmd"
+    elif docker exec "$SQLSERVER_CONTAINER" test -x /opt/mssql-tools/bin/sqlcmd 2>/dev/null; then
+        echo "/opt/mssql-tools/bin/sqlcmd"
+    else
+        echo ""
+    fi
+}
+
+SQLCMD_PATH=""
+
 # Logging functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $*"
@@ -102,7 +115,7 @@ execute_sqlserver_sql() {
     local sql="$1"
     log_info "Executing SQL Server SQL..."
 
-    docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+    docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -d "$SQLSERVER_DB" \
         -Q "$sql" \
@@ -116,7 +129,7 @@ verify_scenario() {
     local verify_file="$1"
     local verify_filename=$(basename "$verify_file")
 
-    local result=$(docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+    local result=$(docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -d "$SQLSERVER_DB" \
         -i "/verify/$verify_filename" \
@@ -144,7 +157,7 @@ cleanup_test_data() {
         -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
 
     # Clean SQL Server
-    docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+    docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -d "$SQLSERVER_DB" \
         -Q "TRUNCATE TABLE dbo.t1;" \
@@ -217,6 +230,15 @@ main() {
     log_info "=========================================="
     log_info "CDC Chaos Integration Test Suite (SQL Server)"
     log_info "=========================================="
+
+    # Detect sqlcmd path
+    SQLCMD_PATH=$(detect_sqlcmd)
+    if [ -z "$SQLCMD_PATH" ]; then
+        log_error "sqlcmd not found in SQL Server container"
+        exit 1
+    fi
+    log_info "Using sqlcmd: $SQLCMD_PATH"
+
     log_info "Max retries per scenario: $MAX_RETRIES"
     log_info "Retry interval: $RETRY_INTERVAL seconds"
     log_info "Container under test: $CONTAINER_NAME"

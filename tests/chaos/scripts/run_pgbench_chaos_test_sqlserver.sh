@@ -41,6 +41,19 @@ SQLSERVER_CONTAINER="${CDC_SQLSERVER_CONTAINER:-cdc_sqlserver}"
 SQLSERVER_PASSWORD="${CDC_SQLSERVER_PASSWORD:-Test.123!}"
 SQLSERVER_DB="${CDC_SQLSERVER_DB:-cdc_db}"
 
+# Detect sqlcmd path inside SQL Server container
+detect_sqlcmd() {
+    if docker exec "$SQLSERVER_CONTAINER" test -x /opt/mssql-tools18/bin/sqlcmd 2>/dev/null; then
+        echo "/opt/mssql-tools18/bin/sqlcmd"
+    elif docker exec "$SQLSERVER_CONTAINER" test -x /opt/mssql-tools/bin/sqlcmd 2>/dev/null; then
+        echo "/opt/mssql-tools/bin/sqlcmd"
+    else
+        echo ""
+    fi
+}
+
+SQLCMD_PATH=""
+
 # PGBench configuration
 PGBENCH_SCALE="${PGBENCH_SCALE:-32}"
 PGBENCH_CLIENTS="${PGBENCH_CLIENTS:-100}"
@@ -140,7 +153,7 @@ test_postgres_connection() {
 test_sqlserver_connection() {
     log_info "Testing SQL Server connection..."
 
-    if docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+    if docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -Q "SELECT 1" -b > /dev/null 2>&1; then
         log_success "SQL Server connection successful."
@@ -153,7 +166,7 @@ test_sqlserver_connection() {
 
 # Function to get row count from SQL Server t1 table
 get_sqlserver_row_count() {
-    local count=$(docker exec "$SQLSERVER_CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+    local count=$(docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -d "$SQLSERVER_DB" \
         -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.t1;" \
@@ -262,6 +275,15 @@ main() {
     log_info "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
     log_info "Container under test: $CONTAINER_NAME"
     log_info "SQL Server container: $SQLSERVER_CONTAINER"
+
+    # Detect sqlcmd path
+    SQLCMD_PATH=$(detect_sqlcmd)
+    if [ -z "$SQLCMD_PATH" ]; then
+        log_error "sqlcmd not found in SQL Server container"
+        exit 1
+    fi
+    log_info "Using sqlcmd: $SQLCMD_PATH"
+
     echo "" | tee -a "$RESULTS_FILE"
 
     # Pre-flight checks

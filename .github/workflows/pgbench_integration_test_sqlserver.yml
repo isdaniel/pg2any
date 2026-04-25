@@ -43,16 +43,24 @@ jobs:
         test -f tests/chaos/scripts/run_pgbench_chaos_test_sqlserver.sh || (echo "PGBench SQL Server test script not found!" && exit 1)
         test -f tests/chaos/scripts/chaos_script.sh || (echo "Chaos script not found!" && exit 1)
 
+    - name: Build CDC application image
+      run: |
+        echo "Building CDC application image..."
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
+      working-directory: .
+
     - name: Start PostgreSQL and SQL Server
       run: |
         echo "Starting PostgreSQL and SQL Server..."
-        docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d postgres sqlserver
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d postgres sqlserver
       working-directory: .
 
     - name: Wait for services to be healthy
       run: |
-        echo "Waiting for services to become healthy..."
-        timeout 180 bash -c 'until docker ps | grep cdc_sqlserver | grep -q "healthy"; do sleep 5; done' || true
+        echo "Waiting for PostgreSQL to be ready..."
+        timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
+        echo "Waiting for SQL Server to be ready..."
+        timeout 180 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
         docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
       working-directory: .
 
@@ -65,16 +73,26 @@ jobs:
 
     - name: Initialize SQL Server database
       run: |
+        echo "Detecting sqlcmd path..."
+        if docker exec cdc_sqlserver test -x /opt/mssql-tools18/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools18/bin/sqlcmd
+        elif docker exec cdc_sqlserver test -x /opt/mssql-tools/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools/bin/sqlcmd
+        else
+          echo "sqlcmd not found!" && exit 1
+        fi
+        echo "Using sqlcmd: $SQLCMD"
         echo "Initializing SQL Server database..."
-        docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+        docker exec cdc_sqlserver $SQLCMD -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
         echo "Verifying SQL Server table..."
-        docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -d cdc_db -Q "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 't1';"
+        docker exec cdc_sqlserver $SQLCMD -S localhost -U sa -P 'Test.123!' -C -d cdc_db -Q "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 't1';"
 
     - name: Start CDC application
       run: |
         echo "Starting CDC application..."
-        docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d cdc_app
-        sleep 15
+        docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
+        echo "Waiting for CDC application to initialize..."
+        timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
       working-directory: .
 
     - name: Make scripts executable
@@ -143,7 +161,14 @@ jobs:
         docker exec cdc_postgres psql -U postgres -c "SELECT COUNT(*) FROM t1;"
         echo ""
         echo "SQL Server row count:"
-        docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -d cdc_db -Q "SELECT COUNT(*) FROM dbo.t1;"
+        if docker exec cdc_sqlserver test -x /opt/mssql-tools18/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools18/bin/sqlcmd
+        elif docker exec cdc_sqlserver test -x /opt/mssql-tools/bin/sqlcmd; then
+          SQLCMD=/opt/mssql-tools/bin/sqlcmd
+        else
+          echo "sqlcmd not found" && exit 0
+        fi
+        docker exec cdc_sqlserver $SQLCMD -S localhost -U sa -P 'Test.123!' -C -d cdc_db -Q "SELECT COUNT(*) FROM dbo.t1;"
 
     - name: Show PostgreSQL logs on failure
       if: failure()

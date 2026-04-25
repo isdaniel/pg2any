@@ -183,19 +183,27 @@ pgbench-test-mysql-logs:
 	@echo "Showing CDC application logs..."
 	@docker logs -f cdc_application
 
+# Helper: find sqlcmd path inside SQL Server container
+SQLCMD_EXEC = docker exec cdc_sqlserver bash -c 'if [ -x /opt/mssql-tools18/bin/sqlcmd ]; then /opt/mssql-tools18/bin/sqlcmd "$$@"; elif [ -x /opt/mssql-tools/bin/sqlcmd ]; then /opt/mssql-tools/bin/sqlcmd "$$@"; else echo "sqlcmd not found" >&2; exit 1; fi' --
+
 # SQL Server Chaos Testing commands
 chaos-test-sqlserver-setup:
 	@echo "Setting up SQL Server chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
-	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d postgres sqlserver
-	@echo "Waiting for PostgreSQL and SQL Server to be healthy..."
-	@sleep 30
+	@echo "Building CDC application image..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
+	@echo "Starting PostgreSQL and SQL Server..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d postgres sqlserver
+	@echo "Waiting for PostgreSQL to be ready..."
+	@timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
+	@echo "Waiting for SQL Server to be ready..."
+	@timeout 120 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQL Server database..."
-	@docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@$(SQLCMD_EXEC) -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
 	@echo "Starting CDC application..."
-	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d cdc_app
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@sleep 10
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
 
 chaos-test-sqlserver:
@@ -219,15 +227,20 @@ chaos-test-sqlserver-logs:
 pgbench-test-sqlserver-setup:
 	@echo "Setting up SQL Server pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
-	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d postgres sqlserver
-	@echo "Waiting for PostgreSQL and SQL Server to be healthy..."
-	@sleep 30
+	@echo "Building CDC application image..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
+	@echo "Starting PostgreSQL and SQL Server..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d postgres sqlserver
+	@echo "Waiting for PostgreSQL to be ready..."
+	@timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
+	@echo "Waiting for SQL Server to be ready..."
+	@timeout 120 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQL Server database..."
-	@docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@$(SQLCMD_EXEC) -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
 	@echo "Starting CDC application..."
-	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d cdc_app
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@sleep 10
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
 
 pgbench-test-sqlserver:
@@ -247,13 +260,16 @@ pgbench-test-sqlserver-full: pgbench-test-sqlserver-setup pgbench-test-sqlserver
 chaos-test-sqlite-setup:
 	@echo "Setting up SQLite chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
-	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d postgres
-	@echo "Waiting for PostgreSQL to be healthy..."
-	@sleep 15
+	@echo "Building CDC application image..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml build cdc_app
+	@echo "Starting PostgreSQL..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d postgres
+	@echo "Waiting for PostgreSQL to be ready..."
+	@timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
 	@echo "Starting CDC application..."
-	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d cdc_app
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@sleep 10
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
 	@echo "Initializing SQLite database schema..."
 	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps
@@ -280,13 +296,16 @@ chaos-test-sqlite-logs:
 pgbench-test-sqlite-setup:
 	@echo "Setting up SQLite pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
-	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d postgres
-	@echo "Waiting for PostgreSQL to be healthy..."
-	@sleep 15
+	@echo "Building CDC application image..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml build cdc_app
+	@echo "Starting PostgreSQL..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d postgres
+	@echo "Waiting for PostgreSQL to be ready..."
+	@timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
 	@echo "Starting CDC application..."
-	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d cdc_app
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
-	@sleep 10
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
 	@echo "Initializing SQLite database schema..."
 	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
 	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps

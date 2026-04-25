@@ -39,6 +39,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Create data directory for SQLite and other file-based destinations
+RUN mkdir -p /app/data
+
 # Create non-root user
 RUN useradd -r -u 1001 -g root pg2any_user
 

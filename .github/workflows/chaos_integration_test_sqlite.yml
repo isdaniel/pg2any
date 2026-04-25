@@ -1,0 +1,180 @@
+name: CDC Chaos Integration Test (SQLite)
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  chaos-integration-test-sqlite:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compression: ["true", "false"]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Compose
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+
+    - name: Install PostgreSQL client tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client-common postgresql-client
+
+    - name: Verify test structure
+      run: |
+        echo "Verifying chaos test structure..."
+        ls -la tests/chaos/
+        ls -la tests/chaos/scripts/
+        ls -la tests/chaos/scenarios/verify_sqlite/
+
+    - name: Start Docker Compose services
+      run: |
+        echo "Starting PostgreSQL and CDC application..."
+        docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d
+      working-directory: .
+
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for services to become healthy..."
+        timeout 120 bash -c 'until docker ps | grep -q "healthy"; do sleep 5; done' || true
+        docker-compose -f docker-compose.chaos-test-sqlite.yml ps
+        sleep 15
+      working-directory: .
+
+    - name: Verify PostgreSQL is ready
+      run: |
+        echo "Verifying PostgreSQL connection..."
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
+
+    - name: Initialize SQLite database schema
+      run: |
+        echo "Initializing SQLite database schema..."
+        docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
+        echo "Verifying SQLite table..."
+        docker exec cdc_application sqlite3 /app/data/cdc_target.db ".tables"
+
+    - name: Verify CDC application is running
+      run: |
+        echo "Verifying CDC application..."
+        docker ps -a | grep cdc_application
+        docker logs cdc_application | tail -n 50
+
+    - name: Make scripts executable
+      run: |
+        chmod +x tests/chaos/scripts/*.sh
+        ls -la tests/chaos/scripts/
+
+    - name: Run chaos integration tests
+      run: |
+        echo "=========================================="
+        echo "Starting CDC Chaos Integration Tests (SQLite)"
+        echo "=========================================="
+        echo "OS: ${{ matrix.os }}"
+        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
+        echo ""
+
+        cd tests/chaos/scripts
+        ./run_chaos_tests_sqlite.sh
+      env:
+        CDC_POSTGRES_HOST: 127.0.0.1
+        CDC_POSTGRES_PORT: 5432
+        CDC_POSTGRES_USER: postgres
+        CDC_POSTGRES_PASSWORD: test.123
+        CDC_POSTGRES_DB: postgres
+        CDC_CONTAINER_NAME: cdc_application
+        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
+
+    - name: Show PostgreSQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "PostgreSQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_postgres --tail 100
+
+    - name: Show container status on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Docker Container Status"
+        echo "=========================================="
+        docker-compose -f docker-compose.chaos-test-sqlite.yml ps
+        docker ps -a
+
+    - name: Capture and upload CDC application logs
+      if: failure()
+      run: |
+        echo "Installing colorized-logs for log conversion..."
+        sudo apt-get update
+        sudo apt-get install -y colorized-logs || sudo apt-get install -y ansifilter
+        echo "Capturing full CDC application logs..."
+        if command -v ansi2txt &> /dev/null; then
+          docker logs cdc_application | ansi2txt > cdc_application_log.txt
+        elif command -v ansifilter &> /dev/null; then
+          docker logs cdc_application | ansifilter > cdc_application_log.txt
+        else
+          docker logs cdc_application > cdc_application_log.txt
+        fi
+        echo "Log file created: cdc_application_log.txt"
+        ls -lh cdc_application_log.txt
+
+    - name: Upload CDC application logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdc-sqlite-chaos-logs-${{ matrix.os }}-${{ matrix.compression }}
+        path: cdc_application_log.txt
+        retention-days: 30
+
+    - name: Setup tmate session
+      if: failure()
+      uses: mxschmitt/action-tmate@v3
+
+    - name: Stop and remove containers
+      if: always()
+      run: |
+        echo "Cleaning up Docker containers..."
+        docker-compose -f docker-compose.chaos-test-sqlite.yml down -v
+        docker volume rm chaos_test_sqlite_data 2>/dev/null || true
+        docker network rm chaos_test_network 2>/dev/null || true
+        docker system prune -f
+      working-directory: .
+
+    - name: Show disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df
+
+  notify:
+    needs: chaos-integration-test-sqlite
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Test result summary
+      run: |
+        echo "=========================================="
+        echo "SQLite Chaos Integration Test Summary"
+        echo "=========================================="
+        echo "Job status: ${{ needs.chaos-integration-test-sqlite.result }}"
+        if [ "${{ needs.chaos-integration-test-sqlite.result }}" = "success" ]; then
+          echo "All SQLite chaos integration tests passed!"
+        else
+          echo "Some SQLite chaos integration tests failed."
+        fi

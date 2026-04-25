@@ -1,7 +1,13 @@
 # PostgreSQL CDC Makefile
 # Provides convenient commands for development and deployment
 
-.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean chaos-test chaos-test-setup chaos-test-clean pgbench-test pgbench-test-setup pgbench-test-clean
+.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean \
+	chaos-test-mysql-setup chaos-test-mysql chaos-test-mysql-clean chaos-test-mysql-full \
+	pgbench-test-mysql-setup pgbench-test-mysql pgbench-test-mysql-clean pgbench-test-mysql-full \
+	chaos-test-sqlserver-setup chaos-test-sqlserver chaos-test-sqlserver-clean chaos-test-sqlserver-full \
+	pgbench-test-sqlserver-setup pgbench-test-sqlserver pgbench-test-sqlserver-clean pgbench-test-sqlserver-full \
+	chaos-test-sqlite-setup chaos-test-sqlite chaos-test-sqlite-clean chaos-test-sqlite-full \
+	pgbench-test-sqlite-setup pgbench-test-sqlite pgbench-test-sqlite-clean pgbench-test-sqlite-full
 
 # Default target
 help:
@@ -29,15 +35,41 @@ help:
 	@echo "  test-data      Insert test data"
 	@echo "  show-data      Show data in both databases"
 	@echo ""
-	@echo "Chaos Testing:"
-	@echo "  chaos-test-setup   Set up and start services for chaos testing"
-	@echo "  chaos-test         Run chaos integration tests"
-	@echo "  chaos-test-clean   Clean up after chaos testing"
+	@echo "MySQL Chaos Testing:"
+	@echo "  chaos-test-mysql-setup   Set up and start services for MySQL chaos testing"
+	@echo "  chaos-test-mysql         Run chaos integration tests against MySQL"
+	@echo "  chaos-test-mysql-clean   Clean up after MySQL chaos testing"
+	@echo "  chaos-test-mysql-full    Full MySQL chaos test cycle"
 	@echo ""
-	@echo "PGBench Testing:"
-	@echo "  pgbench-test-setup Set up and start services for pgbench testing"
-	@echo "  pgbench-test       Run pgbench chaos integration tests"
-	@echo "  pgbench-test-clean Clean up after pgbench testing"
+	@echo "MySQL PGBench Testing:"
+	@echo "  pgbench-test-mysql-setup Set up and start services for MySQL pgbench testing"
+	@echo "  pgbench-test-mysql       Run pgbench chaos integration tests against MySQL"
+	@echo "  pgbench-test-mysql-clean Clean up after MySQL pgbench testing"
+	@echo "  pgbench-test-mysql-full  Full MySQL pgbench test cycle"
+	@echo ""
+	@echo "SQL Server Chaos Testing:"
+	@echo "  chaos-test-sqlserver-setup   Set up SQL Server chaos testing environment"
+	@echo "  chaos-test-sqlserver         Run chaos tests against SQL Server"
+	@echo "  chaos-test-sqlserver-clean   Clean up SQL Server chaos testing"
+	@echo "  chaos-test-sqlserver-full    Full SQL Server chaos test cycle"
+	@echo ""
+	@echo "SQL Server PGBench Testing:"
+	@echo "  pgbench-test-sqlserver-setup Set up SQL Server pgbench testing environment"
+	@echo "  pgbench-test-sqlserver       Run pgbench tests against SQL Server"
+	@echo "  pgbench-test-sqlserver-clean Clean up SQL Server pgbench testing"
+	@echo "  pgbench-test-sqlserver-full  Full SQL Server pgbench test cycle"
+	@echo ""
+	@echo "SQLite Chaos Testing:"
+	@echo "  chaos-test-sqlite-setup      Set up SQLite chaos testing environment"
+	@echo "  chaos-test-sqlite            Run chaos tests against SQLite"
+	@echo "  chaos-test-sqlite-clean      Clean up SQLite chaos testing"
+	@echo "  chaos-test-sqlite-full       Full SQLite chaos test cycle"
+	@echo ""
+	@echo "SQLite PGBench Testing:"
+	@echo "  pgbench-test-sqlite-setup    Set up SQLite pgbench testing environment"
+	@echo "  pgbench-test-sqlite          Run pgbench tests against SQLite"
+	@echo "  pgbench-test-sqlite-clean    Clean up SQLite pgbench testing"
+	@echo "  pgbench-test-sqlite-full     Full SQLite pgbench test cycle"
 	@echo ""
 
 # Development commands
@@ -96,57 +128,179 @@ mysql:
 clean:
 	cargo clean
 
-# Chaos Testing commands
-chaos-test-setup:
-	@echo "Setting up chaos testing environment..."
+# MySQL Chaos Testing commands
+chaos-test-mysql-setup:
+	@echo "Setting up MySQL chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@docker-compose -f docker-compose.chaos-test.yml up --build -d
 	@echo "Waiting for services to be healthy..."
 	@docker-compose -f docker-compose.chaos-test.yml ps
 
-chaos-test:
-	@echo "Running chaos integration tests..."
+chaos-test-mysql:
+	@echo "Running chaos integration tests against MySQL..."
 	@echo "This will randomly restart the CDC application to test graceful shutdown"
 	@cd tests/chaos/scripts && ./run_chaos_tests.sh
 
-chaos-test-clean:
-	@echo "Cleaning up chaos testing environment..."
+chaos-test-mysql-clean:
+	@echo "Cleaning up MySQL chaos testing environment..."
 	@docker-compose -f docker-compose.chaos-test.yml down -v
 	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
 	@echo "Cleanup complete."
 
-chaos-test-full: chaos-test-setup chaos-test chaos-test-clean
-	@echo "Full chaos test cycle complete!"
+chaos-test-mysql-full: chaos-test-mysql-setup chaos-test-mysql chaos-test-mysql-clean
+	@echo "Full MySQL chaos test cycle complete!"
 
-chaos-test-logs:
+chaos-test-mysql-logs:
 	@echo "Showing CDC application logs..."
 	@docker logs -f cdc_application
 
-# PGBench Testing commands
-pgbench-test-setup:
-	@echo "Setting up pgbench testing environment..."
+# MySQL PGBench Testing commands
+pgbench-test-mysql-setup:
+	@echo "Setting up MySQL pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@docker-compose -f docker-compose.chaos-test.yml up --build -d
 	@echo "Waiting for services to be healthy..."
 	@docker-compose -f docker-compose.chaos-test.yml ps
 	@sleep 10 # Wait for the CDC application to fully initialize
 
-pgbench-test:
-	@echo "Running pgbench chaos integration test..."
+pgbench-test-mysql:
+	@echo "Running pgbench chaos integration test against MySQL..."
 	@echo "This will run pgbench while randomly restarting the CDC application"
 	@cd tests/chaos/scripts && ./run_pgbench_chaos_test.sh
 
-pgbench-test-clean:
-	@echo "Cleaning up pgbench testing environment..."
+pgbench-test-mysql-clean:
+	@echo "Cleaning up MySQL pgbench testing environment..."
 	@docker-compose -f docker-compose.chaos-test.yml down -v
 	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
 	@echo "Cleanup complete."
 
-pgbench-test-full: pgbench-test-setup pgbench-test pgbench-test-clean
-	@echo "Full pgbench test cycle complete!"
+pgbench-test-mysql-full: pgbench-test-mysql-setup pgbench-test-mysql pgbench-test-mysql-clean
+	@echo "Full MySQL pgbench test cycle complete!"
 
-pgbench-test-logs:
+pgbench-test-mysql-logs:
 	@echo "Showing CDC application logs..."
 	@docker logs -f cdc_application
+
+# SQL Server Chaos Testing commands
+chaos-test-sqlserver-setup:
+	@echo "Setting up SQL Server chaos testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d postgres sqlserver
+	@echo "Waiting for PostgreSQL and SQL Server to be healthy..."
+	@sleep 30
+	@echo "Initializing SQL Server database..."
+	@docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@echo "Starting CDC application..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d cdc_app
+	@echo "Waiting for CDC application to initialize..."
+	@sleep 10
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
+
+chaos-test-sqlserver:
+	@echo "Running chaos integration tests against SQL Server..."
+	@cd tests/chaos/scripts && ./run_chaos_tests_sqlserver.sh
+
+chaos-test-sqlserver-clean:
+	@echo "Cleaning up SQL Server chaos testing environment..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml down -v
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+chaos-test-sqlserver-full: chaos-test-sqlserver-setup chaos-test-sqlserver chaos-test-sqlserver-clean
+	@echo "Full SQL Server chaos test cycle complete!"
+
+chaos-test-sqlserver-logs:
+	@echo "Showing CDC application logs..."
+	@docker logs -f cdc_application
+
+# SQL Server PGBench Testing commands
+pgbench-test-sqlserver-setup:
+	@echo "Setting up SQL Server pgbench testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d postgres sqlserver
+	@echo "Waiting for PostgreSQL and SQL Server to be healthy..."
+	@sleep 30
+	@echo "Initializing SQL Server database..."
+	@docker exec cdc_sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@echo "Starting CDC application..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up --build -d cdc_app
+	@echo "Waiting for CDC application to initialize..."
+	@sleep 10
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml ps
+
+pgbench-test-sqlserver:
+	@echo "Running pgbench chaos integration test against SQL Server..."
+	@cd tests/chaos/scripts && ./run_pgbench_chaos_test_sqlserver.sh
+
+pgbench-test-sqlserver-clean:
+	@echo "Cleaning up SQL Server pgbench testing environment..."
+	@docker-compose -f docker-compose.chaos-test-sqlserver.yml down -v
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+pgbench-test-sqlserver-full: pgbench-test-sqlserver-setup pgbench-test-sqlserver pgbench-test-sqlserver-clean
+	@echo "Full SQL Server pgbench test cycle complete!"
+
+# SQLite Chaos Testing commands
+chaos-test-sqlite-setup:
+	@echo "Setting up SQLite chaos testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d postgres
+	@echo "Waiting for PostgreSQL to be healthy..."
+	@sleep 15
+	@echo "Starting CDC application..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d cdc_app
+	@echo "Waiting for CDC application to initialize..."
+	@sleep 10
+	@echo "Initializing SQLite database schema..."
+	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps
+
+chaos-test-sqlite:
+	@echo "Running chaos integration tests against SQLite..."
+	@cd tests/chaos/scripts && ./run_chaos_tests_sqlite.sh
+
+chaos-test-sqlite-clean:
+	@echo "Cleaning up SQLite chaos testing environment..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml down -v
+	@docker volume rm chaos_test_sqlite_data 2>/dev/null || true
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+chaos-test-sqlite-full: chaos-test-sqlite-setup chaos-test-sqlite chaos-test-sqlite-clean
+	@echo "Full SQLite chaos test cycle complete!"
+
+chaos-test-sqlite-logs:
+	@echo "Showing CDC application logs..."
+	@docker logs -f cdc_application
+
+# SQLite PGBench Testing commands
+pgbench-test-sqlite-setup:
+	@echo "Setting up SQLite pgbench testing environment..."
+	@chmod +x tests/chaos/scripts/*.sh
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d postgres
+	@echo "Waiting for PostgreSQL to be healthy..."
+	@sleep 15
+	@echo "Starting CDC application..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml up --build -d cdc_app
+	@echo "Waiting for CDC application to initialize..."
+	@sleep 10
+	@echo "Initializing SQLite database schema..."
+	@docker exec cdc_application sqlite3 /app/data/cdc_target.db ".read /init/init_sqlite.sql"
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml ps
+
+pgbench-test-sqlite:
+	@echo "Running pgbench chaos integration test against SQLite..."
+	@cd tests/chaos/scripts && ./run_pgbench_chaos_test_sqlite.sh
+
+pgbench-test-sqlite-clean:
+	@echo "Cleaning up SQLite pgbench testing environment..."
+	@docker-compose -f docker-compose.chaos-test-sqlite.yml down -v
+	@docker volume rm chaos_test_sqlite_data 2>/dev/null || true
+	@docker network rm chaos_test_network 2>/dev/null || true
+	@echo "Cleanup complete."
+
+pgbench-test-sqlite-full: pgbench-test-sqlite-setup pgbench-test-sqlite pgbench-test-sqlite-clean
+	@echo "Full SQLite pgbench test cycle complete!"

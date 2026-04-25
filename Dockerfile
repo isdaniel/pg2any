@@ -2,6 +2,9 @@
 # Build stage
 FROM rust:1.88-slim as builder
 
+# Destination features to compile (default: mysql,metrics)
+ARG DEST_FEATURES=mysql,metrics
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -20,8 +23,8 @@ COPY pg2any-lib/ ./pg2any-lib/
 COPY examples/ ./examples/
 
 WORKDIR /app/examples
-# Build the application
-RUN cargo build --release
+# Build the application with selected destination features
+RUN cargo build --release --no-default-features --features "${DEST_FEATURES}"
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -31,6 +34,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     libpq-dev \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

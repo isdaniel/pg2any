@@ -1,0 +1,13 @@
+CREATE DATABASE cdc_db;
+GO
+
+USE cdc_db;
+GO
+
+CREATE TABLE dbo.t1 (
+    ID INT NOT NULL PRIMARY KEY,
+    val INT NOT NULL,
+    col1 CHAR(36) NOT NULL,
+    col2 CHAR(36) NOT NULL
+);
+GO

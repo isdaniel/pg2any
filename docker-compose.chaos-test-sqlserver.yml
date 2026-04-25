@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  # PostgreSQL source database
+  postgres:
+    image: postgres:15-alpine
+    container_name: cdc_postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test.123
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    restart: always
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./examples/scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init_postgres.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_wal_senders=10
+      -c max_connections=500
+    networks:
+      - chaos_test_network
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: cdc_sqlserver
+    restart: always
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Test.123!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - ./examples/scripts/init_sqlserver.sql:/init/init_sqlserver.sql:ro
+      - ./tests/chaos/scenarios/verify_sqlserver:/verify:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test.123!' -C -Q 'SELECT 1' -b"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - chaos_test_network
+
+  cdc_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DEST_FEATURES: sqlserver,metrics
+    container_name: cdc_application
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sqlserver:
+        condition: service_healthy
+    env_file:
+      - ./env/.env.sqlserver
+    environment:
+      RUST_LOG: info
+      RUST_BACKTRACE: 1
+      CDC_LAST_LSN_FILE: /app/pg2any_last_lsn.metadata
+    ports:
+      - "8080:8080"
+    restart: "no"
+    stop_grace_period: 300s
+    stop_signal: SIGTERM
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - chaos_test_network
+
+networks:
+  chaos_test_network:
+    driver: bridge
+    name: chaos_test_network

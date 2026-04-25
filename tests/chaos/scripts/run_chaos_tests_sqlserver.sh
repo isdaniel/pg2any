@@ -14,11 +14,9 @@ ENV_FILE="$PROJECT_ROOT/env/.env.sqlserver"
 
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    while IFS='=' read -r key value; do
-        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-        [[ "$value" == *" "* ]] && continue
-        export "$key=$value"
-    done < "$ENV_FILE"
+    set -a
+    source "$ENV_FILE"
+    set +a
 else
     echo "Warning: .env.sqlserver file not found at $ENV_FILE, using defaults"
 fi
@@ -96,6 +94,23 @@ cleanup() {
 # Set up trap for cleanup
 trap cleanup EXIT INT TERM
 
+# Function to wait for container to be running
+wait_for_container_running() {
+    local container="$1"
+    local max_wait="${2:-120}"
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        if docker ps --filter "name=^${container}$" --format "{{.Status}}" | grep -q "^Up"; then
+            return 0
+        fi
+        log_warning "Container '$container' is not running. Waiting... (${waited}s/${max_wait}s)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "Container '$container' did not start within ${max_wait}s"
+    return 1
+}
+
 # Function to execute PostgreSQL SQL
 execute_postgres_sql() {
     local sql_file="$1"
@@ -129,15 +144,21 @@ execute_sqlserver_sql() {
 # Function to verify test result via mounted verify scripts
 verify_scenario() {
     local verify_file="$1"
-    local verify_filename=$(basename "$verify_file")
+    local verify_filename
+    verify_filename=$(basename "$verify_file")
 
-    local result=$(docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
+    if ! wait_for_container_running "$SQLSERVER_CONTAINER" 120; then
+        log_error "SQL Server container not running, cannot verify scenario"
+        return 1
+    fi
+
+    local result
+    result=$(docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
         -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
         -d "$SQLSERVER_DB" \
         -i "/verify/$verify_filename" \
         -h -1 -W 2>&1)
 
-    # Check if result contains "PASS"
     if echo "$result" | grep -q "PASS"; then
         return 0
     else

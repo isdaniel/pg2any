@@ -50,7 +50,6 @@ PGBENCH_SCRIPT="${PGBENCH_SCRIPT:-$PROJECT_ROOT/examples/scripts/pgbench_testing
 # Verification configuration
 MAX_RETRIES=60
 RETRY_INTERVAL=45
-EXPECTED_ROW_COUNT=$((3000 * PGBENCH_CLIENTS * PGBENCH_TRANSACTIONS))
 
 # Connection string
 POSTGRES_CONNSTRING="postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?user=${POSTGRES_USER}&password=${POSTGRES_PASSWORD}"
@@ -102,6 +101,43 @@ cleanup() {
 # Set up trap for cleanup
 trap cleanup EXIT INT TERM
 
+# Function to wait for container to be running
+wait_for_container_running() {
+    local container="$1"
+    local max_wait="${2:-120}"
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        if docker ps --filter "name=^${container}$" --format "{{.Status}}" | grep -q "^Up"; then
+            return 0
+        fi
+        log_warning "Container '$container' is not running. Waiting... (${waited}s/${max_wait}s)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "Container '$container' did not start within ${max_wait}s"
+    return 1
+}
+
+# Function to stop chaos script and ensure container is healthy
+stop_chaos_and_stabilize() {
+    if [ -n "$CHAOS_SCRIPT_PID" ] && kill -0 "$CHAOS_SCRIPT_PID" 2>/dev/null; then
+        log_info "Stopping chaos script before verification (PID: $CHAOS_SCRIPT_PID)..."
+        kill "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        CHAOS_SCRIPT_PID=""
+    fi
+
+    log_info "Ensuring CDC container is running and stable..."
+    if ! wait_for_container_running "$CDC_CONTAINER" 120; then
+        log_error "CDC container failed to start after stopping chaos"
+        return 1
+    fi
+
+    sleep 10
+    log_success "Container stabilized for verification phase"
+    return 0
+}
+
 # Function to check if container exists
 check_container() {
     if ! docker ps -a --filter "name=^${CONTAINER_NAME}$" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
@@ -150,7 +186,13 @@ test_sqlite_connection() {
 
 # Function to get row count from SQLite t1 table
 get_sqlite_row_count() {
-    local count=$(docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
+    if ! wait_for_container_running "$CDC_CONTAINER" 120; then
+        echo ""
+        return 1
+    fi
+
+    local count
+    count=$(docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
         "SELECT COUNT(*) FROM t1;" 2>/dev/null | tr -d '[:space:]')
 
     echo "$count"
@@ -293,6 +335,20 @@ main() {
     fi
 
     echo "" | tee -a "$RESULTS_FILE"
+
+    # Query actual row count from PG source (some transactions may have failed under load)
+    EXPECTED_ROW_COUNT=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT COUNT(*) FROM t1;" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$EXPECTED_ROW_COUNT" ] || [ "$EXPECTED_ROW_COUNT" -eq 0 ] 2>/dev/null; then
+        log_error "Failed to get row count from PostgreSQL source or no rows found"
+        exit 1
+    fi
+    log_info "Actual PostgreSQL source row count: $EXPECTED_ROW_COUNT"
+
+    # Stop chaos and stabilize container before verification
+    if ! stop_chaos_and_stabilize; then
+        log_error "Failed to stabilize container for verification"
+        exit 1
+    fi
 
     # Verify replication with retry loop
     log_section "Verifying Replication"

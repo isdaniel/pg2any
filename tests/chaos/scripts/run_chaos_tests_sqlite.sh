@@ -80,6 +80,23 @@ cleanup() {
 # Set up trap for cleanup
 trap cleanup EXIT INT TERM
 
+# Function to wait for container to be running
+wait_for_container_running() {
+    local container="$1"
+    local max_wait="${2:-120}"
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        if docker ps --filter "name=^${container}$" --format "{{.Status}}" | grep -q "^Up"; then
+            return 0
+        fi
+        log_warning "Container '$container' is not running. Waiting... (${waited}s/${max_wait}s)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "Container '$container' did not start within ${max_wait}s"
+    return 1
+}
+
 # Function to execute PostgreSQL SQL
 execute_postgres_sql() {
     local sql_file="$1"
@@ -99,12 +116,18 @@ execute_postgres_sql() {
 # Function to verify test result via docker exec with sqlite3
 verify_scenario() {
     local verify_file="$1"
-    local verify_filename=$(basename "$verify_file")
+    local verify_filename
+    verify_filename=$(basename "$verify_file")
 
-    local result=$(docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
+    if ! wait_for_container_running "$CDC_CONTAINER" 120; then
+        log_error "Container not running, cannot verify scenario"
+        return 1
+    fi
+
+    local result
+    result=$(docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
         ".read /verify/$verify_filename" 2>&1)
 
-    # Check if result contains "PASS"
     if echo "$result" | grep -q "PASS"; then
         return 0
     else

@@ -184,6 +184,7 @@ pgbench-test-mysql-logs:
 	@docker logs -f cdc_application
 
 # Helper: find sqlcmd path inside SQL Server container
+SQLSERVER_SA_PASSWORD ?= Test.123!
 SQLCMD_EXEC = docker exec cdc_sqlserver bash -c 'if [ -x /opt/mssql-tools18/bin/sqlcmd ]; then /opt/mssql-tools18/bin/sqlcmd "$$@"; elif [ -x /opt/mssql-tools/bin/sqlcmd ]; then /opt/mssql-tools/bin/sqlcmd "$$@"; else echo "sqlcmd not found" >&2; exit 1; fi' --
 
 # SQL Server Chaos Testing commands
@@ -199,7 +200,7 @@ chaos-test-sqlserver-setup:
 	@echo "Waiting for SQL Server to be ready..."
 	@timeout 120 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQL Server database..."
-	@$(SQLCMD_EXEC) -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@$(SQLCMD_EXEC) -S localhost -U sa -P '$(SQLSERVER_SA_PASSWORD)' -C -i /init/init_sqlserver.sql
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."
@@ -236,7 +237,7 @@ pgbench-test-sqlserver-setup:
 	@echo "Waiting for SQL Server to be ready..."
 	@timeout 120 bash -c 'until docker ps --filter name=cdc_sqlserver --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@echo "Initializing SQL Server database..."
-	@$(SQLCMD_EXEC) -S localhost -U sa -P 'Test.123!' -C -i /init/init_sqlserver.sql
+	@$(SQLCMD_EXEC) -S localhost -U sa -P '$(SQLSERVER_SA_PASSWORD)' -C -i /init/init_sqlserver.sql
 	@echo "Starting CDC application..."
 	@docker-compose -f docker-compose.chaos-test-sqlserver.yml up -d cdc_app
 	@echo "Waiting for CDC application to initialize..."

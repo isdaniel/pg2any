@@ -12,18 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/env/.env.sqlserver"
 
-load_env_file() {
-    local env_file="$1"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" != *=* ]] && continue
-        export "$line"
-    done < "$env_file"
-}
-
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    load_env_file "$ENV_FILE"
+    set -a
+    source "$ENV_FILE"
+    set +a
 else
     echo "Warning: .env.sqlserver file not found at $ENV_FILE, using defaults"
 fi
@@ -130,20 +123,6 @@ execute_postgres_sql() {
         -U "$POSTGRES_USER" \
         -d "$POSTGRES_DB" \
         -f "$sql_file" \
-        2>&1
-
-    return ${PIPESTATUS[0]}
-}
-
-# Function to execute SQL Server SQL via docker exec
-execute_sqlserver_sql() {
-    local sql="$1"
-    log_info "Executing SQL Server SQL..."
-
-    docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
-        -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
-        -d "$SQLSERVER_DB" \
-        -Q "$sql" \
         2>&1
 
     return ${PIPESTATUS[0]}

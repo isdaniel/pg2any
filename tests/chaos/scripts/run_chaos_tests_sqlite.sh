@@ -12,18 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/env/.env.sqlite"
 
-load_env_file() {
-    local env_file="$1"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" != *=* ]] && continue
-        export "$line"
-    done < "$env_file"
-}
-
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    load_env_file "$ENV_FILE"
+    set -a
+    source "$ENV_FILE"
+    set +a
 else
     echo "Warning: .env.sqlite file not found at $ENV_FILE, using defaults"
 fi
@@ -157,6 +150,7 @@ cleanup_test_data() {
         -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
 
     # Clean SQLite (DELETE instead of TRUNCATE - SQLite doesn't support TRUNCATE)
+    wait_for_container_running "$CDC_CONTAINER" 60
     docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
         "DELETE FROM t1;" 2>&1 || true
 

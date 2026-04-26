@@ -12,11 +12,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/env/.env.sqlserver"
 
+load_env_file() {
+    local env_file="$1"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *=* ]] && continue
+        export "$line"
+    done < "$env_file"
+}
+
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    set -a
-    source "$ENV_FILE"
-    set +a
+    load_env_file "$ENV_FILE"
 else
     echo "Warning: .env.sqlserver file not found at $ENV_FILE, using defaults"
 fi

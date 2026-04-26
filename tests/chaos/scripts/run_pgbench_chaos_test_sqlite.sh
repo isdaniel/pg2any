@@ -208,7 +208,8 @@ get_sqlite_row_count() {
 
 # Function to verify replication completed
 verify_replication() {
-    local current_count=$(get_sqlite_row_count)
+    local current_count
+    current_count=$(get_sqlite_row_count)
 
     if [ -z "$current_count" ]; then
         log_warning "Failed to get row count from SQLite"

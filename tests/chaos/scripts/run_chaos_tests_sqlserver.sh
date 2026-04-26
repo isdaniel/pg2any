@@ -323,7 +323,8 @@ main() {
 
     for scenario_file in "${scenario_files[@]}"; do
         # Extract scenario number from filename
-        local scenario_num=$(basename "$scenario_file" | sed 's/scenario\([0-9]*\)_input.sql/\1/')
+        local scenario_num
+        scenario_num=$(basename "$scenario_file" | sed 's/scenario\([0-9]*\)_input.sql/\1/')
 
         # Clean up before each scenario
         cleanup_test_data

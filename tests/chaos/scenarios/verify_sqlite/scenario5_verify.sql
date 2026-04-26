@@ -1,14 +1,17 @@
--- Scenario 5: Verification - Check if high-volume data (3M rows) was replicated
+-- Scenario 5: Verification - Check if high-volume data was replicated
+-- Expected row count must match scenario5_input.sql generate_series(1, N)
+WITH expected(cnt) AS (VALUES (3000000))
 SELECT
     CASE
-        WHEN COUNT(*) = 3000000 THEN 'PASS'
+        WHEN COUNT(*) = expected.cnt THEN 'PASS'
         ELSE 'FAIL'
     END AS test_result,
     COUNT(*) AS actual_count,
-    3000000 AS expected_count,
+    expected.cnt AS expected_count,
     CASE
-        WHEN COUNT(*) = 3000000 THEN 'All 3M rows replicated successfully'
-        WHEN COUNT(*) > 0 THEN 'Partial replication: ' || CAST(COUNT(*) AS TEXT) || ' of 3M rows'
+        WHEN COUNT(*) = expected.cnt THEN 'All ' || CAST(expected.cnt AS TEXT) || ' rows replicated successfully'
+        WHEN COUNT(*) > 0 THEN 'Partial replication: ' || CAST(COUNT(*) AS TEXT) || ' of ' || CAST(expected.cnt AS TEXT) || ' rows'
         ELSE 'No data replicated'
     END AS status_message
-FROM t1;
+FROM t1, expected
+GROUP BY expected.cnt;

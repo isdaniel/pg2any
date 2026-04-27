@@ -10,8 +10,15 @@ repository = "https://github.com/isdaniel/pg2any"
 homepage = "https://github.com/isdaniel/pg2any"
 documentation = "https://docs.rs/pg2any"
 
+[features]
+default = ["mysql", "metrics"]
+mysql = ["pg2any_lib/mysql"]
+sqlserver = ["pg2any_lib/sqlserver"]
+sqlite = ["pg2any_lib/sqlite"]
+metrics = ["pg2any_lib/metrics"]
+
 [dependencies]
-pg2any_lib = { path = "../pg2any-lib", default-features = false, features = ["mysql", "metrics"] }
+pg2any_lib = { path = "../pg2any-lib", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

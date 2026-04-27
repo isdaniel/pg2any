@@ -147,8 +147,8 @@ verify_scenario() {
     fi
 
     local result
-    result=$(docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
-        -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
+    result=$(docker exec -e SQLCMDPASSWORD="$SQLSERVER_PASSWORD" "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
+        -S localhost -U sa -C \
         -d "$SQLSERVER_DB" \
         -i "/verify/$verify_filename" \
         -h -1 -W 2>&1)
@@ -174,8 +174,8 @@ cleanup_test_data() {
         -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
 
     # Clean SQL Server
-    docker exec "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
-        -S localhost -U sa -P "$SQLSERVER_PASSWORD" -C \
+    docker exec -e SQLCMDPASSWORD="$SQLSERVER_PASSWORD" "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
+        -S localhost -U sa -C \
         -d "$SQLSERVER_DB" \
         -Q "TRUNCATE TABLE dbo.t1;" \
         2>&1 || true
@@ -292,7 +292,7 @@ main() {
     sleep 5
 
     # Find all scenario input files
-    local scenario_files=($(ls "$SCENARIOS_DIR"/input/scenario*_input.sql 2>/dev/null | sort))
+    local scenario_files=("$SCENARIOS_DIR"/input/scenario*_input.sql)
     local total_scenarios=${#scenario_files[@]}
 
     if [ $total_scenarios -eq 0 ]; then

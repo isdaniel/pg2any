@@ -264,7 +264,7 @@ main() {
     sleep 5
 
     # Find all scenario input files
-    local scenario_files=($(ls "$SCENARIOS_DIR"/input/scenario*_input.sql 2>/dev/null | sort))
+    local scenario_files=("$SCENARIOS_DIR"/input/scenario*_input.sql)
     local total_scenarios=${#scenario_files[@]}
 
     if [ $total_scenarios -eq 0 ]; then

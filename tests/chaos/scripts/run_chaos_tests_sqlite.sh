@@ -156,13 +156,37 @@ cleanup_test_data() {
         -d "$POSTGRES_DB" \
         -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
 
-    # Clean SQLite (DELETE instead of TRUNCATE - SQLite doesn't support TRUNCATE)
-    wait_for_container_running "$CDC_CONTAINER" 60
-    docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
-        "DELETE FROM t1;" 2>&1 || true
+    # Wait for CDC to replicate the TRUNCATE and verify SQLite is clean
+    local cleanup_retries=0
+    local max_cleanup_retries=12
+    while [ $cleanup_retries -lt $max_cleanup_retries ]; do
+        if ! wait_for_container_running "$CDC_CONTAINER" 120; then
+            cleanup_retries=$((cleanup_retries + 1))
+            sleep 5
+            continue
+        fi
 
-    # Wait for truncate to replicate
-    sleep 5
+        local row_count
+        row_count=$(docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
+            "SELECT COUNT(*) FROM t1;" 2>/dev/null | tr -d '[:space:]')
+
+        if [ "$row_count" = "0" ]; then
+            log_info "Cleanup verified: SQLite t1 table is empty"
+            break
+        fi
+
+        log_warning "SQLite still has $row_count rows, waiting for CDC to replicate TRUNCATE..."
+        cleanup_retries=$((cleanup_retries + 1))
+        sleep 5
+    done
+
+    if [ $cleanup_retries -ge $max_cleanup_retries ]; then
+        log_warning "Cleanup verification timed out, forcing direct DELETE on SQLite"
+        wait_for_container_running "$CDC_CONTAINER" 60
+        docker exec "$CDC_CONTAINER" sqlite3 "$SQLITE_DB_PATH" \
+            "DELETE FROM t1;" 2>&1 || true
+        sleep 5
+    fi
 }
 
 # Function to run a single scenario

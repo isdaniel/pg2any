@@ -173,15 +173,42 @@ cleanup_test_data() {
         -d "$POSTGRES_DB" \
         -c "TRUNCATE TABLE public.t1;" > /dev/null 2>&1 || true
 
-    # Clean SQL Server
-    docker exec -e SQLCMDPASSWORD="$SQLSERVER_PASSWORD" "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
-        -S localhost -U sa -C \
-        -d "$SQLSERVER_DB" \
-        -Q "TRUNCATE TABLE dbo.t1;" \
-        2>&1 || true
+    # Wait for CDC to replicate the TRUNCATE and verify SQL Server is clean
+    local cleanup_retries=0
+    local max_cleanup_retries=12
+    while [ $cleanup_retries -lt $max_cleanup_retries ]; do
+        if ! wait_for_container_running "$SQLSERVER_CONTAINER" 120; then
+            cleanup_retries=$((cleanup_retries + 1))
+            sleep 5
+            continue
+        fi
 
-    # Wait for truncate to replicate
-    sleep 5
+        local row_count
+        row_count=$(docker exec -e SQLCMDPASSWORD="$SQLSERVER_PASSWORD" "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
+            -S localhost -U sa -C \
+            -d "$SQLSERVER_DB" \
+            -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.t1;" \
+            -h -1 -W 2>/dev/null | tr -d '[:space:]')
+
+        if [ "$row_count" = "0" ]; then
+            log_info "Cleanup verified: SQL Server t1 table is empty"
+            break
+        fi
+
+        log_warning "SQL Server still has $row_count rows, waiting for CDC to replicate TRUNCATE..."
+        cleanup_retries=$((cleanup_retries + 1))
+        sleep 5
+    done
+
+    if [ $cleanup_retries -ge $max_cleanup_retries ]; then
+        log_warning "Cleanup verification timed out, forcing direct TRUNCATE on SQL Server"
+        docker exec -e SQLCMDPASSWORD="$SQLSERVER_PASSWORD" "$SQLSERVER_CONTAINER" $SQLCMD_PATH \
+            -S localhost -U sa -C \
+            -d "$SQLSERVER_DB" \
+            -Q "TRUNCATE TABLE dbo.t1;" \
+            2>&1 || true
+        sleep 5
+    fi
 }
 
 # Function to run a single scenario

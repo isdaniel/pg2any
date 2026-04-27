@@ -68,21 +68,28 @@ services:
     environment:
       RUST_LOG: info
       RUST_BACKTRACE: 1
-      CDC_LAST_LSN_FILE: /app/pg2any_last_lsn.metadata
+      CDC_LAST_LSN_FILE: /app/data/pg2any_last_lsn.metadata
+      CDC_TRANSACTION_FILE_BASE_PATH: /app/data
     ports:
       - "8080:8080"  # Metrics endpoint
-    restart: "no"
+    restart: unless-stopped
     # Graceful shutdown timeout - critical for testing
     stop_grace_period: 300s
     stop_signal: SIGTERM
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"] 
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 30s
+    volumes:
+      - cdc_data:/app/data
     networks:
       - chaos_test_network
+
+volumes:
+  cdc_data:
+    name: chaos_test_cdc_data
 
 networks:
   chaos_test_network:

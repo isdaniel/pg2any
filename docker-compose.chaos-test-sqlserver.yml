@@ -69,6 +69,7 @@ services:
       RUST_LOG: info
       RUST_BACKTRACE: 1
       CDC_LAST_LSN_FILE: /app/data/pg2any_last_lsn.metadata
+      CDC_TRANSACTION_FILE_BASE_PATH: /app/data
     ports:
       - "8080:8080"
     restart: unless-stopped

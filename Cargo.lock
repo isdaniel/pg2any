@@ -1606,9 +1606,9 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e444c2b868ae1b4cd8bfcbdfb571e9fbdbfda39ca0b4142a588c5cb66e05365"
+checksum = "b7aab32056d8081f809a49a21fc20324a695e61ef1abb9599111ff12330db894"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1618,6 +1618,7 @@ dependencies = [
  "postgres-protocol",
  "rustls",
  "serde",
+ "smallvec",
  "socket2",
  "tokio",
  "tokio-rustls",

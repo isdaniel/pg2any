@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL source database
   postgres:
@@ -49,10 +47,6 @@ services:
       CDC_STREAMING: "false"
     ports:
       - "8080:8080"
-    volumes:
-      - sqlite_data:/app/data
-      - ./examples/scripts/init_sqlite.sql:/init/init_sqlite.sql:ro
-      - ./tests/chaos/scenarios/verify_sqlite:/verify:ro
     restart: unless-stopped
     stop_grace_period: 300s
     stop_signal: SIGTERM
@@ -62,11 +56,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+    volumes:
+      - ./examples/scripts/init_sqlite.sql:/init/init_sqlite.sql:ro
+      - ./tests/chaos/scenarios/verify_sqlite:/verify:ro
+      - cdc_data:/app/data
     networks:
       - chaos_test_network
 
 volumes:
-  sqlite_data:
+  cdc_data:
     name: chaos_test_sqlite_data
 
 networks:

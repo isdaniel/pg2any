@@ -291,6 +291,7 @@ async fn test_sqlite_destination_connection_lifecycle() {
         .unwrap();
 
     // Clean up
+    pool.close().await;
     let _ = destination.close().await;
 }
 

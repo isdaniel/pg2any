@@ -146,6 +146,7 @@ jobs:
 
     - name: Setup tmate session
       if: failure()
+      timeout-minutes: 15
       uses: mxschmitt/action-tmate@v3
 
     - name: Stop and remove containers

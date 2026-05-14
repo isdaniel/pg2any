@@ -170,24 +170,23 @@ impl CdcApp {
 
         let shutdown_handler = setup_shutdown_handler(self.client.cancellation_token());
 
-        tokio::select! {
-            result = self.client.start_replication_from_lsn(start_lsn) => {
-                match result {
-                    Ok(()) => {
-                        info!("CDC replication completed successfully");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::error!("CDC replication failed: {}", e);
-                        Err(e)
-                    }
-                }
-            }
-            _ = shutdown_handler => {
-                info!("Shutdown signal received, stopping CDC replication gracefully");
-                self.client.stop().await?;
-                info!("CDC replication stopped successfully");
-                Ok(())
+        // Spawn the shutdown handler so it cancels the token on SIGTERM/SIGINT.
+        tokio::spawn(async move {
+            shutdown_handler.await;
+        });
+
+        // The replication future observes the cancellation token internally and exits cleanly after flushing any in-progress batch metadata.
+        let replication_result = self.client.start_replication_from_lsn(start_lsn).await;
+
+        self.client.stop().await?;
+        info!("CDC replication stopped successfully");
+
+        match replication_result {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => {
+                tracing::error!("CDC replication failed: {}", e);
+                Err(e)
             }
         }
     }

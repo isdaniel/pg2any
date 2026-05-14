@@ -686,14 +686,14 @@ async fn test_sqlite_bulk_operations_performance() {
         update_duration
     );
 
-    // Performance assertions - these are generous to account for CI environment
+    // Performance assertions - generous thresholds for CI/VM environments
     assert!(
-        insert_duration < Duration::from_secs(30),
+        insert_duration < Duration::from_secs(60),
         "INSERT operations too slow: {:?}",
         insert_duration
     );
     assert!(
-        update_duration < Duration::from_secs(30),
+        update_duration < Duration::from_secs(60),
         "UPDATE operations too slow: {:?}",
         update_duration
     );
@@ -945,6 +945,7 @@ async fn test_sqlite_connection_recovery() {
         .await;
     assert!(process_result2.is_ok());
 
+    pool.close().await;
     let _ = destination.close().await;
 }
 

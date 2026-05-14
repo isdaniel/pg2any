@@ -1823,7 +1823,9 @@ impl TransactionManager {
             pending_tx.metadata.segments.clone()
         };
 
-        let mut all_events: Vec<ChangeEvent> = Vec::new();
+        let mut batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
+        let mut batch_count = 0usize;
+        let mut total_events = 0usize;
 
         for segment in &segments {
             let is_compressed = segment
@@ -1857,7 +1859,45 @@ impl TransactionManager {
                     let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
                         CdcError::generic(format!("Failed to deserialize event: {e}"))
                     })?;
-                    all_events.push(event);
+                    batch.push(event);
+
+                    if batch.len() >= batch_size {
+                        if cancellation_token.is_cancelled() {
+                            warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
+                            return Ok(());
+                        }
+                        batch_count += 1;
+                        total_events += batch.len();
+                        let metadata_path = pending_tx.file_path.clone();
+                        let file_manager = self.clone();
+                        let staged_index = batch_count * batch_size;
+
+                        let pre_commit_hook: Option<PreCommitHook> =
+                            Some(Box::new(move || {
+                                let metadata_path = metadata_path.clone();
+                                let file_manager = file_manager.clone();
+                                Box::pin(async move {
+                                    file_manager
+                                        .stage_pending_metadata_progress(
+                                            &metadata_path,
+                                            staged_index,
+                                        )
+                                        .await?;
+                                    Ok(())
+                                })
+                            }));
+
+                        destination_handler
+                            .execute_events_batch_with_hook(
+                                &batch,
+                                tx_id,
+                                pending_tx.metadata.commit_timestamp,
+                                pending_tx.metadata.commit_lsn,
+                                pre_commit_hook,
+                            )
+                            .await?;
+                        batch.clear();
+                    }
                 }
             } else {
                 let content = fs::read_to_string(&segment.path).await.map_err(|e| {
@@ -1872,23 +1912,57 @@ impl TransactionManager {
                     let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
                         CdcError::generic(format!("Failed to deserialize event: {e}"))
                     })?;
-                    all_events.push(event);
+                    batch.push(event);
+
+                    if batch.len() >= batch_size {
+                        if cancellation_token.is_cancelled() {
+                            warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
+                            return Ok(());
+                        }
+                        batch_count += 1;
+                        total_events += batch.len();
+                        let metadata_path = pending_tx.file_path.clone();
+                        let file_manager = self.clone();
+                        let staged_index = batch_count * batch_size;
+
+                        let pre_commit_hook: Option<PreCommitHook> =
+                            Some(Box::new(move || {
+                                let metadata_path = metadata_path.clone();
+                                let file_manager = file_manager.clone();
+                                Box::pin(async move {
+                                    file_manager
+                                        .stage_pending_metadata_progress(
+                                            &metadata_path,
+                                            staged_index,
+                                        )
+                                        .await?;
+                                    Ok(())
+                                })
+                            }));
+
+                        destination_handler
+                            .execute_events_batch_with_hook(
+                                &batch,
+                                tx_id,
+                                pending_tx.metadata.commit_timestamp,
+                                pending_tx.metadata.commit_lsn,
+                                pre_commit_hook,
+                            )
+                            .await?;
+                        batch.clear();
+                    }
                 }
             }
         }
 
-        if cancellation_token.is_cancelled() {
-            return Ok(());
-        }
-
-        let mut batch_count = 0usize;
-        for chunk in all_events.chunks(batch_size) {
+        // Flush remaining events
+        if !batch.is_empty() {
             if cancellation_token.is_cancelled() {
                 warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
                 return Ok(());
             }
-
             batch_count += 1;
+            total_events += batch.len();
             let metadata_path = pending_tx.file_path.clone();
             let file_manager = self.clone();
             let staged_index = batch_count * batch_size;
@@ -1906,7 +1980,7 @@ impl TransactionManager {
 
             destination_handler
                 .execute_events_batch_with_hook(
-                    chunk,
+                    &batch,
                     tx_id,
                     pending_tx.metadata.commit_timestamp,
                     pending_tx.metadata.commit_lsn,
@@ -1918,7 +1992,7 @@ impl TransactionManager {
         let duration = start_time.elapsed();
         info!(
             "Event-mode: processed {} events in {} batches in {:?} (tx_id: {})",
-            all_events.len(),
+            total_events,
             batch_count,
             duration,
             tx_id
@@ -1928,7 +2002,7 @@ impl TransactionManager {
             pending_tx,
             lsn_tracker,
             metrics_collector,
-            all_events.len(),
+            total_events,
             shared_lsn_feedback,
         )
         .await?;

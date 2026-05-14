@@ -158,7 +158,7 @@ impl KafkaDestination {
         serde_json::to_string(&key).ok()
     }
 
-    fn enqueue_event(&self, topic: &str, key: Option<&str>, value: &str) -> Result<()> {
+    async fn enqueue_event(&self, topic: &str, key: Option<&str>, value: &str) -> Result<()> {
         let producer = self
             .producer
             .as_ref()
@@ -180,7 +180,7 @@ impl KafkaDestination {
                     ),
                     _,
                 )) if attempt < 9 => {
-                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
+                    tokio::time::sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
                     producer.poll(Duration::from_millis(100));
                 }
                 Err((err, _)) => {
@@ -330,7 +330,7 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, None, &value)?;
+                    self.enqueue_event(&topic, None, &value).await?;
                 }
                 pg_walstream::EventType::Update {
                     schema,
@@ -359,7 +359,7 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, key.as_deref(), &value)?;
+                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
                 }
                 pg_walstream::EventType::Delete {
                     schema,
@@ -385,7 +385,7 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, key.as_deref(), &value)?;
+                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
                 }
                 pg_walstream::EventType::Truncate(tables) => {
                     for table_spec in tables.iter() {
@@ -407,7 +407,7 @@ impl DestinationHandler for KafkaDestination {
                         let value = serde_json::to_string(&envelope).map_err(|e| {
                             CdcError::generic(format!("JSON serialization failed: {e}"))
                         })?;
-                        self.enqueue_event(&topic, None, &value)?;
+                        self.enqueue_event(&topic, None, &value).await?;
                     }
                 }
                 _ => {

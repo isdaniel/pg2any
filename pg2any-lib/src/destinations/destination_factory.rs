@@ -1,8 +1,10 @@
 use crate::{
     error::{CdcError, Result},
-    types::DestinationType,
+    types::{DestinationType, Lsn},
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use pg_walstream::ChangeEvent;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 pub type PreCommitHook =
@@ -76,6 +78,23 @@ pub trait DestinationHandler: Send + Sync {
 
     /// Close the connection
     async fn close(&mut self) -> Result<()>;
+
+    fn supports_event_mode(&self) -> bool {
+        false
+    }
+
+    async fn execute_events_batch_with_hook(
+        &mut self,
+        _events: &[ChangeEvent],
+        _transaction_id: u32,
+        _commit_timestamp: DateTime<Utc>,
+        _commit_lsn: Option<Lsn>,
+        _pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        Err(CdcError::unsupported(
+            "Event mode not supported by this destination",
+        ))
+    }
 }
 
 /// Factory for creating destination handlers
@@ -93,6 +112,9 @@ impl DestinationFactory {
 
             #[cfg(feature = "sqlite")]
             DestinationType::SQLite => Ok(Box::new(SQLiteDestination::new())),
+
+            #[cfg(feature = "kafka")]
+            DestinationType::Kafka => Ok(Box::new(super::kafka::KafkaDestination::new())),
 
             #[allow(unreachable_patterns)]
             _ => Err(CdcError::unsupported(format!(

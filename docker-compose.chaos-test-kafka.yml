@@ -27,18 +27,49 @@ services:
     networks:
       - chaos_test_network
 
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: cdc_kafka
+    restart: always
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_MESSAGE_MAX_BYTES: "10485760"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    networks:
+      - chaos_test_network
+
   cdc_app:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        DEST_FEATURES: sqlite,metrics
+        DEST_FEATURES: kafka,metrics
     container_name: cdc_application
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     env_file:
-      - ./env/.env.sqlite
+      - ./env/.env.kafka
     environment:
       RUST_LOG: info
       RUST_BACKTRACE: 1
@@ -46,7 +77,7 @@ services:
       CDC_TRANSACTION_FILE_BASE_PATH: /app/data
       CDC_STREAMING: "false"
     ports:
-      - "18082:8080"
+      - "18085:8080"
     restart: unless-stopped
     stop_grace_period: 120s
     stop_signal: SIGTERM
@@ -57,15 +88,13 @@ services:
       retries: 3
       start_period: 30s
     volumes:
-      - ./examples/scripts/init_sqlite.sql:/init/init_sqlite.sql:ro
-      - ./tests/chaos/scenarios/verify_sqlite:/verify:ro
       - cdc_data:/app/data
     networks:
       - chaos_test_network
 
 volumes:
   cdc_data:
-    name: chaos_test_sqlite_data
+    name: chaos_test_cdc_data
 
 networks:
   chaos_test_network:

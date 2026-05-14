@@ -334,6 +334,96 @@ impl TransactionStorage for CompressedStorage {
         Ok((compressed_path, total_statements))
     }
 
+    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+        let compressed_path = file_path.with_extension("sql.gz");
+
+        info!(
+            "Compressing raw lines {:?} to {:?} (interval: {})",
+            file_path, compressed_path, SYNC_POINT_INTERVAL
+        );
+
+        let source_file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            CdcError::generic(format!("Failed to open source file {file_path:?}: {e}"))
+        })?;
+
+        let mut dest_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&compressed_path)
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to create dest file: {e}")))?;
+
+        let mut index = CompressionIndex::new();
+        let mut total_lines: usize = 0;
+        let mut current_offset: u64 = 0;
+        let mut current_chunk: Vec<String> = Vec::with_capacity(SYNC_POINT_INTERVAL);
+
+        let buf_reader = BufReader::with_capacity(65536, source_file);
+        let mut lines = buf_reader.lines();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            if current_chunk.is_empty() {
+                index.sync_points.push(StatementOffset {
+                    statement_index: total_lines,
+                    compressed_offset: current_offset,
+                });
+            }
+
+            current_chunk.push(line);
+            total_lines += 1;
+
+            if current_chunk.len() >= SYNC_POINT_INTERVAL {
+                let compressed = Self::compress_raw_lines_chunk(&current_chunk).await?;
+                dest_file.write_all(&compressed).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to write compressed data: {e}"))
+                })?;
+                current_offset += compressed.len() as u64;
+                current_chunk.clear();
+            }
+        }
+
+        if !current_chunk.is_empty() {
+            let compressed = Self::compress_raw_lines_chunk(&current_chunk).await?;
+            dest_file
+                .write_all(&compressed)
+                .await
+                .map_err(|e| CdcError::generic(format!("Failed to write compressed data: {e}")))?;
+        }
+
+        if total_lines == 0 {
+            let _ = fs::remove_file(&compressed_path).await;
+            return Ok((compressed_path, 0));
+        }
+
+        dest_file
+            .flush()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to flush dest file: {e}")))?;
+
+        index.total_statements = total_lines;
+
+        let index_path = Self::index_path(&compressed_path);
+        index.save_to_file(&index_path).await?;
+
+        info!(
+            "Compressed raw lines: {:?} ({} sync points, {} lines)",
+            index_path,
+            index.sync_points.len(),
+            total_lines
+        );
+
+        Ok((compressed_path, total_lines))
+    }
+
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
         let index_path = Self::index_path(file_path);
 
@@ -428,6 +518,28 @@ impl CompressedStorage {
 
     async fn compress_chunk(chunk: &[String]) -> Result<Vec<u8>> {
         let chunk_data = build_chunk_text(chunk);
+
+        let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(chunk_data.as_bytes())
+                .map_err(|e| CdcError::generic(format!("Compression write failed: {e}")))?;
+            encoder
+                .finish()
+                .map_err(|e| CdcError::generic(format!("Compression finish failed: {e}")))
+        })
+        .await
+        .map_err(|e| CdcError::generic(format!("Compression task failed: {e}")))?;
+
+        buffer
+    }
+
+    async fn compress_raw_lines_chunk(lines: &[String]) -> Result<Vec<u8>> {
+        let mut chunk_data = String::new();
+        for line in lines {
+            chunk_data.push_str(line);
+            chunk_data.push('\n');
+        }
 
         let buffer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -594,6 +706,170 @@ mod tests {
 
         // Clean up
         storage.delete_transaction(&written_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sql_parser_corrupts_json_with_semicolons() {
+        let temp_dir = create_temp_dir().await;
+        let source_path = temp_dir.join("corrupted.sql");
+
+        // JSON containing semicolons — SqlStreamParser splits on these
+        let json = r#"{"event_type":{"Insert":{"data":{"val":"hello; world"}}}}"#;
+        let content = format!("{json}\n");
+        tokio::fs::write(&source_path, &content).await.unwrap();
+
+        let storage = CompressedStorage::new();
+        let (compressed_path, _) = storage
+            .write_transaction_from_file(&source_path)
+            .await
+            .unwrap();
+
+        // Read back using event-mode reader (line-based)
+        let file = tokio::fs::File::open(&compressed_path).await.unwrap();
+        let buf_reader = tokio::io::BufReader::new(file);
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(buf_reader);
+        decoder.multiple_members(true);
+        let mut lines_reader = tokio::io::BufReader::new(decoder).lines();
+
+        let mut any_corrupted = false;
+        while let Some(line) = lines_reader.next_line().await.unwrap() {
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                any_corrupted = true;
+            }
+        }
+
+        // write_transaction_from_file uses SqlStreamParser which corrupts JSON
+        // containing semicolons — this is the bug that write_raw_lines_from_file fixes
+        assert!(
+            any_corrupted,
+            "Expected SqlStreamParser to corrupt JSON with semicolons"
+        );
+
+        storage.delete_transaction(&compressed_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_raw_lines_preserves_json_with_semicolons() {
+        let temp_dir = create_temp_dir().await;
+        let source_path = temp_dir.join("728_000001.sql");
+
+        // JSON event lines that contain semicolons inside string values —
+        // the exact pattern that SqlStreamParser would corrupt
+        let json_lines = vec![
+            r#"{"event_type":{"Insert":{"schema":"public","table":"t1","data":{"id":"1","val":"hello; world"}}}}"#,
+            r#"{"event_type":{"Insert":{"schema":"public","table":"t1","data":{"id":"2","val":"a;b;c;d"}}}}"#,
+            r#"{"event_type":{"Insert":{"schema":"public","table":"t1","data":{"id":"3","val":"no semicolons here"}}}}"#,
+        ];
+
+        // Write source file (simulates what BufferedEventWriter produces)
+        let mut content = String::new();
+        for line in &json_lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        tokio::fs::write(&source_path, &content).await.unwrap();
+
+        let storage = CompressedStorage::new();
+        let (compressed_path, line_count) = storage
+            .write_raw_lines_from_file(&source_path)
+            .await
+            .unwrap();
+
+        assert_eq!(line_count, 3);
+        assert!(compressed_path.to_string_lossy().ends_with(".sql.gz"));
+
+        // Read back using the same path the event-mode consumer uses:
+        // GzipDecoder with multiple_members → BufReader → lines()
+        let file = tokio::fs::File::open(&compressed_path).await.unwrap();
+        let buf_reader = tokio::io::BufReader::new(file);
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(buf_reader);
+        decoder.multiple_members(true);
+        let mut lines_reader = tokio::io::BufReader::new(decoder).lines();
+
+        let mut recovered: Vec<String> = Vec::new();
+        while let Some(line) = lines_reader.next_line().await.unwrap() {
+            let line = line.trim().to_string();
+            if !line.is_empty() {
+                // This is the exact check the consumer does — must parse as valid JSON
+                let _: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                    panic!("JSON corrupted after compress/decompress roundtrip: {e}\nLine: {line}");
+                });
+                recovered.push(line);
+            }
+        }
+
+        assert_eq!(recovered.len(), 3);
+        for (original, roundtripped) in json_lines.iter().zip(recovered.iter()) {
+            assert_eq!(*original, roundtripped);
+        }
+
+        // Cleanup
+        storage.delete_transaction(&compressed_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_raw_lines_across_sync_point_boundary() {
+        let temp_dir = create_temp_dir().await;
+        let source_path = temp_dir.join("big_event.sql");
+
+        // Write 1500 JSON lines — crosses the SYNC_POINT_INTERVAL (1000) boundary
+        let mut content = String::new();
+        for i in 0..1500 {
+            let line = format!(
+                r#"{{"event_type":{{"Insert":{{"schema":"public","table":"t1","data":{{"id":"{}","val":"semi;colon;{}"}}}}}}}}"#,
+                i, i
+            );
+            content.push_str(&line);
+            content.push('\n');
+        }
+        tokio::fs::write(&source_path, &content).await.unwrap();
+
+        let storage = CompressedStorage::new();
+        let (compressed_path, line_count) = storage
+            .write_raw_lines_from_file(&source_path)
+            .await
+            .unwrap();
+
+        assert_eq!(line_count, 1500);
+
+        // Verify index has 2 sync points (0 and 1000)
+        let index_path = CompressedStorage::index_path(&compressed_path);
+        let index = CompressionIndex::load_from_file(&index_path).await.unwrap();
+        assert_eq!(index.total_statements, 1500);
+        assert_eq!(index.sync_points.len(), 2);
+        assert_eq!(index.sync_points[0].statement_index, 0);
+        assert_eq!(index.sync_points[1].statement_index, 1000);
+
+        // Read back every line and verify JSON integrity
+        let file = tokio::fs::File::open(&compressed_path).await.unwrap();
+        let buf_reader = tokio::io::BufReader::new(file);
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(buf_reader);
+        decoder.multiple_members(true);
+        let mut lines_reader = tokio::io::BufReader::new(decoder).lines();
+
+        let mut count = 0usize;
+        while let Some(line) = lines_reader.next_line().await.unwrap() {
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                panic!("JSON corrupted at line {count} after roundtrip: {e}\nLine: {line}");
+            });
+            let id = parsed["event_type"]["Insert"]["data"]["id"]
+                .as_str()
+                .unwrap();
+            assert_eq!(id, count.to_string());
+            count += 1;
+        }
+
+        assert_eq!(count, 1500);
+
+        storage.delete_transaction(&compressed_path).await.unwrap();
     }
 
     #[tokio::test]

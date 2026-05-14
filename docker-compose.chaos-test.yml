@@ -69,10 +69,10 @@ services:
       CDC_LAST_LSN_FILE: /app/data/pg2any_last_lsn.metadata
       CDC_TRANSACTION_FILE_BASE_PATH: /app/data
     ports:
-      - "8080:8080"  # Metrics endpoint
+      - "18081:8080"  # Metrics endpoint
     restart: unless-stopped
     # Graceful shutdown timeout - critical for testing
-    stop_grace_period: 300s
+    stop_grace_period: 120s
     stop_signal: SIGTERM
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

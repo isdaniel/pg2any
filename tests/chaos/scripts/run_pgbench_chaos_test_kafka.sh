@@ -1,31 +1,33 @@
 #!/bin/bash
 #
-# PGBench Chaos Test Runner
+# PGBench Chaos Test Runner - Kafka Destination
 # This script runs pgbench performance testing while randomly restarting the CDC application
 # to test graceful shutdown and recovery under load.
 #
-# The script will:
-# 1. Start the chaos script in background to randomly restart cdc_application
-# 2. Initialize pgbench with scale factor 32
-# 3. Run pgbench select-only benchmark (100 clients, 8 threads, 12 transactions)
-# 4. Stop chaos script when benchmark completes
-# 5. Report results
+# Verification uses kafkacat/kcat to count Kafka insert events vs PostgreSQL source row count.
 #
 
-set -e
+set -eo pipefail
 
-# Load environment variables from .env file if it exists
+# Load safe environment variables from .env file if it exists
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-ENV_FILE="$PROJECT_ROOT/env/.env"
+ENV_FILE="$PROJECT_ROOT/env/.env.kafka"
+
+load_env_file() {
+    local env_file="$1"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" != *=* ]] && continue
+        export "$line"
+    done < "$env_file"
+}
 
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from: $ENV_FILE"
-    set -a
-    source "$ENV_FILE"
-    set +a
+    load_env_file "$ENV_FILE"
 else
-    echo "Warning: .env file not found at $ENV_FILE, using defaults"
+    echo "Warning: .env.kafka file not found at $ENV_FILE, using defaults"
 fi
 
 # Colors for output
@@ -44,11 +46,9 @@ POSTGRES_PASSWORD="${CDC_POSTGRES_PASSWORD:-test.123}"
 POSTGRES_DB="${CDC_POSTGRES_DB:-postgres}"
 CONTAINER_NAME="${CDC_CONTAINER_NAME:-cdc_application}"
 
-MYSQL_HOST="${CDC_MYSQL_HOST:-127.0.0.1}"
-MYSQL_PORT="${CDC_MYSQL_PORT:-3306}"
-MYSQL_USER="${CDC_MYSQL_USER:-root}"
-MYSQL_PASSWORD="${CDC_MYSQL_PASSWORD:-test.123}"
-MYSQL_DB="${CDC_MYSQL_DB:-cdc_db}"
+KAFKA_CONTAINER="${CDC_KAFKA_CONTAINER:-cdc_kafka}"
+KAFKA_BROKER="${CDC_KAFKA_BROKER:-127.0.0.1:9094}"
+KAFKA_TOPIC="${CDC_KAFKA_TOPIC:-pg2any.public.t1}"
 
 # PGBench configuration
 PGBENCH_SCALE="${PGBENCH_SCALE:-32}"
@@ -58,9 +58,8 @@ PGBENCH_TRANSACTIONS="${PGBENCH_TRANSACTIONS:-12}"
 PGBENCH_SCRIPT="${PGBENCH_SCRIPT:-$PROJECT_ROOT/examples/scripts/pgbench_testing.sql}"
 
 # Verification configuration
-MAX_RETRIES=60
+MAX_RETRIES=30
 RETRY_INTERVAL=45
-EXPECTED_ROW_COUNT=$((3000 * PGBENCH_CLIENTS * PGBENCH_TRANSACTIONS))
 
 # Connection string
 POSTGRES_CONNSTRING="postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?user=${POSTGRES_USER}&password=${POSTGRES_PASSWORD}"
@@ -70,7 +69,20 @@ CHAOS_SCRIPT="$SCRIPT_DIR/chaos_script.sh"
 CHAOS_SCRIPT_PID=""
 
 # Results file
-RESULTS_FILE="$SCRIPT_DIR/pgbench_chaos_results_$(date +%Y%m%d_%H%M%S).log"
+RESULTS_FILE="$SCRIPT_DIR/pgbench_chaos_kafka_results_$(date +%Y%m%d_%H%M%S).log"
+
+# Detect kafkacat or kcat
+detect_kafkacat() {
+    if command -v kcat &> /dev/null; then
+        echo "kcat"
+    elif command -v kafkacat &> /dev/null; then
+        echo "kafkacat"
+    else
+        echo ""
+    fi
+}
+
+KAFKACAT_CMD=""
 
 # Logging functions
 log_info() {
@@ -98,13 +110,13 @@ log_section() {
 # Cleanup function
 cleanup() {
     log_info "Cleaning up..."
-    
+
     if [ -n "$CHAOS_SCRIPT_PID" ] && kill -0 "$CHAOS_SCRIPT_PID" 2>/dev/null; then
         log_info "Stopping chaos script (PID: $CHAOS_SCRIPT_PID)..."
         kill "$CHAOS_SCRIPT_PID" 2>/dev/null || true
         wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
     fi
-    
+
     log_info "Cleanup complete."
     log_info "Results saved to: $RESULTS_FILE"
 }
@@ -112,13 +124,56 @@ cleanup() {
 # Set up trap for cleanup
 trap cleanup EXIT INT TERM
 
+# Function to wait for container to be running
+wait_for_container_running() {
+    local container="$1"
+    local max_wait="${2:-120}"
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        if docker ps --filter "name=^${container}$" --format "{{.Status}}" | grep -q "^Up"; then
+            return 0
+        fi
+        log_warning "Container '$container' is not running. Attempting to start... (${waited}s/${max_wait}s)"
+        docker start "$container" 2>/dev/null || true
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "Container '$container' did not start within ${max_wait}s"
+    return 1
+}
+
+# Function to stop chaos script and ensure container is healthy
+stop_chaos_and_stabilize() {
+    if [ -n "$CHAOS_SCRIPT_PID" ] && kill -0 "$CHAOS_SCRIPT_PID" 2>/dev/null; then
+        log_info "Stopping chaos script before verification (PID: $CHAOS_SCRIPT_PID)..."
+        kill "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        CHAOS_SCRIPT_PID=""
+    fi
+
+    # Kill any pending docker stop commands targeting the CDC container
+    # (chaos script's docker stop --time 120 continues running even after the script is killed)
+    pkill -f "docker stop.*${CONTAINER_NAME}" 2>/dev/null || true
+    sleep 2
+
+    log_info "Ensuring CDC container is running and stable..."
+    if ! wait_for_container_running "$CONTAINER_NAME" 120; then
+        log_error "CDC container failed to start after stopping chaos"
+        return 1
+    fi
+
+    sleep 10
+    log_success "Container stabilized for verification phase"
+    return 0
+}
+
 # Function to check if container exists
 check_container() {
     if ! docker ps -a --filter "name=^${CONTAINER_NAME}$" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
         log_error "Container '$CONTAINER_NAME' not found. Please start docker-compose first."
         exit 1
     fi
-    
+
     log_success "Container '$CONTAINER_NAME' found."
 }
 
@@ -128,14 +183,14 @@ check_pgbench() {
         log_error "pgbench is not installed. Please install PostgreSQL client tools."
         exit 1
     fi
-    
+
     log_success "pgbench is installed."
 }
 
 # Function to test PostgreSQL connection
 test_postgres_connection() {
     log_info "Testing PostgreSQL connection..."
-    
+
     if PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1" > /dev/null 2>&1; then
         log_success "PostgreSQL connection successful."
         return 0
@@ -145,45 +200,64 @@ test_postgres_connection() {
     fi
 }
 
-# Function to test MySQL connection
-test_mysql_connection() {
-    log_info "Testing MySQL connection..."
-    
-    if mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DB" -e "SELECT 1" > /dev/null 2>&1; then
-        log_success "MySQL connection successful."
+# Function to test Kafka connection
+test_kafka_connection() {
+    log_info "Testing Kafka connection..."
+
+    if docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1; then
+        log_success "Kafka connection successful."
         return 0
     else
-        log_error "Cannot connect to MySQL."
+        log_error "Cannot connect to Kafka."
         return 1
     fi
 }
 
-# Function to get row count from MySQL t1 table
-get_mysql_row_count() {
-    local count=$(mysql \
-        -h "$MYSQL_HOST" \
-        -P "$MYSQL_PORT" \
-        -u "$MYSQL_USER" \
-        -p"$MYSQL_PASSWORD" \
-        "$MYSQL_DB" \
-        -N -B \
-        -e "SELECT COUNT(*) FROM t1;" 2>/dev/null)
-    
-    echo "$count"
+# Function to get total message count from Kafka topic
+get_kafka_total_count() {
+    local count
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+        | wc -l | tr -d '[:space:]' || true)
+    echo "${count:-0}"
+}
+
+# Function to get total message offset from Kafka (fast, no consumption)
+get_kafka_offset_count() {
+    local offset
+    offset=$(docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-get-offsets.sh \
+        --broker-list localhost:9092 --topic "$KAFKA_TOPIC" 2>/dev/null \
+        | awk -F: '{sum += $NF} END {print sum}')
+    echo "${offset:-0}"
+}
+
+# Function to get insert event count from Kafka
+get_kafka_insert_count() {
+    # For large topics, use fast offset-based count since test only produces INSERT events
+    local offset_count
+    offset_count=$(get_kafka_offset_count)
+    if [ "$offset_count" -ge 10000 ] 2>/dev/null; then
+        echo "$offset_count"
+        return
+    fi
+    local count
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+        | grep -c '"op":"c"' || true)
+    echo "${count:-0}"
 }
 
 # Function to verify replication completed
 verify_replication() {
-    local current_count=$(get_mysql_row_count)
-    
-    if [ -z "$current_count" ]; then
-        log_warning "Failed to get row count from MySQL"
+    local current_count
+    current_count=$(get_kafka_offset_count)
+
+    if [ -z "$current_count" ] || [ "$current_count" -eq 0 ] 2>/dev/null; then
+        log_warning "Failed to get offset count from Kafka or topic is empty"
         return 1
     fi
-    
-    log_info "Current MySQL row count: $current_count / Expected: $EXPECTED_ROW_COUNT"
-    
-    if [ "$current_count" -eq "$EXPECTED_ROW_COUNT" ]; then
+
+    log_info "Kafka offset count: $current_count / Expected: $EXPECTED_ROW_COUNT (at-least-once)"
+
+    if [ "$current_count" -ge "$EXPECTED_ROW_COUNT" ] 2>/dev/null; then
         return 0
     else
         return 1
@@ -193,9 +267,9 @@ verify_replication() {
 # Function to initialize pgbench
 initialize_pgbench() {
     log_section "Initializing PGBench (Scale: $PGBENCH_SCALE)"
-    
+
     local start_time=$(date +%s)
-    
+
     if pgbench -i -s "$PGBENCH_SCALE" --unlogged-tables --foreign-keys "$POSTGRES_CONNSTRING" 2>&1 | tee -a "$RESULTS_FILE"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
@@ -216,23 +290,22 @@ run_pgbench_benchmark() {
     log_info "  - Transactions per client: $PGBENCH_TRANSACTIONS"
     log_info "  - Script: $PGBENCH_SCRIPT"
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     local start_time=$(date +%s)
-    
-    # Check if custom script exists
+
     local pgbench_cmd="pgbench -c $PGBENCH_CLIENTS -j $PGBENCH_THREADS -t $PGBENCH_TRANSACTIONS"
-    
+
     if [ -f "$PGBENCH_SCRIPT" ]; then
         log_info "Using custom script: $PGBENCH_SCRIPT"
         pgbench_cmd="$pgbench_cmd -f $PGBENCH_SCRIPT"
     else
         log_warning "Custom script not found: $PGBENCH_SCRIPT"
     fi
-    
+
     pgbench_cmd="$pgbench_cmd $POSTGRES_CONNSTRING"
-    
+
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     if eval "$pgbench_cmd" 2>&1 | tee -a "$RESULTS_FILE"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
@@ -247,98 +320,102 @@ run_pgbench_benchmark() {
 # Function to start chaos testing
 start_chaos_testing() {
     log_section "Starting Chaos Testing"
-    
+
     if [ ! -f "$CHAOS_SCRIPT" ]; then
         log_error "Chaos script not found: $CHAOS_SCRIPT"
         exit 1
     fi
-    
-    # Make chaos script executable
+
     chmod +x "$CHAOS_SCRIPT"
-    
-    # Start chaos script in background
+
     log_info "Starting chaos script for container: $CONTAINER_NAME"
+    rm -f "$SCRIPT_DIR/pgbench_chaos_script.log"
     "$CHAOS_SCRIPT" "$CONTAINER_NAME" > "$SCRIPT_DIR/pgbench_chaos_script.log" 2>&1 &
     CHAOS_SCRIPT_PID=$!
-    
+
     log_success "Chaos script started with PID: $CHAOS_SCRIPT_PID"
     log_info "Chaos script logs: $SCRIPT_DIR/pgbench_chaos_script.log"
-    
-    # Wait a moment for chaos to begin
+
     sleep 5
 }
 
 # Main execution
 main() {
     export PGPASSWORD=$POSTGRES_PASSWORD
-    log_section "PGBench Chaos Integration Test"
+    log_section "PGBench Chaos Integration Test (Kafka)"
     log_info "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
     log_info "Container under test: $CONTAINER_NAME"
+    log_info "Kafka broker: $KAFKA_BROKER"
+    log_info "Kafka topic: $KAFKA_TOPIC"
+
+    # Detect kafkacat
+    KAFKACAT_CMD=$(detect_kafkacat)
+    if [ -z "$KAFKACAT_CMD" ]; then
+        log_error "kafkacat/kcat not found. Please install kafkacat."
+        exit 1
+    fi
+    log_info "Using: $KAFKACAT_CMD"
+
+    if ! command -v jq &> /dev/null; then
+        log_error "jq not found. Please install jq."
+        exit 1
+    fi
+
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     # Pre-flight checks
     log_info "Running pre-flight checks..."
     check_pgbench
     test_postgres_connection || exit 1
-    test_mysql_connection || exit 1
+    test_kafka_connection || exit 1
     check_container
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     # Initialize pgbench
     if ! initialize_pgbench; then
         log_error "Failed to initialize pgbench. Exiting."
         exit 1
     fi
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     # Wait for initialization to settle
     log_info "Waiting for initialization to settle..."
     sleep 10
-    
+
     # Start chaos testing
     start_chaos_testing
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     # Wait for chaos to take effect
     log_info "Allowing chaos script to run for a few cycles..."
     sleep 15
-    
+
     # Run benchmark
     local benchmark_result=0
     if ! run_pgbench_benchmark; then
         log_error "Benchmark failed."
         benchmark_result=1
     fi
-    
+
     echo "" | tee -a "$RESULTS_FILE"
 
-    # Stop chaos before verification to allow CDC to stabilize and catch up
-    log_section "Stopping Chaos for Verification"
-    if [ -n "$CHAOS_SCRIPT_PID" ] && kill -0 "$CHAOS_SCRIPT_PID" 2>/dev/null; then
-        log_info "Stopping chaos script (PID: $CHAOS_SCRIPT_PID) to allow CDC to stabilize..."
-        kill "$CHAOS_SCRIPT_PID" 2>/dev/null || true
-        wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
-        CHAOS_SCRIPT_PID=""
-        log_success "Chaos script stopped."
+    # Query actual row count from PG source (pgbench custom script inserts into t1)
+    EXPECTED_ROW_COUNT=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT COUNT(*) FROM t1;" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$EXPECTED_ROW_COUNT" ] || [ "$EXPECTED_ROW_COUNT" -eq 0 ] 2>/dev/null; then
+        log_error "Failed to get row count from PostgreSQL source or no rows found"
+        exit 1
     fi
+    log_info "Actual PostgreSQL source row count: $EXPECTED_ROW_COUNT"
 
-    # Ensure CDC container is running and healthy before verification
-    log_info "Ensuring CDC container is running for catch-up..."
-    local container_status
-    container_status=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
-    if [ "$container_status" != "running" ]; then
-        log_info "Container is '$container_status', starting it..."
-        docker start "$CONTAINER_NAME" 2>/dev/null || true
-        sleep 10
+    # Stop chaos and stabilize container before verification
+    if ! stop_chaos_and_stabilize; then
+        log_error "Failed to stabilize container for verification"
+        exit 1
     fi
-
-    # Give CDC time to process remaining transactions after chaos stops
-    log_info "Waiting 30s for CDC to process remaining transactions..."
-    sleep 30
 
     # Verify replication with retry loop
     log_section "Verifying Replication"
-    log_info "Expected row count: $EXPECTED_ROW_COUNT"
+    log_info "Expected insert event count: $EXPECTED_ROW_COUNT"
     log_info "Max retries: $MAX_RETRIES"
     log_info "Retry interval: $RETRY_INTERVAL seconds"
     echo "" | tee -a "$RESULTS_FILE"
@@ -353,23 +430,23 @@ main() {
         log_info "Verification attempt $retry_count/$MAX_RETRIES..."
 
         if verify_replication; then
-            log_success "✓ Replication verification PASSED on attempt $retry_count"
+            log_success "Replication verification PASSED on attempt $retry_count"
             verification_passed=true
             break
         else
-            log_warning "✗ Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
+            log_warning "Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
 
-            # Stall detection: if count unchanged for 3 consecutive retries, CDC is likely dead
+            # Stall detection: if count unchanged for 8 consecutive retries, CDC is likely dead
+            # (8 × 45s = 360s tolerance for container restart + WAL replay after chaos stops)
+            # Skip stall detection when count is 0 — transaction may still be in producer phase
             local current_count
-            current_count=$(get_mysql_row_count)
-            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+            current_count=$(get_kafka_offset_count)
+            if [ "$current_count" -gt 0 ] && [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
                 stall_count=$((stall_count + 1))
-                if [ $stall_count -ge 3 ]; then
-                    log_error "Replication stalled at $current_count rows for 3 consecutive retries — CDC likely dead or stuck"
-                    log_error "Attempting container restart to recover..."
-                    docker restart "$CONTAINER_NAME" 2>/dev/null || true
-                    sleep 30
-                    stall_count=0
+                if [ $stall_count -ge 8 ]; then
+                    log_error "Replication stalled at $current_count for 8 consecutive retries — CDC likely dead or stuck"
+                    log_error "Check CDC application logs for errors"
+                    break
                 fi
             else
                 stall_count=0
@@ -382,24 +459,24 @@ main() {
             fi
         fi
     done
-    
+
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     # Summary
     log_section "Test Complete"
     log_info "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
-    
+
     if [ $benchmark_result -eq 0 ] && [ "$verification_passed" = true ]; then
-        log_success "✓ PGBench chaos test completed successfully!"
-        log_success "✓ All $EXPECTED_ROW_COUNT rows replicated to MySQL"
+        log_success "PGBench chaos test completed successfully! (Kafka)"
+        log_success "At least $EXPECTED_ROW_COUNT insert events replicated to Kafka"
         log_info "Check the results file for detailed metrics: $RESULTS_FILE"
         exit 0
     else
         if [ $benchmark_result -ne 0 ]; then
-            log_error "✗ Benchmark failed!"
+            log_error "Benchmark failed!"
         fi
         if [ "$verification_passed" = false ]; then
-            log_error "✗ Replication verification failed after $MAX_RETRIES attempts!"
+            log_error "Replication verification failed after $MAX_RETRIES attempts!"
         fi
         exit 1
     fi

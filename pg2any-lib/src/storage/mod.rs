@@ -91,26 +91,19 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_from_env_default() {
-        // Without setting env var, should default to uncompressed
+    fn test_factory_from_env() {
         std::env::remove_var("PG2ANY_ENABLE_COMPRESSION");
         let storage = StorageFactory::from_env();
         assert_eq!(storage.file_extension(), "sql");
-    }
 
-    #[test]
-    fn test_factory_from_env_true() {
         std::env::set_var("PG2ANY_ENABLE_COMPRESSION", "true");
         let storage = StorageFactory::from_env();
         assert_eq!(storage.file_extension(), "sql.gz");
-        std::env::remove_var("PG2ANY_ENABLE_COMPRESSION");
-    }
 
-    #[test]
-    fn test_factory_from_env_one() {
         std::env::set_var("PG2ANY_ENABLE_COMPRESSION", "1");
         let storage = StorageFactory::from_env();
         assert_eq!(storage.file_extension(), "sql.gz");
+
         std::env::remove_var("PG2ANY_ENABLE_COMPRESSION");
     }
 }

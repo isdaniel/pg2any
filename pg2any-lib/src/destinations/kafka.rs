@@ -181,7 +181,6 @@ impl KafkaDestination {
                     _,
                 )) if attempt < 9 => {
                     tokio::time::sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
-                    producer.poll(Duration::from_millis(100));
                 }
                 Err((err, _)) => {
                     return Err(CdcError::generic(format!("Kafka enqueue failed: {err}")));

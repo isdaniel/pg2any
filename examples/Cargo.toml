@@ -15,6 +15,7 @@ default = ["mysql", "metrics"]
 mysql = ["pg2any_lib/mysql"]
 sqlserver = ["pg2any_lib/sqlserver"]
 sqlite = ["pg2any_lib/sqlite"]
+kafka = ["pg2any_lib/kafka"]
 metrics = ["pg2any_lib/metrics"]
 
 [dependencies]

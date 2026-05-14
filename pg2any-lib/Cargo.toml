@@ -28,6 +28,8 @@ flate2 = { workspace = true }
 async-compression = { workspace = true }
 tiberius = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
@@ -39,5 +41,6 @@ default = ["mysql", "sqlserver", "sqlite"]
 mysql = ["sqlx/mysql"]
 sqlserver = ["tiberius"]
 sqlite = ["sqlx/sqlite"]
+kafka = ["rdkafka", "base64"]
 metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 

@@ -261,6 +261,8 @@ pub struct TransactionManager {
     segment_size_bytes: usize,
     /// Storage implementation (compressed or uncompressed)
     storage: Arc<dyn TransactionStorage>,
+    /// When true, stores raw ChangeEvent JSON instead of generated SQL
+    event_mode: bool,
 }
 
 impl TransactionManager {
@@ -298,12 +300,18 @@ impl TransactionManager {
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
             storage,
+            event_mode: false,
         })
     }
 
     /// Set schema mappings for SQL generation
     pub fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
         self.schema_mappings = mappings;
+    }
+
+    /// Enable event-mode: stores raw ChangeEvent JSON instead of generated SQL
+    pub fn set_event_mode(&mut self, enabled: bool) {
+        self.event_mode = enabled;
     }
 
     /// Flush all pending buffered writes
@@ -412,7 +420,7 @@ impl TransactionManager {
             transaction_type: transaction_type.to_string(),
         };
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
+        let metadata_json = serde_json::to_string(&metadata)?;
         let mut metadata_file = File::create(&metadata_path).await?;
         metadata_file.write_all(metadata_json.as_bytes()).await?;
         metadata_file.flush().await?;
@@ -468,7 +476,7 @@ impl TransactionManager {
             .collect();
         metadata.current_segment_index = current_segment_index;
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)
+        let metadata_json = serde_json::to_string(&metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut metadata_file = File::create(&received_metadata_path).await.map_err(|e| {
@@ -487,12 +495,22 @@ impl TransactionManager {
     /// Uses buffered I/O to accumulate events in memory before flushing to disk
     /// Automatically flushes when buffer reaches capacity
     pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
-        let sql = self.generate_sql_for_event(event)?;
-
-        // Skip empty SQL (metadata events)
-        if sql.is_empty() {
-            return Ok(());
-        }
+        let line = if self.event_mode {
+            match &event.event_type {
+                EventType::Insert { .. }
+                | EventType::Update { .. }
+                | EventType::Delete { .. }
+                | EventType::Truncate(_) => serde_json::to_string(event)
+                    .map_err(|e| CdcError::generic(format!("Failed to serialize event: {e}")))?,
+                _ => return Ok(()),
+            }
+        } else {
+            let sql = self.generate_sql_for_event(event)?;
+            if sql.is_empty() {
+                return Ok(());
+            }
+            sql
+        };
 
         let mut transactions = self.active_transactions.lock().await;
 
@@ -503,9 +521,9 @@ impl TransactionManager {
             ))
         })?;
 
-        let sql_bytes = sql.len() + 1; // include newline
+        let line_bytes = line.len() + 1; // include newline
         let estimated_size =
-            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
+            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + line_bytes;
 
         let should_rotate = estimated_size > self.segment_size_bytes
             && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
@@ -541,7 +559,7 @@ impl TransactionManager {
             );
         }
 
-        let should_flush = tx_state.writer.append(&sql);
+        let should_flush = tx_state.writer.append(&line);
         if let Some(count) = tx_state
             .segment_statement_counts
             .get_mut(tx_state.current_segment_index)
@@ -604,10 +622,13 @@ impl TransactionManager {
         let mut final_segments = Vec::new();
 
         for (idx, segment_path) in segment_paths.iter().enumerate() {
-            let (final_data_path, statement_count) = self
-                .storage
-                .write_transaction_from_file(segment_path)
-                .await?;
+            let (final_data_path, statement_count) = if self.event_mode {
+                self.storage.write_raw_lines_from_file(segment_path).await?
+            } else {
+                self.storage
+                    .write_transaction_from_file(segment_path)
+                    .await?
+            };
 
             let fallback_count = segment_counts.get(idx).copied().unwrap_or(0);
             let final_count = if statement_count == 0 {
@@ -643,7 +664,7 @@ impl TransactionManager {
         pending_metadata_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let updated_json = serde_json::to_string_pretty(metadata)
+        let updated_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut pending_file = File::create(pending_metadata_path).await.map_err(|e| {
@@ -837,7 +858,7 @@ impl TransactionManager {
         metadata_file_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let metadata_json = serde_json::to_string_pretty(metadata)
+        let metadata_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let temp_path = metadata_file_path.with_extension("meta.tmp");
@@ -1173,6 +1194,7 @@ impl TransactionManager {
                     self.append_quoted_identifier(&mut sql, table);
                     sql.push(';');
                 }
+                DestinationType::Kafka => {}
             }
         }
 
@@ -1242,6 +1264,9 @@ impl TransactionManager {
             DestinationType::SQLite => {
                 self.append_quoted_identifier(out, table);
             }
+            DestinationType::Kafka => {
+                self.append_quoted_identifier(out, table);
+            }
         }
     }
 
@@ -1252,7 +1277,7 @@ impl TransactionManager {
         let (open, close, escape_ch) = match self.destination_type {
             DestinationType::MySQL => ('`', '`', '`'),
             DestinationType::SqlServer => ('[', ']', ']'),
-            DestinationType::SQLite => ('"', '"', '"'),
+            DestinationType::SQLite | DestinationType::Kafka => ('"', '"', '"'),
         };
         out.reserve(name.len() + 2);
         out.push(open);
@@ -1287,7 +1312,9 @@ impl TransactionManager {
         static HEX: &[u8; 16] = b"0123456789abcdef";
         let (prefix, suffix) = match self.destination_type {
             DestinationType::SqlServer => ("0x", ""),
-            DestinationType::MySQL | DestinationType::SQLite => ("X'", "'"),
+            DestinationType::MySQL | DestinationType::SQLite | DestinationType::Kafka => {
+                ("X'", "'")
+            }
         };
         out.reserve(prefix.len() + bytes.len() * 2 + suffix.len());
         out.push_str(prefix);
@@ -1428,6 +1455,8 @@ impl TransactionManager {
             commands.len(),
             batch_duration
         );
+
+        self.flush_staged_pending_progress().await?;
 
         Ok(())
     }
@@ -1607,6 +1636,37 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
+        // Skip transactions already applied (position-tracking based deduplication)
+        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
+            let current_flush_lsn = lsn_tracker.get();
+            if commit_lsn.0 <= current_flush_lsn && current_flush_lsn > 0 {
+                info!(
+                    "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
+                    pending_tx.metadata.transaction_id,
+                    commit_lsn,
+                    pg_walstream::format_lsn(current_flush_lsn)
+                );
+                if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
+                    warn!("Failed to delete duplicate pending file: {}", e);
+                }
+                return Ok(());
+            }
+        }
+
+        if self.event_mode {
+            return self
+                .process_transaction_file_event_mode(
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    lsn_tracker,
+                    metrics_collector,
+                    batch_size,
+                    shared_lsn_feedback,
+                )
+                .await;
+        }
+
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
 
@@ -1676,25 +1736,15 @@ impl TransactionManager {
                 .await;
 
             if let Err(e) = stream_result {
-                if e.is_cancelled() {
-                    warn!(
-                        "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                        tx_id
-                    );
-                    return Ok(());
-                }
-
                 return Err(e);
             }
         }
 
         if !batch.is_empty() {
             if cancellation_token.is_cancelled() {
-                warn!(
-                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                    tx_id
-                );
-                return Ok(());
+                return Err(CdcError::cancelled(
+                    "Transaction file processing cancelled by shutdown signal",
+                ));
             }
 
             let batch_len = batch.len();
@@ -1762,6 +1812,233 @@ impl TransactionManager {
         Ok(())
     }
 
+    async fn process_event_lines<R: AsyncRead + Unpin>(
+        self: &Arc<Self>,
+        mut lines: tokio::io::Lines<BufReader<R>>,
+        segment_path: &Path,
+        batch: &mut Vec<ChangeEvent>,
+        batch_count: &mut usize,
+        total_events: &mut usize,
+        events_seen: &mut usize,
+        skip_until: usize,
+        batch_size: usize,
+        tx_id: u32,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        while let Some(line) = lines.next_line().await.map_err(|e| {
+            CdcError::generic(format!("Failed to read segment {:?}: {e}", segment_path))
+        })? {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            *events_seen += 1;
+            if *events_seen <= skip_until {
+                continue;
+            }
+
+            let event: ChangeEvent = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Err(CdcError::generic(format!(
+                        "Corrupted event line in segment {:?} at index {}: {e}. \
+                         Stopping to prevent silent data loss.",
+                        segment_path, events_seen
+                    )));
+                }
+            };
+            batch.push(event);
+
+            if batch.len() >= batch_size {
+                if cancellation_token.is_cancelled() {
+                    return Err(CdcError::cancelled(
+                        "Event-mode processing cancelled by shutdown signal",
+                    ));
+                }
+                *batch_count += 1;
+                *total_events += batch.len();
+                let metadata_path = pending_tx.file_path.clone();
+                let file_manager = self.clone();
+                let staged_index = *events_seen;
+
+                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                    let metadata_path = metadata_path.clone();
+                    let file_manager = file_manager.clone();
+                    Box::pin(async move {
+                        file_manager
+                            .stage_pending_metadata_progress(&metadata_path, staged_index)
+                            .await?;
+                        Ok(())
+                    })
+                }));
+
+                destination_handler
+                    .execute_events_batch_with_hook(
+                        batch,
+                        tx_id,
+                        pending_tx.metadata.commit_timestamp,
+                        pending_tx.metadata.commit_lsn,
+                        pre_commit_hook,
+                    )
+                    .await?;
+                self.flush_staged_pending_progress().await?;
+                batch.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a transaction file in event-mode (for non-SQL destinations like Kafka).
+    /// Reads JSON-serialized ChangeEvents from segment files and calls
+    /// execute_events_batch_with_hook() on the destination handler.
+    pub(crate) async fn process_transaction_file_event_mode(
+        self: Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) -> Result<()> {
+        let tx_id = pending_tx.metadata.transaction_id;
+        let start_time = Instant::now();
+
+        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        let segments = if !latest_metadata.segments.is_empty() {
+            latest_metadata.segments
+        } else {
+            pending_tx.metadata.segments.clone()
+        };
+
+        let skip_until = latest_metadata.last_executed_command_index.unwrap_or(0);
+
+        if skip_until > 0 {
+            info!(
+                "Event-mode: resuming tx {} from event index {} (skipping already processed)",
+                tx_id, skip_until
+            );
+        }
+
+        let mut batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
+        let mut batch_count = 0usize;
+        let mut total_events = 0usize;
+        let mut events_seen = 0usize;
+
+        for segment in &segments {
+            let is_compressed = segment
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                .unwrap_or(false);
+
+            if is_compressed {
+                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!(
+                        "Failed to open compressed segment {:?}: {e}",
+                        segment.path
+                    ))
+                })?;
+                let buf_reader = BufReader::new(file);
+                let mut decoder = GzipDecoder::new(buf_reader);
+                decoder.multiple_members(true);
+                let lines = BufReader::new(decoder).lines();
+                self.process_event_lines(
+                    lines,
+                    &segment.path,
+                    &mut batch,
+                    &mut batch_count,
+                    &mut total_events,
+                    &mut events_seen,
+                    skip_until,
+                    batch_size,
+                    tx_id,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                )
+                .await?;
+            } else {
+                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to open segment {:?}: {e}", segment.path))
+                })?;
+                let lines = BufReader::new(file).lines();
+                self.process_event_lines(
+                    lines,
+                    &segment.path,
+                    &mut batch,
+                    &mut batch_count,
+                    &mut total_events,
+                    &mut events_seen,
+                    skip_until,
+                    batch_size,
+                    tx_id,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                )
+                .await?;
+            }
+        }
+
+        // Flush remaining events
+        if !batch.is_empty() {
+            if cancellation_token.is_cancelled() {
+                return Err(CdcError::cancelled(
+                    "Event-mode processing cancelled by shutdown signal",
+                ));
+            }
+            batch_count += 1;
+            total_events += batch.len();
+            let metadata_path = pending_tx.file_path.clone();
+            let file_manager = self.clone();
+            let staged_index = events_seen;
+
+            let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                let metadata_path = metadata_path.clone();
+                let file_manager = file_manager.clone();
+                Box::pin(async move {
+                    file_manager
+                        .stage_pending_metadata_progress(&metadata_path, staged_index)
+                        .await?;
+                    Ok(())
+                })
+            }));
+
+            destination_handler
+                .execute_events_batch_with_hook(
+                    &batch,
+                    tx_id,
+                    pending_tx.metadata.commit_timestamp,
+                    pending_tx.metadata.commit_lsn,
+                    pre_commit_hook,
+                )
+                .await?;
+            self.flush_staged_pending_progress().await?;
+        }
+
+        let duration = start_time.elapsed();
+        info!(
+            "Event-mode: processed {} events in {} batches in {:?} (tx_id: {})",
+            total_events, batch_count, duration, tx_id
+        );
+
+        self.finalize_transaction_file(
+            pending_tx,
+            lsn_tracker,
+            metrics_collector,
+            total_events,
+            shared_lsn_feedback,
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Core logic for finalizing transaction file processing
     ///
     /// PROTOCOL COMPLIANCE - ACK AFTER APPLY:
@@ -1788,12 +2065,17 @@ impl TransactionManager {
             // 1. Update confirmed_flush_lsn (last successfully applied LSN)
             lsn_tracker.commit_lsn(commit_lsn.0);
 
-            // 2. Update apply_lsn - transaction is now applied to destination
-            // (flush_lsn was already updated by producer when file was persisted)
+            // 2. Update apply_lsn and flush_lsn - transaction is now delivered to destination
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
+            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
+
+            // 3. Persist LSN to disk immediately for crash safety
+            if let Err(e) = lsn_tracker.persist_async().await {
+                warn!("Failed to persist LSN after transaction {}: {}", tx_id, e);
+            }
 
             info!(
-                "Updated apply_lsn to {} (transaction {} applied to destination)",
+                "Updated apply_lsn and flush_lsn to {} (transaction {} delivered to destination)",
                 commit_lsn, tx_id
             );
         } else {

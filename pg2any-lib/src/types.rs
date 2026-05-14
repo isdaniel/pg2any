@@ -8,6 +8,7 @@ pub enum DestinationType {
     MySQL,
     SqlServer,
     SQLite,
+    Kafka,
 }
 
 impl std::fmt::Display for DestinationType {
@@ -16,6 +17,7 @@ impl std::fmt::Display for DestinationType {
             DestinationType::MySQL => write!(f, "mysql"),
             DestinationType::SqlServer => write!(f, "sqlserver"),
             DestinationType::SQLite => write!(f, "sqlite"),
+            DestinationType::Kafka => write!(f, "kafka"),
         }
     }
 }

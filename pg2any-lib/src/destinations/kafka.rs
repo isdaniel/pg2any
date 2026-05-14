@@ -164,7 +164,11 @@ impl KafkaDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
 
-        for attempt in 0..10 {
+        const MAX_RETRIES: u32 = 10;
+        const BASE_DELAY_MS: u64 = 100;
+        const MAX_DELAY_MS: u64 = 10_000;
+
+        for attempt in 0..MAX_RETRIES {
             let mut record = FutureRecord::to(topic).payload(value);
             if let Some(k) = key {
                 record = record.key(k);
@@ -179,8 +183,11 @@ impl KafkaDestination {
                         | RDKafkaErrorCode::QueueFull,
                     ),
                     _,
-                )) if attempt < 9 => {
-                    tokio::time::sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+                )) if attempt < MAX_RETRIES - 1 => {
+                    let delay_ms = BASE_DELAY_MS
+                        .saturating_mul(1u64 << attempt)
+                        .min(MAX_DELAY_MS);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err((err, _)) => {
                     return Err(CdcError::generic(format!("Kafka enqueue failed: {err}")));
@@ -188,7 +195,7 @@ impl KafkaDestination {
             }
         }
 
-        Err(CdcError::generic("Kafka enqueue failed after 10 retries"))
+        Err(CdcError::generic("Kafka enqueue failed after max retries"))
     }
 
     fn flush_producer(&self, timeout: Duration) -> Result<()> {

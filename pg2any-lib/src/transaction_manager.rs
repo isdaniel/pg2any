@@ -1852,7 +1852,7 @@ impl TransactionManager {
                         segment.path
                     ))
                 })? {
-                    let line = line.trim().trim_end_matches(';');
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
@@ -1896,12 +1896,15 @@ impl TransactionManager {
                     }
                 }
             } else {
-                let content = fs::read_to_string(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
+                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to open segment {:?}: {e}", segment.path))
                 })?;
+                let mut lines = BufReader::new(file).lines();
 
-                for line in content.lines() {
-                    let line = line.trim().trim_end_matches(';');
+                while let Some(line) = lines.next_line().await.map_err(|e| {
+                    CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
+                })? {
+                    let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }

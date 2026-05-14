@@ -261,6 +261,8 @@ pub struct TransactionManager {
     segment_size_bytes: usize,
     /// Storage implementation (compressed or uncompressed)
     storage: Arc<dyn TransactionStorage>,
+    /// When true, stores raw ChangeEvent JSON instead of generated SQL
+    event_mode: bool,
 }
 
 impl TransactionManager {
@@ -298,12 +300,19 @@ impl TransactionManager {
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
             storage,
+            event_mode: false,
         })
     }
 
     /// Set schema mappings for SQL generation
     pub fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
         self.schema_mappings = mappings;
+    }
+
+    /// Enable event-mode: stores raw ChangeEvent JSON instead of generated SQL
+    #[allow(dead_code)]
+    pub fn set_event_mode(&mut self, enabled: bool) {
+        self.event_mode = enabled;
     }
 
     /// Flush all pending buffered writes
@@ -412,7 +421,7 @@ impl TransactionManager {
             transaction_type: transaction_type.to_string(),
         };
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
+        let metadata_json = serde_json::to_string(&metadata)?;
         let mut metadata_file = File::create(&metadata_path).await?;
         metadata_file.write_all(metadata_json.as_bytes()).await?;
         metadata_file.flush().await?;
@@ -468,7 +477,7 @@ impl TransactionManager {
             .collect();
         metadata.current_segment_index = current_segment_index;
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)
+        let metadata_json = serde_json::to_string(&metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut metadata_file = File::create(&received_metadata_path).await.map_err(|e| {
@@ -487,12 +496,23 @@ impl TransactionManager {
     /// Uses buffered I/O to accumulate events in memory before flushing to disk
     /// Automatically flushes when buffer reaches capacity
     pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
-        let sql = self.generate_sql_for_event(event)?;
-
-        // Skip empty SQL (metadata events)
-        if sql.is_empty() {
-            return Ok(());
-        }
+        let line = if self.event_mode {
+            match &event.event_type {
+                EventType::Insert { .. }
+                | EventType::Update { .. }
+                | EventType::Delete { .. }
+                | EventType::Truncate(_) => serde_json::to_string(event).map_err(|e| {
+                    CdcError::generic(format!("Failed to serialize event: {e}"))
+                })?,
+                _ => return Ok(()),
+            }
+        } else {
+            let sql = self.generate_sql_for_event(event)?;
+            if sql.is_empty() {
+                return Ok(());
+            }
+            sql
+        };
 
         let mut transactions = self.active_transactions.lock().await;
 
@@ -503,9 +523,9 @@ impl TransactionManager {
             ))
         })?;
 
-        let sql_bytes = sql.len() + 1; // include newline
+        let line_bytes = line.len() + 1; // include newline
         let estimated_size =
-            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + sql_bytes;
+            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + line_bytes;
 
         let should_rotate = estimated_size > self.segment_size_bytes
             && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
@@ -541,7 +561,7 @@ impl TransactionManager {
             );
         }
 
-        let should_flush = tx_state.writer.append(&sql);
+        let should_flush = tx_state.writer.append(&line);
         if let Some(count) = tx_state
             .segment_statement_counts
             .get_mut(tx_state.current_segment_index)
@@ -643,7 +663,7 @@ impl TransactionManager {
         pending_metadata_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let updated_json = serde_json::to_string_pretty(metadata)
+        let updated_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let mut pending_file = File::create(pending_metadata_path).await.map_err(|e| {
@@ -837,7 +857,7 @@ impl TransactionManager {
         metadata_file_path: &Path,
         metadata: &TransactionFileMetadata,
     ) -> Result<()> {
-        let metadata_json = serde_json::to_string_pretty(metadata)
+        let metadata_json = serde_json::to_string(metadata)
             .map_err(|e| CdcError::generic(format!("Failed to serialize metadata: {e}")))?;
 
         let temp_path = metadata_file_path.with_extension("meta.tmp");
@@ -1173,6 +1193,8 @@ impl TransactionManager {
                     self.append_quoted_identifier(&mut sql, table);
                     sql.push(';');
                 }
+                DestinationType::Kafka => {
+                }
             }
         }
 
@@ -1242,6 +1264,9 @@ impl TransactionManager {
             DestinationType::SQLite => {
                 self.append_quoted_identifier(out, table);
             }
+            DestinationType::Kafka => {
+                self.append_quoted_identifier(out, table);
+            }
         }
     }
 
@@ -1252,7 +1277,7 @@ impl TransactionManager {
         let (open, close, escape_ch) = match self.destination_type {
             DestinationType::MySQL => ('`', '`', '`'),
             DestinationType::SqlServer => ('[', ']', ']'),
-            DestinationType::SQLite => ('"', '"', '"'),
+            DestinationType::SQLite | DestinationType::Kafka => ('"', '"', '"'),
         };
         out.reserve(name.len() + 2);
         out.push(open);
@@ -1287,7 +1312,7 @@ impl TransactionManager {
         static HEX: &[u8; 16] = b"0123456789abcdef";
         let (prefix, suffix) = match self.destination_type {
             DestinationType::SqlServer => ("0x", ""),
-            DestinationType::MySQL | DestinationType::SQLite => ("X'", "'"),
+            DestinationType::MySQL | DestinationType::SQLite | DestinationType::Kafka => ("X'", "'"),
         };
         out.reserve(prefix.len() + bytes.len() * 2 + suffix.len());
         out.push_str(prefix);
@@ -1755,6 +1780,107 @@ impl TransactionManager {
             lsn_tracker,
             metrics_collector,
             total_commands,
+            shared_lsn_feedback,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Process a transaction file in event-mode (for non-SQL destinations like Kafka).
+    /// Reads JSON-serialized ChangeEvents from segment files and calls
+    /// execute_events_batch_with_hook() on the destination handler.
+    #[allow(dead_code)]
+    pub(crate) async fn process_transaction_file_event_mode(
+        self: Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) -> Result<()> {
+        let tx_id = pending_tx.metadata.transaction_id;
+        let start_time = Instant::now();
+
+        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        let segments = if !latest_metadata.segments.is_empty() {
+            latest_metadata.segments
+        } else {
+            pending_tx.metadata.segments.clone()
+        };
+
+        let mut all_events: Vec<ChangeEvent> = Vec::new();
+
+        for segment in &segments {
+            let content = fs::read_to_string(&segment.path).await.map_err(|e| {
+                CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
+            })?;
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
+                    CdcError::generic(format!("Failed to deserialize event: {e}"))
+                })?;
+                all_events.push(event);
+            }
+        }
+
+        if cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+
+        let mut batch_count = 0usize;
+        for chunk in all_events.chunks(batch_size) {
+            if cancellation_token.is_cancelled() {
+                warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
+                return Ok(());
+            }
+
+            batch_count += 1;
+            let metadata_path = pending_tx.file_path.clone();
+            let file_manager = self.clone();
+            let staged_index = batch_count * batch_size;
+
+            let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                let metadata_path = metadata_path.clone();
+                let file_manager = file_manager.clone();
+                Box::pin(async move {
+                    file_manager
+                        .stage_pending_metadata_progress(&metadata_path, staged_index)
+                        .await?;
+                    Ok(())
+                })
+            }));
+
+            destination_handler
+                .execute_events_batch_with_hook(
+                    chunk,
+                    tx_id,
+                    pending_tx.metadata.commit_timestamp,
+                    pending_tx.metadata.commit_lsn,
+                    pre_commit_hook,
+                )
+                .await?;
+        }
+
+        let duration = start_time.elapsed();
+        info!(
+            "Event-mode: processed {} events in {} batches in {:?} (tx_id: {})",
+            all_events.len(),
+            batch_count,
+            duration,
+            tx_id
+        );
+
+        self.finalize_transaction_file(
+            pending_tx,
+            lsn_tracker,
+            metrics_collector,
+            all_events.len(),
             shared_lsn_feedback,
         )
         .await?;

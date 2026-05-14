@@ -13,6 +13,10 @@ pub mod sqlserver;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// Kafka destination implementation
+#[cfg(feature = "kafka")]
+pub mod kafka;
+
 /// Destination factory and trait definitions
 pub mod destination_factory;
 
@@ -25,6 +29,9 @@ pub use sqlserver::SqlServerDestination;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SQLiteDestination;
+
+#[cfg(feature = "kafka")]
+pub use kafka::KafkaDestination;
 
 // Re-export factory and trait
 pub use destination_factory::{DestinationFactory, DestinationHandler, PreCommitHook};

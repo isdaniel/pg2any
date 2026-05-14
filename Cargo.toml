@@ -33,6 +33,7 @@ tiberius = { version = "0.12.3", features = ["tds73", "sql-browser-tokio", "bigd
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "sqlite", "chrono", "uuid"] }
 flate2 = "1.1.9"
 async-compression = { version = "0.4.41", features = ["tokio", "gzip"] }
+rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
 
 # Monitoring and metrics
 prometheus = { version = "0.14.0", features = ["process"] }

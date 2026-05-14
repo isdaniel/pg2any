@@ -152,9 +152,12 @@ chaos-test-mysql-setup:
 	@echo "Setting up MySQL chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_mysql 2>/dev/null || true
+	@sleep 3
 	@docker compose -f docker-compose.chaos-test.yml up --build --remove-orphans -d
 	@echo "Waiting for services to be healthy..."
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@docker compose -f docker-compose.chaos-test.yml ps
 
 chaos-test-mysql:
@@ -164,9 +167,10 @@ chaos-test-mysql:
 
 chaos-test-mysql-clean:
 	@echo "Cleaning up MySQL chaos testing environment..."
-	@docker compose -f docker-compose.chaos-test.yml down -v
-	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_mysql 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 chaos-test-mysql-full: chaos-test-mysql-setup chaos-test-mysql chaos-test-mysql-clean
@@ -181,11 +185,13 @@ pgbench-test-mysql-setup:
 	@echo "Setting up MySQL pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_mysql 2>/dev/null || true
+	@sleep 3
 	@docker compose -f docker-compose.chaos-test.yml up --build --remove-orphans -d
 	@echo "Waiting for services to be healthy..."
+	@timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
 	@docker compose -f docker-compose.chaos-test.yml ps
-	@sleep 10 # Wait for the CDC application to fully initialize
 
 pgbench-test-mysql:
 	@echo "Running pgbench chaos integration test against MySQL..."
@@ -194,9 +200,11 @@ pgbench-test-mysql:
 
 pgbench-test-mysql-clean:
 	@echo "Cleaning up MySQL pgbench testing environment..."
-	@docker compose -f docker-compose.chaos-test.yml down -v
-	@docker volume rm chaos_test_lsn_data 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_mysql 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
+	@echo "Cleanup complete."
 	@echo "Cleanup complete."
 
 pgbench-test-mysql-full: pgbench-test-mysql-setup pgbench-test-mysql pgbench-test-mysql-clean
@@ -215,7 +223,9 @@ chaos-test-sqlserver-setup:
 	@echo "Setting up SQL Server chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_sqlserver 2>/dev/null || true
+	@sleep 3
 	@echo "Building CDC application image..."
 	@docker compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
 	@echo "Starting PostgreSQL and SQL Server..."
@@ -239,8 +249,10 @@ chaos-test-sqlserver:
 
 chaos-test-sqlserver-clean:
 	@echo "Cleaning up SQL Server chaos testing environment..."
-	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v
+	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_sqlserver 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 chaos-test-sqlserver-full: chaos-test-sqlserver-setup chaos-test-sqlserver chaos-test-sqlserver-clean
@@ -255,7 +267,9 @@ pgbench-test-sqlserver-setup:
 	@echo "Setting up SQL Server pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_sqlserver 2>/dev/null || true
+	@sleep 3
 	@echo "Building CDC application image..."
 	@docker compose -f docker-compose.chaos-test-sqlserver.yml build cdc_app
 	@echo "Starting PostgreSQL and SQL Server..."
@@ -279,8 +293,10 @@ pgbench-test-sqlserver:
 
 pgbench-test-sqlserver-clean:
 	@echo "Cleaning up SQL Server pgbench testing environment..."
-	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v
+	@docker compose -f docker-compose.chaos-test-sqlserver.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_sqlserver 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 pgbench-test-sqlserver-full: pgbench-test-sqlserver-setup pgbench-test-sqlserver pgbench-test-sqlserver-clean
@@ -291,7 +307,9 @@ chaos-test-sqlite-setup:
 	@echo "Setting up SQLite chaos testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres 2>/dev/null || true
+	@sleep 3
 	@echo "Building CDC application image..."
 	@docker compose -f docker-compose.chaos-test-sqlite.yml build cdc_app
 	@echo "Starting PostgreSQL..."
@@ -313,9 +331,10 @@ chaos-test-sqlite:
 
 chaos-test-sqlite-clean:
 	@echo "Cleaning up SQLite chaos testing environment..."
-	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v
-	@docker volume rm chaos_test_sqlite_data 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 chaos-test-sqlite-full: chaos-test-sqlite-setup chaos-test-sqlite chaos-test-sqlite-clean
@@ -330,7 +349,9 @@ pgbench-test-sqlite-setup:
 	@echo "Setting up SQLite pgbench testing environment..."
 	@chmod +x tests/chaos/scripts/*.sh
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres 2>/dev/null || true
+	@sleep 3
 	@echo "Building CDC application image..."
 	@docker compose -f docker-compose.chaos-test-sqlite.yml build cdc_app
 	@echo "Starting PostgreSQL..."
@@ -352,9 +373,10 @@ pgbench-test-sqlite:
 
 pgbench-test-sqlite-clean:
 	@echo "Cleaning up SQLite pgbench testing environment..."
-	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v
-	@docker volume rm chaos_test_sqlite_data 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-sqlite.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 pgbench-test-sqlite-full: pgbench-test-sqlite-setup pgbench-test-sqlite pgbench-test-sqlite-clean
@@ -366,7 +388,9 @@ chaos-test-kafka-setup:
 	@chmod +x tests/chaos/scripts/*.sh
 	@chmod +x tests/chaos/scenarios/verify_kafka/*.sh 2>/dev/null || true
 	@echo "Cleaning up previous state..."
-	@docker compose -f docker-compose.chaos-test-kafka.yml down -v 2>/dev/null || true
+	@docker compose -f docker-compose.chaos-test-kafka.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_kafka 2>/dev/null || true
+	@sleep 3
 	@echo "Building CDC application image..."
 	@docker compose -f docker-compose.chaos-test-kafka.yml build cdc_app
 	@echo "Starting PostgreSQL and Kafka..."
@@ -388,8 +412,10 @@ chaos-test-kafka:
 
 chaos-test-kafka-clean:
 	@echo "Cleaning up Kafka chaos testing environment..."
-	@docker compose -f docker-compose.chaos-test-kafka.yml down -v
+	@docker compose -f docker-compose.chaos-test-kafka.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_kafka 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 chaos-test-kafka-full: chaos-test-kafka-setup chaos-test-kafka chaos-test-kafka-clean
@@ -427,8 +453,10 @@ pgbench-test-kafka:
 
 pgbench-test-kafka-clean:
 	@echo "Cleaning up Kafka pgbench testing environment..."
-	@docker compose -f docker-compose.chaos-test-kafka.yml down -v
+	@docker compose -f docker-compose.chaos-test-kafka.yml down -v --remove-orphans 2>/dev/null || true
+	@docker rm -f cdc_application cdc_postgres cdc_kafka 2>/dev/null || true
 	@docker network rm chaos_test_network 2>/dev/null || true
+	@sleep 3
 	@echo "Cleanup complete."
 
 pgbench-test-kafka-full: pgbench-test-kafka-setup pgbench-test-kafka pgbench-test-kafka-clean

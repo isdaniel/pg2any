@@ -46,7 +46,7 @@ services:
       CDC_TRANSACTION_FILE_BASE_PATH: /app/data
       CDC_STREAMING: "false"
     ports:
-      - "8082:8080"
+      - "18082:8080"
     restart: unless-stopped
     stop_grace_period: 300s
     stop_signal: SIGTERM

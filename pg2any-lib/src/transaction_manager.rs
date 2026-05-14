@@ -1800,6 +1800,67 @@ impl TransactionManager {
         Ok(())
     }
 
+    async fn process_event_lines<R: AsyncRead + Unpin>(
+        self: &Arc<Self>,
+        mut lines: tokio::io::Lines<BufReader<R>>,
+        segment_path: &Path,
+        batch: &mut Vec<ChangeEvent>,
+        batch_count: &mut usize,
+        total_events: &mut usize,
+        batch_size: usize,
+        tx_id: u32,
+        pending_tx: &PendingTransactionFile,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        while let Some(line) = lines.next_line().await.map_err(|e| {
+            CdcError::generic(format!("Failed to read segment {:?}: {e}", segment_path))
+        })? {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event: ChangeEvent = serde_json::from_str(line)
+                .map_err(|e| CdcError::generic(format!("Failed to deserialize event: {e}")))?;
+            batch.push(event);
+
+            if batch.len() >= batch_size {
+                if cancellation_token.is_cancelled() {
+                    warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
+                    return Ok(());
+                }
+                *batch_count += 1;
+                *total_events += batch.len();
+                let metadata_path = pending_tx.file_path.clone();
+                let file_manager = self.clone();
+                let staged_index = *batch_count * batch_size;
+
+                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                    let metadata_path = metadata_path.clone();
+                    let file_manager = file_manager.clone();
+                    Box::pin(async move {
+                        file_manager
+                            .stage_pending_metadata_progress(&metadata_path, staged_index)
+                            .await?;
+                        Ok(())
+                    })
+                }));
+
+                destination_handler
+                    .execute_events_batch_with_hook(
+                        batch,
+                        tx_id,
+                        pending_tx.metadata.commit_timestamp,
+                        pending_tx.metadata.commit_lsn,
+                        pre_commit_hook,
+                    )
+                    .await?;
+                batch.clear();
+            }
+        }
+        Ok(())
+    }
+
     /// Process a transaction file in event-mode (for non-SQL destinations like Kafka).
     /// Reads JSON-serialized ChangeEvents from segment files and calls
     /// execute_events_batch_with_hook() on the destination handler.
@@ -1845,108 +1906,38 @@ impl TransactionManager {
                 let buf_reader = BufReader::new(file);
                 let mut decoder = GzipDecoder::new(buf_reader);
                 decoder.multiple_members(true);
-                let mut lines = BufReader::new(decoder).lines();
-                while let Some(line) = lines.next_line().await.map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to read compressed segment {:?}: {e}",
-                        segment.path
-                    ))
-                })? {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
-                        CdcError::generic(format!("Failed to deserialize event: {e}"))
-                    })?;
-                    batch.push(event);
-
-                    if batch.len() >= batch_size {
-                        if cancellation_token.is_cancelled() {
-                            warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
-                            return Ok(());
-                        }
-                        batch_count += 1;
-                        total_events += batch.len();
-                        let metadata_path = pending_tx.file_path.clone();
-                        let file_manager = self.clone();
-                        let staged_index = batch_count * batch_size;
-
-                        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                            let metadata_path = metadata_path.clone();
-                            let file_manager = file_manager.clone();
-                            Box::pin(async move {
-                                file_manager
-                                    .stage_pending_metadata_progress(&metadata_path, staged_index)
-                                    .await?;
-                                Ok(())
-                            })
-                        }));
-
-                        destination_handler
-                            .execute_events_batch_with_hook(
-                                &batch,
-                                tx_id,
-                                pending_tx.metadata.commit_timestamp,
-                                pending_tx.metadata.commit_lsn,
-                                pre_commit_hook,
-                            )
-                            .await?;
-                        batch.clear();
-                    }
-                }
+                let lines = BufReader::new(decoder).lines();
+                self.process_event_lines(
+                    lines,
+                    &segment.path,
+                    &mut batch,
+                    &mut batch_count,
+                    &mut total_events,
+                    batch_size,
+                    tx_id,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                )
+                .await?;
             } else {
                 let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
                     CdcError::generic(format!("Failed to open segment {:?}: {e}", segment.path))
                 })?;
-                let mut lines = BufReader::new(file).lines();
-
-                while let Some(line) = lines.next_line().await.map_err(|e| {
-                    CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
-                })? {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
-                        CdcError::generic(format!("Failed to deserialize event: {e}"))
-                    })?;
-                    batch.push(event);
-
-                    if batch.len() >= batch_size {
-                        if cancellation_token.is_cancelled() {
-                            warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
-                            return Ok(());
-                        }
-                        batch_count += 1;
-                        total_events += batch.len();
-                        let metadata_path = pending_tx.file_path.clone();
-                        let file_manager = self.clone();
-                        let staged_index = batch_count * batch_size;
-
-                        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                            let metadata_path = metadata_path.clone();
-                            let file_manager = file_manager.clone();
-                            Box::pin(async move {
-                                file_manager
-                                    .stage_pending_metadata_progress(&metadata_path, staged_index)
-                                    .await?;
-                                Ok(())
-                            })
-                        }));
-
-                        destination_handler
-                            .execute_events_batch_with_hook(
-                                &batch,
-                                tx_id,
-                                pending_tx.metadata.commit_timestamp,
-                                pending_tx.metadata.commit_lsn,
-                                pre_commit_hook,
-                            )
-                            .await?;
-                        batch.clear();
-                    }
-                }
+                let lines = BufReader::new(file).lines();
+                self.process_event_lines(
+                    lines,
+                    &segment.path,
+                    &mut batch,
+                    &mut batch_count,
+                    &mut total_events,
+                    batch_size,
+                    tx_id,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                )
+                .await?;
             }
         }
 

@@ -21,6 +21,7 @@ pub struct KafkaDestination {
     topic_prefix: String,
     source_db_name: String,
     schema_mappings: HashMap<String, String>,
+    key_columns_config: HashMap<String, Vec<String>>,
 }
 
 impl KafkaDestination {
@@ -30,6 +31,7 @@ impl KafkaDestination {
             topic_prefix: DEFAULT_TOPIC_PREFIX.to_string(),
             source_db_name: "postgres".to_string(),
             schema_mappings: HashMap::new(),
+            key_columns_config: HashMap::new(),
         }
     }
 
@@ -63,6 +65,71 @@ impl KafkaDestination {
         Value::Object(map)
     }
 
+    fn build_field_schema(data: &pg_walstream::RowData) -> Value {
+        let fields: Vec<Value> = data
+            .iter()
+            .map(|(col_name, col_value)| {
+                let field_type = match col_value {
+                    ColumnValue::Null => "string",
+                    ColumnValue::Text(_) => "string",
+                    ColumnValue::Binary(_) => "bytes",
+                };
+                json!({
+                    "type": field_type,
+                    "optional": true,
+                    "field": col_name.as_ref()
+                })
+            })
+            .collect();
+        json!(fields)
+    }
+
+    fn build_key_for_insert(
+        &self,
+        schema: &str,
+        table: &str,
+        data: &pg_walstream::RowData,
+    ) -> Option<String> {
+        let table_key = format!("{}.{}", schema, table);
+        let key_cols = self.key_columns_config.get(&table_key);
+
+        let key_column_names: Vec<&str> = if let Some(cols) = key_cols {
+            cols.iter().map(|s| s.as_str()).collect()
+        } else {
+            return None;
+        };
+
+        let mut payload = serde_json::Map::new();
+        let mut fields = Vec::new();
+
+        for col_name in &key_column_names {
+            if let Some(val) = data.get(col_name) {
+                payload.insert(col_name.to_string(), Self::column_value_to_json(val));
+                fields.push(json!({
+                    "type": "string",
+                    "optional": false,
+                    "field": *col_name
+                }));
+            }
+        }
+
+        if payload.is_empty() {
+            return None;
+        }
+
+        let key = json!({
+            "schema": {
+                "type": "struct",
+                "fields": fields,
+                "optional": false,
+                "name": format!("{}.{}.{}.Key", self.topic_prefix, schema, table)
+            },
+            "payload": Value::Object(payload)
+        });
+
+        serde_json::to_string(&key).ok()
+    }
+
     fn build_source_block(
         &self,
         schema: &str,
@@ -84,25 +151,40 @@ impl KafkaDestination {
         })
     }
 
-    fn build_debezium_envelope(
+    fn build_change_envelope(
         &self,
         op: &str,
         schema: &str,
         table: &str,
         before: Option<Value>,
         after: Option<Value>,
+        before_fields: Option<Value>,
+        after_fields: Option<Value>,
         transaction_id: u32,
         commit_timestamp: DateTime<Utc>,
         lsn: Option<Lsn>,
     ) -> Value {
         let source = self.build_source_block(schema, table, transaction_id, commit_timestamp, lsn);
 
+        let before_schema = json!({
+            "type": "struct",
+            "fields": before_fields.unwrap_or_else(|| json!([])),
+            "optional": true,
+            "field": "before"
+        });
+        let after_schema = json!({
+            "type": "struct",
+            "fields": after_fields.unwrap_or_else(|| json!([])),
+            "optional": true,
+            "field": "after"
+        });
+
         json!({
             "schema": {
                 "type": "struct",
                 "fields": [
-                    {"type": "struct", "fields": [], "optional": true, "field": "before"},
-                    {"type": "struct", "fields": [], "optional": true, "field": "after"},
+                    before_schema,
+                    after_schema,
                     {"type": "struct", "fields": [], "optional": false, "field": "source"},
                     {"type": "string", "optional": false, "field": "op"},
                     {"type": "int64", "optional": true, "field": "ts_ms"}
@@ -266,6 +348,24 @@ impl DestinationHandler for KafkaDestination {
         self.topic_prefix = topic_prefix;
         self.source_db_name = source_db_name;
 
+        // Parse key columns config: CDC_KAFKA_KEY_COLUMNS="schema.table:col1,col2;schema2.table2:col3"
+        if let Ok(key_cols_str) = std::env::var("CDC_KAFKA_KEY_COLUMNS") {
+            for entry in key_cols_str.split(';') {
+                let entry = entry.trim();
+                if let Some((table_ref, cols)) = entry.split_once(':') {
+                    let columns: Vec<String> =
+                        cols.split(',').map(|c| c.trim().to_string()).collect();
+                    if !columns.is_empty() {
+                        self.key_columns_config
+                            .insert(table_ref.trim().to_string(), columns);
+                    }
+                }
+            }
+            if !self.key_columns_config.is_empty() {
+                debug!("Kafka key columns config: {:?}", self.key_columns_config);
+            }
+        }
+
         info!(
             "Kafka producer connected to {} (topic_prefix={})",
             connection_string, self.topic_prefix
@@ -322,13 +422,17 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let schema = self.map_schema(schema);
                     let topic = self.topic_name(schema, table);
+                    let after_fields = Some(Self::build_field_schema(data));
                     let after = Some(Self::row_data_to_json(data));
-                    let envelope = self.build_debezium_envelope(
+                    let key = self.build_key_for_insert(schema, table, data);
+                    let envelope = self.build_change_envelope(
                         "c",
                         schema,
                         table,
                         None,
                         after,
+                        None,
+                        after_fields,
                         transaction_id,
                         commit_timestamp,
                         commit_lsn,
@@ -336,7 +440,7 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, None, &value).await?;
+                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
                 }
                 pg_walstream::EventType::Update {
                     schema,
@@ -348,16 +452,20 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let schema = self.map_schema(schema);
                     let topic = self.topic_name(schema, table);
+                    let before_fields = old_data.as_ref().map(Self::build_field_schema);
+                    let after_fields = Some(Self::build_field_schema(new_data));
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
                     let key = self.build_key_from_data(schema, table, key_data, key_columns);
-                    let envelope = self.build_debezium_envelope(
+                    let envelope = self.build_change_envelope(
                         "u",
                         schema,
                         table,
                         before,
                         after,
+                        before_fields,
+                        after_fields,
                         transaction_id,
                         commit_timestamp,
                         commit_lsn,
@@ -376,13 +484,16 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let schema = self.map_schema(schema);
                     let topic = self.topic_name(schema, table);
+                    let before_fields = Some(Self::build_field_schema(old_data));
                     let before = Some(Self::row_data_to_json(old_data));
                     let key = self.build_key_from_data(schema, table, old_data, key_columns);
-                    let envelope = self.build_debezium_envelope(
+                    let envelope = self.build_change_envelope(
                         "d",
                         schema,
                         table,
                         before,
+                        None,
+                        before_fields,
                         None,
                         transaction_id,
                         commit_timestamp,
@@ -400,10 +511,12 @@ impl DestinationHandler for KafkaDestination {
                             _ => (self.map_schema("public"), table_spec.as_ref()),
                         };
                         let topic = self.topic_name(schema, table);
-                        let envelope = self.build_debezium_envelope(
+                        let envelope = self.build_change_envelope(
                             "t",
                             schema,
                             table,
+                            None,
+                            None,
                             None,
                             None,
                             transaction_id,
@@ -534,19 +647,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_debezium_envelope_insert() {
+    fn test_build_change_envelope_insert() {
         let dest = test_destination();
         let ts = DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let after_data = json!({"id": "1", "name": "Alice"});
+        let after_fields = json!([
+            {"type": "string", "optional": true, "field": "id"},
+            {"type": "string", "optional": true, "field": "name"}
+        ]);
 
-        let envelope = dest.build_debezium_envelope(
+        let envelope = dest.build_change_envelope(
             "c",
             "public",
             "users",
             None,
             Some(after_data.clone()),
+            None,
+            Some(after_fields),
             100,
             ts,
             Some(Lsn(12345)),
@@ -561,19 +680,25 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(".Envelope"));
+        // Verify after field schema is populated
+        let after_schema = &envelope["schema"]["fields"][1];
+        assert_eq!(after_schema["field"], "after");
+        assert!(!after_schema["fields"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_build_debezium_envelope_delete() {
+    fn test_build_change_envelope_delete() {
         let dest = test_destination();
         let ts = Utc::now();
         let before_data = json!({"id": "1", "name": "Alice"});
 
-        let envelope = dest.build_debezium_envelope(
+        let envelope = dest.build_change_envelope(
             "d",
             "public",
             "users",
             Some(before_data.clone()),
+            None,
+            Some(json!([{"type": "string", "optional": true, "field": "id"}])),
             None,
             101,
             ts,
@@ -587,14 +712,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_debezium_envelope_truncate() {
+    fn test_build_change_envelope_truncate() {
         let dest = test_destination();
         let ts = Utc::now();
 
-        let envelope = dest.build_debezium_envelope(
+        let envelope = dest.build_change_envelope(
             "t",
             "public",
             "users",
+            None,
+            None,
             None,
             None,
             102,
@@ -690,5 +817,53 @@ mod tests {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert_eq!(hex_encode(&[]), "");
         assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+    }
+
+    #[test]
+    fn test_build_field_schema() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("Alice")),
+            (
+                "avatar",
+                ColumnValue::Binary(bytes::Bytes::from_static(&[0x01])),
+            ),
+            ("deleted", ColumnValue::Null),
+        ]);
+        let schema = KafkaDestination::build_field_schema(&data);
+        let fields = schema.as_array().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0]["field"], "id");
+        assert_eq!(fields[0]["type"], "string");
+        assert_eq!(fields[2]["field"], "avatar");
+        assert_eq!(fields[2]["type"], "bytes");
+        assert_eq!(fields[3]["field"], "deleted");
+        assert_eq!(fields[3]["type"], "string");
+    }
+
+    #[test]
+    fn test_build_key_for_insert_with_config() {
+        let mut dest = test_destination();
+        dest.key_columns_config
+            .insert("public.users".to_string(), vec!["id".to_string()]);
+
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("Alice")),
+        ]);
+
+        let key = dest.build_key_for_insert("public", "users", &data);
+        assert!(key.is_some());
+        let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
+        assert_eq!(key_json["payload"]["id"], Value::String("42".to_string()));
+    }
+
+    #[test]
+    fn test_build_key_for_insert_no_config() {
+        let dest = test_destination();
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
+
+        let key = dest.build_key_for_insert("public", "users", &data);
+        assert!(key.is_none());
     }
 }

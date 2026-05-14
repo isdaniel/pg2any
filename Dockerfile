@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     clang \
     libclang-dev \
+    cmake \
+    libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -35,6 +37,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libpq-dev \
     sqlite3 \
+    kafkacat \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

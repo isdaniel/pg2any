@@ -1,0 +1,262 @@
+name: PGBench Chaos Integration Test (Kafka)
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  pgbench-integration-test-kafka:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compression: ["true", "false"]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 480
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Compose
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker-compose
+
+    - name: Install PostgreSQL client tools and Kafka tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client-common postgresql-client kafkacat jq
+        pgbench --version
+
+    - name: Verify test structure
+      run: |
+        echo "Verifying pgbench Kafka test structure..."
+        ls -la tests/chaos/scripts/
+        test -f tests/chaos/scripts/run_pgbench_chaos_test_kafka.sh || (echo "PGBench Kafka test script not found!" && exit 1)
+        test -f tests/chaos/scripts/chaos_script.sh || (echo "Chaos script not found!" && exit 1)
+
+    - name: Build CDC application image
+      run: |
+        echo "Building CDC application image with Kafka support..."
+        docker-compose -f docker-compose.chaos-test-kafka.yml build cdc_app
+      working-directory: .
+
+    - name: Start PostgreSQL and Kafka
+      run: |
+        echo "Starting PostgreSQL and Kafka..."
+        docker-compose -f docker-compose.chaos-test-kafka.yml up -d postgres kafka
+      working-directory: .
+
+    - name: Wait for services to be healthy
+      run: |
+        echo "Waiting for PostgreSQL to be ready..."
+        timeout 60 bash -c 'until docker exec cdc_postgres pg_isready -U postgres 2>/dev/null; do sleep 2; done'
+        echo "Waiting for Kafka to be ready..."
+        timeout 120 bash -c 'until docker ps --filter name=cdc_kafka --format "{{.Status}}" | grep -q healthy; do sleep 5; done'
+        docker-compose -f docker-compose.chaos-test-kafka.yml ps
+      working-directory: .
+
+    - name: Verify PostgreSQL is ready
+      run: |
+        echo "Verifying PostgreSQL connection..."
+        docker exec cdc_postgres pg_isready -U postgres
+        docker exec cdc_postgres psql -U postgres -c "SELECT version();"
+        docker exec cdc_postgres psql -U postgres -c "SHOW wal_level;"
+
+    - name: Verify Kafka is ready
+      run: |
+        echo "Verifying Kafka connection..."
+        docker exec cdc_kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+        echo "Kafka is ready."
+
+    - name: Drop stale replication slot
+      run: |
+        docker exec cdc_postgres psql -U postgres -c "SELECT pg_drop_replication_slot('cdc_slot') FROM pg_replication_slots WHERE slot_name = 'cdc_slot';" 2>/dev/null || true
+
+    - name: Start CDC application
+      run: |
+        echo "Starting CDC application..."
+        docker-compose -f docker-compose.chaos-test-kafka.yml up -d cdc_app
+        echo "Waiting for CDC application to initialize..."
+        timeout 60 bash -c 'until docker ps --filter name=cdc_application --format "{{.Status}}" | grep -q healthy; do sleep 5; done' || true
+      working-directory: .
+
+    - name: Make scripts executable
+      run: |
+        chmod +x tests/chaos/scripts/*.sh
+        chmod +x tests/chaos/scenarios/verify_kafka/*.sh
+        ls -la tests/chaos/scripts/
+
+    - name: Run pgbench chaos integration test
+      run: |
+        echo "=========================================="
+        echo "Starting PGBench Chaos Integration Test (Kafka)"
+        echo "=========================================="
+        echo "OS: ${{ matrix.os }}"
+        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
+        echo ""
+
+        cd tests/chaos/scripts
+        ./run_pgbench_chaos_test_kafka.sh
+      env:
+        CDC_POSTGRES_HOST: 127.0.0.1
+        CDC_POSTGRES_PORT: 5432
+        CDC_POSTGRES_USER: postgres
+        CDC_POSTGRES_PASSWORD: test.123
+        CDC_POSTGRES_DB: postgres
+        CDC_KAFKA_CONTAINER: cdc_kafka
+        CDC_KAFKA_BROKER: 127.0.0.1:9094
+        CDC_KAFKA_TOPIC: pg2any.public.t1
+        CDC_CONTAINER_NAME: cdc_application
+        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
+        PGBENCH_SCALE: 32
+        PGBENCH_CLIENTS: 100
+        PGBENCH_THREADS: 8
+        PGBENCH_TRANSACTIONS: 12
+
+    - name: Show pgbench results
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "PGBench Test Results (Kafka)"
+        echo "=========================================="
+        if ls tests/chaos/scripts/pgbench_chaos_kafka_results_*.log 1>/dev/null 2>&1; then
+          cat tests/chaos/scripts/pgbench_chaos_kafka_results_*.log
+        else
+          echo "No results file found"
+        fi
+
+    - name: Show chaos script logs
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Chaos Script Activity Log"
+        echo "=========================================="
+        if [ -f tests/chaos/scripts/pgbench_chaos_script.log ]; then
+          cat tests/chaos/scripts/pgbench_chaos_script.log
+        else
+          echo "No chaos script log found"
+        fi
+
+    - name: Show Kafka topic info
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Kafka Topic Information"
+        echo "=========================================="
+        docker exec cdc_kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null || true
+        docker exec cdc_kafka kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic pg2any.public.t1 2>/dev/null || true
+
+    - name: Verify replication statistics
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Final Replication Statistics"
+        echo "=========================================="
+        echo "PostgreSQL row count:"
+        docker exec cdc_postgres psql -U postgres -c "SELECT COUNT(*) FROM t1;" 2>/dev/null || echo "Unable to query"
+        echo ""
+        echo "Kafka message count:"
+        kafkacat -C -b 127.0.0.1:9094 -t pg2any.public.t1 -e -q -o beginning 2>/dev/null | wc -l || echo "Unable to count"
+
+    - name: Show PostgreSQL logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "PostgreSQL Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_postgres --tail 100
+
+    - name: Show Kafka logs on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Kafka Logs (Last 100 lines)"
+        echo "=========================================="
+        docker logs cdc_kafka --tail 100
+
+    - name: Show container status on failure
+      if: failure()
+      run: |
+        echo "=========================================="
+        echo "Docker Container Status"
+        echo "=========================================="
+        docker-compose -f docker-compose.chaos-test-kafka.yml ps
+        docker ps -a
+
+    - name: Capture and upload CDC application logs
+      if: failure()
+      run: |
+        echo "Installing colorized-logs for log conversion..."
+        sudo apt-get update
+        sudo apt-get install -y colorized-logs || sudo apt-get install -y ansifilter
+        echo "Capturing full CDC application logs..."
+        if command -v ansi2txt &> /dev/null; then
+          docker logs cdc_application | ansi2txt > cdc_application_log.txt
+        elif command -v ansifilter &> /dev/null; then
+          docker logs cdc_application | ansifilter > cdc_application_log.txt
+        else
+          docker logs cdc_application > cdc_application_log.txt
+        fi
+        echo "Log file created: cdc_application_log.txt"
+        ls -lh cdc_application_log.txt
+
+    - name: Upload CDC application logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cdc-pgbench-kafka-logs-${{ matrix.os }}-${{ matrix.compression }}
+        path: cdc_application_log.txt
+        retention-days: 30
+
+    - name: Upload pgbench results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pgbench-kafka-results-${{ matrix.os }}-${{ matrix.compression }}
+        path: tests/chaos/scripts/pgbench_chaos_kafka_results_*.log
+        retention-days: 30
+
+    - name: Setup tmate session
+      if: failure()
+      uses: mxschmitt/action-tmate@v3
+
+    - name: Stop and remove containers
+      if: always()
+      run: |
+        echo "Cleaning up Docker containers..."
+        docker-compose -f docker-compose.chaos-test-kafka.yml down -v
+        docker network rm chaos_test_network 2>/dev/null || true
+        docker system prune -f
+      working-directory: .
+
+    - name: Show disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df
+
+  notify:
+    needs: pgbench-integration-test-kafka
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Test result summary
+      run: |
+        echo "=========================================="
+        echo "PGBench Kafka Integration Test Summary"
+        echo "=========================================="
+        echo "Job status: ${{ needs.pgbench-integration-test-kafka.result }}"
+        if [ "${{ needs.pgbench-integration-test-kafka.result }}" = "success" ]; then
+          echo "PGBench Kafka chaos integration test passed!"
+        else
+          echo "PGBench Kafka chaos integration test failed."
+        fi

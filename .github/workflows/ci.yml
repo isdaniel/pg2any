@@ -62,7 +62,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev cmake libcurl4-openssl-dev
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -116,7 +116,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libpq-dev pkg-config libssl-dev
+        sudo apt-get install -y libpq-dev pkg-config libssl-dev cmake libcurl4-openssl-dev
 
     - name: Build documentation
       run: cargo doc --no-deps --all-features

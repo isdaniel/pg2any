@@ -138,6 +138,9 @@ pub use crate::destinations::SqlServerDestination;
 #[cfg(feature = "sqlite")]
 pub use crate::destinations::SQLiteDestination;
 
+#[cfg(feature = "kafka")]
+pub use crate::destinations::KafkaDestination;
+
 pub use crate::destinations::{DestinationFactory, DestinationHandler};
 pub use crate::types::{DestinationType, Transaction};
 

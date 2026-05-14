@@ -66,6 +66,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         "MySQL" | "mysql" => DestinationType::MySQL,
         "SqlServer" | "sqlserver" => DestinationType::SqlServer,
         "SQLite" | "sqlite" => DestinationType::SQLite,
+        "Kafka" | "kafka" => DestinationType::Kafka,
         _ => {
             tracing::warn!(
                 "Unknown destination type '{}', defaulting to MySQL",

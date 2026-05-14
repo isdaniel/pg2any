@@ -500,9 +500,8 @@ impl TransactionManager {
                 EventType::Insert { .. }
                 | EventType::Update { .. }
                 | EventType::Delete { .. }
-                | EventType::Truncate(_) => serde_json::to_string(event).map_err(|e| {
-                    CdcError::generic(format!("Failed to serialize event: {e}"))
-                })?,
+                | EventType::Truncate(_) => serde_json::to_string(event)
+                    .map_err(|e| CdcError::generic(format!("Failed to serialize event: {e}")))?,
                 _ => return Ok(()),
             }
         } else {
@@ -1192,8 +1191,7 @@ impl TransactionManager {
                     self.append_quoted_identifier(&mut sql, table);
                     sql.push(';');
                 }
-                DestinationType::Kafka => {
-                }
+                DestinationType::Kafka => {}
             }
         }
 
@@ -1311,7 +1309,9 @@ impl TransactionManager {
         static HEX: &[u8; 16] = b"0123456789abcdef";
         let (prefix, suffix) = match self.destination_type {
             DestinationType::SqlServer => ("0x", ""),
-            DestinationType::MySQL | DestinationType::SQLite | DestinationType::Kafka => ("X'", "'"),
+            DestinationType::MySQL | DestinationType::SQLite | DestinationType::Kafka => {
+                ("X'", "'")
+            }
         };
         out.reserve(prefix.len() + bytes.len() * 2 + suffix.len());
         out.push_str(prefix);
@@ -1835,14 +1835,20 @@ impl TransactionManager {
 
             if is_compressed {
                 let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!("Failed to open compressed segment {:?}: {e}", segment.path))
+                    CdcError::generic(format!(
+                        "Failed to open compressed segment {:?}: {e}",
+                        segment.path
+                    ))
                 })?;
                 let buf_reader = BufReader::new(file);
                 let mut decoder = GzipDecoder::new(buf_reader);
                 decoder.multiple_members(true);
                 let mut lines = BufReader::new(decoder).lines();
                 while let Some(line) = lines.next_line().await.map_err(|e| {
-                    CdcError::generic(format!("Failed to read compressed segment {:?}: {e}", segment.path))
+                    CdcError::generic(format!(
+                        "Failed to read compressed segment {:?}: {e}",
+                        segment.path
+                    ))
                 })? {
                     let line = line.trim().trim_end_matches(';');
                     if line.is_empty() {

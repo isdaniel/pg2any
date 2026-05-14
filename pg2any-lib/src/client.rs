@@ -118,7 +118,9 @@ impl CdcClient {
         manager.set_schema_mappings(config.schema_mappings.clone());
 
         if destination_handler.supports_event_mode() {
-            info!("Destination supports event mode, enabling event-mode for transaction processing");
+            info!(
+                "Destination supports event mode, enabling event-mode for transaction processing"
+            );
             manager.set_event_mode(true);
         }
 

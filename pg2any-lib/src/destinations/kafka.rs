@@ -172,11 +172,14 @@ impl KafkaDestination {
 
             match producer.send_result(record) {
                 Ok(_) => return Ok(()),
-                Err((KafkaError::MessageProduction(
-                    RDKafkaErrorCode::UnknownTopic |
-                    RDKafkaErrorCode::UnknownTopicOrPartition |
-                    RDKafkaErrorCode::QueueFull
-                ), _)) if attempt < 9 => {
+                Err((
+                    KafkaError::MessageProduction(
+                        RDKafkaErrorCode::UnknownTopic
+                        | RDKafkaErrorCode::UnknownTopicOrPartition
+                        | RDKafkaErrorCode::QueueFull,
+                    ),
+                    _,
+                )) if attempt < 9 => {
                     std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
                     producer.poll(Duration::from_millis(100));
                 }
@@ -194,9 +197,9 @@ impl KafkaDestination {
             .producer
             .as_ref()
             .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
-        producer.flush(timeout).map_err(|e| {
-            CdcError::generic(format!("Kafka flush failed: {e}"))
-        })
+        producer
+            .flush(timeout)
+            .map_err(|e| CdcError::generic(format!("Kafka flush failed: {e}")))
     }
 }
 
@@ -219,8 +222,7 @@ impl DestinationHandler for KafkaDestination {
             std::env::var("CDC_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".to_string());
         let batch_size =
             std::env::var("CDC_KAFKA_BATCH_SIZE").unwrap_or_else(|_| "16384".to_string());
-        let linger_ms =
-            std::env::var("CDC_KAFKA_LINGER_MS").unwrap_or_else(|_| "5".to_string());
+        let linger_ms = std::env::var("CDC_KAFKA_LINGER_MS").unwrap_or_else(|_| "5".to_string());
         let acks = std::env::var("CDC_KAFKA_ACKS").unwrap_or_else(|_| "all".to_string());
         let message_max_bytes =
             std::env::var("CDC_KAFKA_MESSAGE_MAX_BYTES").unwrap_or_else(|_| "1048576".to_string());
@@ -325,8 +327,9 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope)
-                        .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
+                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                        CdcError::generic(format!("JSON serialization failed: {e}"))
+                    })?;
                     self.enqueue_event(&topic, None, &value)?;
                 }
                 pg_walstream::EventType::Update {
@@ -353,8 +356,9 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope)
-                        .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
+                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                        CdcError::generic(format!("JSON serialization failed: {e}"))
+                    })?;
                     self.enqueue_event(&topic, key.as_deref(), &value)?;
                 }
                 pg_walstream::EventType::Delete {
@@ -378,8 +382,9 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope)
-                        .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
+                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                        CdcError::generic(format!("JSON serialization failed: {e}"))
+                    })?;
                     self.enqueue_event(&topic, key.as_deref(), &value)?;
                 }
                 pg_walstream::EventType::Truncate(tables) => {
@@ -429,9 +434,9 @@ impl DestinationHandler for KafkaDestination {
                 "Flushing Kafka producer (timeout {:?})...",
                 DEFAULT_FLUSH_TIMEOUT
             );
-            producer.flush(DEFAULT_FLUSH_TIMEOUT).map_err(|e| {
-                CdcError::generic(format!("Kafka producer flush failed: {e}"))
-            })?;
+            producer
+                .flush(DEFAULT_FLUSH_TIMEOUT)
+                .map_err(|e| CdcError::generic(format!("Kafka producer flush failed: {e}")))?;
             info!("Kafka producer flushed and closed successfully");
         }
         Ok(())

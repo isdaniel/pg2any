@@ -37,7 +37,7 @@ rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 
 # Monitoring and metrics
 prometheus = { version = "0.14.0", features = ["process"] }
-hyper = { version = "1.8.1", features = ["full"] }
+hyper = { version = "1.9.0", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 http-body-util = "0.1.3"
 

@@ -1872,20 +1872,16 @@ impl TransactionManager {
                         let file_manager = self.clone();
                         let staged_index = batch_count * batch_size;
 
-                        let pre_commit_hook: Option<PreCommitHook> =
-                            Some(Box::new(move || {
-                                let metadata_path = metadata_path.clone();
-                                let file_manager = file_manager.clone();
-                                Box::pin(async move {
-                                    file_manager
-                                        .stage_pending_metadata_progress(
-                                            &metadata_path,
-                                            staged_index,
-                                        )
-                                        .await?;
-                                    Ok(())
-                                })
-                            }));
+                        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                            let metadata_path = metadata_path.clone();
+                            let file_manager = file_manager.clone();
+                            Box::pin(async move {
+                                file_manager
+                                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                                    .await?;
+                                Ok(())
+                            })
+                        }));
 
                         destination_handler
                             .execute_events_batch_with_hook(
@@ -1925,20 +1921,16 @@ impl TransactionManager {
                         let file_manager = self.clone();
                         let staged_index = batch_count * batch_size;
 
-                        let pre_commit_hook: Option<PreCommitHook> =
-                            Some(Box::new(move || {
-                                let metadata_path = metadata_path.clone();
-                                let file_manager = file_manager.clone();
-                                Box::pin(async move {
-                                    file_manager
-                                        .stage_pending_metadata_progress(
-                                            &metadata_path,
-                                            staged_index,
-                                        )
-                                        .await?;
-                                    Ok(())
-                                })
-                            }));
+                        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                            let metadata_path = metadata_path.clone();
+                            let file_manager = file_manager.clone();
+                            Box::pin(async move {
+                                file_manager
+                                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                                    .await?;
+                                Ok(())
+                            })
+                        }));
 
                         destination_handler
                             .execute_events_batch_with_hook(
@@ -1992,10 +1984,7 @@ impl TransactionManager {
         let duration = start_time.elapsed();
         info!(
             "Event-mode: processed {} events in {} batches in {:?} (tx_id: {})",
-            total_events,
-            batch_count,
-            duration,
-            tx_id
+            total_events, batch_count, duration, tx_id
         );
 
         self.finalize_transaction_file(

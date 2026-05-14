@@ -1013,10 +1013,12 @@ impl CdcClient {
                             .await
                         {
                             error!(
-                                "Failed to process transaction {} after producer shutdown: {}",
+                                "Failed to process transaction {} after producer shutdown: {}. \
+                                 Stopping to prevent LSN advancement past failed transaction.",
                                 next_tx.metadata.transaction_id, e
                             );
                             metrics_collector.record_error("transaction_file_processing_failed", "consumer");
+                            break;
                         }
                     }
 
@@ -1077,12 +1079,15 @@ impl CdcClient {
                                     .await
                                 {
                                     error!(
-                                        "Failed to process transaction {} from file {:?}: {}",
+                                        "Failed to process transaction {} from file {:?}: {}. \
+                                         Stopping consumer to prevent LSN advancement past failed transaction.",
                                         next_tx.metadata.transaction_id, next_tx.file_path, e
                                     );
                                     metrics_collector.record_error("transaction_file_processing_failed", "consumer");
-                                    // Continue to next transaction rather than failing completely
-                                    // Note: This transaction will NOT be ACKed since it failed
+                                    // Re-insert the failed transaction back for retry on next startup
+                                    commit_queue.push(std::cmp::Reverse(next_tx));
+                                    // Break out of processing loop — do NOT advance past failed tx
+                                    break;
                                 }
                             }
                         }

@@ -208,16 +208,28 @@ test_kafka_connection() {
     fi
 }
 
+# Function to get total message count from Kafka topic
+get_kafka_total_count() {
+    local count
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+        | wc -l | tr -d '[:space:]' || true)
+    echo "${count:-0}"
+}
+
 # Function to get insert event count from Kafka
 get_kafka_insert_count() {
     local count
-    count=$(timeout 300 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
         | grep -c '"op":"c"' || true)
     echo "${count:-0}"
 }
 
 # Function to verify replication completed
 verify_replication() {
+    local total_msgs
+    total_msgs=$(get_kafka_total_count)
+    log_info "Total messages in Kafka topic: $total_msgs"
+
     local current_count
     current_count=$(get_kafka_insert_count)
 

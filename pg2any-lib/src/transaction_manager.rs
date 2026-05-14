@@ -1828,8 +1828,16 @@ impl TransactionManager {
                 continue;
             }
 
-            let event: ChangeEvent = serde_json::from_str(line)
-                .map_err(|e| CdcError::generic(format!("Failed to deserialize event: {e}")))?;
+            let event: ChangeEvent = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        "Skipping corrupted event line in segment {:?} at index {}: {e}",
+                        segment_path, events_seen
+                    );
+                    continue;
+                }
+            };
             batch.push(event);
 
             if batch.len() >= batch_size {

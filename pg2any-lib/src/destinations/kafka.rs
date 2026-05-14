@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn};
 use rdkafka::config::ClientConfig;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -157,23 +158,45 @@ impl KafkaDestination {
         serde_json::to_string(&key).ok()
     }
 
-    async fn publish_event(&self, topic: &str, key: Option<&str>, value: &str) -> Result<()> {
+    fn enqueue_event(&self, topic: &str, key: Option<&str>, value: &str) -> Result<()> {
         let producer = self
             .producer
             .as_ref()
             .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
 
-        let mut record = FutureRecord::to(topic).payload(value);
-        if let Some(k) = key {
-            record = record.key(k);
+        for attempt in 0..10 {
+            let mut record = FutureRecord::to(topic).payload(value);
+            if let Some(k) = key {
+                record = record.key(k);
+            }
+
+            match producer.send_result(record) {
+                Ok(_) => return Ok(()),
+                Err((KafkaError::MessageProduction(
+                    RDKafkaErrorCode::UnknownTopic |
+                    RDKafkaErrorCode::UnknownTopicOrPartition |
+                    RDKafkaErrorCode::QueueFull
+                ), _)) if attempt < 9 => {
+                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1) as u64));
+                    producer.poll(Duration::from_millis(100));
+                }
+                Err((err, _)) => {
+                    return Err(CdcError::generic(format!("Kafka enqueue failed: {err}")));
+                }
+            }
         }
 
-        producer
-            .send(record, Duration::from_secs(10))
-            .await
-            .map_err(|(err, _)| CdcError::generic(format!("Kafka send failed: {err}")))?;
+        Err(CdcError::generic("Kafka enqueue failed after 10 retries"))
+    }
 
-        Ok(())
+    fn flush_producer(&self, timeout: Duration) -> Result<()> {
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
+        producer.flush(timeout).map_err(|e| {
+            CdcError::generic(format!("Kafka flush failed: {e}"))
+        })
     }
 }
 
@@ -212,7 +235,10 @@ impl DestinationHandler for KafkaDestination {
             .set("linger.ms", &linger_ms)
             .set("acks", &acks)
             .set("message.max.bytes", &message_max_bytes)
-            .set("retries", &retries);
+            .set("retries", &retries)
+            .set("message.timeout.ms", "30000")
+            .set("retry.backoff.ms", "200")
+            .set("topic.metadata.refresh.interval.ms", "5000");
 
         if let Ok(mechanism) = std::env::var("CDC_KAFKA_SASL_MECHANISM") {
             config.set("sasl.mechanism", &mechanism);
@@ -301,7 +327,7 @@ impl DestinationHandler for KafkaDestination {
                     );
                     let value = serde_json::to_string(&envelope)
                         .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
-                    self.publish_event(&topic, None, &value).await?;
+                    self.enqueue_event(&topic, None, &value)?;
                 }
                 pg_walstream::EventType::Update {
                     schema,
@@ -329,7 +355,7 @@ impl DestinationHandler for KafkaDestination {
                     );
                     let value = serde_json::to_string(&envelope)
                         .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
-                    self.publish_event(&topic, key.as_deref(), &value).await?;
+                    self.enqueue_event(&topic, key.as_deref(), &value)?;
                 }
                 pg_walstream::EventType::Delete {
                     schema,
@@ -354,7 +380,7 @@ impl DestinationHandler for KafkaDestination {
                     );
                     let value = serde_json::to_string(&envelope)
                         .map_err(|e| CdcError::generic(format!("JSON serialization failed: {e}")))?;
-                    self.publish_event(&topic, key.as_deref(), &value).await?;
+                    self.enqueue_event(&topic, key.as_deref(), &value)?;
                 }
                 pg_walstream::EventType::Truncate(tables) => {
                     for table_spec in tables.iter() {
@@ -376,7 +402,7 @@ impl DestinationHandler for KafkaDestination {
                         let value = serde_json::to_string(&envelope).map_err(|e| {
                             CdcError::generic(format!("JSON serialization failed: {e}"))
                         })?;
-                        self.publish_event(&topic, None, &value).await?;
+                        self.enqueue_event(&topic, None, &value)?;
                     }
                 }
                 _ => {
@@ -387,6 +413,8 @@ impl DestinationHandler for KafkaDestination {
                 }
             }
         }
+
+        self.flush_producer(DEFAULT_FLUSH_TIMEOUT)?;
 
         if let Some(hook) = pre_commit_hook {
             hook().await?;

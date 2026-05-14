@@ -310,7 +310,6 @@ impl TransactionManager {
     }
 
     /// Enable event-mode: stores raw ChangeEvent JSON instead of generated SQL
-    #[allow(dead_code)]
     pub fn set_event_mode(&mut self, enabled: bool) {
         self.event_mode = enabled;
     }
@@ -1632,6 +1631,20 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
+        if self.event_mode {
+            return self
+                .process_transaction_file_event_mode(
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    lsn_tracker,
+                    metrics_collector,
+                    batch_size,
+                    shared_lsn_feedback,
+                )
+                .await;
+        }
+
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
 
@@ -1790,7 +1803,6 @@ impl TransactionManager {
     /// Process a transaction file in event-mode (for non-SQL destinations like Kafka).
     /// Reads JSON-serialized ChangeEvents from segment files and calls
     /// execute_events_batch_with_hook() on the destination handler.
-    #[allow(dead_code)]
     pub(crate) async fn process_transaction_file_event_mode(
         self: Arc<Self>,
         pending_tx: &PendingTransactionFile,
@@ -1814,18 +1826,48 @@ impl TransactionManager {
         let mut all_events: Vec<ChangeEvent> = Vec::new();
 
         for segment in &segments {
-            let content = fs::read_to_string(&segment.path).await.map_err(|e| {
-                CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
-            })?;
+            let is_compressed = segment
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                .unwrap_or(false);
 
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
-                    CdcError::generic(format!("Failed to deserialize event: {e}"))
+            if is_compressed {
+                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to open compressed segment {:?}: {e}", segment.path))
                 })?;
-                all_events.push(event);
+                let buf_reader = BufReader::new(file);
+                let mut decoder = GzipDecoder::new(buf_reader);
+                decoder.multiple_members(true);
+                let mut lines = BufReader::new(decoder).lines();
+                while let Some(line) = lines.next_line().await.map_err(|e| {
+                    CdcError::generic(format!("Failed to read compressed segment {:?}: {e}", segment.path))
+                })? {
+                    let line = line.trim().trim_end_matches(';');
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
+                        CdcError::generic(format!("Failed to deserialize event: {e}"))
+                    })?;
+                    all_events.push(event);
+                }
+            } else {
+                let content = fs::read_to_string(&segment.path).await.map_err(|e| {
+                    CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
+                })?;
+
+                for line in content.lines() {
+                    let line = line.trim().trim_end_matches(';');
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event: ChangeEvent = serde_json::from_str(line).map_err(|e| {
+                        CdcError::generic(format!("Failed to deserialize event: {e}"))
+                    })?;
+                    all_events.push(event);
+                }
             }
         }
 

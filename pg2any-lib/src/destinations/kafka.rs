@@ -51,9 +51,9 @@ impl KafkaDestination {
             ColumnValue::Null => Value::Null,
             ColumnValue::Text(b) => match std::str::from_utf8(b) {
                 Ok(s) => Value::String(s.to_string()),
-                Err(_) => Value::String(format!("\\x{}", hex_encode(b))),
+                Err(_) => Value::String(base64_encode(b)),
             },
-            ColumnValue::Binary(b) => Value::String(format!("\\x{}", hex_encode(b))),
+            ColumnValue::Binary(b) => Value::String(base64_encode(b)),
         }
     }
 
@@ -185,7 +185,17 @@ impl KafkaDestination {
                 "fields": [
                     before_schema,
                     after_schema,
-                    {"type": "struct", "fields": [], "optional": false, "field": "source"},
+                    {"type": "struct", "fields": [
+                        {"type": "string", "optional": false, "field": "version"},
+                        {"type": "string", "optional": false, "field": "connector"},
+                        {"type": "string", "optional": false, "field": "name"},
+                        {"type": "int64", "optional": false, "field": "ts_ms"},
+                        {"type": "string", "optional": false, "field": "db"},
+                        {"type": "string", "optional": true, "field": "schema"},
+                        {"type": "string", "optional": false, "field": "table"},
+                        {"type": "int64", "optional": true, "field": "txId"},
+                        {"type": "int64", "optional": true, "field": "lsn"}
+                    ], "optional": false, "field": "source"},
                     {"type": "string", "optional": false, "field": "op"},
                     {"type": "int64", "optional": true, "field": "ts_ms"}
                 ],
@@ -580,12 +590,30 @@ impl DestinationHandler for KafkaDestination {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(LUT[(b >> 4) as usize] as char);
-        out.push(LUT[(b & 0x0f) as usize] as char);
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let chunks = bytes.chunks(3);
+    for chunk in chunks {
+        let (b0, b1, b2) = match chunk.len() {
+            3 => (chunk[0], chunk[1], chunk[2]),
+            2 => (chunk[0], chunk[1], 0),
+            _ => (chunk[0], 0, 0),
+        };
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
     }
     out
 }
@@ -632,7 +660,7 @@ mod tests {
         let result = KafkaDestination::column_value_to_json(&ColumnValue::Binary(
             bytes::Bytes::from_static(&[0xde, 0xad]),
         ));
-        assert_eq!(result, Value::String("\\xdead".to_string()));
+        assert_eq!(result, Value::String("3q0=".to_string()));
     }
 
     #[test]
@@ -831,10 +859,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hex_encode() {
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
-        assert_eq!(hex_encode(&[]), "");
-        assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+    fn test_base64_encode() {
+        assert_eq!(base64_encode(&[0xde, 0xad, 0xbe, 0xef]), "3q2+7w==");
+        assert_eq!(base64_encode(&[]), "");
+        assert_eq!(base64_encode(&[0x00, 0xff]), "AP8=");
+        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
     }
 
     #[test]

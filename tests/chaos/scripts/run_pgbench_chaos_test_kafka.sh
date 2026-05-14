@@ -370,7 +370,7 @@ main() {
 
     echo "" | tee -a "$RESULTS_FILE"
 
-    # Query actual row count from PG source (pgbench custom script uses INSERTs into t1)
+    # Query actual row count from PG source (pgbench custom script inserts into t1)
     EXPECTED_ROW_COUNT=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT COUNT(*) FROM t1;" 2>/dev/null | tr -d '[:space:]')
     if [ -z "$EXPECTED_ROW_COUNT" ] || [ "$EXPECTED_ROW_COUNT" -eq 0 ] 2>/dev/null; then
         log_error "Failed to get row count from PostgreSQL source or no rows found"

@@ -95,6 +95,28 @@ impl TransactionStorage for UncompressedStorage {
         Ok((file_path.to_path_buf(), statement_count))
     }
 
+    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;
+
+        let reader = tokio::io::BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut line_count = 0usize;
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        {
+            if !line.trim().is_empty() {
+                line_count += 1;
+            }
+        }
+
+        Ok((file_path.to_path_buf(), line_count))
+    }
+
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
         let mut parser = SqlStreamParser::new();
         let statements = parser

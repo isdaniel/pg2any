@@ -17,6 +17,11 @@ pub enum CdcError {
     #[error("MySQL connection error: {0}")]
     MySQL(#[from] sqlx::Error),
 
+    /// Kafka producer errors
+    #[cfg(feature = "kafka")]
+    #[error("Kafka error: {0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
+
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(String),

@@ -1807,6 +1807,8 @@ impl TransactionManager {
         batch: &mut Vec<ChangeEvent>,
         batch_count: &mut usize,
         total_events: &mut usize,
+        events_seen: &mut usize,
+        skip_until: usize,
         batch_size: usize,
         tx_id: u32,
         pending_tx: &PendingTransactionFile,
@@ -1820,6 +1822,12 @@ impl TransactionManager {
             if line.is_empty() {
                 continue;
             }
+
+            *events_seen += 1;
+            if *events_seen <= skip_until {
+                continue;
+            }
+
             let event: ChangeEvent = serde_json::from_str(line)
                 .map_err(|e| CdcError::generic(format!("Failed to deserialize event: {e}")))?;
             batch.push(event);
@@ -1833,7 +1841,7 @@ impl TransactionManager {
                 *total_events += batch.len();
                 let metadata_path = pending_tx.file_path.clone();
                 let file_manager = self.clone();
-                let staged_index = *batch_count * batch_size;
+                let staged_index = *events_seen;
 
                 let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
                     let metadata_path = metadata_path.clone();
@@ -1884,9 +1892,19 @@ impl TransactionManager {
             pending_tx.metadata.segments.clone()
         };
 
+        let skip_until = latest_metadata.last_executed_command_index.unwrap_or(0);
+
+        if skip_until > 0 {
+            info!(
+                "Event-mode: resuming tx {} from event index {} (skipping already processed)",
+                tx_id, skip_until
+            );
+        }
+
         let mut batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
         let mut batch_count = 0usize;
         let mut total_events = 0usize;
+        let mut events_seen = 0usize;
 
         for segment in &segments {
             let is_compressed = segment
@@ -1913,6 +1931,8 @@ impl TransactionManager {
                     &mut batch,
                     &mut batch_count,
                     &mut total_events,
+                    &mut events_seen,
+                    skip_until,
                     batch_size,
                     tx_id,
                     pending_tx,
@@ -1931,6 +1951,8 @@ impl TransactionManager {
                     &mut batch,
                     &mut batch_count,
                     &mut total_events,
+                    &mut events_seen,
+                    skip_until,
                     batch_size,
                     tx_id,
                     pending_tx,
@@ -1951,7 +1973,7 @@ impl TransactionManager {
             total_events += batch.len();
             let metadata_path = pending_tx.file_path.clone();
             let file_manager = self.clone();
-            let staged_index = batch_count * batch_size;
+            let staged_index = events_seen;
 
             let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
                 let metadata_path = metadata_path.clone();

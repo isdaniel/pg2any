@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -240,7 +240,12 @@ impl KafkaDestination {
         serde_json::to_string(&key).ok()
     }
 
-    async fn enqueue_event(&self, topic: &str, key: Option<&str>, value: &str) -> Result<()> {
+    async fn enqueue_event(
+        &self,
+        topic: &str,
+        key: Option<&str>,
+        value: &str,
+    ) -> Result<DeliveryFuture> {
         let producer = self
             .producer
             .as_ref()
@@ -257,7 +262,7 @@ impl KafkaDestination {
             }
 
             match producer.send_result(record) {
-                Ok(_) => return Ok(()),
+                Ok(future) => return Ok(future),
                 Err((
                     KafkaError::MessageProduction(
                         RDKafkaErrorCode::UnknownTopic
@@ -280,14 +285,21 @@ impl KafkaDestination {
         Err(CdcError::generic("Kafka enqueue failed after max retries"))
     }
 
-    fn flush_producer(&self, timeout: Duration) -> Result<()> {
-        let producer = self
-            .producer
-            .as_ref()
-            .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
-        producer
-            .flush(timeout)
-            .map_err(|e| CdcError::generic(format!("Kafka flush failed: {e}")))
+    async fn await_delivery_futures(&self, futures: Vec<DeliveryFuture>) -> Result<()> {
+        for future in futures {
+            match future.await {
+                Ok(Ok(_)) => {}
+                Ok(Err((err, _))) => {
+                    return Err(CdcError::generic(format!(
+                        "Kafka message delivery failed: {err}"
+                    )));
+                }
+                Err(_cancelled) => {
+                    return Err(CdcError::generic("Kafka delivery future cancelled"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -412,6 +424,8 @@ impl DestinationHandler for KafkaDestination {
             return Ok(());
         }
 
+        let mut delivery_futures: Vec<DeliveryFuture> = Vec::with_capacity(events.len());
+
         for event in events {
             match &event.event_type {
                 pg_walstream::EventType::Insert {
@@ -440,7 +454,8 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    delivery_futures.push(future);
                 }
                 pg_walstream::EventType::Update {
                     schema,
@@ -473,7 +488,8 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    delivery_futures.push(future);
                 }
                 pg_walstream::EventType::Delete {
                     schema,
@@ -502,7 +518,8 @@ impl DestinationHandler for KafkaDestination {
                     let value = serde_json::to_string(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
-                    self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
+                    delivery_futures.push(future);
                 }
                 pg_walstream::EventType::Truncate(tables) => {
                     for table_spec in tables.iter() {
@@ -526,7 +543,8 @@ impl DestinationHandler for KafkaDestination {
                         let value = serde_json::to_string(&envelope).map_err(|e| {
                             CdcError::generic(format!("JSON serialization failed: {e}"))
                         })?;
-                        self.enqueue_event(&topic, None, &value).await?;
+                        let future = self.enqueue_event(&topic, None, &value).await?;
+                        delivery_futures.push(future);
                     }
                 }
                 _ => {
@@ -538,7 +556,7 @@ impl DestinationHandler for KafkaDestination {
             }
         }
 
-        self.flush_producer(DEFAULT_FLUSH_TIMEOUT)?;
+        self.await_delivery_futures(delivery_futures).await?;
 
         if let Some(hook) = pre_commit_hook {
             hook().await?;

@@ -36,6 +36,21 @@ pub trait TransactionStorage: Send + Sync {
     /// * `(PathBuf, usize)` - Actual path where data was written and total statements
     async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)>;
 
+    /// Write a raw-lines file (event mode) from an existing uncompressed file
+    ///
+    /// Unlike `write_transaction_from_file`, this does NOT use SQL-aware parsing.
+    /// Each line in the source file is treated as one opaque record (e.g. JSON).
+    /// Used by event-mode destinations (Kafka) where data is JSON, not SQL.
+    ///
+    /// # Arguments
+    /// * `file_path` - Uncompressed file path containing newline-delimited records
+    ///
+    /// # Returns
+    /// * `(PathBuf, usize)` - Actual path where data was written and total line count
+    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+        self.write_transaction_from_file(file_path).await
+    }
+
     /// Read SQL commands from a transaction file, starting from a specific index
     ///
     /// # Arguments

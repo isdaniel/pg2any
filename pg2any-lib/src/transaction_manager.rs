@@ -622,10 +622,13 @@ impl TransactionManager {
         let mut final_segments = Vec::new();
 
         for (idx, segment_path) in segment_paths.iter().enumerate() {
-            let (final_data_path, statement_count) = self
-                .storage
-                .write_transaction_from_file(segment_path)
-                .await?;
+            let (final_data_path, statement_count) = if self.event_mode {
+                self.storage.write_raw_lines_from_file(segment_path).await?
+            } else {
+                self.storage
+                    .write_transaction_from_file(segment_path)
+                    .await?
+            };
 
             let fallback_count = segment_counts.get(idx).copied().unwrap_or(0);
             let final_count = if statement_count == 0 {

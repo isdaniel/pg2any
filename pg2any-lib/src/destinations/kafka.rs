@@ -93,12 +93,14 @@ impl KafkaDestination {
         table_key: &str,
         data: &pg_walstream::RowData,
     ) -> Value {
-        if let Some(cached) = self.field_schema_cache.get(table_key) {
+        // Include column count in cache key to detect schema changes (DDL)
+        let col_count = data.len();
+        let cache_key = format!("{}:{}", table_key, col_count);
+        if let Some(cached) = self.field_schema_cache.get(&cache_key) {
             return cached.clone();
         }
         let schema = Self::build_field_schema(data);
-        self.field_schema_cache
-            .insert(table_key.to_string(), schema.clone());
+        self.field_schema_cache.insert(cache_key, schema.clone());
         schema
     }
 
@@ -242,25 +244,37 @@ impl KafkaDestination {
         &self,
         schema: &str,
         table: &str,
+        source_table_key: &str,
         data: &pg_walstream::RowData,
         key_columns: &[Arc<str>],
     ) -> Result<Option<String>> {
-        if key_columns.is_empty() {
-            return Ok(None);
-        }
+        // Prefer manual key_columns_config over replication stream's key_columns
+        // to ensure consistent keys across Insert/Update/Delete for the same row
+        let effective_columns: Vec<&str> =
+            if let Some(config_cols) = self.key_columns_config.get(source_table_key) {
+                config_cols.iter().map(|s| s.as_str()).collect()
+            } else if !key_columns.is_empty() {
+                key_columns.iter().map(|c| c.as_ref()).collect()
+            } else {
+                return Ok(None);
+            };
 
         let mut payload = serde_json::Map::new();
         let mut fields = Vec::new();
 
-        for col in key_columns {
-            if let Some(val) = data.get(col.as_ref()) {
+        for col in &effective_columns {
+            if let Some(val) = data.get(*col) {
                 payload.insert(col.to_string(), Self::column_value_to_json(val));
                 fields.push(json!({
                     "type": "string",
                     "optional": false,
-                    "field": col.as_ref()
+                    "field": *col
                 }));
             }
+        }
+
+        if payload.is_empty() {
+            return Ok(None);
         }
 
         let key = json!({
@@ -478,11 +492,13 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
-                    let table_key = format!("{}.{}", mapped_schema, table);
+                    let source_table_key = format!("{}.{}", schema, table);
                     let topic = self.topic_name(&mapped_schema, table);
-                    let after_fields = Some(self.get_or_build_field_schema(&table_key, data));
+                    let after_fields =
+                        Some(self.get_or_build_field_schema(&source_table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let key = self.build_key_for_insert(&mapped_schema, table, &table_key, data)?;
+                    let key =
+                        self.build_key_for_insert(&mapped_schema, table, &source_table_key, data)?;
                     let envelope = self.build_change_envelope(
                         "c",
                         &mapped_schema,
@@ -510,17 +526,23 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
-                    let table_key = format!("{}.{}", mapped_schema, table);
+                    let source_table_key = format!("{}.{}", schema, table);
                     let topic = self.topic_name(&mapped_schema, table);
                     let before_fields = old_data
                         .as_ref()
-                        .map(|d| self.get_or_build_field_schema(&table_key, d));
-                    let after_fields = Some(self.get_or_build_field_schema(&table_key, new_data));
+                        .map(|d| self.get_or_build_field_schema(&source_table_key, d));
+                    let after_fields =
+                        Some(self.get_or_build_field_schema(&source_table_key, new_data));
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
-                    let key =
-                        self.build_key_from_data(&mapped_schema, table, key_data, key_columns)?;
+                    let key = self.build_key_from_data(
+                        &mapped_schema,
+                        table,
+                        &source_table_key,
+                        key_data,
+                        key_columns,
+                    )?;
                     let envelope = self.build_change_envelope(
                         "u",
                         &mapped_schema,
@@ -547,12 +569,18 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
-                    let table_key = format!("{}.{}", mapped_schema, table);
+                    let source_table_key = format!("{}.{}", schema, table);
                     let topic = self.topic_name(&mapped_schema, table);
-                    let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
+                    let before_fields =
+                        Some(self.get_or_build_field_schema(&source_table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
-                    let key =
-                        self.build_key_from_data(&mapped_schema, table, old_data, key_columns)?;
+                    let key = self.build_key_from_data(
+                        &mapped_schema,
+                        table,
+                        &source_table_key,
+                        old_data,
+                        key_columns,
+                    )?;
                     let envelope = self.build_change_envelope(
                         "d",
                         &mapped_schema,
@@ -806,7 +834,7 @@ mod tests {
         let key_columns = vec![Arc::from("id")];
 
         let key = dest
-            .build_key_from_data("public", "users", &data, &key_columns)
+            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
             .unwrap();
         assert!(key.is_some());
 
@@ -825,7 +853,7 @@ mod tests {
         let key_columns: Vec<Arc<str>> = vec![];
 
         let key = dest
-            .build_key_from_data("public", "users", &data, &key_columns)
+            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
             .unwrap();
         assert!(key.is_none());
     }
@@ -841,7 +869,7 @@ mod tests {
         let key_columns = vec![Arc::from("tenant_id"), Arc::from("user_id")];
 
         let key = dest
-            .build_key_from_data("public", "users", &data, &key_columns)
+            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
             .unwrap();
         assert!(key.is_some());
 
@@ -854,6 +882,35 @@ mod tests {
             key_json["payload"]["user_id"],
             Value::String("u1".to_string())
         );
+    }
+
+    #[test]
+    fn test_build_key_from_data_prefers_config_over_stream_keys() {
+        let mut dest = test_destination();
+        dest.key_columns_config
+            .insert("public.users".to_string(), vec!["id".to_string()]);
+
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("Alice")),
+        ]);
+        // Stream provides "name" as key column, but config says "id"
+        let stream_key_columns = vec![Arc::from("name")];
+
+        let key = dest
+            .build_key_from_data(
+                "public",
+                "users",
+                "public.users",
+                &data,
+                &stream_key_columns,
+            )
+            .unwrap();
+        assert!(key.is_some());
+        let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
+        // Config's "id" should win over stream's "name"
+        assert_eq!(key_json["payload"]["id"], Value::String("42".to_string()));
+        assert!(key_json["payload"].get("name").is_none());
     }
 
     #[test]

@@ -957,7 +957,74 @@ impl CdcClient {
         let mut commit_queue: BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> =
             BinaryHeap::new();
 
+        // Retry delay for failed transactions (exponential backoff capped at 30s)
+        let mut retry_delay: Option<tokio::time::Sleep> = None;
+
         loop {
+            // If queue has pending work and we're in retry mode, wait then process
+            if !commit_queue.is_empty() {
+                if let Some(delay) = retry_delay.take() {
+                    tokio::select! {
+                        biased;
+
+                        _ = &mut producer_shutdown_rx => {
+                            info!("Consumer: Received producer shutdown signal during retry wait, draining remaining transactions");
+
+                            while let Ok(notification) = commit_receiver.try_recv() {
+                                commit_queue.push(std::cmp::Reverse(notification));
+                            }
+
+                            Self::drain_commit_queue_on_shutdown(
+                                &mut commit_queue,
+                                &transaction_file_manager,
+                                &mut destination_handler,
+                                &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
+                                &shared_lsn_feedback,
+                            )
+                            .await;
+
+                            Self::flush_and_persist_on_shutdown(
+                                &transaction_file_manager,
+                                &lsn_tracker,
+                            )
+                            .await;
+
+                            info!("Consumer: Shutdown complete after draining all queued transactions");
+                            shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
+                            break;
+                        }
+
+                        // Drain any new notifications while waiting
+                        result = commit_receiver.recv() => {
+                            if let Some(notification) = result {
+                                commit_queue.push(std::cmp::Reverse(notification));
+                            }
+                        }
+
+                        _ = delay => {
+                            // Retry timer expired, fall through to process queue below
+                        }
+                    }
+
+                    // Process queue after retry delay (or new notification)
+                    Self::process_commit_queue(
+                        &mut commit_queue,
+                        &transaction_file_manager,
+                        &mut destination_handler,
+                        &cancellation_token,
+                        &lsn_tracker,
+                        &metrics_collector,
+                        batch_size,
+                        &shared_lsn_feedback,
+                        &mut retry_delay,
+                    )
+                    .await;
+                    continue;
+                }
+            }
+
             tokio::select! {
                 biased;
 
@@ -1007,38 +1074,18 @@ impl CdcClient {
                             commit_queue.push(std::cmp::Reverse(notification));
 
                             // Process all transactions that are ready (in commit_lsn order)
-                            while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-                                info!(
-                                    "Consumer processing transaction {} in commit_lsn order (LSN: {:?})",
-                                    next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
-                                );
-
-                                // Process the transaction - THIS IS WHERE APPLY HAPPENS
-                                if let Err(e) = transaction_file_manager
-                                    .clone()
-                                    .process_transaction_file(
-                                        &next_tx,
-                                        &mut destination_handler,
-                                        &cancellation_token,
-                                        &lsn_tracker,
-                                        &metrics_collector,
-                                        batch_size,
-                                        &shared_lsn_feedback,  // ACK is sent inside process_transaction_file
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to process transaction {} from file {:?}: {}. \
-                                         Stopping consumer to prevent LSN advancement past failed transaction.",
-                                        next_tx.metadata.transaction_id, next_tx.file_path, e
-                                    );
-                                    metrics_collector.record_error("transaction_file_processing_failed", "consumer");
-                                    // Re-insert the failed transaction back for retry on next startup
-                                    commit_queue.push(std::cmp::Reverse(next_tx));
-                                    // Break out of processing loop — do NOT advance past failed tx
-                                    break;
-                                }
-                            }
+                            Self::process_commit_queue(
+                                &mut commit_queue,
+                                &transaction_file_manager,
+                                &mut destination_handler,
+                                &cancellation_token,
+                                &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
+                                &shared_lsn_feedback,
+                                &mut retry_delay,
+                            )
+                            .await;
                         }
                         None => {
                             // Channel closed - producer has dropped the sender
@@ -1075,6 +1122,71 @@ impl CdcClient {
 
         info!("Consumer stopped gracefully");
         Ok(())
+    }
+
+    /// Process all transactions in the commit queue in commit_lsn order.
+    ///
+    /// On failure, re-inserts the failed transaction and sets a retry delay
+    /// with exponential backoff (1s, 2s, 4s, ... up to 30s).
+    async fn process_commit_queue(
+        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
+        transaction_file_manager: &Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        retry_delay: &mut Option<tokio::time::Sleep>,
+    ) {
+        while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
+            info!(
+                "Consumer processing transaction {} in commit_lsn order (LSN: {:?})",
+                next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
+            );
+
+            if let Err(e) = transaction_file_manager
+                .clone()
+                .process_transaction_file(
+                    &next_tx,
+                    destination_handler,
+                    cancellation_token,
+                    lsn_tracker,
+                    metrics_collector,
+                    batch_size,
+                    shared_lsn_feedback,
+                )
+                .await
+            {
+                error!(
+                    "Failed to process transaction {} from file {:?}: {}. Will retry after backoff.",
+                    next_tx.metadata.transaction_id, next_tx.file_path, e
+                );
+                metrics_collector.record_error("transaction_file_processing_failed", "consumer");
+                commit_queue.push(std::cmp::Reverse(next_tx));
+
+                // Set retry delay with exponential backoff (1s base, 30s cap)
+                let current_backoff = retry_delay
+                    .as_ref()
+                    .map(|_| std::time::Duration::from_secs(1))
+                    .unwrap_or(std::time::Duration::from_secs(1));
+                let next_backoff = current_backoff
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+                *retry_delay = Some(tokio::time::sleep(next_backoff));
+                info!(
+                    "Consumer: scheduling retry in {:?} for {} queued transaction(s)",
+                    next_backoff,
+                    commit_queue.len()
+                );
+                break;
+            }
+        }
+
+        // Clear retry state on success (queue fully drained)
+        if commit_queue.is_empty() {
+            *retry_delay = None;
+        }
     }
 
     /// Drain and process all remaining transactions in the commit queue during shutdown.

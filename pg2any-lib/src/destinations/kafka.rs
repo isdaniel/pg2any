@@ -1,6 +1,7 @@
 use super::destination_factory::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
+use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn};
 use rdkafka::config::ClientConfig;
@@ -23,6 +24,7 @@ pub struct KafkaDestination {
     source_db_name: String,
     schema_mappings: HashMap<String, String>,
     key_columns_config: HashMap<String, Vec<String>>,
+    field_schema_cache: HashMap<String, Value>,
 }
 
 impl KafkaDestination {
@@ -33,6 +35,7 @@ impl KafkaDestination {
             source_db_name: "postgres".to_string(),
             schema_mappings: HashMap::new(),
             key_columns_config: HashMap::new(),
+            field_schema_cache: HashMap::new(),
         }
     }
 
@@ -40,11 +43,11 @@ impl KafkaDestination {
         format!("{}.{}.{}", self.topic_prefix, schema, table)
     }
 
-    fn map_schema<'a>(&'a self, source_schema: &'a str) -> &'a str {
+    fn map_schema<'a>(&'a self, source_schema: &'a str) -> String {
         self.schema_mappings
             .get(source_schema)
-            .map(String::as_str)
-            .unwrap_or(source_schema)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| source_schema.to_string())
     }
 
     fn column_value_to_json(value: &ColumnValue) -> Value {
@@ -52,9 +55,9 @@ impl KafkaDestination {
             ColumnValue::Null => Value::Null,
             ColumnValue::Text(b) => match std::str::from_utf8(b) {
                 Ok(s) => Value::String(s.to_string()),
-                Err(_) => Value::String(base64_encode(b)),
+                Err(_) => Value::String(BASE64_STANDARD.encode(b)),
             },
-            ColumnValue::Binary(b) => Value::String(base64_encode(b)),
+            ColumnValue::Binary(b) => Value::String(BASE64_STANDARD.encode(b)),
         }
     }
 
@@ -83,6 +86,20 @@ impl KafkaDestination {
             })
             .collect();
         json!(fields)
+    }
+
+    fn get_or_build_field_schema(
+        &mut self,
+        table_key: &str,
+        data: &pg_walstream::RowData,
+    ) -> Value {
+        if let Some(cached) = self.field_schema_cache.get(table_key) {
+            return cached.clone();
+        }
+        let schema = Self::build_field_schema(data);
+        self.field_schema_cache
+            .insert(table_key.to_string(), schema.clone());
+        schema
     }
 
     fn build_key_for_insert(
@@ -451,13 +468,14 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let schema = self.map_schema(schema);
-                    let topic = self.topic_name(schema, table);
-                    let after_fields = Some(Self::build_field_schema(data));
+                    let topic = self.topic_name(&schema, table);
+                    let table_key = format!("{}.{}", schema, table);
+                    let after_fields = Some(self.get_or_build_field_schema(&table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let key = self.build_key_for_insert(schema, table, data);
+                    let key = self.build_key_for_insert(&schema, table, data);
                     let envelope = self.build_change_envelope(
                         "c",
-                        schema,
+                        &schema,
                         table,
                         None,
                         after,
@@ -482,16 +500,19 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let schema = self.map_schema(schema);
-                    let topic = self.topic_name(schema, table);
-                    let before_fields = old_data.as_ref().map(Self::build_field_schema);
-                    let after_fields = Some(Self::build_field_schema(new_data));
+                    let topic = self.topic_name(&schema, table);
+                    let table_key = format!("{}.{}", schema, table);
+                    let before_fields = old_data
+                        .as_ref()
+                        .map(|d| self.get_or_build_field_schema(&table_key, d));
+                    let after_fields = Some(self.get_or_build_field_schema(&table_key, new_data));
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
-                    let key = self.build_key_from_data(schema, table, key_data, key_columns);
+                    let key = self.build_key_from_data(&schema, table, key_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "u",
-                        schema,
+                        &schema,
                         table,
                         before,
                         after,
@@ -515,13 +536,14 @@ impl DestinationHandler for KafkaDestination {
                     ..
                 } => {
                     let schema = self.map_schema(schema);
-                    let topic = self.topic_name(schema, table);
-                    let before_fields = Some(Self::build_field_schema(old_data));
+                    let topic = self.topic_name(&schema, table);
+                    let table_key = format!("{}.{}", schema, table);
+                    let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
-                    let key = self.build_key_from_data(schema, table, old_data, key_columns);
+                    let key = self.build_key_from_data(&schema, table, old_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "d",
-                        schema,
+                        &schema,
                         table,
                         before,
                         None,
@@ -543,10 +565,10 @@ impl DestinationHandler for KafkaDestination {
                             Some((s, t)) if !t.contains('.') => (self.map_schema(s), t),
                             _ => (self.map_schema("public"), table_spec.as_ref()),
                         };
-                        let topic = self.topic_name(schema, table);
+                        let topic = self.topic_name(&schema, table);
                         let envelope = self.build_change_envelope(
                             "t",
-                            schema,
+                            &schema,
                             table,
                             None,
                             None,
@@ -587,40 +609,17 @@ impl DestinationHandler for KafkaDestination {
                 "Flushing Kafka producer (timeout {:?})...",
                 DEFAULT_FLUSH_TIMEOUT
             );
-            match producer.flush(DEFAULT_FLUSH_TIMEOUT) {
+            let timeout = DEFAULT_FLUSH_TIMEOUT;
+            let result = tokio::task::spawn_blocking(move || producer.flush(timeout))
+                .await
+                .map_err(|e| CdcError::generic(format!("Kafka flush task panicked: {e}")))?;
+            match result {
                 Ok(()) => info!("Kafka producer flushed and closed successfully"),
                 Err(e) => warn!("Kafka producer flush timed out or failed: {e} — some messages may be re-delivered on restart"),
             }
         }
         Ok(())
     }
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    let chunks = bytes.chunks(3);
-    for chunk in chunks {
-        let (b0, b1, b2) = match chunk.len() {
-            3 => (chunk[0], chunk[1], chunk[2]),
-            2 => (chunk[0], chunk[1], 0),
-            _ => (chunk[0], 0, 0),
-        };
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -865,10 +864,10 @@ mod tests {
 
     #[test]
     fn test_base64_encode() {
-        assert_eq!(base64_encode(&[0xde, 0xad, 0xbe, 0xef]), "3q2+7w==");
-        assert_eq!(base64_encode(&[]), "");
-        assert_eq!(base64_encode(&[0x00, 0xff]), "AP8=");
-        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
+        assert_eq!(BASE64_STANDARD.encode([0xde, 0xad, 0xbe, 0xef]), "3q2+7w==");
+        assert_eq!(BASE64_STANDARD.encode([]), "");
+        assert_eq!(BASE64_STANDARD.encode([0x00, 0xff]), "AP8=");
+        assert_eq!(BASE64_STANDARD.encode(b"Hello"), "SGVsbG8=");
     }
 
     #[test]

@@ -1831,11 +1831,11 @@ impl TransactionManager {
             let event: ChangeEvent = match serde_json::from_str(line) {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
-                        "Skipping corrupted event line in segment {:?} at index {}: {e}",
+                    return Err(CdcError::generic(format!(
+                        "Corrupted event line in segment {:?} at index {}: {e}. \
+                         Stopping to prevent silent data loss.",
                         segment_path, events_seen
-                    );
-                    continue;
+                    )));
                 }
             };
             batch.push(event);

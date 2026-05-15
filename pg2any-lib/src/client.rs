@@ -1002,7 +1002,15 @@ impl CdcClient {
                                 next_tx.metadata.transaction_id, e
                             );
                             metrics_collector.record_error("transaction_file_processing_failed", "consumer");
-                            break;
+
+                            Self::flush_and_persist_on_shutdown(
+                                &transaction_file_manager,
+                                &lsn_tracker,
+                            )
+                            .await;
+
+                            metrics_collector.update_destination_connection_status(&destination_type, false);
+                            return Err(e);
                         }
                     }
 

@@ -509,7 +509,8 @@ impl DestinationHandler for KafkaDestination {
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
-                    let key = self.build_key_from_data(&mapped_schema, table, key_data, key_columns);
+                    let key =
+                        self.build_key_from_data(&mapped_schema, table, key_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "u",
                         &mapped_schema,
@@ -540,7 +541,8 @@ impl DestinationHandler for KafkaDestination {
                     let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
-                    let key = self.build_key_from_data(&mapped_schema, table, old_data, key_columns);
+                    let key =
+                        self.build_key_from_data(&mapped_schema, table, old_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "d",
                         &mapped_schema,

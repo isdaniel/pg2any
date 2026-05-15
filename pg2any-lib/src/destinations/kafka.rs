@@ -3,6 +3,7 @@ use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -338,8 +339,15 @@ impl KafkaDestination {
     }
 
     async fn await_delivery_futures(&self, futures: Vec<DeliveryFuture>) -> Result<()> {
-        for future in futures {
-            match tokio::time::timeout(DELIVERY_FUTURE_TIMEOUT, future).await {
+        let timed_futures: Vec<_> = futures
+            .into_iter()
+            .map(|f| tokio::time::timeout(DELIVERY_FUTURE_TIMEOUT, f))
+            .collect();
+
+        let results = join_all(timed_futures).await;
+
+        for result in results {
+            match result {
                 Ok(Ok(Ok(_))) => {}
                 Ok(Ok(Err((err, _)))) => {
                     return Err(CdcError::generic(format!(

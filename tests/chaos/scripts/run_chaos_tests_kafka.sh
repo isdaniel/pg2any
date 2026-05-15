@@ -160,6 +160,13 @@ reset_kafka_topic() {
         --bootstrap-server localhost:9092 \
         --delete --topic "$KAFKA_TOPIC" 2>/dev/null || true
     sleep 3
+    # Pre-create the topic to avoid auto-creation race conditions that can lose first message
+    docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9092 \
+        --create --topic "$KAFKA_TOPIC" \
+        --partitions 1 --replication-factor 1 \
+        --config max.message.bytes=10485760 2>/dev/null || true
+    sleep 2
     log_info "Kafka topic reset complete"
 }
 

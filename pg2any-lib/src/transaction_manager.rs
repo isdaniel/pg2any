@@ -2049,12 +2049,12 @@ impl TransactionManager {
             // 1. Update confirmed_flush_lsn (last successfully applied LSN)
             lsn_tracker.commit_lsn(commit_lsn.0);
 
-            // 2. Update apply_lsn - transaction is now applied to destination
-            // (flush_lsn was already updated by producer when file was persisted)
+            // 2. Update apply_lsn and flush_lsn - transaction is now delivered to destination
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
+            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
 
             info!(
-                "Updated apply_lsn to {} (transaction {} applied to destination)",
+                "Updated apply_lsn and flush_lsn to {} (transaction {} delivered to destination)",
                 commit_lsn, tx_id
             );
         } else {

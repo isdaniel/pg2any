@@ -251,7 +251,6 @@ impl CdcClient {
             let metrics = self.metrics_collector.clone();
             let start_lsn = start_lsn.unwrap_or_else(|| Lsn::new(0));
             let file_mgr = transaction_file_manager.clone();
-            let lsn_feedback = shared_lsn_feedback.clone();
 
             tokio::spawn(Self::run_producer(
                 replication_stream,
@@ -259,7 +258,6 @@ impl CdcClient {
                 start_lsn,
                 metrics,
                 file_mgr,
-                lsn_feedback,
                 tx_commit_notifier,
                 producer_shutdown_tx,
             ))
@@ -367,7 +365,6 @@ impl CdcClient {
     /// * `event_lsn` - LSN of the commit event (commit_lsn from PostgreSQL)
     /// * `transaction_type` - Type of transaction ("normal" or "streaming") for logging
     /// * `transaction_file_manager` - File manager for moving transaction files
-    /// * `shared_lsn_feedback` - Shared LSN feedback for updating flush_lsn
     /// * `commit_notifier` - Channel sender for notifying consumer
     /// * `metrics_collector` - Metrics collector for error recording
     async fn handle_transaction_commit(
@@ -375,7 +372,6 @@ impl CdcClient {
         event_lsn: Option<Lsn>,
         transaction_type: &str,
         transaction_file_manager: &Arc<TransactionManager>,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         commit_notifier: &mpsc::Sender<PendingTransactionFile>,
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
@@ -388,15 +384,6 @@ impl CdcClient {
                     "Committed {} transaction file to: {:?} (commit_lsn: {:?})",
                     transaction_type, pending_path, event_lsn
                 );
-
-                // Update flush_lsn - transaction file is now durably persisted to disk
-                if let Some(lsn) = event_lsn {
-                    shared_lsn_feedback.update_flushed_lsn(lsn.0);
-                    debug!(
-                        "Updated flush_lsn to {} for {} transaction {} (file persisted to sql_pending_tx/)",
-                        lsn, transaction_type, transaction_id
-                    );
-                }
 
                 // Notify consumer with transaction details for immediate processing
                 match tokio::fs::read_to_string(&pending_path).await {
@@ -484,7 +471,6 @@ impl CdcClient {
         start_lsn: Lsn,
         metrics_collector: Arc<MetricsCollector>,
         transaction_file_manager: Arc<TransactionManager>,
-        shared_lsn_feedback: Arc<SharedLsnFeedback>,
         commit_notifier: mpsc::Sender<PendingTransactionFile>,
         producer_shutdown_signal: oneshot::Sender<()>,
     ) -> Result<()> {
@@ -612,7 +598,6 @@ impl CdcClient {
                                     Some(event.lsn),
                                     "normal",
                                     &transaction_file_manager,
-                                    &shared_lsn_feedback,
                                     &commit_notifier,
                                     &metrics_collector,
                                 )
@@ -693,7 +678,6 @@ impl CdcClient {
                                     Some(event.lsn),
                                     "streaming",
                                     &transaction_file_manager,
-                                    &shared_lsn_feedback,
                                     &commit_notifier,
                                     &metrics_collector,
                                 )

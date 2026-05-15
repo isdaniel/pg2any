@@ -1456,6 +1456,8 @@ impl TransactionManager {
             batch_duration
         );
 
+        self.flush_staged_pending_progress().await?;
+
         Ok(())
     }
 
@@ -1874,6 +1876,7 @@ impl TransactionManager {
                         pre_commit_hook,
                     )
                     .await?;
+                self.flush_staged_pending_progress().await?;
                 batch.clear();
             }
         }
@@ -2006,6 +2009,7 @@ impl TransactionManager {
                     pre_commit_hook,
                 )
                 .await?;
+            self.flush_staged_pending_progress().await?;
         }
 
         let duration = start_time.elapsed();

@@ -108,13 +108,13 @@ impl KafkaDestination {
         table: &str,
         table_key: &str,
         data: &pg_walstream::RowData,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         let key_cols = self.key_columns_config.get(table_key);
 
         let key_column_names: Vec<&str> = if let Some(cols) = key_cols {
             cols.iter().map(|s| s.as_str()).collect()
         } else {
-            return None;
+            return Ok(None);
         };
 
         let mut payload = serde_json::Map::new();
@@ -132,7 +132,7 @@ impl KafkaDestination {
         }
 
         if payload.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let key = json!({
@@ -145,7 +145,9 @@ impl KafkaDestination {
             "payload": Value::Object(payload)
         });
 
-        serde_json::to_string(&key).ok()
+        serde_json::to_string(&key)
+            .map_err(|e| CdcError::generic(format!("Key serialization failed: {e}")))
+            .map(Some)
     }
 
     fn build_source_block(
@@ -242,9 +244,9 @@ impl KafkaDestination {
         table: &str,
         data: &pg_walstream::RowData,
         key_columns: &[Arc<str>],
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         if key_columns.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut payload = serde_json::Map::new();
@@ -271,7 +273,9 @@ impl KafkaDestination {
             "payload": Value::Object(payload)
         });
 
-        serde_json::to_string(&key).ok()
+        serde_json::to_string(&key)
+            .map_err(|e| CdcError::generic(format!("Key serialization failed: {e}")))
+            .map(Some)
     }
 
     async fn enqueue_event(
@@ -475,10 +479,10 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let table_key = format!("{}.{}", mapped_schema, table);
-                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
+                    let topic = self.topic_name(&mapped_schema, table);
                     let after_fields = Some(self.get_or_build_field_schema(&table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let key = self.build_key_for_insert(&mapped_schema, table, &table_key, data);
+                    let key = self.build_key_for_insert(&mapped_schema, table, &table_key, data)?;
                     let envelope = self.build_change_envelope(
                         "c",
                         &mapped_schema,
@@ -507,7 +511,7 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let table_key = format!("{}.{}", mapped_schema, table);
-                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
+                    let topic = self.topic_name(&mapped_schema, table);
                     let before_fields = old_data
                         .as_ref()
                         .map(|d| self.get_or_build_field_schema(&table_key, d));
@@ -516,7 +520,7 @@ impl DestinationHandler for KafkaDestination {
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
                     let key =
-                        self.build_key_from_data(&mapped_schema, table, key_data, key_columns);
+                        self.build_key_from_data(&mapped_schema, table, key_data, key_columns)?;
                     let envelope = self.build_change_envelope(
                         "u",
                         &mapped_schema,
@@ -544,11 +548,11 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let table_key = format!("{}.{}", mapped_schema, table);
-                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
+                    let topic = self.topic_name(&mapped_schema, table);
                     let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
                     let key =
-                        self.build_key_from_data(&mapped_schema, table, old_data, key_columns);
+                        self.build_key_from_data(&mapped_schema, table, old_data, key_columns)?;
                     let envelope = self.build_change_envelope(
                         "d",
                         &mapped_schema,
@@ -801,7 +805,9 @@ mod tests {
         ]);
         let key_columns = vec![Arc::from("id")];
 
-        let key = dest.build_key_from_data("public", "users", &data, &key_columns);
+        let key = dest
+            .build_key_from_data("public", "users", &data, &key_columns)
+            .unwrap();
         assert!(key.is_some());
 
         let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
@@ -818,7 +824,9 @@ mod tests {
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
         let key_columns: Vec<Arc<str>> = vec![];
 
-        let key = dest.build_key_from_data("public", "users", &data, &key_columns);
+        let key = dest
+            .build_key_from_data("public", "users", &data, &key_columns)
+            .unwrap();
         assert!(key.is_none());
     }
 
@@ -832,7 +840,9 @@ mod tests {
         ]);
         let key_columns = vec![Arc::from("tenant_id"), Arc::from("user_id")];
 
-        let key = dest.build_key_from_data("public", "users", &data, &key_columns);
+        let key = dest
+            .build_key_from_data("public", "users", &data, &key_columns)
+            .unwrap();
         assert!(key.is_some());
 
         let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
@@ -911,7 +921,9 @@ mod tests {
             ("name", ColumnValue::text("Alice")),
         ]);
 
-        let key = dest.build_key_for_insert("public", "users", "public.users", &data);
+        let key = dest
+            .build_key_for_insert("public", "users", "public.users", &data)
+            .unwrap();
         assert!(key.is_some());
         let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
         assert_eq!(key_json["payload"]["id"], Value::String("42".to_string()));
@@ -922,7 +934,9 @@ mod tests {
         let dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
 
-        let key = dest.build_key_for_insert("public", "users", "public.users", &data);
+        let key = dest
+            .build_key_for_insert("public", "users", "public.users", &data)
+            .unwrap();
         assert!(key.is_none());
     }
 }

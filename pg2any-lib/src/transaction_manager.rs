@@ -1719,25 +1719,15 @@ impl TransactionManager {
                 .await;
 
             if let Err(e) = stream_result {
-                if e.is_cancelled() {
-                    warn!(
-                        "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                        tx_id
-                    );
-                    return Ok(());
-                }
-
                 return Err(e);
             }
         }
 
         if !batch.is_empty() {
             if cancellation_token.is_cancelled() {
-                warn!(
-                    "Transaction file processing cancelled by shutdown signal (tx_id: {})",
-                    tx_id
-                );
-                return Ok(());
+                return Err(CdcError::cancelled(
+                    "Transaction file processing cancelled by shutdown signal",
+                ));
             }
 
             let batch_len = batch.len();
@@ -1847,8 +1837,9 @@ impl TransactionManager {
 
             if batch.len() >= batch_size {
                 if cancellation_token.is_cancelled() {
-                    warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
-                    return Ok(());
+                    return Err(CdcError::cancelled(
+                        "Event-mode processing cancelled by shutdown signal",
+                    ));
                 }
                 *batch_count += 1;
                 *total_events += batch.len();
@@ -1980,8 +1971,9 @@ impl TransactionManager {
         // Flush remaining events
         if !batch.is_empty() {
             if cancellation_token.is_cancelled() {
-                warn!("Event-mode processing cancelled (tx_id: {})", tx_id);
-                return Ok(());
+                return Err(CdcError::cancelled(
+                    "Event-mode processing cancelled by shutdown signal",
+                ));
             }
             batch_count += 1;
             total_events += batch.len();

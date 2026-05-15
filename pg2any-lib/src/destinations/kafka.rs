@@ -467,15 +467,15 @@ impl DestinationHandler for KafkaDestination {
                     data,
                     ..
                 } => {
-                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let mapped_schema = self.map_schema(schema).to_owned();
+                    let table_key = format!("{}.{}", mapped_schema, table);
                     let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let after_fields = Some(self.get_or_build_field_schema(&table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let schema_part = &table_key[..table_key.find('.').unwrap()];
-                    let key = self.build_key_for_insert(schema_part, table, &table_key, data);
+                    let key = self.build_key_for_insert(&mapped_schema, table, &table_key, data);
                     let envelope = self.build_change_envelope(
                         "c",
-                        schema_part,
+                        &mapped_schema,
                         table,
                         None,
                         after,
@@ -499,7 +499,8 @@ impl DestinationHandler for KafkaDestination {
                     key_columns,
                     ..
                 } => {
-                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let mapped_schema = self.map_schema(schema).to_owned();
+                    let table_key = format!("{}.{}", mapped_schema, table);
                     let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let before_fields = old_data
                         .as_ref()
@@ -507,12 +508,11 @@ impl DestinationHandler for KafkaDestination {
                     let after_fields = Some(self.get_or_build_field_schema(&table_key, new_data));
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
-                    let schema_part = &table_key[..table_key.find('.').unwrap()];
                     let key_data = old_data.as_ref().unwrap_or(new_data);
-                    let key = self.build_key_from_data(schema_part, table, key_data, key_columns);
+                    let key = self.build_key_from_data(&mapped_schema, table, key_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "u",
-                        schema_part,
+                        &mapped_schema,
                         table,
                         before,
                         after,
@@ -535,15 +535,15 @@ impl DestinationHandler for KafkaDestination {
                     key_columns,
                     ..
                 } => {
-                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let mapped_schema = self.map_schema(schema).to_owned();
+                    let table_key = format!("{}.{}", mapped_schema, table);
                     let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
-                    let schema_part = &table_key[..table_key.find('.').unwrap()];
-                    let key = self.build_key_from_data(schema_part, table, old_data, key_columns);
+                    let key = self.build_key_from_data(&mapped_schema, table, old_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "d",
-                        schema_part,
+                        &mapped_schema,
                         table,
                         before,
                         None,

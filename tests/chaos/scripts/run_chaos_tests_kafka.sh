@@ -50,7 +50,7 @@ KAFKA_BROKER="${CDC_KAFKA_BROKER:-127.0.0.1:9094}"
 KAFKA_TOPIC="${CDC_KAFKA_TOPIC:-pg2any.public.t1}"
 
 CONTAINER_NAME="${CDC_CONTAINER_NAME:-cdc_application}"
-MAX_RETRIES=40
+MAX_RETRIES=20
 RETRY_INTERVAL=45
 CHAOS_SCRIPT_PID=""
 
@@ -140,7 +140,7 @@ get_kafka_offset_count() {
 # Function to get insert count from Kafka topic
 get_kafka_insert_count() {
     local count
-    count=$(timeout 300 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
         | grep -c '"op":"c"' || true)
     echo "${count:-0}"
 }
@@ -148,7 +148,7 @@ get_kafka_insert_count() {
 # Function to get total message count from Kafka topic
 get_kafka_total_count() {
     local count
-    count=$(timeout 300 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
+    count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
         | wc -l | tr -d '[:space:]')
     echo "${count:-0}"
 }
@@ -240,6 +240,8 @@ run_scenario() {
     # Retry verification until it passes
     local retry_count=0
     local verification_passed=false
+    local last_count=-1
+    local stall_count=0
 
     while [ $retry_count -lt $MAX_RETRIES ]; do
         retry_count=$((retry_count + 1))
@@ -251,6 +253,20 @@ run_scenario() {
             break
         else
             log_warning "Scenario $scenario_num verification failed (attempt $retry_count/$MAX_RETRIES)"
+
+            # Stall detection: if count unchanged for 3 consecutive retries, CDC is likely dead
+            local current_count
+            current_count=$(get_kafka_insert_count)
+            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+                stall_count=$((stall_count + 1))
+                if [ $stall_count -ge 3 ]; then
+                    log_error "Scenario $scenario_num stalled at $current_count inserts for 3 retries — CDC likely dead"
+                    break
+                fi
+            else
+                stall_count=0
+            fi
+            last_count=$current_count
 
             if [ $retry_count -lt $MAX_RETRIES ]; then
                 log_info "Waiting $RETRY_INTERVAL seconds before retry..."

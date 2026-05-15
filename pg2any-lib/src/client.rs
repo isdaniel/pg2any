@@ -1292,41 +1292,54 @@ impl CdcClient {
     /// Wait for producer and consumer tasks to complete gracefully
     /// Both tasks should complete before signaling the producer to send final ACK
     async fn wait_for_tasks_completion(&mut self) -> Result<()> {
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
         let producer_handle = self.producer_handle.take();
         let consumer_handle = self.consumer_handle.take();
 
-        let producer_task = async {
-            if let Some(h) = producer_handle {
-                h.await.expect("Producer task panicked")
-            } else {
-                Ok(())
-            }
+        let join_both = async {
+            let producer_result = async {
+                if let Some(h) = producer_handle {
+                    h.await.expect("Producer task panicked")
+                } else {
+                    Ok(())
+                }
+            };
+
+            let consumer_result = async {
+                if let Some(h) = consumer_handle {
+                    h.await.expect("Consumer task panicked")
+                } else {
+                    Ok(())
+                }
+            };
+
+            tokio::join!(producer_result, consumer_result)
         };
 
-        let consumer_task = async {
-            if let Some(h) = consumer_handle {
-                h.await.expect("Consumer task panicked")
-            } else {
-                Ok(())
-            }
-        };
-
-        match tokio::join!(producer_task, consumer_task) {
-            (Ok(()), Ok(())) => {
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, join_both).await {
+            Ok((Ok(()), Ok(()))) => {
                 info!("All CDC tasks completed successfully");
             }
-            (Err(producer_err), Ok(_)) => {
+            Ok((Err(producer_err), Ok(_))) => {
                 error!("Producer task failed: {}", producer_err);
                 return Err(producer_err);
             }
-            (Ok(_), Err(consumer_err)) => {
+            Ok((Ok(_), Err(consumer_err))) => {
                 error!("Consumer task failed: {}", consumer_err);
                 return Err(consumer_err);
             }
-            (Err(producer_err), Err(consumer_err)) => {
+            Ok((Err(producer_err), Err(consumer_err))) => {
                 error!("Producer task failed: {}", producer_err);
                 error!("Consumer task failed: {}", consumer_err);
                 return Err(producer_err);
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "Timed out waiting for tasks to complete after {:?}. \
+                     Proceeding with shutdown to avoid SIGKILL.",
+                    SHUTDOWN_TIMEOUT
+                );
             }
         }
 

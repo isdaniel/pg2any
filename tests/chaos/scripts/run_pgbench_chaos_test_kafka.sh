@@ -58,7 +58,7 @@ PGBENCH_TRANSACTIONS="${PGBENCH_TRANSACTIONS:-12}"
 PGBENCH_SCRIPT="${PGBENCH_SCRIPT:-$PROJECT_ROOT/examples/scripts/pgbench_testing.sql}"
 
 # Verification configuration
-MAX_RETRIES=60
+MAX_RETRIES=30
 RETRY_INTERVAL=45
 
 # Connection string
@@ -405,6 +405,8 @@ main() {
 
     local retry_count=0
     local verification_passed=false
+    local last_count=-1
+    local stall_count=0
 
     while [ $retry_count -lt $MAX_RETRIES ]; do
         retry_count=$((retry_count + 1))
@@ -416,6 +418,21 @@ main() {
             break
         else
             log_warning "Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
+
+            # Stall detection: if count unchanged for 3 consecutive retries, CDC is likely dead
+            local current_count
+            current_count=$(get_kafka_insert_count)
+            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+                stall_count=$((stall_count + 1))
+                if [ $stall_count -ge 3 ]; then
+                    log_error "Replication stalled at $current_count for 3 consecutive retries — CDC likely dead or stuck"
+                    log_error "Check CDC application logs for errors"
+                    break
+                fi
+            else
+                stall_count=0
+            fi
+            last_count=$current_count
 
             if [ $retry_count -lt $MAX_RETRIES ]; then
                 log_info "Waiting $RETRY_INTERVAL seconds before retry..."

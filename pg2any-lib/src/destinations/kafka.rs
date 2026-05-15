@@ -10,10 +10,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const DEFAULT_TOPIC_PREFIX: &str = "pg2any";
 const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+const DELIVERY_FUTURE_TIMEOUT: Duration = Duration::from_secs(60);
 const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct KafkaDestination {
@@ -297,15 +298,20 @@ impl KafkaDestination {
 
     async fn await_delivery_futures(&self, futures: Vec<DeliveryFuture>) -> Result<()> {
         for future in futures {
-            match future.await {
-                Ok(Ok(_)) => {}
-                Ok(Err((err, _))) => {
+            match tokio::time::timeout(DELIVERY_FUTURE_TIMEOUT, future).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err((err, _)))) => {
                     return Err(CdcError::generic(format!(
                         "Kafka message delivery failed: {err}"
                     )));
                 }
-                Err(_cancelled) => {
+                Ok(Err(_cancelled)) => {
                     return Err(CdcError::generic("Kafka delivery future cancelled"));
+                }
+                Err(_elapsed) => {
+                    return Err(CdcError::generic(
+                        "Kafka delivery future timed out waiting for broker acknowledgement",
+                    ));
                 }
             }
         }
@@ -581,10 +587,10 @@ impl DestinationHandler for KafkaDestination {
                 "Flushing Kafka producer (timeout {:?})...",
                 DEFAULT_FLUSH_TIMEOUT
             );
-            producer
-                .flush(DEFAULT_FLUSH_TIMEOUT)
-                .map_err(|e| CdcError::generic(format!("Kafka producer flush failed: {e}")))?;
-            info!("Kafka producer flushed and closed successfully");
+            match producer.flush(DEFAULT_FLUSH_TIMEOUT) {
+                Ok(()) => info!("Kafka producer flushed and closed successfully"),
+                Err(e) => warn!("Kafka producer flush timed out or failed: {e} — some messages may be re-delivered on restart"),
+            }
         }
         Ok(())
     }

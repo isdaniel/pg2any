@@ -19,7 +19,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    timeout-minutes: 480
+    timeout-minutes: 90
 
     steps:
     - name: Checkout repository
@@ -96,6 +96,7 @@ jobs:
         ls -la tests/chaos/scripts/
 
     - name: Run pgbench chaos integration test
+      timeout-minutes: 60
       run: |
         echo "=========================================="
         echo "Starting PGBench Chaos Integration Test (Kafka)"
@@ -227,6 +228,7 @@ jobs:
 
     - name: Setup tmate session
       if: failure()
+      timeout-minutes: 15
       uses: mxschmitt/action-tmate@v3
 
     - name: Stop and remove containers

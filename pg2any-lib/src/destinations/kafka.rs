@@ -43,11 +43,11 @@ impl KafkaDestination {
         format!("{}.{}.{}", self.topic_prefix, schema, table)
     }
 
-    fn map_schema<'a>(&'a self, source_schema: &'a str) -> String {
+    fn map_schema<'a>(&'a self, source_schema: &'a str) -> &'a str {
         self.schema_mappings
             .get(source_schema)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| source_schema.to_string())
+            .map(|s| s.as_str())
+            .unwrap_or(source_schema)
     }
 
     fn column_value_to_json(value: &ColumnValue) -> Value {
@@ -106,10 +106,10 @@ impl KafkaDestination {
         &self,
         schema: &str,
         table: &str,
+        table_key: &str,
         data: &pg_walstream::RowData,
     ) -> Option<String> {
-        let table_key = format!("{}.{}", schema, table);
-        let key_cols = self.key_columns_config.get(&table_key);
+        let key_cols = self.key_columns_config.get(table_key);
 
         let key_column_names: Vec<&str> = if let Some(cols) = key_cols {
             cols.iter().map(|s| s.as_str()).collect()
@@ -272,7 +272,7 @@ impl KafkaDestination {
         &self,
         topic: &str,
         key: Option<&str>,
-        value: &str,
+        value: &[u8],
     ) -> Result<DeliveryFuture> {
         let producer = self
             .producer
@@ -467,15 +467,15 @@ impl DestinationHandler for KafkaDestination {
                     data,
                     ..
                 } => {
-                    let schema = self.map_schema(schema);
-                    let topic = self.topic_name(&schema, table);
-                    let table_key = format!("{}.{}", schema, table);
+                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let after_fields = Some(self.get_or_build_field_schema(&table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let key = self.build_key_for_insert(&schema, table, data);
+                    let schema_part = &table_key[..table_key.find('.').unwrap()];
+                    let key = self.build_key_for_insert(schema_part, table, &table_key, data);
                     let envelope = self.build_change_envelope(
                         "c",
-                        &schema,
+                        schema_part,
                         table,
                         None,
                         after,
@@ -485,7 +485,7 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                    let value = serde_json::to_vec(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
                     let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
@@ -499,20 +499,20 @@ impl DestinationHandler for KafkaDestination {
                     key_columns,
                     ..
                 } => {
-                    let schema = self.map_schema(schema);
-                    let topic = self.topic_name(&schema, table);
-                    let table_key = format!("{}.{}", schema, table);
+                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let before_fields = old_data
                         .as_ref()
                         .map(|d| self.get_or_build_field_schema(&table_key, d));
                     let after_fields = Some(self.get_or_build_field_schema(&table_key, new_data));
                     let before = old_data.as_ref().map(Self::row_data_to_json);
                     let after = Some(Self::row_data_to_json(new_data));
+                    let schema_part = &table_key[..table_key.find('.').unwrap()];
                     let key_data = old_data.as_ref().unwrap_or(new_data);
-                    let key = self.build_key_from_data(&schema, table, key_data, key_columns);
+                    let key = self.build_key_from_data(schema_part, table, key_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "u",
-                        &schema,
+                        schema_part,
                         table,
                         before,
                         after,
@@ -522,7 +522,7 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                    let value = serde_json::to_vec(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
                     let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
@@ -535,15 +535,15 @@ impl DestinationHandler for KafkaDestination {
                     key_columns,
                     ..
                 } => {
-                    let schema = self.map_schema(schema);
-                    let topic = self.topic_name(&schema, table);
-                    let table_key = format!("{}.{}", schema, table);
+                    let table_key = format!("{}.{}", self.map_schema(schema), table);
+                    let topic = format!("{}.{}", self.topic_prefix, &table_key);
                     let before_fields = Some(self.get_or_build_field_schema(&table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
-                    let key = self.build_key_from_data(&schema, table, old_data, key_columns);
+                    let schema_part = &table_key[..table_key.find('.').unwrap()];
+                    let key = self.build_key_from_data(schema_part, table, old_data, key_columns);
                     let envelope = self.build_change_envelope(
                         "d",
-                        &schema,
+                        schema_part,
                         table,
                         before,
                         None,
@@ -553,7 +553,7 @@ impl DestinationHandler for KafkaDestination {
                         commit_timestamp,
                         commit_lsn,
                     );
-                    let value = serde_json::to_string(&envelope).map_err(|e| {
+                    let value = serde_json::to_vec(&envelope).map_err(|e| {
                         CdcError::generic(format!("JSON serialization failed: {e}"))
                     })?;
                     let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
@@ -565,10 +565,10 @@ impl DestinationHandler for KafkaDestination {
                             Some((s, t)) if !t.contains('.') => (self.map_schema(s), t),
                             _ => (self.map_schema("public"), table_spec.as_ref()),
                         };
-                        let topic = self.topic_name(&schema, table);
+                        let topic = self.topic_name(schema, table);
                         let envelope = self.build_change_envelope(
                             "t",
-                            &schema,
+                            schema,
                             table,
                             None,
                             None,
@@ -578,7 +578,7 @@ impl DestinationHandler for KafkaDestination {
                             commit_timestamp,
                             commit_lsn,
                         );
-                        let value = serde_json::to_string(&envelope).map_err(|e| {
+                        let value = serde_json::to_vec(&envelope).map_err(|e| {
                             CdcError::generic(format!("JSON serialization failed: {e}"))
                         })?;
                         let future = self.enqueue_event(&topic, None, &value).await?;
@@ -903,7 +903,7 @@ mod tests {
             ("name", ColumnValue::text("Alice")),
         ]);
 
-        let key = dest.build_key_for_insert("public", "users", &data);
+        let key = dest.build_key_for_insert("public", "users", "public.users", &data);
         assert!(key.is_some());
         let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
         assert_eq!(key_json["payload"]["id"], Value::String("42".to_string()));
@@ -914,7 +914,7 @@ mod tests {
         let dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
 
-        let key = dest.build_key_for_insert("public", "users", &data);
+        let key = dest.build_key_for_insert("public", "users", "public.users", &data);
         assert!(key.is_none());
     }
 }

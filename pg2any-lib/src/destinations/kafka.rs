@@ -184,15 +184,21 @@ impl KafkaDestination {
     ) -> Value {
         let source = self.build_source_block(schema, table, transaction_id, commit_timestamp, lsn);
 
+        let unified_fields = after_fields
+            .as_ref()
+            .or(before_fields.as_ref())
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+
         let before_schema = json!({
             "type": "struct",
-            "fields": before_fields.unwrap_or_else(|| json!([])),
+            "fields": unified_fields,
             "optional": true,
             "field": "before"
         });
         let after_schema = json!({
             "type": "struct",
-            "fields": after_fields.unwrap_or_else(|| json!([])),
+            "fields": unified_fields,
             "optional": true,
             "field": "after"
         });

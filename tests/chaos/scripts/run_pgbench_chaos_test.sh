@@ -311,28 +311,71 @@ main() {
     fi
     
     echo "" | tee -a "$RESULTS_FILE"
-    
+
+    # Stop chaos before verification to allow CDC to stabilize and catch up
+    log_section "Stopping Chaos for Verification"
+    if [ -n "$CHAOS_SCRIPT_PID" ] && kill -0 "$CHAOS_SCRIPT_PID" 2>/dev/null; then
+        log_info "Stopping chaos script (PID: $CHAOS_SCRIPT_PID) to allow CDC to stabilize..."
+        kill "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
+        CHAOS_SCRIPT_PID=""
+        log_success "Chaos script stopped."
+    fi
+
+    # Ensure CDC container is running and healthy before verification
+    log_info "Ensuring CDC container is running for catch-up..."
+    local container_status
+    container_status=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+    if [ "$container_status" != "running" ]; then
+        log_info "Container is '$container_status', starting it..."
+        docker start "$CONTAINER_NAME" 2>/dev/null || true
+        sleep 10
+    fi
+
+    # Give CDC time to process remaining transactions after chaos stops
+    log_info "Waiting 30s for CDC to process remaining transactions..."
+    sleep 30
+
     # Verify replication with retry loop
     log_section "Verifying Replication"
     log_info "Expected row count: $EXPECTED_ROW_COUNT"
     log_info "Max retries: $MAX_RETRIES"
     log_info "Retry interval: $RETRY_INTERVAL seconds"
     echo "" | tee -a "$RESULTS_FILE"
-    
+
     local retry_count=0
     local verification_passed=false
-    
+    local last_count=-1
+    local stall_count=0
+
     while [ $retry_count -lt $MAX_RETRIES ]; do
         retry_count=$((retry_count + 1))
         log_info "Verification attempt $retry_count/$MAX_RETRIES..."
-        
+
         if verify_replication; then
             log_success "✓ Replication verification PASSED on attempt $retry_count"
             verification_passed=true
             break
         else
             log_warning "✗ Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
-            
+
+            # Stall detection: if count unchanged for 3 consecutive retries, CDC is likely dead
+            local current_count
+            current_count=$(get_mysql_row_count)
+            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+                stall_count=$((stall_count + 1))
+                if [ $stall_count -ge 3 ]; then
+                    log_error "Replication stalled at $current_count rows for 3 consecutive retries — CDC likely dead or stuck"
+                    log_error "Attempting container restart to recover..."
+                    docker restart "$CONTAINER_NAME" 2>/dev/null || true
+                    sleep 30
+                    stall_count=0
+                fi
+            else
+                stall_count=0
+            fi
+            last_count=$current_count
+
             if [ $retry_count -lt $MAX_RETRIES ]; then
                 log_info "Waiting $RETRY_INTERVAL seconds before retry..."
                 sleep "$RETRY_INTERVAL"

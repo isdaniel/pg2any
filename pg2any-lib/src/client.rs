@@ -959,6 +959,7 @@ impl CdcClient {
 
         // Retry delay for failed transactions (exponential backoff capped at 30s)
         let mut retry_delay: Option<tokio::time::Sleep> = None;
+        let mut retry_count: u32 = 0;
 
         loop {
             // If queue has pending work and we're in retry mode, wait then process
@@ -968,22 +969,15 @@ impl CdcClient {
                         biased;
 
                         _ = &mut producer_shutdown_rx => {
-                            info!("Consumer: Received producer shutdown signal during retry wait, draining remaining transactions");
+                            info!("Consumer: Received producer shutdown signal during retry wait, persisting current position");
 
-                            while let Ok(notification) = commit_receiver.try_recv() {
-                                commit_queue.push(std::cmp::Reverse(notification));
+                            let remaining = commit_queue.len();
+                            if remaining > 0 {
+                                info!(
+                                    "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
+                                    remaining
+                                );
                             }
-
-                            Self::drain_commit_queue_on_shutdown(
-                                &mut commit_queue,
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &lsn_tracker,
-                                &metrics_collector,
-                                batch_size,
-                                &shared_lsn_feedback,
-                            )
-                            .await;
 
                             Self::flush_and_persist_on_shutdown(
                                 &transaction_file_manager,
@@ -991,7 +985,7 @@ impl CdcClient {
                             )
                             .await;
 
-                            info!("Consumer: Shutdown complete after draining all queued transactions");
+                            info!("Consumer: Shutdown complete, position persisted");
                             shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                             break;
                         }
@@ -1005,16 +999,13 @@ impl CdcClient {
                                 warn!("Consumer: mpsc channel closed during retry wait, awaiting producer shutdown signal");
                                 let _ = producer_shutdown_rx.await;
 
-                                Self::drain_commit_queue_on_shutdown(
-                                    &mut commit_queue,
-                                    &transaction_file_manager,
-                                    &mut destination_handler,
-                                    &lsn_tracker,
-                                    &metrics_collector,
-                                    batch_size,
-                                    &shared_lsn_feedback,
-                                )
-                                .await;
+                                let remaining = commit_queue.len();
+                                if remaining > 0 {
+                                    info!(
+                                        "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
+                                        remaining
+                                    );
+                                }
 
                                 Self::flush_and_persist_on_shutdown(
                                     &transaction_file_manager,
@@ -1044,6 +1035,7 @@ impl CdcClient {
                         batch_size,
                         &shared_lsn_feedback,
                         &mut retry_delay,
+                        &mut retry_count,
                     )
                     .await;
                     continue;
@@ -1056,23 +1048,15 @@ impl CdcClient {
                 // Handle producer shutdown signal (producer stopped gracefully)
                 // This is the ONLY shutdown path - producer detects cancellation and signals us
                 _ = &mut producer_shutdown_rx => {
-                    info!("Consumer: Received producer shutdown signal, draining remaining transactions");
+                    info!("Consumer: Received producer shutdown signal, persisting current position");
 
-                    // Drain remaining notifications from the channel into the queue
-                    while let Ok(notification) = commit_receiver.try_recv() {
-                        commit_queue.push(std::cmp::Reverse(notification));
+                    let remaining = commit_queue.len();
+                    if remaining > 0 {
+                        info!(
+                            "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
+                            remaining
+                        );
                     }
-
-                    Self::drain_commit_queue_on_shutdown(
-                        &mut commit_queue,
-                        &transaction_file_manager,
-                        &mut destination_handler,
-                        &lsn_tracker,
-                        &metrics_collector,
-                        batch_size,
-                        &shared_lsn_feedback,
-                    )
-                    .await;
 
                     Self::flush_and_persist_on_shutdown(
                         &transaction_file_manager,
@@ -1080,7 +1064,7 @@ impl CdcClient {
                     )
                     .await;
 
-                    info!("Consumer: Shutdown complete after draining all queued transactions");
+                    info!("Consumer: Shutdown complete, position persisted");
                     shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                     break;
                 }
@@ -1109,6 +1093,7 @@ impl CdcClient {
                                 batch_size,
                                 &shared_lsn_feedback,
                                 &mut retry_delay,
+                                &mut retry_count,
                             )
                             .await;
                         }
@@ -1118,16 +1103,13 @@ impl CdcClient {
 
                             let _ = producer_shutdown_rx.await;
 
-                            Self::drain_commit_queue_on_shutdown(
-                                &mut commit_queue,
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &lsn_tracker,
-                                &metrics_collector,
-                                batch_size,
-                                &shared_lsn_feedback,
-                            )
-                            .await;
+                            let remaining = commit_queue.len();
+                            if remaining > 0 {
+                                info!(
+                                    "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
+                                    remaining
+                                );
+                            }
 
                             Self::flush_and_persist_on_shutdown(
                                 &transaction_file_manager,
@@ -1163,6 +1145,7 @@ impl CdcClient {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         retry_delay: &mut Option<tokio::time::Sleep>,
+        retry_count: &mut u32,
     ) {
         while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
             info!(
@@ -1183,6 +1166,14 @@ impl CdcClient {
                 )
                 .await
             {
+                if e.is_cancelled() {
+                    info!(
+                        "Consumer: transaction {} cancelled by shutdown, will be recovered on restart",
+                        next_tx.metadata.transaction_id
+                    );
+                    break;
+                }
+
                 error!(
                     "Failed to process transaction {} from file {:?}: {}. Will retry after backoff.",
                     next_tx.metadata.transaction_id, next_tx.file_path, e
@@ -1190,14 +1181,10 @@ impl CdcClient {
                 metrics_collector.record_error("transaction_file_processing_failed", "consumer");
                 commit_queue.push(std::cmp::Reverse(next_tx));
 
-                // Set retry delay with exponential backoff (1s base, 30s cap)
-                let current_backoff = retry_delay
-                    .as_ref()
-                    .map(|_| std::time::Duration::from_secs(1))
-                    .unwrap_or(std::time::Duration::from_secs(1));
-                let next_backoff = current_backoff
-                    .saturating_mul(2)
-                    .min(std::time::Duration::from_secs(30));
+                // Set retry delay with exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap)
+                *retry_count = retry_count.saturating_add(1);
+                let backoff_secs = 2u64.saturating_pow(*retry_count).min(30);
+                let next_backoff = std::time::Duration::from_secs(backoff_secs);
                 *retry_delay = Some(tokio::time::sleep(next_backoff));
                 info!(
                     "Consumer: scheduling retry in {:?} for {} queued transaction(s)",
@@ -1211,70 +1198,8 @@ impl CdcClient {
         // Clear retry state on success (queue fully drained)
         if commit_queue.is_empty() {
             *retry_delay = None;
+            *retry_count = 0;
         }
-    }
-
-    /// Drain and process all remaining transactions in the commit queue during shutdown.
-    ///
-    /// Uses a never-cancelled token so that in-progress batch processing completes
-    /// rather than aborting mid-transaction. This ensures all committed transactions
-    /// are applied to the destination before the process exits.
-    async fn drain_commit_queue_on_shutdown(
-        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
-        transaction_file_manager: &Arc<TransactionManager>,
-        destination_handler: &mut Box<dyn DestinationHandler>,
-        lsn_tracker: &Arc<LsnTracker>,
-        metrics_collector: &Arc<MetricsCollector>,
-        batch_size: usize,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-    ) {
-        if commit_queue.is_empty() {
-            return;
-        }
-
-        let drain_count = commit_queue.len();
-        info!(
-            "Consumer: Draining {} queued transaction(s) before shutdown",
-            drain_count
-        );
-
-        // Use a never-cancelled token so batch processing won't abort mid-transaction
-        let drain_token = CancellationToken::new();
-
-        while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-            info!(
-                "Consumer drain: processing transaction {} (LSN: {:?})",
-                next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
-            );
-
-            if let Err(e) = transaction_file_manager
-                .clone()
-                .process_transaction_file(
-                    &next_tx,
-                    destination_handler,
-                    &drain_token,
-                    lsn_tracker,
-                    metrics_collector,
-                    batch_size,
-                    shared_lsn_feedback,
-                )
-                .await
-            {
-                error!(
-                    "Consumer drain: failed to process transaction {} during shutdown: {}. \
-                     Remaining transactions will be recovered on restart.",
-                    next_tx.metadata.transaction_id, e
-                );
-                metrics_collector
-                    .record_error("transaction_file_processing_failed_on_shutdown", "consumer");
-                break;
-            }
-        }
-
-        info!(
-            "Consumer: Drain complete, processed {} transaction(s)",
-            drain_count - commit_queue.len()
-        );
     }
 
     #[inline]

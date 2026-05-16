@@ -72,7 +72,7 @@ services:
     ports:
       - "18083:8080"
     restart: unless-stopped
-    stop_grace_period: 300s
+    stop_grace_period: 120s
     stop_signal: SIGTERM
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

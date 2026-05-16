@@ -26,6 +26,7 @@ pub struct KafkaDestination {
     schema_mappings: HashMap<String, String>,
     key_columns_config: HashMap<String, Vec<String>>,
     field_schema_cache: HashMap<String, Value>,
+    topic_cache: HashMap<String, String>,
 }
 
 impl KafkaDestination {
@@ -37,11 +38,15 @@ impl KafkaDestination {
             schema_mappings: HashMap::new(),
             key_columns_config: HashMap::new(),
             field_schema_cache: HashMap::new(),
+            topic_cache: HashMap::new(),
         }
     }
 
-    fn topic_name(&self, schema: &str, table: &str) -> String {
-        format!("{}.{}.{}", self.topic_prefix, schema, table)
+    fn topic_name(&mut self, schema: &str, table: &str) -> &str {
+        let cache_key = format!("{}.{}", schema, table);
+        self.topic_cache
+            .entry(cache_key)
+            .or_insert_with_key(|_| format!("{}.{}.{}", self.topic_prefix, schema, table))
     }
 
     fn map_schema<'a>(&'a self, source_schema: &'a str) -> &'a str {
@@ -94,9 +99,12 @@ impl KafkaDestination {
         table_key: &str,
         data: &pg_walstream::RowData,
     ) -> Value {
-        // Include column count in cache key to detect schema changes (DDL)
-        let col_count = data.len();
-        let cache_key = format!("{}:{}", table_key, col_count);
+        let mut cache_key = String::with_capacity(table_key.len() + data.len() * 10);
+        cache_key.push_str(table_key);
+        for (col_name, _) in data.iter() {
+            cache_key.push(':');
+            cache_key.push_str(col_name);
+        }
         if let Some(cached) = self.field_schema_cache.get(&cache_key) {
             return cached.clone();
         }
@@ -330,7 +338,7 @@ impl KafkaDestination {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err((err, _)) => {
-                    return Err(CdcError::generic(format!("Kafka enqueue failed: {err}")));
+                    return Err(CdcError::Kafka(err));
                 }
             }
         }
@@ -393,6 +401,13 @@ impl DestinationHandler for KafkaDestination {
             std::env::var("CDC_KAFKA_MESSAGE_MAX_BYTES").unwrap_or_else(|_| "1048576".to_string());
         let retries = std::env::var("CDC_KAFKA_RETRIES").unwrap_or_else(|_| "3".to_string());
 
+        let message_timeout_ms =
+            std::env::var("CDC_KAFKA_MESSAGE_TIMEOUT_MS").unwrap_or_else(|_| "30000".to_string());
+        let retry_backoff_ms =
+            std::env::var("CDC_KAFKA_RETRY_BACKOFF_MS").unwrap_or_else(|_| "200".to_string());
+        let metadata_refresh_ms = std::env::var("CDC_KAFKA_METADATA_REFRESH_INTERVAL_MS")
+            .unwrap_or_else(|_| "5000".to_string());
+
         let mut config = ClientConfig::new();
         config
             .set("bootstrap.servers", connection_string)
@@ -403,9 +418,9 @@ impl DestinationHandler for KafkaDestination {
             .set("acks", &acks)
             .set("message.max.bytes", &message_max_bytes)
             .set("retries", &retries)
-            .set("message.timeout.ms", "30000")
-            .set("retry.backoff.ms", "200")
-            .set("topic.metadata.refresh.interval.ms", "5000");
+            .set("message.timeout.ms", &message_timeout_ms)
+            .set("retry.backoff.ms", &retry_backoff_ms)
+            .set("topic.metadata.refresh.interval.ms", &metadata_refresh_ms);
 
         if let Ok(mechanism) = std::env::var("CDC_KAFKA_SASL_MECHANISM") {
             config.set("sasl.mechanism", &mechanism);
@@ -501,7 +516,7 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
-                    let topic = self.topic_name(&mapped_schema, table);
+                    let topic = self.topic_name(&mapped_schema, table).to_owned();
                     let after_fields =
                         Some(self.get_or_build_field_schema(&source_table_key, data));
                     let after = Some(Self::row_data_to_json(data));
@@ -535,7 +550,7 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
-                    let topic = self.topic_name(&mapped_schema, table);
+                    let topic = self.topic_name(&mapped_schema, table).to_owned();
                     let before_fields = old_data
                         .as_ref()
                         .map(|d| self.get_or_build_field_schema(&source_table_key, d));
@@ -578,7 +593,7 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
-                    let topic = self.topic_name(&mapped_schema, table);
+                    let topic = self.topic_name(&mapped_schema, table).to_owned();
                     let before_fields =
                         Some(self.get_or_build_field_schema(&source_table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
@@ -610,13 +625,13 @@ impl DestinationHandler for KafkaDestination {
                 pg_walstream::EventType::Truncate(tables) => {
                     for table_spec in tables.iter() {
                         let (schema, table) = match table_spec.split_once('.') {
-                            Some((s, t)) if !t.contains('.') => (self.map_schema(s), t),
-                            _ => (self.map_schema("public"), table_spec.as_ref()),
+                            Some((s, t)) if !t.contains('.') => (self.map_schema(s).to_owned(), t),
+                            _ => (self.map_schema("public").to_owned(), table_spec.as_ref()),
                         };
-                        let topic = self.topic_name(schema, table);
+                        let topic = self.topic_name(&schema, table).to_owned();
                         let envelope = self.build_change_envelope(
                             "t",
-                            schema,
+                            &schema,
                             table,
                             None,
                             None,
@@ -634,10 +649,7 @@ impl DestinationHandler for KafkaDestination {
                     }
                 }
                 _ => {
-                    debug!(
-                        "Skipping non-DML event for Kafka: {:?}",
-                        std::mem::discriminant(&event.event_type)
-                    );
+                    debug!("Skipping non-DML event for Kafka");
                 }
             }
         }
@@ -684,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_topic_name() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         assert_eq!(
             dest.topic_name("public", "users"),
             "test_prefix.public.users"

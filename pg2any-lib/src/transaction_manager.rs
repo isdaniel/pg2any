@@ -1636,6 +1636,23 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
+        // Skip transactions already applied (position-tracking based deduplication)
+        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
+            let current_flush_lsn = lsn_tracker.get();
+            if commit_lsn.0 <= current_flush_lsn && current_flush_lsn > 0 {
+                info!(
+                    "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
+                    pending_tx.metadata.transaction_id,
+                    commit_lsn,
+                    pg_walstream::format_lsn(current_flush_lsn)
+                );
+                if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
+                    warn!("Failed to delete duplicate pending file: {}", e);
+                }
+                return Ok(());
+            }
+        }
+
         if self.event_mode {
             return self
                 .process_transaction_file_event_mode(
@@ -2051,6 +2068,11 @@ impl TransactionManager {
             // 2. Update apply_lsn and flush_lsn - transaction is now delivered to destination
             shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
             shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
+
+            // 3. Persist LSN to disk immediately for crash safety
+            if let Err(e) = lsn_tracker.persist_async().await {
+                warn!("Failed to persist LSN after transaction {}: {}", tx_id, e);
+            }
 
             info!(
                 "Updated apply_lsn and flush_lsn to {} (transaction {} delivered to destination)",

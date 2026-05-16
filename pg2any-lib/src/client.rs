@@ -263,19 +263,6 @@ impl CdcClient {
             ))
         };
 
-        // Process any pending transactions from previous run before starting consumer
-        info!("Checking for pending transaction files from previous run...");
-        let pending_count = transaction_file_manager
-            .list_pending_transactions()
-            .await?
-            .len();
-        if pending_count > 0 {
-            info!(
-                "Found {} pending transaction files to process before starting consumer",
-                pending_count
-            );
-        }
-
         // Start consumer (reads from files only)
         let dest_type = &self.config.destination_type;
         let schema_mappings = self.config.schema_mappings.clone();
@@ -451,20 +438,11 @@ impl CdcClient {
     ///
     /// ## Shutdown Coordination
     ///
-    /// During graceful shutdown, the producer simply exits gracefully without transferring
-    /// ownership. The LogicalReplicationStream remains stored in CdcClient. The main thread's stop()
-    /// function waits for both producer and consumer to complete, ensuring all transactions
-    /// are committed, then calls stop() on the stored LogicalReplicationStream to send final ACK.
-    /// This ensures the ACK includes all transactions successfully applied by the consumer,
-    /// preventing re-download of already applied transactions on restart.
-    ///
-    /// # Shutdown Coordination
-    ///
     /// When cancellation is signaled:
-    /// 1. Producer drops the mpsc sender (tx_commit_notifier) to signal "no more messages"
+    /// 1. Producer flushes buffers and drops the mpsc sender to signal "no more messages"
     /// 2. Producer sends oneshot signal to notify consumer it has stopped
-    /// 3. Consumer receives None from mpsc (channel closed) and processes remaining queue
-    /// 4. Consumer then exits after draining all pending transactions
+    /// 3. Consumer drains mpsc channel and processes all remaining queued transactions
+    /// 4. Main thread's stop() waits for both, then sends final ACK to PostgreSQL
     async fn run_producer(
         replication_stream: Arc<Mutex<LogicalReplicationStream>>,
         cancellation_token: CancellationToken,
@@ -824,7 +802,7 @@ impl CdcClient {
             info!("Producer: Sent shutdown notification to consumer");
         }
 
-        info!("ReplicationStream ownership transferred successfully, producer shutting down");
+        info!("Producer shutdown complete");
         Ok(())
     }
 
@@ -969,24 +947,19 @@ impl CdcClient {
                         biased;
 
                         _ = &mut producer_shutdown_rx => {
-                            info!("Consumer: Received producer shutdown signal during retry wait, persisting current position");
+                            info!("Consumer: Received producer shutdown signal during retry wait, draining remaining transactions");
 
-                            let remaining = commit_queue.len();
-                            if remaining > 0 {
-                                info!(
-                                    "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
-                                    remaining
-                                );
-                            }
-
-                            Self::flush_and_persist_on_shutdown(
+                            Self::drain_and_shutdown(
+                                &mut commit_queue,
+                                &mut commit_receiver,
                                 &transaction_file_manager,
+                                &mut destination_handler,
                                 &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
+                                &shared_lsn_feedback,
                             )
                             .await;
-
-                            info!("Consumer: Shutdown complete, position persisted");
-                            shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                             break;
                         }
 
@@ -999,22 +972,17 @@ impl CdcClient {
                                 warn!("Consumer: mpsc channel closed during retry wait, awaiting producer shutdown signal");
                                 let _ = producer_shutdown_rx.await;
 
-                                let remaining = commit_queue.len();
-                                if remaining > 0 {
-                                    info!(
-                                        "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
-                                        remaining
-                                    );
-                                }
-
-                                Self::flush_and_persist_on_shutdown(
+                                Self::drain_and_shutdown(
+                                    &mut commit_queue,
+                                    &mut commit_receiver,
                                     &transaction_file_manager,
+                                    &mut destination_handler,
                                     &lsn_tracker,
+                                    &metrics_collector,
+                                    batch_size,
+                                    &shared_lsn_feedback,
                                 )
                                 .await;
-
-                                info!("Consumer: Shutdown complete after channel closed during retry");
-                                shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                                 return Ok(());
                             }
                         }
@@ -1046,26 +1014,20 @@ impl CdcClient {
                 biased;
 
                 // Handle producer shutdown signal (producer stopped gracefully)
-                // This is the ONLY shutdown path - producer detects cancellation and signals us
                 _ = &mut producer_shutdown_rx => {
-                    info!("Consumer: Received producer shutdown signal, persisting current position");
+                    info!("Consumer: Received producer shutdown signal, draining remaining transactions");
 
-                    let remaining = commit_queue.len();
-                    if remaining > 0 {
-                        info!(
-                            "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
-                            remaining
-                        );
-                    }
-
-                    Self::flush_and_persist_on_shutdown(
+                    Self::drain_and_shutdown(
+                        &mut commit_queue,
+                        &mut commit_receiver,
                         &transaction_file_manager,
+                        &mut destination_handler,
                         &lsn_tracker,
+                        &metrics_collector,
+                        batch_size,
+                        &shared_lsn_feedback,
                     )
                     .await;
-
-                    info!("Consumer: Shutdown complete, position persisted");
-                    shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                     break;
                 }
 
@@ -1103,21 +1065,17 @@ impl CdcClient {
 
                             let _ = producer_shutdown_rx.await;
 
-                            let remaining = commit_queue.len();
-                            if remaining > 0 {
-                                info!(
-                                    "Consumer: {} transaction(s) remain in queue, will be recovered on restart",
-                                    remaining
-                                );
-                            }
-
-                            Self::flush_and_persist_on_shutdown(
+                            Self::drain_and_shutdown(
+                                &mut commit_queue,
+                                &mut commit_receiver,
                                 &transaction_file_manager,
+                                &mut destination_handler,
                                 &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
+                                &shared_lsn_feedback,
                             )
                             .await;
-
-                            shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
                             break;
                         }
                     }
@@ -1129,6 +1087,88 @@ impl CdcClient {
 
         info!("Consumer stopped gracefully");
         Ok(())
+    }
+
+    /// Drain remaining channel messages and process all queued transactions before shutdown.
+    ///
+    /// Uses a fresh CancellationToken (never cancelled) so that transaction processing
+    /// completes fully during the drain phase. This ensures the final LSN position
+    /// reflects all applied transactions, preventing duplicate replay on restart.
+    async fn drain_and_shutdown(
+        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
+        commit_receiver: &mut mpsc::Receiver<PendingTransactionFile>,
+        transaction_file_manager: &Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) {
+        // Drain any remaining notifications from the channel
+        while let Ok(notification) = commit_receiver.try_recv() {
+            commit_queue.push(std::cmp::Reverse(notification));
+        }
+
+        if !commit_queue.is_empty() {
+            info!(
+                "Consumer: Processing {} remaining transaction(s) before shutdown",
+                commit_queue.len()
+            );
+
+            let drain_token = CancellationToken::new();
+            const MAX_DRAIN_RETRIES: u32 = 3;
+
+            while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
+                let mut attempt = 0u32;
+                let mut success = false;
+
+                while attempt < MAX_DRAIN_RETRIES {
+                    attempt += 1;
+                    match transaction_file_manager
+                        .clone()
+                        .process_transaction_file(
+                            &next_tx,
+                            destination_handler,
+                            &drain_token,
+                            lsn_tracker,
+                            metrics_collector,
+                            batch_size,
+                            shared_lsn_feedback,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Drain: failed to process transaction {} (attempt {}/{}): {}",
+                                next_tx.metadata.transaction_id, attempt, MAX_DRAIN_RETRIES, e
+                            );
+                            if attempt < MAX_DRAIN_RETRIES {
+                                let backoff =
+                                    std::time::Duration::from_secs(2u64.saturating_pow(attempt));
+                                tokio::time::sleep(backoff).await;
+                            }
+                        }
+                    }
+                }
+
+                if !success {
+                    warn!(
+                        "Drain: giving up on transaction {} after {} retries, will be recovered on restart",
+                        next_tx.metadata.transaction_id, MAX_DRAIN_RETRIES
+                    );
+                    break;
+                }
+            }
+        }
+
+        Self::flush_and_persist_on_shutdown(transaction_file_manager, lsn_tracker).await;
+
+        info!("Consumer: Shutdown complete, position persisted");
+        shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
     }
 
     /// Process all transactions in the commit queue in commit_lsn order.
@@ -1251,20 +1291,9 @@ impl CdcClient {
             handler.close().await?;
         }
 
-        // Shutdown LSN tracker to persist final state
-        info!("Shutting down LSN tracker and persisting final state");
-        if let Err(e) = self
-            .transaction_file_manager
-            .flush_staged_pending_progress()
-            .await
-        {
-            warn!(
-                "Failed to flush staged pending progress during shutdown: {}",
-                e
-            );
-        }
-
-        // Shutdown LSN tracker, which includes a final state persistence.
+        // Final safety-net persist (drain_and_shutdown already persisted, but
+        // shutdown_async is idempotent and ensures state is written even if
+        // the consumer exited without draining)
         self.lsn_tracker.shutdown_async().await;
 
         // Log final state after shutdown

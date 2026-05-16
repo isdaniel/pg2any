@@ -106,18 +106,16 @@ audit:
 	cargo audit
 
 format:
-	cargo fmt
-
-fmt-check:
+	cargo fmt --all
 	cargo fmt --all -- --check
-
+	
 run:
 	cargo run
 
 doc-check:
 	cargo doc --no-deps --all-features
 
-before-git-push: check build fmt-check format audit test doc-check
+before-git-push: check build format audit test doc-check
 
 # Docker commands
 docker-build:

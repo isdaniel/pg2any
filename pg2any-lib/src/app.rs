@@ -170,25 +170,28 @@ impl CdcApp {
 
         let shutdown_handler = setup_shutdown_handler(self.client.cancellation_token());
 
-        tokio::select! {
+        let replication_error = tokio::select! {
             result = self.client.start_replication_from_lsn(start_lsn) => {
                 match result {
-                    Ok(()) => {
-                        info!("CDC replication completed successfully");
-                        Ok(())
-                    }
+                    Ok(()) => None,
                     Err(e) => {
                         tracing::error!("CDC replication failed: {}", e);
-                        Err(e)
+                        Some(e)
                     }
                 }
             }
             _ = shutdown_handler => {
                 info!("Shutdown signal received, stopping CDC replication gracefully");
-                self.client.stop().await?;
-                info!("CDC replication stopped successfully");
-                Ok(())
+                None
             }
+        };
+
+        self.client.stop().await?;
+        info!("CDC replication stopped successfully");
+
+        match replication_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 }

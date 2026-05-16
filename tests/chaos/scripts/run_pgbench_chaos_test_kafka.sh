@@ -7,7 +7,7 @@
 # Verification uses kafkacat/kcat to count Kafka insert events vs PostgreSQL source row count.
 #
 
-set -e
+set -eo pipefail
 
 # Load safe environment variables from .env file if it exists
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,6 +150,11 @@ stop_chaos_and_stabilize() {
         wait "$CHAOS_SCRIPT_PID" 2>/dev/null || true
         CHAOS_SCRIPT_PID=""
     fi
+
+    # Kill any pending docker stop commands targeting the CDC container
+    # (chaos script's docker stop --time 120 continues running even after the script is killed)
+    pkill -f "docker stop.*${CONTAINER_NAME}" 2>/dev/null || true
+    sleep 2
 
     log_info "Ensuring CDC container is running and stable..."
     if ! wait_for_container_running "$CONTAINER_NAME" 120; then
@@ -435,13 +440,15 @@ main() {
         else
             log_warning "Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
 
-            # Stall detection: if count unchanged for 5 consecutive retries, CDC is likely dead
+            # Stall detection: if count unchanged for 8 consecutive retries, CDC is likely dead
+            # (8 × 45s = 360s tolerance for container restart + WAL replay after chaos stops)
+            # Skip stall detection when count is 0 — transaction may still be in producer phase
             local current_count
-            current_count=$(get_kafka_insert_count)
-            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+            current_count=$(get_kafka_offset_count)
+            if [ "$current_count" -gt 0 ] && [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
                 stall_count=$((stall_count + 1))
-                if [ $stall_count -ge 5 ]; then
-                    log_error "Replication stalled at $current_count for 5 consecutive retries — CDC likely dead or stuck"
+                if [ $stall_count -ge 8 ]; then
+                    log_error "Replication stalled at $current_count for 8 consecutive retries — CDC likely dead or stuck"
                     log_error "Check CDC application logs for errors"
                     break
                 fi

@@ -8,7 +8,7 @@
 # Between scenarios, the Kafka topic is deleted for clean state.
 #
 
-set -e
+set -eo pipefail
 
 # Load safe environment variables from .env file if it exists
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -271,9 +271,10 @@ run_scenario() {
 
             # Stall detection: if count unchanged for 5 consecutive retries, CDC is likely dead
             # (5 × 45s = 225s tolerance accounts for Docker restart cycle + large transaction replay)
+            # Skip stall detection when count is 0 — transaction may still be in producer phase
             local current_count
-            current_count=$(get_kafka_insert_count)
-            if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
+            current_count=$(get_kafka_offset_count)
+            if [ "$current_count" -gt 0 ] && [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
                 stall_count=$((stall_count + 1))
                 if [ $stall_count -ge 5 ]; then
                     log_error "Scenario $scenario_num stalled at $current_count inserts for 5 retries — CDC likely dead"

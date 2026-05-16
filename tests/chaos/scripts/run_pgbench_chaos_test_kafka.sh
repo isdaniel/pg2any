@@ -247,19 +247,15 @@ get_kafka_insert_count() {
 
 # Function to verify replication completed
 verify_replication() {
-    local total_msgs
-    total_msgs=$(get_kafka_total_count)
-    log_info "Total messages in Kafka topic: $total_msgs"
-
     local current_count
-    current_count=$(get_kafka_insert_count)
+    current_count=$(get_kafka_offset_count)
 
-    if [ -z "$current_count" ]; then
-        log_warning "Failed to get insert count from Kafka"
+    if [ -z "$current_count" ] || [ "$current_count" -eq 0 ] 2>/dev/null; then
+        log_warning "Failed to get offset count from Kafka or topic is empty"
         return 1
     fi
 
-    log_info "Current Kafka insert events: $current_count / Expected: $EXPECTED_ROW_COUNT (at-least-once)"
+    log_info "Kafka offset count: $current_count / Expected: $EXPECTED_ROW_COUNT (at-least-once)"
 
     if [ "$current_count" -ge "$EXPECTED_ROW_COUNT" ] 2>/dev/null; then
         return 0

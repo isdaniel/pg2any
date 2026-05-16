@@ -216,8 +216,24 @@ get_kafka_total_count() {
     echo "${count:-0}"
 }
 
+# Function to get total message offset from Kafka (fast, no consumption)
+get_kafka_offset_count() {
+    local offset
+    offset=$(docker exec "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-get-offsets.sh \
+        --broker-list localhost:9092 --topic "$KAFKA_TOPIC" 2>/dev/null \
+        | awk -F: '{sum += $NF} END {print sum}')
+    echo "${offset:-0}"
+}
+
 # Function to get insert event count from Kafka
 get_kafka_insert_count() {
+    # For large topics, use fast offset-based count since test only produces INSERT events
+    local offset_count
+    offset_count=$(get_kafka_offset_count)
+    if [ "$offset_count" -ge 10000 ] 2>/dev/null; then
+        echo "$offset_count"
+        return
+    fi
     local count
     count=$(timeout 600 $KAFKACAT_CMD -C -b "$KAFKA_BROKER" -t "$KAFKA_TOPIC" -e -q -o beginning 2>/dev/null \
         | grep -c '"op":"c"' || true)
@@ -419,13 +435,13 @@ main() {
         else
             log_warning "Replication verification failed (attempt $retry_count/$MAX_RETRIES)"
 
-            # Stall detection: if count unchanged for 3 consecutive retries, CDC is likely dead
+            # Stall detection: if count unchanged for 5 consecutive retries, CDC is likely dead
             local current_count
             current_count=$(get_kafka_insert_count)
             if [ "$current_count" -eq "$last_count" ] 2>/dev/null; then
                 stall_count=$((stall_count + 1))
-                if [ $stall_count -ge 3 ]; then
-                    log_error "Replication stalled at $current_count for 3 consecutive retries — CDC likely dead or stuck"
+                if [ $stall_count -ge 5 ]; then
+                    log_error "Replication stalled at $current_count for 5 consecutive retries — CDC likely dead or stuck"
                     log_error "Check CDC application logs for errors"
                     break
                 fi

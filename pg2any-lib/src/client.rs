@@ -1091,9 +1091,8 @@ impl CdcClient {
 
     /// Drain remaining channel messages and process all queued transactions before shutdown.
     ///
-    /// Uses a fresh CancellationToken (never cancelled) so that transaction processing
-    /// completes fully during the drain phase. This ensures the final LSN position
-    /// reflects all applied transactions, preventing duplicate replay on restart.
+    /// Single-pass drain: process each queued transaction once. On failure, skip and
+    /// let the next restart recover from the persisted position.
     async fn drain_and_shutdown(
         commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
         commit_receiver: &mut mpsc::Receiver<PendingTransactionFile>,
@@ -1104,7 +1103,6 @@ impl CdcClient {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
-        // Drain any remaining notifications from the channel
         while let Ok(notification) = commit_receiver.try_recv() {
             commit_queue.push(std::cmp::Reverse(notification));
         }
@@ -1116,51 +1114,29 @@ impl CdcClient {
             );
 
             let drain_token = CancellationToken::new();
-            const MAX_DRAIN_RETRIES: u32 = 3;
 
             while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-                let mut attempt = 0u32;
-                let mut success = false;
-
-                while attempt < MAX_DRAIN_RETRIES {
-                    attempt += 1;
-                    match transaction_file_manager
-                        .clone()
-                        .process_transaction_file(
-                            &next_tx,
-                            destination_handler,
-                            &drain_token,
-                            lsn_tracker,
-                            metrics_collector,
-                            batch_size,
-                            shared_lsn_feedback,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            success = true;
-                            break;
-                        }
-                        Err(e) => {
-                            error!(
-                                "Drain: failed to process transaction {} (attempt {}/{}): {}",
-                                next_tx.metadata.transaction_id, attempt, MAX_DRAIN_RETRIES, e
-                            );
-                            if attempt < MAX_DRAIN_RETRIES {
-                                let backoff =
-                                    std::time::Duration::from_secs(2u64.saturating_pow(attempt));
-                                tokio::time::sleep(backoff).await;
-                            }
-                        }
+                match transaction_file_manager
+                    .clone()
+                    .process_transaction_file(
+                        &next_tx,
+                        destination_handler,
+                        &drain_token,
+                        lsn_tracker,
+                        metrics_collector,
+                        batch_size,
+                        shared_lsn_feedback,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!(
+                            "Drain: transaction {} failed: {}, will be recovered on restart",
+                            next_tx.metadata.transaction_id, e
+                        );
+                        break;
                     }
-                }
-
-                if !success {
-                    warn!(
-                        "Drain: giving up on transaction {} after {} retries, will be recovered on restart",
-                        next_tx.metadata.transaction_id, MAX_DRAIN_RETRIES
-                    );
-                    break;
                 }
             }
         }

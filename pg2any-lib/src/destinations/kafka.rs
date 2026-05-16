@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_TOPIC_PREFIX: &str = "pg2any";
 const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
-const DELIVERY_FUTURE_TIMEOUT: Duration = Duration::from_secs(60);
+const DELIVERY_FUTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct KafkaDestination {
@@ -27,6 +27,9 @@ pub struct KafkaDestination {
     key_columns_config: HashMap<String, Vec<String>>,
     field_schema_cache: HashMap<String, Value>,
     topic_cache: HashMap<String, String>,
+    /// Cached key columns from Update/Delete events, used as fallback for Insert events
+    /// that don't carry key_columns in the replication protocol.
+    stream_key_columns: HashMap<String, Vec<Arc<str>>>,
 }
 
 impl KafkaDestination {
@@ -39,6 +42,7 @@ impl KafkaDestination {
             key_columns_config: HashMap::new(),
             field_schema_cache: HashMap::new(),
             topic_cache: HashMap::new(),
+            stream_key_columns: HashMap::new(),
         }
     }
 
@@ -120,10 +124,11 @@ impl KafkaDestination {
         table_key: &str,
         data: &pg_walstream::RowData,
     ) -> Result<Option<String>> {
-        let key_cols = self.key_columns_config.get(table_key);
-
-        let key_column_names: Vec<&str> = if let Some(cols) = key_cols {
+        let key_column_names: Vec<&str> = if let Some(cols) = self.key_columns_config.get(table_key)
+        {
             cols.iter().map(|s| s.as_str()).collect()
+        } else if let Some(stream_cols) = self.stream_key_columns.get(table_key) {
+            stream_cols.iter().map(|c| c.as_ref()).collect()
         } else {
             return Ok(None);
         };
@@ -312,9 +317,9 @@ impl KafkaDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("Kafka producer not initialized"))?;
 
-        const MAX_RETRIES: u32 = 10;
+        const MAX_RETRIES: u32 = 5;
         const BASE_DELAY_MS: u64 = 100;
-        const MAX_DELAY_MS: u64 = 10_000;
+        const MAX_DELAY_MS: u64 = 3_000;
 
         for attempt in 0..MAX_RETRIES {
             let mut record = FutureRecord::to(topic).payload(value);
@@ -358,9 +363,7 @@ impl KafkaDestination {
             match result {
                 Ok(Ok(Ok(_))) => {}
                 Ok(Ok(Err((err, _)))) => {
-                    return Err(CdcError::generic(format!(
-                        "Kafka message delivery failed: {err}"
-                    )));
+                    return Err(CdcError::Kafka(err));
                 }
                 Ok(Err(_cancelled)) => {
                     return Err(CdcError::generic("Kafka delivery future cancelled"));
@@ -550,6 +553,11 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
+                    if !key_columns.is_empty() {
+                        self.stream_key_columns
+                            .entry(source_table_key.clone())
+                            .or_insert_with(|| key_columns.clone());
+                    }
                     let topic = self.topic_name(&mapped_schema, table).to_owned();
                     let before_fields = old_data
                         .as_ref()
@@ -593,6 +601,11 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
+                    if !key_columns.is_empty() {
+                        self.stream_key_columns
+                            .entry(source_table_key.clone())
+                            .or_insert_with(|| key_columns.clone());
+                    }
                     let topic = self.topic_name(&mapped_schema, table).to_owned();
                     let before_fields =
                         Some(self.get_or_build_field_schema(&source_table_key, old_data));
@@ -669,8 +682,7 @@ impl DestinationHandler for KafkaDestination {
                 "Flushing Kafka producer (timeout {:?})...",
                 DEFAULT_FLUSH_TIMEOUT
             );
-            let timeout = DEFAULT_FLUSH_TIMEOUT;
-            let result = tokio::task::spawn_blocking(move || producer.flush(timeout))
+            let result = tokio::task::spawn_blocking(move || producer.flush(DEFAULT_FLUSH_TIMEOUT))
                 .await
                 .map_err(|e| CdcError::generic(format!("Kafka flush task panicked: {e}")))?;
             match result {

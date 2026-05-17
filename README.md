@@ -308,7 +308,7 @@ metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 | serde / serde_json | Serialization |
 | prometheus | Metrics collection |
 | thiserror | Error handling |
-| flate2 / async-compression | SQL file compression |
+| `flate2` / `async-compression` | SQL file compression |
 
 ## License
 

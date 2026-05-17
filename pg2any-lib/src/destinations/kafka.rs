@@ -30,6 +30,12 @@ pub struct KafkaDestination {
     /// Cached key columns from Update/Delete events, used as fallback for Insert events
     /// that don't carry key_columns in the replication protocol.
     stream_key_columns: HashMap<String, Vec<Arc<str>>>,
+    /// Cached per-table key schema name ("{prefix}.{schema}.{table}.Key")
+    key_schema_name_cache: HashMap<String, String>,
+    /// Cached per-table envelope schema name ("{prefix}.{schema}.{table}.Envelope")
+    envelope_schema_name_cache: HashMap<String, String>,
+    /// Cached static source schema fields (constant across all events)
+    source_schema_fields: Value,
 }
 
 impl KafkaDestination {
@@ -43,7 +49,38 @@ impl KafkaDestination {
             field_schema_cache: HashMap::new(),
             topic_cache: HashMap::new(),
             stream_key_columns: HashMap::new(),
+            key_schema_name_cache: HashMap::new(),
+            envelope_schema_name_cache: HashMap::new(),
+            source_schema_fields: Self::build_source_schema_fields(),
         }
+    }
+
+    fn build_source_schema_fields() -> Value {
+        json!({"type": "struct", "fields": [
+            {"type": "string", "optional": false, "field": "version"},
+            {"type": "string", "optional": false, "field": "connector"},
+            {"type": "string", "optional": false, "field": "name"},
+            {"type": "int64", "optional": false, "field": "ts_ms"},
+            {"type": "string", "optional": false, "field": "db"},
+            {"type": "string", "optional": true, "field": "schema"},
+            {"type": "string", "optional": false, "field": "table"},
+            {"type": "int64", "optional": true, "field": "txId"},
+            {"type": "int64", "optional": true, "field": "lsn"}
+        ], "optional": false, "field": "source"})
+    }
+
+    fn get_key_schema_name(&mut self, schema: &str, table: &str) -> &str {
+        let cache_key = format!("{}.{}", schema, table);
+        self.key_schema_name_cache
+            .entry(cache_key)
+            .or_insert_with_key(|_| format!("{}.{}.{}.Key", self.topic_prefix, schema, table))
+    }
+
+    fn get_envelope_schema_name(&mut self, schema: &str, table: &str) -> &str {
+        let cache_key = format!("{}.{}", schema, table);
+        self.envelope_schema_name_cache
+            .entry(cache_key)
+            .or_insert_with_key(|_| format!("{}.{}.{}.Envelope", self.topic_prefix, schema, table))
     }
 
     fn topic_name(&mut self, schema: &str, table: &str) -> &str {
@@ -118,7 +155,7 @@ impl KafkaDestination {
     }
 
     fn build_key_for_insert(
-        &self,
+        &mut self,
         schema: &str,
         table: &str,
         table_key: &str,
@@ -151,12 +188,13 @@ impl KafkaDestination {
             return Ok(None);
         }
 
+        let key_schema_name = self.get_key_schema_name(schema, table).to_owned();
         let key = json!({
             "schema": {
                 "type": "struct",
                 "fields": fields,
                 "optional": false,
-                "name": format!("{}.{}.{}.Key", self.topic_prefix, schema, table)
+                "name": key_schema_name
             },
             "payload": Value::Object(payload)
         });
@@ -188,7 +226,7 @@ impl KafkaDestination {
     }
 
     fn build_change_envelope(
-        &self,
+        &mut self,
         op: &str,
         schema: &str,
         table: &str,
@@ -201,6 +239,7 @@ impl KafkaDestination {
         lsn: Option<Lsn>,
     ) -> Value {
         let source = self.build_source_block(schema, table, transaction_id, commit_timestamp, lsn);
+        let envelope_name = self.get_envelope_schema_name(schema, table).to_owned();
 
         let unified_fields = after_fields
             .as_ref()
@@ -227,22 +266,12 @@ impl KafkaDestination {
                 "fields": [
                     before_schema,
                     after_schema,
-                    {"type": "struct", "fields": [
-                        {"type": "string", "optional": false, "field": "version"},
-                        {"type": "string", "optional": false, "field": "connector"},
-                        {"type": "string", "optional": false, "field": "name"},
-                        {"type": "int64", "optional": false, "field": "ts_ms"},
-                        {"type": "string", "optional": false, "field": "db"},
-                        {"type": "string", "optional": true, "field": "schema"},
-                        {"type": "string", "optional": false, "field": "table"},
-                        {"type": "int64", "optional": true, "field": "txId"},
-                        {"type": "int64", "optional": true, "field": "lsn"}
-                    ], "optional": false, "field": "source"},
+                    self.source_schema_fields,
                     {"type": "string", "optional": false, "field": "op"},
                     {"type": "int64", "optional": true, "field": "ts_ms"}
                 ],
                 "optional": false,
-                "name": format!("{}.{}.{}.Envelope", self.topic_prefix, schema, table)
+                "name": envelope_name
             },
             "payload": {
                 "before": before.unwrap_or(Value::Null),
@@ -255,7 +284,7 @@ impl KafkaDestination {
     }
 
     fn build_key_from_data(
-        &self,
+        &mut self,
         schema: &str,
         table: &str,
         source_table_key: &str,
@@ -291,12 +320,13 @@ impl KafkaDestination {
             return Ok(None);
         }
 
+        let key_schema_name = self.get_key_schema_name(schema, table).to_owned();
         let key = json!({
             "schema": {
                 "type": "struct",
                 "fields": fields,
                 "optional": false,
-                "name": format!("{}.{}.{}.Key", self.topic_prefix, schema, table)
+                "name": key_schema_name
             },
             "payload": Value::Object(payload)
         });
@@ -770,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_build_change_envelope_insert() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let ts = DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -810,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_build_change_envelope_delete() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let ts = Utc::now();
         let before_data = json!({"id": "1", "name": "Alice"});
 
@@ -835,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_build_change_envelope_truncate() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let ts = Utc::now();
 
         let envelope = dest.build_change_envelope(
@@ -858,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_build_key_from_data_with_keys() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let data = RowData::from_pairs(vec![
             ("id", ColumnValue::text("42")),
             ("name", ColumnValue::text("Alice")),
@@ -880,7 +910,7 @@ mod tests {
 
     #[test]
     fn test_build_key_from_data_no_keys() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
         let key_columns: Vec<Arc<str>> = vec![];
 
@@ -892,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_build_key_composite() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let data = RowData::from_pairs(vec![
             ("tenant_id", ColumnValue::text("t1")),
             ("user_id", ColumnValue::text("u1")),
@@ -1020,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_build_key_for_insert_no_config() {
-        let dest = test_destination();
+        let mut dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
 
         let key = dest

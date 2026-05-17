@@ -401,7 +401,7 @@ impl TransactionStorage for CompressedStorage {
 
         if total_lines == 0 {
             let _ = fs::remove_file(&compressed_path).await;
-            return Err(CdcError::generic("No lines to compress"));
+            return Ok((compressed_path, 0));
         }
 
         dest_file

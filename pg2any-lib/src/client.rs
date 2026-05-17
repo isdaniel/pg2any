@@ -948,36 +948,22 @@ impl CdcClient {
             BinaryHeap::new();
 
         // Retry delay for failed transactions (exponential backoff capped at 30s)
-        let mut retry_delay: Option<tokio::time::Sleep> = None;
+        // Stored as an absolute deadline to avoid resetting the timer on each new notification.
+        let mut retry_deadline: Option<tokio::time::Instant> = None;
         let mut retry_count: u32 = 0;
 
         loop {
             // If queue has pending work and we're in retry mode, wait for backoff to expire
             if !commit_queue.is_empty() {
-                if let Some(delay) = retry_delay.take() {
+                if let Some(deadline) = retry_deadline {
+                    let delay = tokio::time::sleep_until(deadline);
                     tokio::pin!(delay);
-                    tokio::select! {
-                        biased;
+                    loop {
+                        tokio::select! {
+                            biased;
 
-                        _ = &mut producer_shutdown_rx => {
-                            info!("Consumer: Received producer shutdown signal during retry wait, persisting position");
-
-                            Self::drain_and_shutdown(
-                                &transaction_file_manager,
-                                &lsn_tracker,
-                                &shared_lsn_feedback,
-                            )
-                            .await;
-                            break;
-                        }
-
-                        // Enqueue new notifications while waiting, but preserve the backoff
-                        result = commit_receiver.recv() => {
-                            if let Some(notification) = result {
-                                commit_queue.push(std::cmp::Reverse(notification));
-                            } else {
-                                warn!("Consumer: mpsc channel closed during retry wait, awaiting producer shutdown signal");
-                                let _ = producer_shutdown_rx.await;
+                            _ = &mut producer_shutdown_rx => {
+                                info!("Consumer: Received producer shutdown signal during retry wait, persisting position");
 
                                 Self::drain_and_shutdown(
                                     &transaction_file_manager,
@@ -985,17 +971,41 @@ impl CdcClient {
                                     &shared_lsn_feedback,
                                 )
                                 .await;
+                                // Use a labeled block to break outer loop
+                                metrics_collector.update_destination_connection_status(&destination_type, false);
+                                info!("Consumer stopped gracefully");
                                 return Ok(());
                             }
-                            // Restore backoff — do NOT process queue until delay expires
-                            retry_delay = Some(Self::schedule_retry_backoff(retry_count));
-                            continue;
-                        }
 
-                        _ = delay => {
-                            // Retry timer expired, fall through to process queue below
+                            // Enqueue new notifications while waiting, but do NOT reset the timer
+                            result = commit_receiver.recv() => {
+                                if let Some(notification) = result {
+                                    commit_queue.push(std::cmp::Reverse(notification));
+                                    // Continue waiting for deadline — do NOT restart backoff
+                                    continue;
+                                } else {
+                                    warn!("Consumer: mpsc channel closed during retry wait, awaiting producer shutdown signal");
+                                    let _ = producer_shutdown_rx.await;
+
+                                    Self::drain_and_shutdown(
+                                        &transaction_file_manager,
+                                        &lsn_tracker,
+                                        &shared_lsn_feedback,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            }
+
+                            _ = &mut delay => {
+                                // Retry timer expired, fall through to process queue
+                                break;
+                            }
                         }
                     }
+
+                    // Clear deadline before processing
+                    retry_deadline = None;
 
                     // Backoff expired — process queue
                     Self::process_commit_queue(
@@ -1007,7 +1017,7 @@ impl CdcClient {
                         &metrics_collector,
                         batch_size,
                         &shared_lsn_feedback,
-                        &mut retry_delay,
+                        &mut retry_deadline,
                         &mut retry_count,
                     )
                     .await;
@@ -1054,7 +1064,7 @@ impl CdcClient {
                                 &metrics_collector,
                                 batch_size,
                                 &shared_lsn_feedback,
-                                &mut retry_delay,
+                                &mut retry_deadline,
                                 &mut retry_count,
                             )
                             .await;
@@ -1117,7 +1127,7 @@ impl CdcClient {
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-        retry_delay: &mut Option<tokio::time::Sleep>,
+        retry_deadline: &mut Option<tokio::time::Instant>,
         retry_count: &mut u32,
     ) -> bool {
         while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
@@ -1155,13 +1165,15 @@ impl CdcClient {
                 metrics_collector.record_error("transaction_file_processing_failed", "consumer");
                 commit_queue.push(std::cmp::Reverse(next_tx));
 
-                // Set retry delay with exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap)
+                // Set retry deadline with exponential backoff (2s, 4s, 8s, 16s, 30s cap)
                 *retry_count = retry_count.saturating_add(1);
-                let next_backoff = Self::schedule_retry_backoff(*retry_count);
-                *retry_delay = Some(next_backoff);
+                let backoff_secs = 2u64.saturating_pow(*retry_count).min(30);
+                *retry_deadline = Some(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+                );
                 info!(
                     "Consumer: scheduling retry in {}s for {} queued transaction(s)",
-                    2u64.saturating_pow(*retry_count).min(30),
+                    backoff_secs,
                     commit_queue.len()
                 );
                 break;
@@ -1170,16 +1182,10 @@ impl CdcClient {
 
         // Clear retry state on success (queue fully drained)
         if commit_queue.is_empty() {
-            *retry_delay = None;
+            *retry_deadline = None;
             *retry_count = 0;
         }
         false
-    }
-
-    #[inline]
-    fn schedule_retry_backoff(retry_count: u32) -> tokio::time::Sleep {
-        let secs = 2u64.saturating_pow(retry_count).min(30);
-        tokio::time::sleep(std::time::Duration::from_secs(secs))
     }
 
     #[inline]

@@ -178,7 +178,6 @@ impl CdcApp {
         // The replication future observes the cancellation token internally and exits cleanly after flushing any in-progress batch metadata.
         let replication_result = self.client.start_replication_from_lsn(start_lsn).await;
 
-
         self.client.stop().await?;
         info!("CDC replication stopped successfully");
 
@@ -188,7 +187,7 @@ impl CdcApp {
             Err(e) => {
                 tracing::error!("CDC replication failed: {}", e);
                 Err(e)
-            },
+            }
         }
     }
 }

@@ -3,205 +3,115 @@
 [![Crates.io Total Downloads](https://img.shields.io/crates/d/pg2any_lib)](https://crates.io/crates/pg2any_lib)
 [![docs.rs](https://img.shields.io/docsrs/pg2any_lib)](https://docs.rs/pg2any-lib)
 
-# PostgreSQL to Any Database Replication (pg2any) 
+# pg2any
 
-A high-performance, production-ready PostgreSQL to Any database replication tool using Change Data Capture (CDC) with logical replication. This tool streams database changes in real-time from PostgreSQL to target databases such as MySQL and SQL Server with comprehensive error handling and monitoring.
+A high-performance PostgreSQL Change Data Capture (CDC) tool that streams database changes in real-time to multiple destination databases via logical replication.
 
-## Project Status
+## Supported Destinations
 
-This is a **fully functional CDC implementation** providing enterprise-grade PostgreSQL to Any database replication using logical replication production-ready features.
+| Destination | Driver | Feature Flag |
+|-------------|--------|--------------|
+| MySQL | SQLx | `mysql` (default) |
+| SQL Server | Tiberius (TDS) | `sqlserver` (default) |
+| SQLite | SQLx | `sqlite` (default) |
+| Kafka | rdkafka (librdkafka) | `kafka` |
 
-**Current Status**: Production-ready CDC tool with complete PostgreSQL logical replication protocol implementation, and real-time change streaming capabilities with graceful shutdown and LSN persistence.
+## Key Features
 
-### What's Implemented
+- **Crash-safe persistence** - File-based producer-consumer with automatic crash recovery
+- **Resumable processing** - Restart from the exact position within large transaction files
+- **Streaming transactions** - Handles PostgreSQL protocol v2+ in-progress transaction streaming
+- **SQL compression** - Optional gzip compression for transaction files with streaming decompression
+- **Schema mapping** - Configurable PostgreSQL schema to destination database/schema translation
+- **Prometheus metrics** - Built-in HTTP metrics endpoint (feature: `metrics`)
+- **Graceful shutdown** - Coordinated producer-consumer shutdown with LSN persistence
 
-- **Production-Ready Architecture**: File-based producer-consumer with crash recovery
-- **PostgreSQL Logical Replication**: Full protocol implementation with libpq-sys integration
-- **Real-time CDC Pipeline**: Live streaming of INSERT, UPDATE, DELETE, TRUNCATE operations
-- **Crash Recovery**: Automatic recovery from incomplete transactions on restart
-- **Database Destinations**: Complete MySQL, SQL Server, and SQLite implementations
-- **Schema Mapping**: Configurable PostgreSQL schema to destination database name translation
-- **LSN Metadata Tracking**: Flush LSN plus high-level consumer state for recovery; per-transaction resume position is stored in sql_pending_tx/.meta files
-- **Configuration Management**: Environment variables and builder pattern with validation
-- **Docker Development**: Multi-service environment with PostgreSQL, MySQL setup
-- **Development Tooling**: Makefile automation, formatting, linting, and quality checks
-- **Production Logging**: Structured tracing with configurable levels and filtering
+## Quick Start
 
-## Features
+### Prerequisites
 
-- **Async Runtime**: High-performance async/await with Tokio and proper cancellation
-- **PostgreSQL Integration**: Native logical replication with libpq-sys bindings
-- **Multiple Destinations**: MySQL (via SQLx), SQL Server (via Tiberius), and SQLite (via SQLx) support
-- **Transaction Atomicity**: Complete transactions processed atomically with rollback on failure
-- **Streaming Transaction Support**: Handles large transactions with mid-stream batching and buffered I/O
-- **Memory-Efficient SQL Parsing**: Streaming SQL parser with state machine for parsing SQL statements without loading entire files into memory
-- **SQL Compression**: Optional SQL file compression with streaming decompression for reduced disk usage and network transfer
-- **Schema Mapping**: Configurable mapping from PostgreSQL schemas to destination database names
-- **LSN Metadata Tracking**: Flush LSN plus high-level consumer state; per-transaction progress is stored in sql_pending_tx/.meta files
-- **Resumable Processing**: Can restart from exact position within large transaction files, avoiding duplicate execution and minimizing re-processing overhead
-- **Configuration**: Environment variables, builder pattern, and validation
-- **Error Handling**: Comprehensive error types with thiserror and proper propagation
-- **Real-time Streaming**: Live change capture for all DML operations
-- **Production Ready**: Structured logging, graceful shutdown, and resource management
-- **Monitoring & Metrics**: Comprehensive Prometheus metrics and health monitoring
-- **HTTP Metrics Endpoint**: Built-in metrics server on port 8080 with Prometheus format
-- **Development Tools**: Docker environment, Makefile automation, extensive testing
+PostgreSQL with logical replication enabled:
 
-### PostgreSQL Setup
+```sql
+ALTER SYSTEM SET wal_level = logical;
+-- Restart PostgreSQL after this change
 
-1. Enable logical replication in your PostgreSQL configuration:
-   ```sql
-   ALTER SYSTEM SET wal_level = logical;
-   -- Restart PostgreSQL server after this change
-   ```
+CREATE PUBLICATION my_publication FOR ALL TABLES;
+CREATE USER replicator WITH REPLICATION LOGIN PASSWORD 'password';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
+```
 
-2. Create a publication for the tables you want to replicate:
-   ```sql
-   CREATE PUBLICATION my_publication FOR TABLE table1, table2;
-   -- Or for all tables:
-   CREATE PUBLICATION my_publication FOR ALL TABLES;
-   ```
+### Docker
 
-3. Create a user with replication privileges:
-   ```sql
-   CREATE USER replicator WITH REPLICATION LOGIN PASSWORD 'password';
-   GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
-   ```
+```bash
+git clone https://github.com/isdaniel/pg2any
+cd pg2any
+docker-compose up -d
+make build && RUST_LOG=info make run
+```
 
-### Basic Usage
+### As a Library
 
 ```rust
 use pg2any_lib::{load_config_from_env, run_cdc_app};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Main entry point for the CDC application
-/// This function sets up a complete CDC pipeline from PostgreSQL to MySQL/SqlServer/SQLite
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize comprehensive logging
-    init_logging();
-
-    tracing::info!("Starting PostgreSQL CDC Application");
-
-    // Load configuration from environment variables
     let config = load_config_from_env()?;
-
-    // Run the CDC application with graceful shutdown handling
     run_cdc_app(config, None).await?;
-
-    tracing::info!("CDC application stopped");
     Ok(())
 }
+```
 
-/// Initialize comprehensive logging configuration
-///
-/// Sets up structured logging with filtering, thread IDs, and ANSI colors.
-/// The log level can be controlled via the `RUST_LOG` environment variable.
-///
-/// # Default Log Level
-///
-/// If `RUST_LOG` is not set, defaults to:
-/// - `pg2any=debug` - Debug level for our application
-/// - `tokio_postgres=info` - Info level for PostgreSQL client
-/// - `sqlx=info` - Info level for SQL execution
-pub fn init_logging() {
-    // Create a sophisticated logging setup
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("pg2any=debug,tokio_postgres=info,sqlx=info"));
+### Programmatic Configuration
 
-    let fmt_layer = fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_level(true)
-        .with_ansi(true)
-        .compact();
+```rust
+use pg2any_lib::{Config, DestinationType};
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .init();
-
-    tracing::info!("Logging initialized with level filtering");
-}
+let config = Config::builder()
+    .source_connection_string("postgresql://user:pass@localhost:5432/db?replication=database")
+    .destination_type(DestinationType::MySQL)
+    .destination_connection_string("mysql://root:pass@localhost:3306/replica_db")
+    .replication_slot_name("cdc_slot")
+    .publication_name("cdc_pub")
+    .streaming(true)
+    .build()?;
 ```
 
 ## Architecture
 
-### File-Based Transaction Processing Architecture
-
 pg2any uses a **file-based producer-consumer pattern** for reliable, crash-safe transaction processing:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    PostgreSQL Logical Replication                       │
-│                           (WAL Stream)                                  │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │   Producer Task        │
-                    │  (Replication Reader)  │
-                    │                        │
-                    │  - BEGIN: Create files │
-                    │  - Events: Append SQL  │
-                    │  - COMMIT: Move files  │
-                    └────────┬───────────────┘
-                             │
-                             ▼
-        ┌────────────────────────────────────────────┐
-        │      File System (Transaction Store)       │
-        ├────────────────────────────────────────────┤
-        │  sql_data_tx/       SQL data files (.sql)  │
-        │  sql_received_tx/   In-progress (.meta)    │
-        │  sql_pending_tx/    Ready to execute       │
-        └────────┬───────────────────────────────────┘
-                 │
-                 ▼ Notification via channel
-        ┌────────────────────────┐
-        │   Consumer Task        │
-        │  (SQL Executor)        │
-        │                        │
-        │  - Read pending files  │
-        │  - Execute SQL batches │
-        │  - Delete on success   │
-        │  - Update LSN          │
-        └────────┬───────────────┘
-                 │
-                 ▼
-        ┌────────────────────────┐
-        │  Target Database       │
-        │  (MySQL/SqlServer/     │
-        │   SQLite)              │
-        └────────────────────────┘
-
-Key Features:
-- Crash-safe: Transactions persisted to disk before execution
-- Resumable: Can restart from last committed LSN
-- Ordered: Transactions executed in commit order
-- Atomic: All events in a transaction succeed or fail together
+PostgreSQL WAL Stream
+        |
+        v
+  +-----------+       +------------------+       +-----------+
+  | Producer  | ----> | File System      | ----> | Consumer  |
+  | (WAL      |       |                  |       | (SQL      |
+  |  Reader)  |       | sql_data_tx/     |       |  Executor)|
+  |           |       | sql_received_tx/ |       |           |
+  +-----------+       | sql_pending_tx/  |       +-----------+
+                      +------------------+             |
+                                                       v
+                                                 Destination DB
 ```
 
-### Transaction File Structure
+### Transaction Lifecycle
 
-pg2any uses a three-directory structure for reliable transaction processing:
+1. **BEGIN** - Create `.sql` file in `sql_data_tx/` and `.meta` in `sql_received_tx/`
+2. **Events** - Append SQL commands to `.sql` file via buffered writes (8MB buffer)
+3. **COMMIT** - Move `.meta` from `sql_received_tx/` to `sql_pending_tx/`; notify consumer
+4. **Execute** - Consumer reads pending `.meta`, executes SQL from `.sql` in batches
+5. **Cleanup** - Delete both `.meta` and `.sql` files on success; update flush LSN
 
-```
-transaction_files/
-├── sql_data_tx/          # Actual SQL statements (never moved)
-│   └── {txid}_{timestamp}.sql
-├── sql_received_tx/      # In-progress transaction metadata
-│   └── {txid}_{timestamp}.meta
-└── sql_pending_tx/       # Committed, ready for execution
-    └── {txid}_{timestamp}.meta
-```
+### Crash Recovery
 
-**Transaction Lifecycle:**
-1. **BEGIN**: Create `.sql` file in `sql_data_tx/` and `.meta` in `sql_received_tx/`
-2. **Events**: Append SQL commands to `.sql` file (buffered writes)
-3. **COMMIT**: Move `.meta` from `sql_received_tx/` to `sql_pending_tx/`
-4. **Execution**: Consumer reads pending `.meta`, executes SQL from `.sql`
-5. **Success**: Delete both `.meta` and `.sql` files
-6. **Recovery**: Cleanup incomplete transactions from `sql_received_tx/`
+On restart, pg2any:
+- Cleans up incomplete transactions from `sql_received_tx/` (uncommitted)
+- Replays committed transactions from `sql_pending_tx/` (committed but not yet applied)
+- Resumes from `last_executed_command_index` within partially-executed transaction files
+- Starts replication from the persisted `flush_lsn`
 
 ### Workflow Diagrams
 
@@ -218,53 +128,44 @@ sequenceDiagram
     participant LSN as LSN Tracker
 
     Note over PG,LSN: Transaction Processing Flow
-    
+
     PG->>Producer: BEGIN (tx_id: 12345)
     Producer->>FS: Create 12345.sql in sql_data_tx/
     Producer->>FS: Create 12345.meta in sql_received_tx/
-    
+
     PG->>Producer: INSERT event
     Producer->>Producer: Generate SQL
-    Producer->>FS: Append to buffer (64KB)
-    
+    Producer->>FS: Append to buffer (8MB)
+
     PG->>Producer: UPDATE event
     Producer->>Producer: Generate SQL
     Producer->>FS: Append to buffer
-    
+
     PG->>Producer: DELETE event
     Producer->>Producer: Generate SQL
     Producer->>FS: Append to buffer
-    
-    Note over Producer,FS: Buffer reaches 64KB
+
+    Note over Producer,FS: Buffer reaches 8MB
     Producer->>FS: Flush buffer to 12345.sql
-    
-    PG->>Producer: More events...
-    Producer->>FS: Append to buffer
-    
+
     PG->>Producer: COMMIT (LSN: 0/1A2B3C4D)
     Producer->>FS: Flush remaining buffer
     Producer->>FS: Move 12345.meta to sql_pending_tx/
     Producer->>Channel: Send notification
-    Producer->>PG: Send LSN feedback (write_lsn)
-    
+
     Channel->>Consumer: Transaction ready
     Consumer->>FS: Read 12345.meta from sql_pending_tx/
-    Consumer->>FS: Get segment paths from metadata
     Consumer->>FS: Read SQL commands from 12345.sql
-    
-    loop For each SQL batch (100 commands)
+
+    loop For each SQL batch
         Consumer->>Dest: BEGIN TRANSACTION
         Consumer->>Dest: Execute SQL batch
         Consumer->>Dest: COMMIT TRANSACTION
-        Consumer->>FS: Update pending .meta progress (last_executed_command_index)
-        Consumer->>FS: Persist pending .meta progress
+        Consumer->>FS: Update pending .meta progress
     end
-    
-    Consumer->>FS: Delete 12345.meta from sql_pending_tx/
-    Consumer->>FS: Delete 12345.sql from sql_data_tx/
-    Consumer->>LSN: Update flush_lsn (0/1A2B3C4D)
-    Consumer->>LSN: Persist metadata (flush_lsn + consumer summary)
-    Consumer->>PG: Send LSN feedback (flush_lsn, replay_lsn)
+
+    Consumer->>FS: Delete 12345.meta and 12345.sql
+    Consumer->>LSN: Update and persist flush_lsn
 ```
 
 #### Crash Recovery Workflow
@@ -273,518 +174,148 @@ sequenceDiagram
 graph TB
     Crash([System Crash]) --> Restart[Restart pg2any]
     Restart --> LoadMeta[Load LSN Metadata]
-    LoadMeta --> CheckMeta{Metadata<br/>Exists?}
-    
+    LoadMeta --> CheckMeta{Metadata Exists?}
+
     CheckMeta -->|No| StartFresh[Start from Latest]
-    CheckMeta -->|Yes| ParseMeta[Parse JSON Metadata]
-    
-    ParseMeta --> GetLSN[Extract flush_lsn]
-    
+    CheckMeta -->|Yes| GetLSN[Extract flush_lsn]
+
     GetLSN --> CleanReceived[Cleanup sql_received_tx/]
-    
-    CleanReceived --> ScanReceived[Scan sql_received_tx/<br/>for .meta files]
-    ScanReceived --> ForEachReceived{For Each<br/>.meta}
-    
-    ForEachReceived -->|More files| ReadReceivedMeta[Read .meta]
-    ForEachReceived -->|Done| ProcessPending[Process sql_pending_tx/]
-    
-    ReadReceivedMeta --> GetDataFile[Get segment paths]
-    GetDataFile --> DeleteIncomplete[Delete .meta and .sql]
-    DeleteIncomplete --> ForEachReceived
-    
-    ProcessPending --> ScanPending[Scan sql_pending_tx/<br/>for .meta files]
-    ScanPending --> SortByTimestamp[Sort by commit_timestamp]
-    SortByTimestamp --> ForEachPending{For Each<br/>.meta}
-    
-    ForEachPending -->|More files| CheckResumeFile{Has last_executed_command_index?}
+    CleanReceived --> ProcessPending[Process sql_pending_tx/]
+
+    ProcessPending --> SortByTimestamp[Sort by commit_timestamp]
+    SortByTimestamp --> ForEachPending{For Each .meta}
+
+    ForEachPending -->|More files| CheckResume{Has resume index?}
     ForEachPending -->|Done| SetStartLSN[Set start_lsn = flush_lsn]
-    
-    CheckResumeFile -->|Yes| ResumeFromIndex[Read SQL from<br/>last_executed_command_index + 1]
-    CheckResumeFile -->|No| ReadAllCommands[Read All SQL Commands]
-    
-    ResumeFromIndex --> ExecuteRecovery[Execute Remaining Commands]
-    ReadAllCommands --> ExecuteRecovery
-    
-    ExecuteRecovery --> UpdateRecoveryLSN[Update LSN Metadata]
-    UpdateRecoveryLSN --> DeleteRecoveryFiles[Delete .meta and .sql]
-    DeleteRecoveryFiles --> ForEachPending
-    
-    SetStartLSN --> StartReplication[Start Replication from flush_lsn]
+
+    CheckResume -->|Yes| ResumeFromIndex[Resume from last_executed_command_index + 1]
+    CheckResume -->|No| ReadAll[Read All SQL Commands]
+
+    ResumeFromIndex --> Execute[Execute Remaining Commands]
+    ReadAll --> Execute
+
+    Execute --> UpdateLSN[Update LSN Metadata]
+    UpdateLSN --> DeleteFiles[Delete .meta and .sql]
+    DeleteFiles --> ForEachPending
+
+    SetStartLSN --> StartReplication[Start Replication]
     StartFresh --> StartReplication
     StartReplication --> NormalOperation([Normal Operation])
-    
+
     style Crash fill:#ff6b6b
     style NormalOperation fill:#51cf66
     style ResumeFromIndex fill:#ffd43b
 ```
 
-## Supported Destination Databases
-
-### Currently Implemented
-- **MySQL**: Full implementation using SQLx with connection pooling, type mapping, and DML operations
-- **SQL Server**: Native implementation using Tiberius TDS protocol with comprehensive type support
-- **SQLite**: Complete implementation using SQLx with file-based storage and embedded scenarios
-
-## Change Event Types
-
-```rust
-pub enum EventType {
-    Insert,
-    Update, 
-    Delete,
-    Truncate,
-    Begin,       // Transaction begin
-    Commit,      // Transaction commit
-    Relation,    // Table schema information
-    Type,        // Data type information
-    Origin,      // Replication origin
-    Message,     // Custom logical replication message
-}
-```
-
 ## Configuration
 
-pg2any supports comprehensive configuration through environment variables or the `ConfigBuilder` pattern. All configuration can be managed through environment variables for containerized deployments or programmatically using the builder pattern.
+All configuration is via environment variables (ideal for containers) or the `ConfigBuilder` API.
 
-### Environment Variables Mapping Table
+### Required
 
-| Category | Variable | Description | Default Value | Example | Notes |
-|----------|----------|-------------|---------------|---------|-------|
-| **Source PostgreSQL** | | | | | |
-| | `CDC_SOURCE_CONNECTION_STRING` | Complete PostgreSQL connection string | | `postgresql://user:pass@host:port/db?replication=database` | Required for PostgreSQL logical replication |
-| **Destination** | | | | | |
-| | `CDC_DEST_TYPE` | Target database type | `MySQL` | `MySQL`, `SqlServer`, `SQLite` | Case-insensitive |
-| | `CDC_DEST_URI` | **Complete destination connection string** | | See destination-specific examples below | **Primary connection method - replaces individual host/port/user/password variables** |
-| **CDC Settings** | | | | | |
-| | `CDC_REPLICATION_SLOT` | PostgreSQL replication slot | `cdc_slot` | `my_app_slot` | |
-| | `CDC_PUBLICATION` | PostgreSQL publication name | `cdc_pub` | `my_app_publication` | |
-| | `CDC_PROTOCOL_VERSION` | Replication protocol version | `1` | `1` | Integer value |
-| | `CDC_BINARY_FORMAT` | Use binary message format | `false` | `true` | Boolean |
-| | `CDC_STREAMING` | Enable streaming mode | `true` | `false` | Boolean |
-| **Schema Mapping** | | | | | |
-| | `CDC_SCHEMA_MAPPING` | Schema name translation for destination | | `public:cdc_db,myschema:mydb` | Maps PostgreSQL schemas to destination database names |
-| **Timeouts** | | | | | |
-| | `CDC_CONNECTION_TIMEOUT` | Connection timeout (seconds) | `30` | `60` | Integer |
-| | `CDC_QUERY_TIMEOUT` | Query timeout (seconds) | `10` | `30` | Integer |
-| **Performance** | | | | | |
-| | `CDC_BUFFER_SIZE` | Transaction channel capacity between producer and consumer | `500` | `3000`, `6000` | Integer. Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory |
-| | `CDC_TRANSACTION_SEGMENT_SIZE_MB` | Max size in MB per transaction segment | `64` | `128` | Controls when a new segment file is created for large transactions |
-| **SQL data Compression** | | | | | |
-| | `PG2ANY_ENABLE_COMPRESSION` | Enable SQL file compression with streaming decompression | `false` | `true`, `1` | Boolean. Compresses transaction SQL files (.sql.gz) to reduce disk usage and network transfer. Uses gzip with sync points for efficient seeking |
-| **System** | | | | | |
-| | `CDC_LAST_LSN_FILE` | Base path for LSN metadata file (actual file will have `.metadata` extension) | `./pg2any_last_lsn` | `/data/lsn_state` | File stores flush_lsn and high-level consumer state (e.g., pending_file_count). Per-transaction resume position is stored in sql_pending_tx/.meta files |
-| | `CDC_TRANSACTION_FILE_BASE_PATH` | Base directory for transaction file storage | `./` | `/data/transactions` | Contains sql_data_tx/, sql_received_tx/, sql_pending_tx/ subdirectories |
-| | `RUST_LOG` | Logging level | `pg2any=debug,tokio_postgres=info,sqlx=info` | `info` | Standard Rust logging |
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `CDC_SOURCE_CONNECTION_STRING` | PostgreSQL connection string | `postgresql://user:pass@host:5432/db?replication=database` |
+| `CDC_DEST_TYPE` | Target database type | `MySQL`, `SqlServer`, `SQLite`, `Kafka` |
+| `CDC_DEST_URI` | Destination connection string | See format table below |
 
-### Key Configuration Approach
+### Destination URI Formats
 
- pg2any uses `CDC_DEST_URI` as the primary method for destination database configuration. This uses standard database connection string formats instead of separate host, port, user, and password variables, making configuration simpler and more portable.
+| Database | Format | Example |
+|----------|--------|---------|
+| MySQL | `mysql://user:pass@host:port/db` | `mysql://root:pass@localhost:3306/mydb` |
+| SQL Server | `sqlserver://user:pass@host:port/db` | `sqlserver://sa:pass@localhost:1433/master` |
+| SQLite | File path | `./replica.db` or `/data/replica.db` |
+| Kafka | Broker list | `broker1:9092,broker2:9092` |
+
+### Optional
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CDC_REPLICATION_SLOT` | `cdc_slot` | PostgreSQL replication slot name |
+| `CDC_PUBLICATION` | `cdc_pub` | PostgreSQL publication name |
+| `CDC_PROTOCOL_VERSION` | `1` | Replication protocol version (1-4) |
+| `CDC_STREAMING` | `true` | Stream in-progress transactions (requires protocol v2+) |
+| `CDC_SCHEMA_MAPPING` | | Schema translation, e.g. `public:cdc_db,sales:sales_db` |
+| `CDC_BUFFER_SIZE` | `500` | Transaction channel capacity |
+| `CDC_TRANSACTION_SEGMENT_SIZE_MB` | `64` | Max segment file size in MB |
+| `CDC_CONNECTION_TIMEOUT` | `30` | Connection timeout (seconds) |
+| `CDC_QUERY_TIMEOUT` | `10` | Query timeout (seconds) |
+| `CDC_LAST_LSN_FILE` | `./pg2any_last_lsn` | Base path for LSN metadata file |
+| `CDC_TRANSACTION_FILE_BASE_PATH` | `./` | Base directory for transaction files |
+| `PG2ANY_ENABLE_COMPRESSION` | `false` | Enable gzip compression for SQL files |
+| `RUST_LOG` | `pg2any=debug` | Log level |
+
+## Monitoring
+
+Enable with feature flag `metrics`. Exposes Prometheus-compatible metrics on port 8080.
 
 ```bash
-# Primary configuration method (recommended)
-CDC_DEST_TYPE=MySQL
-CDC_DEST_URI=mysql://user:password@host:port/database
+# Key metrics
+pg2any_events_processed_total
+pg2any_transactions_processed_total
+pg2any_replication_lag_seconds
+pg2any_events_per_second
+pg2any_errors_total
+pg2any_source_connection_status
+pg2any_destination_connection_status
 ```
 
-### Destination Database Environment Configuration
+The Docker Compose setup includes a full observability stack: Prometheus (`:9090`), Node Exporter, PostgreSQL Exporter, and MySQL Exporter with predefined alert rules.
 
-pg2any uses the `CDC_DEST_URI` environment variable as the primary connection method for all destination databases. This simplifies configuration by using connection strings instead of separate host, port, user, and password variables.
+## Development
 
-#### MySQL Destination
 ```bash
-# Source PostgreSQL
-CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
+make build              # Build the application
+make test               # Run full test suite
+make check              # Cargo check + validation
+make format             # Format code with rustfmt
+make before-git-push    # Pre-commit validation
 
-# MySQL Destination - Complete connection string
-CDC_DEST_TYPE=MySQL
-CDC_DEST_URI=mysql://user:password@host:port/database
-
-# Examples:
 # Docker environment
-CDC_DEST_URI=mysql://root:test.123@127.0.0.1:3306/mysql
-# Production environment  
-CDC_DEST_URI=mysql://cdc_user:secure_pass@mysql-prod.company.com:3306/replica_db
+make docker-start       # Start databases + monitoring
+make docker-stop        # Stop all services
 
-# Schema Mapping (maps PostgreSQL schema to MySQL database)
-# Required when PostgreSQL uses "public" schema but MySQL uses a different database name
-CDC_SCHEMA_MAPPING=public:cdc_db
-
-# CDC Configuration
-CDC_REPLICATION_SLOT=cdc_slot
-CDC_PUBLICATION=cdc_pub
+# Chaos & integration tests
+make chaos-test-mysql-full
+make chaos-test-sqlserver-full
+make chaos-test-sqlite-full
+make chaos-test-kafka-full
+make pgbench-test-mysql-full
 ```
 
-#### SQL Server Destination
-```bash
-# Source PostgreSQL
-CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
+## Feature Flags
 
-# SQL Server Destination - Complete connection string
-CDC_DEST_TYPE=SqlServer  
-CDC_DEST_URI=sqlserver://user:password@host:port/database
-
-# Examples:
-# Local SQL Server
-CDC_DEST_URI=sqlserver://sa:MyPass@123@localhost:1433/master
-# Azure SQL Database
-CDC_DEST_URI=sqlserver://user@server:password@server.database.windows.net:1433/mydb
-# Production SQL Server
-CDC_DEST_URI=sqlserver://cdc_user:secure_pass@sqlserver-prod:1433/replica_db
-
-# CDC Configuration
-CDC_REPLICATION_SLOT=cdc_slot
-CDC_PUBLICATION=cdc_pub
+```toml
+[features]
+default = ["mysql", "sqlserver", "sqlite"]
+mysql = ["sqlx/mysql"]
+sqlserver = ["tiberius"]
+sqlite = ["sqlx/sqlite"]
+kafka = ["rdkafka", "futures-util", "base64"]
+metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 ```
-
-#### SQLite Destination
-```bash
-# Source PostgreSQL
-CDC_SOURCE_CONNECTION_STRING=postgresql://postgres:pass.123@127.0.0.1:5432/postgres?replication=database
-
-# SQLite Destination - File path (no authentication needed)
-CDC_DEST_TYPE=SQLite
-CDC_DEST_URI=./path/to/database.db
-
-# Examples:
-# Local development
-CDC_DEST_URI=./my_replica.db
-# Absolute path
-CDC_DEST_URI=/data/cdc/replica.db
-# In-memory (for testing)
-CDC_DEST_URI=:memory:
-
-# CDC Configuration
-CDC_REPLICATION_SLOT=cdc_slot
-CDC_PUBLICATION=cdc_pub
-CDC_STREAMING=true
-```
-
-### Connection String Format Summary
-
-| Database | CDC_DEST_URI Format | Example |
-|----------|---------------------|---------|
-| **MySQL** | `mysql://user:password@host:port/database` | `mysql://root:pass123@localhost:3306/mydb` |
-| **SQL Server** | `sqlserver://user:password@host:port/database` | `sqlserver://sa:pass123@localhost:1433/master` |
-| **SQLite** | `./path/to/file.db` or `/absolute/path/file.db` | `./replica.db` or `/data/replica.db` |
-
-### Schema Mapping Configuration
-
-PostgreSQL uses schemas (e.g., `public`) to organize tables, while MySQL uses databases. When replicating from PostgreSQL to MySQL, you may need to map PostgreSQL schema names to MySQL database names to avoid errors like `Table 'public.t1' doesn't exist`.
-
-The `CDC_SCHEMA_MAPPING` environment variable allows you to configure these mappings:
-
-```bash
-# Format: source_schema:dest_database,source_schema2:dest_database2
-CDC_SCHEMA_MAPPING=public:cdc_db
-
-# Multiple mappings
-CDC_SCHEMA_MAPPING=public:cdc_db,sales:sales_db,hr:hr_db
-```
-
-**Note:** Schema mapping is primarily useful for MySQL and SQL Server destinations. SQLite doesn't use schema namespacing, so mappings are ignored for SQLite destinations.
-
-### SQL Compression Configuration
-
-pg2any supports optional SQL file compression to reduce disk usage and optimize storage for large transactions. When enabled, transaction SQL files are compressed using gzip with sync points, allowing efficient seeking and streaming decompression without loading entire files into memory.
-
-#### Enabling Compression
-
-```bash
-# Enable SQL compression (compresses .sql files to .sql.gz)
-PG2ANY_ENABLE_COMPRESSION=true
-
-# Or use numeric value
-PG2ANY_ENABLE_COMPRESSION=1
-
-# Disable compression (default)
-PG2ANY_ENABLE_COMPRESSION=false
-# Or simply omit the variable
-```
-
-### Performance Tuning
-
-#### Producer-Consumer Architecture
-
-pg2any uses a **single producer-single consumer architecture** optimized for transaction consistency:
-
-- **Single Producer**: Reads from PostgreSQL logical replication stream and pushes events to channel
-- **Single Consumer**: Processes events from channel and writes to destination database
-- **Bounded Channel**: Acts as buffer between producer and consumer for burst traffic handling
-- **Transaction Ordering**: Single consumer ensures strict transaction ordering and consistency
-
-#### Performance Configuration Parameters
-
-**CDC_BUFFER_SIZE** (Transaction Channel Capacity)
-
-The transaction channel capacity determines how many complete transactions can be queued between the producer and consumer:
-- **Smaller capacity** (100-1000): Lower memory usage, better for steady-state workloads
-- **Larger capacity** (3000-6000): Better burst handling, more memory usage
-
-#### Performance Examples
-
-**Low Volume / Low Latency**
-```bash
-CDC_BUFFER_SIZE=100
-```
-
-**Burst Traffic Handling**
-```bash
-CDC_BUFFER_SIZE=6000
-# Best for: Intermittent high-volume bursts
-```
-
-### Programmatic Configuration
-
-You can also configure pg2any programmatically using the builder pattern with connection strings:
-
-```rust
-use pg2any_lib::{Config, DestinationType};
-use std::time::Duration;
-
-// SQLite example
-let sqlite_config = Config::builder()
-    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
-    .destination_type(DestinationType::SQLite)
-    .destination_connection_string("./my_replica.db")
-    .replication_slot_name("cdc_slot")
-    .publication_name("cdc_pub")
-    .protocol_version(2)
-    .binary_format(false)
-    .streaming(true)
-    .build()?;
-
-// MySQL example
-let mysql_config = Config::builder()
-    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
-    .destination_type(DestinationType::MySQL)
-    .destination_connection_string("mysql://root:pass123@localhost:3306/replica_db")
-    .replication_slot_name("cdc_slot")
-    .publication_name("cdc_pub")
-    .connection_timeout(Duration::from_secs(30))
-    .query_timeout(Duration::from_secs(10))
-    .heartbeat_interval(Duration::from_secs(10))
-    .build()?;
-
-// SQL Server example
-let sqlserver_config = Config::builder()
-    .source_connection_string("postgresql://postgres:pass.123@localhost:5432/postgres?replication=database")
-    .destination_type(DestinationType::SqlServer)
-    .destination_connection_string("sqlserver://sa:MyPass@123@localhost:1433/master")
-    .replication_slot_name("cdc_slot")
-    .publication_name("cdc_pub")
-    .build()?;
-```
-
-### Configuration Validation
-
-The configuration system provides comprehensive validation:
-- **Connection Strings**: Automatically formatted and validated
-- **Type Safety**: Proper enum handling for destination types
-- **Default Values**: Sensible defaults for all optional parameters
-- **Error Handling**: Clear error messages for invalid configurations
-
-## Development Status
-
-## Monitoring & Observability
-
-pg2any includes comprehensive monitoring and observability features for production environments:
-
-### Built-in Metrics System
-- **HTTP Metrics Endpoint**: Prometheus-compatible metrics served on port 8080
-- **Real-time Monitoring**: Replication lag, event processing rates, connection status
-- **Resource Tracking**: Memory usage, network I/O, active connections, queue depth
-
-### Key Metrics Available
-
-```prometheus
-# Core Replication Metrics
-pg2any_events_processed_total          # Total CDC events processed
-pg2any_events_by_type_total            # Events by type (insert/update/delete)
-pg2any_transactions_processed_total    # Total transaction batches processed (including sub-batches)
-pg2any_full_transactions_processed_total # Total complete transactions processed (final batches only)
-pg2any_replication_lag_seconds         # Current replication lag
-pg2any_events_per_second               # Event processing rate
-pg2any_last_processed_lsn              # Last processed LSN from PostgreSQL WAL
-
-# Health & Error Metrics
-pg2any_errors_total                    # Total errors by type and component
-pg2any_source_connection_status        # PostgreSQL connection status
-pg2any_destination_connection_status   # Destination database connection status
-
-# Performance Metrics
-pg2any_event_processing_duration_seconds # Event processing time
-pg2any_queue_depth                     # Events waiting to be processed
-pg2any_network_bytes_received_total    # Network I/O from PostgreSQL
-pg2any_buffer_memory_usage_bytes       # Memory usage for event buffers
-```
-
-### Complete Monitoring Stack
-The Docker environment includes a full observability stack:
-
-- **Prometheus**: Metrics collection and storage (port 9090)
-- **Node Exporter**: System metrics (port 9100)
-- **PostgreSQL Exporter**: Database metrics (port 9187)
-- **MySQL Exporter**: Destination database metrics (port 9104)
-- **Alert Rules**: Predefined alerts for lag, errors, and connection issues
-
-## Quick Start with Docker
-
-Get up and running in minutes with the complete development environment including monitoring:
-
-```bash
-# Clone the repository
-git clone https://github.com/isdaniel/pg2any
-cd pg2any
-
-# Start the complete environment (databases + monitoring)
-docker-compose up -d
-
-# Build the application
-make build
-
-# Run the CDC application with monitoring
-RUST_LOG=info make run
-
-# Access monitoring dashboards
-open http://localhost:9090   # Prometheus metrics
-open http://localhost:8080/metrics  # Application metrics
-
-# In another terminal, test with sample data
-make test-data     # Insert test data into PostgreSQL
-make show-data     # Verify replication to destination databases
-```
-
-### Available Make Commands
-
-**Development:**
-```bash
-make build         # Build the Rust application
-make check         # Run cargo check and validation
-make test          # Run the full test suite (104+ tests)
-make format        # Format code with rustfmt
-make run           # Run the CDC application locally
-```
-
-**Docker Management:**
-```bash
-make docker-start  # Start databases and monitoring stack
-make docker-stop   # Stop all services
-make docker-logs   # View application logs
-make docker-status # Check service status
-```
-
-## Local Development
-
-For development without Docker (requires manual database setup):
-
-```bash
-# Build and validate the project
-make build             # Compile the application
-make check             # Run code quality checks
-make test              # Execute full test suite
-make format            # Format code with rustfmt
-
-# Run the application (requires PostgreSQL and destination DB)
-RUST_LOG=info make run
-
-# Development workflow
-make dev-setup         # Complete development setup
-make before-git-push   # Pre-commit validation
-```
-
-## Feature Configuration
-
-pg2any supports feature flags to enable or disable optional functionality, allowing you to build a lighter binary when certain features aren't needed.
 
 ## Dependencies
 
-### Core Runtime
-- **tokio** (1.47.1): Async runtime with full feature set
-- **hyper** (1.x): HTTP server for metrics endpoint
-- **prometheus** (0.13): Metrics collection and Prometheus integration
-- **tokio-util** (0.7.16): Utilities for async operations and cancellation
+| Crate | Purpose |
+|-------|---------|
+| [pg_walstream](https://crates.io/crates/pg_walstream) | PostgreSQL logical replication protocol |
+| tokio | Async runtime |
+| sqlx | MySQL + SQLite async driver |
+| tiberius | SQL Server TDS protocol |
+| rdkafka | Kafka producer (librdkafka wrapper) |
+| serde / serde_json | Serialization |
+| prometheus | Metrics collection |
+| thiserror | Error handling |
+| flate2 / async-compression | SQL file compression |
 
-### PostgreSQL Logical Replication
-- **pg_walstream** : Low-level PostgreSQL logical replication protocol implementation
-  - GitHub: [isdaniel/pg-walstream](https://github.com/isdaniel/pg-walstream)
-  - Crates.io: [pg_walstream](https://crates.io/crates/pg_walstream)
-  - Handles WAL stream parsing, protocol messages, and replication connection management
-  - Provides buffer operations, retry logic, and thread-safe LSN tracking
-  - Supports PostgreSQL logical replication protocol versions 1-4
-  - Zero-copy operations with efficient buffer management using `bytes` crate
-  - Built-in connection management with exponential backoff retry logic
-  - Extracted from pg2any-lib for reusability in other projects
+## License
 
-### Database Clients
-- **sqlx** (0.8.6): MySQL and SQLite async client with runtime-tokio-rustls
-- **tiberius** (0.12): Native SQL Server TDS protocol implementation
-
-### Serialization & Data
-- **serde** (1.0.219): Serialization framework with derive support
-- **serde_json** (1.0.142): JSON serialization
-- **chrono** (0.4.41): Date/time handling with serde support
-- **bytes** (1.10.1): Byte buffer manipulation
-
-### Error Handling & Utilities
-- **thiserror** (2.0.12): Ergonomic error handling and propagation
-- **async-trait** (0.1.88): Async trait definitions
-- **tracing** (0.1.41): Structured logging and instrumentation
-- **tracing-subscriber** (0.3.20): Log filtering and formatting
-- **prometheus** (0.13): Metrics collection library
-- **lazy_static** (1.4): Global metrics registry initialization
-
-### Running Tests
-```bash
-make test                    # Run all tests
-cargo test --lib             # Library unit tests only
-cargo test integration       # Integration tests only
-cargo test mysql             # MySQL-specific tests
-```
-
-## Contributing
-
-This project provides **production-ready PostgreSQL CDC replication** with a solid, well-tested foundation that makes contributing straightforward and impactful.
-
-### Getting Started Contributing
-
-```bash
-# Fork and clone the repository
-git clone https://github.com/YOUR_USERNAME/pg2any
-cd pg2any
-
-# Set up development environment
-make dev-setup          # Runs formatting, tests, and builds Docker
-
-# Start development databases
-make docker-start
-
-# Make your changes and validate
-make check              # Code quality checks
-make test               # Run full test suite
-make format             # Format code
-
-# Test end-to-end functionality
-make run                # Test CDC pipeline locally
-```
-
-### Testing Your Changes
-
-```bash
-# Manual testing with real databases
-make docker-start        # Start PostgreSQL and MySQL
-cargo run               # Test end-to-end replication
-make test-data          # Insert test data
-make show-data          # Verify replication worked
-
-set -a; source env/.env_local; set +a
-```
-
----
+Apache-2.0
 
 ## References
 
 - [PostgreSQL Logical Replication Protocol](https://www.postgresql.org/docs/current/protocol-logical-replication.html)
 - [PostgreSQL WAL Internals](https://www.postgresql.org/docs/current/wal-internals.html)
-- [Logical Decoding Output Plugin](https://www.postgresql.org/docs/current/logicaldecoding-output-plugin.html)
-- [Rust Async Book](https://rust-lang.github.io/async-book/)
-- [Tokio Runtime Documentation](https://docs.rs/tokio/latest/tokio/)
+- [pg_walstream](https://github.com/isdaniel/pg-walstream) - Underlying replication library

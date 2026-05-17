@@ -945,6 +945,7 @@ async fn test_sqlite_connection_recovery() {
         .await;
     assert!(process_result2.is_ok());
 
+    pool.close().await;
     let _ = destination.close().await;
 }
 

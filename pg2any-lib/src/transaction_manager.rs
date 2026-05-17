@@ -1083,7 +1083,7 @@ impl TransactionManager {
         // Pre-size: assume ~32 bytes per (column, value) pair + overhead
         let mut sql = String::with_capacity(64 + new_data.len() * 48);
         sql.push_str("INSERT INTO ");
-        self.append_qualified_table(&mut sql, &schema, table);
+        self.append_qualified_table(&mut sql, schema, table);
         sql.push_str(" (");
         for (i, (k, _)) in new_data.iter().enumerate() {
             if i > 0 {
@@ -1117,7 +1117,7 @@ impl TransactionManager {
 
         let mut sql = String::with_capacity(64 + new_data.len() * 64);
         sql.push_str("UPDATE ");
-        self.append_qualified_table(&mut sql, &schema, table);
+        self.append_qualified_table(&mut sql, schema, table);
         sql.push_str(" SET ");
         for (i, (col, val)) in new_data.iter().enumerate() {
             if i > 0 {
@@ -1151,7 +1151,7 @@ impl TransactionManager {
 
         let mut sql = String::with_capacity(64 + key_columns.len() * 32);
         sql.push_str("DELETE FROM ");
-        self.append_qualified_table(&mut sql, &schema, table);
+        self.append_qualified_table(&mut sql, schema, table);
         sql.push_str(" WHERE ");
         self.append_where_clause(
             &mut sql,
@@ -1735,9 +1735,7 @@ impl TransactionManager {
                 )
                 .await;
 
-            if let Err(e) = stream_result {
-                return Err(e);
-            }
+            stream_result?;
         }
 
         if !batch.is_empty() {

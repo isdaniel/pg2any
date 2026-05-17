@@ -1,6 +1,4 @@
 /// Common utilities and traits for destination implementations
-///
-/// This module provides shared functionality for all destination implementations.
 
 /// Execute a batch of SQL commands within a single sqlx transaction with optional pre-commit hook.
 ///

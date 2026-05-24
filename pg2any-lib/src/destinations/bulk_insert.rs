@@ -115,6 +115,12 @@ fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {
 
     while let Some(ch) = chars.next() {
         match ch {
+            '\\' if in_quotes => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
             '\'' if !in_quotes => {
                 in_quotes = true;
                 current.push(ch);
@@ -159,6 +165,20 @@ mod tests {
         assert_eq!(parsed.columns, vec!["`id`", "`name`"]);
         assert_eq!(parsed.rows.len(), 3);
         assert_eq!(parsed.rows[0], vec!["1", "'hello'"]);
+    }
+
+    #[test]
+    fn test_detect_bulk_insert_backslash_escaped_quotes() {
+        let stmts = vec![
+            "INSERT INTO `db`.`t1` (`id`, `name`) VALUES (1, 'it\\'s here');".to_string(),
+            "INSERT INTO `db`.`t1` (`id`, `name`) VALUES (2, 'she\\'s there');".to_string(),
+        ];
+        let result = detect_bulk_insert_batch(&stmts);
+        assert!(result.is_some());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rows[0], vec!["1", "'it\\'s here'"]);
+        assert_eq!(parsed.rows[1], vec!["2", "'she\\'s there'"]);
     }
 
     #[test]

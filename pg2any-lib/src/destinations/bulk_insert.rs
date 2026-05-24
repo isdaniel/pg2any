@@ -62,11 +62,10 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
         return None;
     }
 
-    let upper = trimmed.to_uppercase();
-    let values_pos = upper.find(" VALUES ")?;
+    let values_pos = find_case_insensitive(trimmed, " VALUES ")?;
     let prefix = &trimmed[..values_pos + 8];
 
-    let into_pos = upper.find("INTO ")?;
+    let into_pos = find_case_insensitive(trimmed, "INTO ")?;
     let after_into = &trimmed[into_pos + 5..];
 
     let col_paren_pos = after_into.find('(')?;
@@ -78,6 +77,19 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     let columns: Vec<String> = col_list.split(',').map(|c| c.trim().to_string()).collect();
 
     Some((prefix.to_string(), columns, table))
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_len = needle.len();
+    if haystack.len() < needle_len {
+        return None;
+    }
+    for i in 0..=(haystack.len() - needle_len) {
+        if haystack[i..i + needle_len].eq_ignore_ascii_case(needle) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {

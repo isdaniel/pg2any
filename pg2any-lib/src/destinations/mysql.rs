@@ -3,6 +3,7 @@ use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::coalescing::{coalesce_commands, QuoteStyle};
@@ -10,6 +11,7 @@ use super::coalescing::{coalesce_commands, QuoteStyle};
 pub struct MySQLDestination {
     pool: Option<MySqlPool>,
     bulk_pool: Option<mysql_async::Pool>,
+    infile_data: Arc<Mutex<Option<bytes::Bytes>>>,
     schema_mappings: HashMap<String, String>,
     max_allowed_packet: u64,
     session_tuning_enabled: bool,
@@ -22,6 +24,7 @@ impl MySQLDestination {
         Self {
             pool: None,
             bulk_pool: None,
+            infile_data: Arc::new(Mutex::new(None)),
             schema_mappings: HashMap::new(),
             max_allowed_packet: 67108864,
             session_tuning_enabled: true,
@@ -66,6 +69,27 @@ impl DestinationHandler for MySQLDestination {
         let opts = mysql_async::Opts::from_url(connection_string).map_err(|e| {
             CdcError::generic(format!("Failed to parse MySQL URL for bulk pool: {e}"))
         })?;
+
+        let infile_data = self.infile_data.clone();
+        let opts = mysql_async::OptsBuilder::from_opts(opts).local_infile_handler(Some(
+            move |_file_name: &[u8]| {
+                let data = infile_data.clone();
+                Box::pin(async move {
+                    let bytes = data
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap_or_else(|| bytes::Bytes::new());
+                    let stream =
+                        futures_util::stream::once(async move { Ok::<_, std::io::Error>(bytes) });
+                    Ok(Box::pin(stream) as mysql_async::InfileData)
+                })
+                    as futures_util::future::BoxFuture<
+                        'static,
+                        std::result::Result<mysql_async::InfileData, mysql_async::LocalInfileError>,
+                    >
+            },
+        ));
 
         let bulk_pool = mysql_async::Pool::new(opts);
         self.bulk_pool = Some(bulk_pool);
@@ -250,21 +274,23 @@ impl MySQLDestination {
 
         let col_spec = columns.join(", ");
         let load_sql = format!(
-            "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE {} FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' ({})",
+            "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE {} \
+             FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' ({})",
             table, col_spec
         );
 
-        let result = conn
-            .exec_batch(&load_sql, std::iter::empty::<Vec<mysql_async::Value>>())
-            .await;
+        *self.infile_data.lock().unwrap() = Some(bytes::Bytes::from(tsv_data));
+
+        let result = conn.query_drop(&load_sql).await;
 
         if let Err(e) = result {
-            // LOAD DATA via exec_batch might not be the right API - fall back to query_drop
-            // with a local infile handler. For now, try the simpler approach.
-            debug!("exec_batch failed for LOAD DATA, trying alternative: {e}");
+            debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
+            let _ = conn
+                .query_drop("SET unique_checks=1, foreign_key_checks=1")
+                .await;
             let _ = conn.query_drop("ROLLBACK").await;
+            drop(conn);
 
-            // Fallback: use multi-value INSERT within the existing sqlx transaction
             let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
             return self
                 .execute_sql_batch_with_hook(&[sql], pre_commit_hook)
@@ -366,6 +392,7 @@ mod tests {
         let destination = MySQLDestination::new();
         assert!(destination.pool.is_none());
         assert!(destination.bulk_pool.is_none());
+        assert!(destination.infile_data.lock().unwrap().is_none());
         assert!(!destination.load_data_available);
     }
 

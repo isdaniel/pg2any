@@ -41,6 +41,11 @@ where
     // Execute all commands in the transaction
     for (idx, sql) in commands.iter().enumerate() {
         if let Err(e) = sqlx::query(sql.as_ref()).execute(&mut *tx).await {
+            if session_tuning && db_name == "MySQL" {
+                let _ = sqlx::query("SET unique_checks=1, foreign_key_checks=1")
+                    .execute(&mut *tx)
+                    .await;
+            }
             // Rollback on error
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(

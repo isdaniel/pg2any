@@ -1,5 +1,3 @@
-/// Common utilities and traits for destination implementations
-
 /// Execute a batch of SQL commands within a single sqlx transaction with optional pre-commit hook.
 ///
 /// This is the shared implementation used by both MySQL and SQLite destinations.

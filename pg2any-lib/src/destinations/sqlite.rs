@@ -19,6 +19,7 @@ use tracing::{debug, info};
 pub struct SQLiteDestination {
     pool: Option<SqlitePool>,
     database_path: Option<String>,
+    max_rows_per_insert: usize,
 }
 
 impl SQLiteDestination {
@@ -27,6 +28,7 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
+            max_rows_per_insert: 1000,
         }
     }
 }
@@ -100,6 +102,12 @@ impl DestinationHandler for SQLiteDestination {
     // SQLite does not use schema/database namespacing like MySQL, so schema mappings are not needed
     fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
 
+    fn set_max_rows_per_insert(&mut self, max_rows: usize) {
+        if max_rows > 0 {
+            self.max_rows_per_insert = max_rows;
+        }
+    }
+
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
@@ -118,7 +126,12 @@ impl DestinationHandler for SQLiteDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::DoubleQuote);
+        let coalesced = coalesce_commands(
+            commands,
+            u64::MAX,
+            QuoteStyle::DoubleQuote,
+            self.max_rows_per_insert,
+        );
 
         if coalesced.len() < commands.len() {
             debug!(

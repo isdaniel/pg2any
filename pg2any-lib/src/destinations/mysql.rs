@@ -259,18 +259,19 @@ impl MySQLDestination {
             table
         );
 
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|e| CdcError::generic(format!("MySQL bulk connection failed: {e}")))?;
-
-        conn.query_drop("START TRANSACTION")
+        let mut tx = pool
+            .start_transaction(mysql_async::TxOpts::default())
             .await
             .map_err(|e| CdcError::generic(format!("MySQL START TRANSACTION failed: {e}")))?;
 
-        conn.query_drop("SET unique_checks=0, foreign_key_checks=0")
-            .await
-            .map_err(|e| CdcError::generic(format!("MySQL session tuning failed: {e}")))?;
+        let use_session_tuning =
+            self.session_tuning_enabled && rows.len() >= self.session_tuning_threshold;
+
+        if use_session_tuning {
+            tx.query_drop("SET unique_checks=0, foreign_key_checks=0")
+                .await
+                .map_err(|e| CdcError::generic(format!("MySQL session tuning failed: {e}")))?;
+        }
 
         let col_spec = columns.join(", ");
         let load_sql = format!(
@@ -281,15 +282,16 @@ impl MySQLDestination {
 
         *self.infile_data.lock().unwrap() = Some(bytes::Bytes::from(tsv_data));
 
-        let result = conn.query_drop(&load_sql).await;
+        let result = tx.query_drop(&load_sql).await;
 
         if let Err(e) = result {
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
-            let _ = conn
-                .query_drop("SET unique_checks=1, foreign_key_checks=1")
-                .await;
-            let _ = conn.query_drop("ROLLBACK").await;
-            drop(conn);
+            if use_session_tuning {
+                let _ = tx
+                    .query_drop("SET unique_checks=1, foreign_key_checks=1")
+                    .await;
+            }
+            drop(tx);
 
             let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
             return self
@@ -297,20 +299,22 @@ impl MySQLDestination {
                 .await;
         }
 
-        conn.query_drop("SET unique_checks=1, foreign_key_checks=1")
-            .await
-            .map_err(|e| CdcError::generic(format!("MySQL session restore failed: {e}")))?;
+        if use_session_tuning {
+            tx.query_drop("SET unique_checks=1, foreign_key_checks=1")
+                .await
+                .map_err(|e| CdcError::generic(format!("MySQL session restore failed: {e}")))?;
+        }
 
         if let Some(hook) = pre_commit_hook {
             if let Err(e) = hook().await {
-                let _ = conn.query_drop("ROLLBACK").await;
+                drop(tx);
                 return Err(CdcError::generic(format!(
                     "MySQL bulk insert pre-commit hook failed, rolled back: {e}"
                 )));
             }
         }
 
-        conn.query_drop("COMMIT")
+        tx.commit()
             .await
             .map_err(|e| CdcError::generic(format!("MySQL COMMIT failed after LOAD DATA: {e}")))?;
 

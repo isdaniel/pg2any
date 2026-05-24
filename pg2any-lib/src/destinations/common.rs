@@ -34,9 +34,7 @@ where
             .execute(&mut *tx)
             .await
             .map_err(|e| {
-                crate::error::CdcError::generic(format!(
-                    "{db_name} session tuning SET failed: {e}"
-                ))
+                crate::error::CdcError::generic(format!("{db_name} session tuning SET failed: {e}"))
             })?;
     }
 

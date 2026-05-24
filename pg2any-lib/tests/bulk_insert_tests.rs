@@ -72,13 +72,7 @@ mod bulk_insert_integration {
             "`value`".to_string(),
         ];
         let rows: Vec<Vec<String>> = (0..5)
-            .map(|i| {
-                vec![
-                    i.to_string(),
-                    format!("'name_{}'", i),
-                    "NULL".to_string(),
-                ]
-            })
+            .map(|i| vec![i.to_string(), format!("'name_{}'", i), "NULL".to_string()])
             .collect();
 
         let sql = build_multi_value_insert(table, &columns, &rows);

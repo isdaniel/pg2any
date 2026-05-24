@@ -129,8 +129,14 @@ impl DestinationHandler for SQLiteDestination {
             );
         }
 
-        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite", false)
-            .await
+        super::common::execute_sqlx_batch_with_hook(
+            pool,
+            &coalesced,
+            pre_commit_hook,
+            "SQLite",
+            false,
+        )
+        .await
     }
 
     async fn close(&mut self) -> Result<()> {

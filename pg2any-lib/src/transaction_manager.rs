@@ -263,6 +263,9 @@ pub struct TransactionManager {
     storage: Arc<dyn TransactionStorage>,
     /// When true, stores raw ChangeEvent JSON instead of generated SQL
     event_mode: bool,
+    /// Whether bulk insert optimization is enabled
+    /// Minimum INSERT count to trigger bulk insert path
+    bulk_insert_threshold: usize,
 }
 
 impl TransactionManager {
@@ -301,6 +304,7 @@ impl TransactionManager {
             segment_size_bytes,
             storage,
             event_mode: false,
+            bulk_insert_threshold: 500,
         })
     }
 
@@ -312,6 +316,11 @@ impl TransactionManager {
     /// Enable event-mode: stores raw ChangeEvent JSON instead of generated SQL
     pub fn set_event_mode(&mut self, enabled: bool) {
         self.event_mode = enabled;
+    }
+
+    /// Configure bulk insert optimization parameters
+    pub fn set_bulk_insert_config(&mut self, threshold: usize) {
+        self.bulk_insert_threshold = threshold;
     }
 
     /// Flush all pending buffered writes
@@ -1403,6 +1412,88 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
+    async fn execute_batch_with_bulk_detection(
+        self: &Arc<Self>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metadata_path: &Path,
+        commands: &[String],
+        last_executed_index: usize,
+        batch_idx: usize,
+        metrics_collector: &Arc<MetricsCollector>,
+        bulk_insert_threshold: usize,
+    ) -> Result<()> {
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        if commands.len() >= bulk_insert_threshold && destination_handler.supports_bulk_insert() {
+            if let Some(parsed) =
+                crate::destinations::bulk_insert::detect_bulk_insert_batch(commands)
+            {
+                debug!(
+                    "Bulk insert detected: {} rows into {} (batch {})",
+                    parsed.rows.len(),
+                    parsed.table,
+                    batch_idx
+                );
+
+                let batch_start_time = Instant::now();
+                let metadata_path_owned = metadata_path.to_path_buf();
+                let file_manager_for_hook = self.clone();
+                let staged_index = last_executed_index;
+
+                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                    let metadata_path = metadata_path_owned;
+                    let file_manager_for_hook = file_manager_for_hook;
+                    Box::pin(async move {
+                        file_manager_for_hook
+                            .stage_pending_metadata_progress(&metadata_path, staged_index)
+                            .await?;
+                        Ok(())
+                    })
+                }));
+
+                match destination_handler
+                    .execute_bulk_insert_with_hook(
+                        &parsed.table,
+                        &parsed.columns,
+                        &parsed.rows,
+                        pre_commit_hook,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let duration = batch_start_time.elapsed();
+                        debug!(
+                            "Bulk insert batch {} complete: {} rows in {:?}",
+                            batch_idx,
+                            parsed.rows.len(),
+                            duration
+                        );
+                        self.flush_staged_pending_progress().await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Bulk insert failed for batch {}, falling back to SQL batch: {}",
+                            batch_idx, e
+                        );
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(any(feature = "mysql", feature = "sqlserver")))]
+        let _ = bulk_insert_threshold;
+
+        self.execute_sql_batch(
+            destination_handler,
+            metadata_path,
+            commands,
+            last_executed_index,
+            batch_idx,
+            metrics_collector,
+        )
+        .await
+    }
+
     async fn execute_sql_batch(
         self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
@@ -1506,13 +1597,14 @@ impl TransactionManager {
                         let last_executed_index = next_command_index - 1;
                         *state.batch_count += 1;
 
-                        self.execute_sql_batch(
+                        self.execute_batch_with_bulk_detection(
                             destination_handler,
                             &pending_tx.file_path,
                             state.batch,
                             last_executed_index,
                             *state.batch_count,
                             metrics_collector,
+                            self.bulk_insert_threshold,
                         )
                         .await?;
 
@@ -1636,23 +1728,6 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
-        // Skip transactions already applied (position-tracking based deduplication)
-        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            let current_flush_lsn = lsn_tracker.get();
-            if commit_lsn.0 <= current_flush_lsn && current_flush_lsn > 0 {
-                info!(
-                    "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
-                    pending_tx.metadata.transaction_id,
-                    commit_lsn,
-                    pg_walstream::format_lsn(current_flush_lsn)
-                );
-                if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
-                    warn!("Failed to delete duplicate pending file: {}", e);
-                }
-                return Ok(());
-            }
-        }
-
         if self.event_mode {
             return self
                 .process_transaction_file_event_mode(
@@ -1750,13 +1825,14 @@ impl TransactionManager {
             let last_executed_index = next_command_index - 1;
             batch_count += 1;
 
-            self.execute_sql_batch(
+            self.execute_batch_with_bulk_detection(
                 destination_handler,
                 &pending_tx.file_path,
                 &batch,
                 last_executed_index,
                 batch_count,
                 metrics_collector,
+                self.bulk_insert_threshold,
             )
             .await?;
 
@@ -2133,6 +2209,164 @@ impl TransactionManager {
         }
 
         Ok(())
+    }
+
+    /// Analyzes AND extracts rows from transaction segments in a single pass.
+    /// Returns `Some((table, columns, rows))` if ALL statements are homogeneous INSERTs
+    /// targeting the same table with the same columns. Returns `None` otherwise.
+    ///
+    /// This combines what was previously two separate passes (analyze + extract) into one,
+    /// eliminating redundant I/O for large transactions.
+    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+    pub async fn analyze_and_extract_rows(
+        &self,
+        segments: &[TransactionSegment],
+    ) -> Result<Option<(String, Vec<String>, Vec<Vec<String>>)>> {
+        use tokio::io::AsyncBufReadExt;
+
+        let total_statements: usize = segments.iter().map(|s| s.statement_count).sum();
+        let mut expected_prefix: Option<String> = None;
+        let mut expected_table: Option<String> = None;
+        let mut expected_columns: Option<Vec<String>> = None;
+        let mut all_rows: Vec<Vec<String>> = Vec::with_capacity(total_statements);
+
+        for segment in segments {
+            let is_compressed = segment
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                .unwrap_or(false);
+
+            let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to open segment {:?} for analysis: {e}",
+                    segment.path
+                ))
+            })?;
+
+            let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = if is_compressed {
+                let buf = tokio::io::BufReader::new(file);
+                let mut decoder = GzipDecoder::new(buf);
+                decoder.multiple_members(true);
+                Box::new(tokio::io::BufReader::new(decoder))
+            } else {
+                Box::new(tokio::io::BufReader::new(file))
+            };
+
+            let mut lines = reader.lines();
+            let mut parser = SqlStreamParser::new();
+            let mut line_stmts: Vec<String> = Vec::new();
+
+            while let Some(line) = lines.next_line().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to read segment {:?} for analysis: {e}",
+                    segment.path
+                ))
+            })? {
+                line_stmts.clear();
+                parser.parse_line(&line, &mut line_stmts)?;
+
+                for stmt in line_stmts.drain(..) {
+                    let trimmed = stmt.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !self.check_and_extract_row(
+                        trimmed,
+                        &mut expected_prefix,
+                        &mut expected_table,
+                        &mut expected_columns,
+                        &mut all_rows,
+                    ) {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            if let Some(stmt) = parser.finish_statement() {
+                let trimmed = stmt.trim();
+                if !trimmed.is_empty()
+                    && !self.check_and_extract_row(
+                        trimmed,
+                        &mut expected_prefix,
+                        &mut expected_table,
+                        &mut expected_columns,
+                        &mut all_rows,
+                    )
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        match (expected_table, expected_columns) {
+            (Some(t), Some(c)) => Ok(Some((t, c, all_rows))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Helper: validates a statement matches the expected INSERT prefix and extracts its row.
+    /// On first call, establishes the prefix. Returns false if statement doesn't match.
+    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+    fn check_and_extract_row(
+        &self,
+        stmt: &str,
+        expected_prefix: &mut Option<String>,
+        expected_table: &mut Option<String>,
+        expected_columns: &mut Option<Vec<String>>,
+        rows: &mut Vec<Vec<String>>,
+    ) -> bool {
+        use crate::destinations::bulk_insert::{extract_insert_prefix, extract_values_from_suffix};
+
+        match expected_prefix {
+            None => {
+                // First statement: parse fully to establish prefix
+                let (prefix, columns, table) = match extract_insert_prefix(stmt) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let values_suffix = &stmt[prefix.len()..];
+                let values = match extract_values_from_suffix(values_suffix) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                *expected_prefix = Some(prefix);
+                *expected_table = Some(table);
+                *expected_columns = Some(columns);
+                rows.push(values);
+                true
+            }
+            Some(prefix) => {
+                // Subsequent statements: fast prefix check then extract values
+                if !stmt.starts_with(prefix.as_str()) {
+                    return false;
+                }
+                let values_suffix = &stmt[prefix.len()..];
+                match extract_values_from_suffix(values_suffix) {
+                    Some(values) => {
+                        rows.push(values);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Delete multiple files in batch. Logs warnings for individual failures
+    /// but does not fail the entire operation.
+    pub async fn batch_delete_files(&self, paths: &[PathBuf]) {
+        for path in paths {
+            if let Err(e) = tokio::fs::remove_file(path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to delete file {:?}: {}", path, e);
+                }
+            }
+        }
+        if !paths.is_empty() {
+            debug!("Batch deleted {} files", paths.len());
+        }
     }
 }
 

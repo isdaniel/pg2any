@@ -70,7 +70,7 @@ pub mod lsn_tracker;
 pub mod client;
 
 // Transaction file persistence
-mod transaction_manager;
+pub mod transaction_manager;
 
 // Storage abstraction for transaction files
 pub mod storage;

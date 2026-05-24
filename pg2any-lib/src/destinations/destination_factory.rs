@@ -95,6 +95,38 @@ pub trait DestinationHandler: Send + Sync {
             "Event mode not supported by this destination",
         ))
     }
+
+    fn supports_bulk_insert(&self) -> bool {
+        false
+    }
+
+    async fn execute_bulk_insert_with_hook(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<String>],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        {
+            let sqls = crate::destinations::bulk_insert::build_chunked_multi_value_inserts(
+                table, columns, rows, None,
+            );
+            return self
+                .execute_sql_batch_with_hook(&sqls, pre_commit_hook)
+                .await;
+        }
+        #[cfg(not(any(feature = "mysql", feature = "sqlserver")))]
+        {
+            let _ = (table, columns, rows, pre_commit_hook);
+            Err(CdcError::unsupported(
+                "Bulk insert not available without mysql or sqlserver feature",
+            ))
+        }
+    }
 }
 
 /// Factory for creating destination handlers

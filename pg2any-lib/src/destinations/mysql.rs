@@ -297,7 +297,7 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
             let trimmed = value.trim();
             if trimmed.eq_ignore_ascii_case("NULL") {
                 buf.extend_from_slice(b"\\N");
-            } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
                 let unquoted = &trimmed[1..trimmed.len() - 1];
                 tsv_escape_string(unquoted, &mut buf);
             } else {
@@ -315,11 +315,11 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
 /// MySQL SQL literals use backslash escaping: \\ → \, \n → newline, \t → tab, etc.
 /// TSV format uses: \\ → \, \n → newline, \t → tab, \N → NULL.
 fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '\'' => {
-                if chars.clone().next() == Some('\'') {
+                if chars.peek() == Some(&'\'') {
                     chars.next();
                 }
                 buf.push(b'\'');

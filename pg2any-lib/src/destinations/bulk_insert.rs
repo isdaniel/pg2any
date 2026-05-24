@@ -22,14 +22,16 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
 
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(statements.len());
 
-    let values = parse_values_tuple(&statements[0][expected_prefix.len()..])?;
+    let first_trimmed = statements[0].trim();
+    let values = parse_values_tuple(&first_trimmed[expected_prefix.len()..])?;
     rows.push(values);
 
     for stmt in &statements[1..] {
-        if !stmt.trim().starts_with(expected_prefix.as_str()) {
+        let trimmed_stmt = stmt.trim();
+        if !trimmed_stmt.starts_with(expected_prefix.as_str()) {
             return None;
         }
-        let values = parse_values_tuple(&stmt[expected_prefix.len()..])?;
+        let values = parse_values_tuple(&trimmed_stmt[expected_prefix.len()..])?;
         rows.push(values);
     }
 

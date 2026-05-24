@@ -19,6 +19,7 @@ use tracing::{debug, info};
 pub struct SQLiteDestination {
     pool: Option<SqlitePool>,
     database_path: Option<String>,
+    max_rows_per_insert: usize,
 }
 
 impl SQLiteDestination {
@@ -27,6 +28,7 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
+            max_rows_per_insert: 500,
         }
     }
 }
@@ -100,6 +102,12 @@ impl DestinationHandler for SQLiteDestination {
     // SQLite does not use schema/database namespacing like MySQL, so schema mappings are not needed
     fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
 
+    fn set_max_rows_per_insert(&mut self, max_rows: usize) {
+        if max_rows > 0 {
+            self.max_rows_per_insert = max_rows;
+        }
+    }
+
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
@@ -118,7 +126,12 @@ impl DestinationHandler for SQLiteDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::DoubleQuote);
+        let coalesced = coalesce_commands(
+            commands,
+            u64::MAX,
+            QuoteStyle::DoubleQuote,
+            self.max_rows_per_insert,
+        );
 
         if coalesced.len() < commands.len() {
             debug!(
@@ -130,6 +143,27 @@ impl DestinationHandler for SQLiteDestination {
         }
 
         super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite")
+            .await
+    }
+
+    async fn execute_bulk_insert_with_hook(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<String>],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
+            table,
+            columns,
+            rows,
+            None,
+            Some(self.max_rows_per_insert),
+        );
+        self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }
 

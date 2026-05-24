@@ -263,6 +263,9 @@ pub struct TransactionManager {
     storage: Arc<dyn TransactionStorage>,
     /// When true, stores raw ChangeEvent JSON instead of generated SQL
     event_mode: bool,
+    /// Whether bulk insert optimization is enabled
+    /// Minimum INSERT count to trigger bulk insert path
+    bulk_insert_threshold: usize,
 }
 
 impl TransactionManager {
@@ -301,6 +304,7 @@ impl TransactionManager {
             segment_size_bytes,
             storage,
             event_mode: false,
+            bulk_insert_threshold: 500,
         })
     }
 
@@ -312,6 +316,11 @@ impl TransactionManager {
     /// Enable event-mode: stores raw ChangeEvent JSON instead of generated SQL
     pub fn set_event_mode(&mut self, enabled: bool) {
         self.event_mode = enabled;
+    }
+
+    /// Configure bulk insert optimization parameters
+    pub fn set_bulk_insert_config(&mut self, threshold: usize) {
+        self.bulk_insert_threshold = threshold;
     }
 
     /// Flush all pending buffered writes
@@ -696,9 +705,41 @@ impl TransactionManager {
 
     /// Move metadata from sql_received_tx to sql_pending_tx
     /// Flushes any pending buffered events before marking transaction as committed
+    ///
+    /// If a pending metadata file already exists with `last_executed_command_index` set
+    /// (indicating a previous run already applied this transaction to the destination),
+    /// the existing file is preserved to prevent duplicate re-execution on recovery.
     pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
+
+        // CRASH SAFETY: If pending file already exists with execution progress,
+        // a previous run already applied this transaction. Don't overwrite — the
+        // consumer's dedup check or recovery finalize will handle it correctly.
+        if fs::metadata(&pending_metadata_path).await.is_ok() {
+            if let Ok(existing) = self.read_metadata(&pending_metadata_path).await {
+                if existing.last_executed_command_index.is_some() {
+                    info!(
+                        "Transaction {} already has pending file with execution progress, preserving existing state",
+                        tx_id
+                    );
+                    // Clean up received file and flush active writer
+                    let _ = self.remove_received_metadata(&received_metadata_path).await;
+                    let tx_state = self
+                        .take_and_flush_active_transaction(tx_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    // Delete orphaned data segment files from this duplicate write
+                    if let Some(state) = tx_state {
+                        for seg_path in &state.segments {
+                            let _ = fs::remove_file(seg_path).await;
+                        }
+                    }
+                    return Ok(pending_metadata_path);
+                }
+            }
+        }
 
         let mut metadata = self.read_received_metadata(&received_metadata_path).await?;
         let tx_state = self.take_and_flush_active_transaction(tx_id).await?;
@@ -1403,6 +1444,84 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
+    async fn execute_batch_with_bulk_detection(
+        self: &Arc<Self>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metadata_path: &Path,
+        commands: &[String],
+        last_executed_index: usize,
+        batch_idx: usize,
+        metrics_collector: &Arc<MetricsCollector>,
+        bulk_insert_threshold: usize,
+    ) -> Result<()> {
+        if commands.len() >= bulk_insert_threshold && destination_handler.supports_bulk_insert() {
+            if let Some(parsed) =
+                crate::destinations::bulk_insert::detect_bulk_insert_batch(commands)
+            {
+                debug!(
+                    "Bulk insert detected: {} rows into {} (batch {})",
+                    parsed.rows.len(),
+                    parsed.table,
+                    batch_idx
+                );
+
+                let batch_start_time = Instant::now();
+                let metadata_path_owned = metadata_path.to_path_buf();
+                let file_manager_for_hook = self.clone();
+                let staged_index = last_executed_index;
+
+                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                    let metadata_path = metadata_path_owned;
+                    let file_manager_for_hook = file_manager_for_hook;
+                    Box::pin(async move {
+                        file_manager_for_hook
+                            .stage_pending_metadata_progress(&metadata_path, staged_index)
+                            .await?;
+                        Ok(())
+                    })
+                }));
+
+                match destination_handler
+                    .execute_bulk_insert_with_hook(
+                        &parsed.table,
+                        &parsed.columns,
+                        &parsed.rows,
+                        pre_commit_hook,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let duration = batch_start_time.elapsed();
+                        debug!(
+                            "Bulk insert batch {} complete: {} rows in {:?}",
+                            batch_idx,
+                            parsed.rows.len(),
+                            duration
+                        );
+                        self.flush_staged_pending_progress().await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Bulk insert failed for batch {}, falling back to SQL batch: {}",
+                            batch_idx, e
+                        );
+                    }
+                }
+            }
+        }
+
+        self.execute_sql_batch(
+            destination_handler,
+            metadata_path,
+            commands,
+            last_executed_index,
+            batch_idx,
+            metrics_collector,
+        )
+        .await
+    }
+
     async fn execute_sql_batch(
         self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
@@ -1506,13 +1625,14 @@ impl TransactionManager {
                         let last_executed_index = next_command_index - 1;
                         *state.batch_count += 1;
 
-                        self.execute_sql_batch(
+                        self.execute_batch_with_bulk_detection(
                             destination_handler,
                             &pending_tx.file_path,
                             state.batch,
                             last_executed_index,
                             *state.batch_count,
                             metrics_collector,
+                            self.bulk_insert_threshold,
                         )
                         .await?;
 
@@ -1750,13 +1870,14 @@ impl TransactionManager {
             let last_executed_index = next_command_index - 1;
             batch_count += 1;
 
-            self.execute_sql_batch(
+            self.execute_batch_with_bulk_detection(
                 destination_handler,
                 &pending_tx.file_path,
                 &batch,
                 last_executed_index,
                 batch_count,
                 metrics_collector,
+                self.bulk_insert_threshold,
             )
             .await?;
 

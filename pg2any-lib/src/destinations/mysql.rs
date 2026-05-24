@@ -351,6 +351,10 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
     buf
 }
 
+/// Unescape MySQL SQL literal content and re-encode for TSV format.
+/// Input is the content between single quotes from a MySQL SQL literal.
+/// MySQL SQL literals use backslash escaping: \\ → \, \n → newline, \t → tab, etc.
+/// TSV format uses: \\ → \, \n → newline, \t → tab, \N → NULL.
 fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
@@ -361,7 +365,21 @@ fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
                 }
                 buf.push(b'\'');
             }
-            '\\' => buf.extend_from_slice(b"\\\\"),
+            '\\' => {
+                match chars.next() {
+                    Some('\\') => buf.extend_from_slice(b"\\\\"), // SQL \\ → literal \ → TSV \\
+                    Some('n') => buf.extend_from_slice(b"\\n"),   // SQL \n → newline → TSV \n
+                    Some('t') => buf.extend_from_slice(b"\\t"),   // SQL \t → tab → TSV \t
+                    Some('r') => buf.extend_from_slice(b"\\r"),   // SQL \r → CR → TSV \r
+                    Some('0') => buf.extend_from_slice(b"\\0"),   // SQL \0 → null → TSV \0
+                    Some(other) => {
+                        // MySQL: \x → x for any unrecognized escape
+                        let mut bytes = [0u8; 4];
+                        buf.extend_from_slice(other.encode_utf8(&mut bytes).as_bytes());
+                    }
+                    None => buf.extend_from_slice(b"\\\\"), // trailing backslash
+                }
+            }
             '\t' => buf.extend_from_slice(b"\\t"),
             '\n' => buf.extend_from_slice(b"\\n"),
             '\r' => buf.extend_from_slice(b"\\r"),
@@ -444,10 +462,17 @@ mod tests {
         let rows = vec![
             vec!["1".to_string(), "'hello\\tworld'".to_string()],
             vec!["2".to_string(), "'line1\\nline2'".to_string()],
+            // SQL literal '\\' means one backslash; TSV should produce \\
             vec!["3".to_string(), "'back\\\\slash'".to_string()],
         ];
         let tsv = generate_tsv_buffer(&rows);
         let output = String::from_utf8(tsv).unwrap();
-        assert!(!output.contains('\t') || output.lines().all(|l| l.split('\t').count() == 2));
+        let lines: Vec<&str> = output.lines().collect();
+        // SQL \t → literal tab → TSV \t
+        assert_eq!(lines[0], "1\thello\\tworld");
+        // SQL \n → literal newline → TSV \n
+        assert_eq!(lines[1], "2\tline1\\nline2");
+        // SQL \\ → literal backslash → TSV \\
+        assert_eq!(lines[2], "3\tback\\\\slash");
     }
 }

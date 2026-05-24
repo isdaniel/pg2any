@@ -41,9 +41,6 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
-    /// Configure session tuning parameters (no-op for destinations that don't support it)
-    fn set_session_tuning(&mut self, _enabled: bool, _threshold: usize) {}
-
     /// Execute a batch of SQL commands within a single transaction with optional pre-commit hook
     ///
     /// This is the primary method used by the consumer to execute transaction files.

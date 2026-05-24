@@ -295,12 +295,6 @@ impl CdcClient {
             consumer_destination.set_schema_mappings(schema_mappings.clone());
         }
 
-        // Apply session tuning config
-        consumer_destination.set_session_tuning(
-            self.config.session_tuning_enabled,
-            self.config.session_tuning_threshold,
-        );
-
         info!("Consumer destination connection established");
 
         let token = self.cancellation_token.clone();

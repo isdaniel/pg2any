@@ -105,8 +105,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
 
     let bulk_insert_enabled = parse_bool_env("CDC_BULK_INSERT_ENABLED", true)?;
     let bulk_insert_threshold = parse_usize_env("CDC_BULK_INSERT_THRESHOLD", 500)?;
-    let session_tuning_enabled = parse_bool_env("CDC_SESSION_TUNING_ENABLED", true)?;
-    let session_tuning_threshold = parse_usize_env("CDC_SESSION_TUNING_THRESHOLD", 100)?;
 
     // Transaction file persistence configuration
     let transaction_file_base_path =
@@ -163,8 +161,6 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .transaction_segment_size_bytes(segment_size_bytes)
         .bulk_insert_enabled(bulk_insert_enabled)
         .bulk_insert_threshold(bulk_insert_threshold)
-        .session_tuning_enabled(session_tuning_enabled)
-        .session_tuning_threshold(session_tuning_threshold)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");

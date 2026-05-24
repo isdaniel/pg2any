@@ -14,8 +14,6 @@ pub struct MySQLDestination {
     infile_data: Arc<Mutex<Option<bytes::Bytes>>>,
     schema_mappings: HashMap<String, String>,
     max_allowed_packet: u64,
-    session_tuning_enabled: bool,
-    session_tuning_threshold: usize,
     load_data_available: bool,
 }
 
@@ -27,16 +25,8 @@ impl MySQLDestination {
             infile_data: Arc::new(Mutex::new(None)),
             schema_mappings: HashMap::new(),
             max_allowed_packet: 67108864,
-            session_tuning_enabled: true,
-            session_tuning_threshold: 100,
             load_data_available: false,
         }
-    }
-
-    pub fn with_session_tuning(mut self, enabled: bool, threshold: usize) -> Self {
-        self.session_tuning_enabled = enabled;
-        self.session_tuning_threshold = threshold;
-        self
     }
 }
 
@@ -125,11 +115,6 @@ impl DestinationHandler for MySQLDestination {
         }
     }
 
-    fn set_session_tuning(&mut self, enabled: bool, threshold: usize) {
-        self.session_tuning_enabled = enabled;
-        self.session_tuning_threshold = threshold;
-    }
-
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
@@ -155,14 +140,8 @@ impl DestinationHandler for MySQLDestination {
             );
         }
 
-        super::common::execute_sqlx_batch_with_hook(
-            pool,
-            &coalesced,
-            pre_commit_hook,
-            "MySQL",
-            self.session_tuning_enabled && commands.len() >= self.session_tuning_threshold,
-        )
-        .await
+        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "MySQL")
+            .await
     }
 
     fn supports_bulk_insert(&self) -> bool {
@@ -264,15 +243,6 @@ impl MySQLDestination {
             .await
             .map_err(|e| CdcError::generic(format!("MySQL START TRANSACTION failed: {e}")))?;
 
-        let use_session_tuning =
-            self.session_tuning_enabled && rows.len() >= self.session_tuning_threshold;
-
-        if use_session_tuning {
-            tx.query_drop("SET unique_checks=0, foreign_key_checks=0")
-                .await
-                .map_err(|e| CdcError::generic(format!("MySQL session tuning failed: {e}")))?;
-        }
-
         let col_spec = columns.join(", ");
         let load_sql = format!(
             "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE {} \
@@ -286,23 +256,12 @@ impl MySQLDestination {
 
         if let Err(e) = result {
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
-            if use_session_tuning {
-                let _ = tx
-                    .query_drop("SET unique_checks=1, foreign_key_checks=1")
-                    .await;
-            }
             drop(tx);
 
             let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
             return self
                 .execute_sql_batch_with_hook(&[sql], pre_commit_hook)
                 .await;
-        }
-
-        if use_session_tuning {
-            tx.query_drop("SET unique_checks=1, foreign_key_checks=1")
-                .await
-                .map_err(|e| CdcError::generic(format!("MySQL session restore failed: {e}")))?;
         }
 
         if let Some(hook) = pre_commit_hook {
@@ -416,13 +375,6 @@ mod tests {
         assert!(destination.bulk_pool.is_none());
         assert!(destination.infile_data.lock().unwrap().is_none());
         assert!(!destination.load_data_available);
-    }
-
-    #[test]
-    fn test_mysql_destination_with_session_tuning() {
-        let destination = MySQLDestination::new().with_session_tuning(true, 50);
-        assert!(destination.session_tuning_enabled);
-        assert_eq!(destination.session_tuning_threshold, 50);
     }
 
     #[test]

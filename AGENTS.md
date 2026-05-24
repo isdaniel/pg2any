@@ -72,7 +72,6 @@ The central abstraction. Every destination implements this:
 pub trait DestinationHandler: Send + Sync {
     async fn connect(&mut self, connection_string: &str) -> Result<()>;
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
-    fn set_session_tuning(&mut self, _enabled: bool, _threshold: usize) {}
     async fn execute_sql_batch_with_hook(&mut self, commands: &[String], pre_commit_hook: Option<PreCommitHook>) -> Result<()>;
     async fn close(&mut self) -> Result<()>;
     fn supports_event_mode(&self) -> bool { false }
@@ -130,15 +129,14 @@ System dependencies for building: `libpq-dev`, `pkg-config`, `libssl-dev`, `cmak
 
 ## Performance Optimization (MySQL & SQL Server)
 
-The consumer-side uses a tiered optimization strategy for batch INSERTs:
+The consumer-side uses a tiered optimization strategy for batch INSERT operations:
 
-1. **DML Coalescing** (always active) - Consecutive INSERTs to same table are combined into multi-value INSERTs
-2. **Session Tuning** (configurable) - `SET unique_checks=0, foreign_key_checks=0` during large batches (safe because PG already validated)
-3. **Bulk Insert Detection** (configurable) - When a batch is entirely INSERTs to one table and exceeds threshold, routes to `execute_bulk_insert_with_hook`
-4. **LOAD DATA LOCAL INFILE** (when server supports it) - MySQL's fastest bulk loading protocol via mysql_async. Falls back to multi-value INSERT if `local_infile` is disabled.
-5. **TDS Bulk Load** (SQL Server, configurable) - Uses tiberius's native `bulk_insert()` API for streaming row insertion via TDS protocol. Falls back to multi-value INSERT if bulk load fails or table metadata retrieval fails.
+1. **DML Coalescing** (always active) - Consecutive INSERT statements to same table are combined into multi-value INSERT
+2. **Bulk Insert Detection** (configurable) - When a batch is entirely INSERT statements to one table and exceeds threshold, routes to `execute_bulk_insert_with_hook`
+3. **LOAD DATA LOCAL INFILE** (when server supports it) - MySQL's fastest bulk loading protocol via mysql_async. Falls back to multi-value INSERT if `local_infile` is disabled.
+4. **TDS Bulk Load** (SQL Server, configurable) - Uses tiberius's native `bulk_insert()` API for streaming row insertion via TDS protocol. Falls back to multi-value INSERT if bulk load fails or table metadata retrieval fails.
 
-Config env vars: `CDC_BULK_INSERT_ENABLED`, `CDC_BULK_INSERT_THRESHOLD`, `CDC_SESSION_TUNING_ENABLED`, `CDC_SESSION_TUNING_THRESHOLD`
+Config env vars: `CDC_BULK_INSERT_ENABLED`, `CDC_BULK_INSERT_THRESHOLD`
 
 ## Common Patterns
 

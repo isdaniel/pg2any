@@ -40,12 +40,13 @@ pg2any/                          # Cargo workspace root
       transaction_manager.rs     # TransactionManager - file lifecycle (begin/append/commit/abort/process)
       destinations/
         destination_factory.rs   # DestinationHandler trait (core interface) + DestinationFactory
-        mysql.rs                 # MySQL impl via SQLx
+        mysql.rs                 # MySQL impl via SQLx + mysql_async (LOAD DATA LOCAL INFILE)
         sqlserver.rs             # SQL Server impl via Tiberius
         sqlite.rs                # SQLite impl via SQLx
         kafka.rs                 # Kafka impl via rdkafka (event mode - sends JSON, not SQL)
-        coalescing.rs            # DML batch coalescing (multi-row INSERT optimization)
-        common.rs                # Shared SQL generation helpers
+        bulk_insert.rs           # TSV generation, INSERT batch detection, multi-value INSERT fallback
+        coalescing.rs            # DML batch coalescing (multi-row INSERT, CASE-WHEN UPDATE)
+        common.rs                # Shared transaction execution with session tuning
       storage/
         traits.rs                # TransactionStorage trait
         compressed.rs            # Gzip storage impl
@@ -74,11 +75,15 @@ pub trait DestinationHandler: Send + Sync {
     async fn execute_sql_batch_with_hook(&mut self, commands: &[String], pre_commit_hook: Option<PreCommitHook>) -> Result<()>;
     async fn close(&mut self) -> Result<()>;
     fn supports_event_mode(&self) -> bool { false }
+    fn supports_bulk_insert(&self) -> bool { false }
+    async fn execute_bulk_insert_with_hook(&mut self, table: &str, columns: &[String], rows: &[Vec<String>], pre_commit_hook: Option<PreCommitHook>) -> Result<()> { ... }
     async fn execute_events_batch_with_hook(&mut self, events: &[ChangeEvent], ...) -> Result<()> { ... }
 }
 ```
 
 - SQL destinations (MySQL, SQLite, SQL Server) use `execute_sql_batch_with_hook`
+- MySQL additionally supports `execute_bulk_insert_with_hook` for LOAD DATA LOCAL INFILE
+- SQL Server supports `execute_bulk_insert_with_hook` for TDS Bulk Load (with multi-value INSERT fallback)
 - Kafka uses event mode (`supports_event_mode() = true`, `execute_events_batch_with_hook`)
 
 ### TransactionStorage (trait) - `storage/traits.rs`
@@ -93,6 +98,7 @@ Builder pattern. All fields have sensible defaults. Required: `source_connection
 
 ```
 default = ["mysql", "sqlserver", "sqlite"]
+mysql   = ["sqlx/mysql", "mysql_async"]
 kafka   = ["rdkafka", "futures-util", "base64"]
 metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 ```
@@ -120,6 +126,17 @@ Consumer uses exponential backoff (2^n seconds, capped at 30s) for transient fai
 - **pg_walstream** (by same author): Low-level PostgreSQL logical replication protocol implementation. Handles WAL parsing, replication state, connection management. [GitHub](https://github.com/isdaniel/pg-walstream)
 
 System dependencies for building: `libpq-dev`, `pkg-config`, `libssl-dev`, `cmake` (for rdkafka).
+
+## Performance Optimization (MySQL & SQL Server)
+
+The consumer-side uses a tiered optimization strategy for batch INSERT operations:
+
+1. **DML Coalescing** (always active) - Consecutive INSERT statements to same table are combined into multi-value INSERT
+2. **Bulk Insert Detection** (configurable) - When a batch is entirely INSERT statements to one table and exceeds threshold, routes to `execute_bulk_insert_with_hook`
+3. **LOAD DATA LOCAL INFILE** (when server supports it) - MySQL's fastest bulk loading protocol via mysql_async. Falls back to multi-value INSERT if `local_infile` is disabled.
+4. **TDS Bulk Load** (SQL Server, configurable) - Uses tiberius's native `bulk_insert()` API for streaming row insertion via TDS protocol. Falls back to multi-value INSERT if bulk load fails or table metadata retrieval fails.
+
+Config env vars: `CDC_BULK_INSERT_THRESHOLD`
 
 ## Common Patterns
 

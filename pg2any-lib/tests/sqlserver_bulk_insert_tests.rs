@@ -12,7 +12,10 @@ mod sqlserver_bulk_insert {
             "INSERT INTO [dbo].[users] ([id], [name]) VALUES (3, 'carol');".to_string(),
         ];
         let result = detect_bulk_insert_batch(&stmts);
-        assert!(result.is_some(), "Should detect bracket-quoted INSERT batch");
+        assert!(
+            result.is_some(),
+            "Should detect bracket-quoted INSERT batch"
+        );
         let parsed = result.unwrap();
         assert_eq!(parsed.table, "[dbo].[users]");
         assert_eq!(parsed.columns, vec!["[id]", "[name]"]);

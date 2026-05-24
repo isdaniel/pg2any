@@ -20,7 +20,10 @@ mod bulk_insert_integration {
             .collect();
 
         let result = detect_bulk_insert_batch(&stmts);
-        assert!(result.is_some(), "Should detect 1000 INSERT statements as bulk batch");
+        assert!(
+            result.is_some(),
+            "Should detect 1000 INSERT statements as bulk batch"
+        );
 
         let parsed = result.unwrap();
         assert_eq!(parsed.table, "`cdc_db`.`t1`");

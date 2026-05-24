@@ -103,6 +103,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let segment_size_mb = parse_usize_env("CDC_TRANSACTION_SEGMENT_SIZE_MB", 64)?;
     let segment_size_bytes = segment_size_mb.saturating_mul(1024 * 1024);
 
+    let bulk_insert_threshold = parse_usize_env("CDC_BULK_INSERT_THRESHOLD", 500)?;
+
     // Transaction file persistence configuration
     let transaction_file_base_path =
         std::env::var("CDC_TRANSACTION_FILE_BASE_PATH").unwrap_or_else(|_| ".".to_string());
@@ -156,6 +158,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .batch_size(batch_size)
         .transaction_file_base_path(transaction_file_base_path)
         .transaction_segment_size_bytes(segment_size_bytes)
+        .bulk_insert_threshold(bulk_insert_threshold)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");

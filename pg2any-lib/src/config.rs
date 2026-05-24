@@ -93,6 +93,9 @@ pub struct Config {
 
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
+
+    /// Minimum number of INSERT statements to trigger bulk insert mode
+    pub bulk_insert_threshold: usize,
 }
 
 /// Origin filtering options
@@ -193,6 +196,7 @@ impl Default for Config {
             transaction_file_base_path: ".".to_string(),
             transaction_segment_size_bytes: 64 * 1024 * 1024,
             extra_options: HashMap::new(),
+            bulk_insert_threshold: 500,
         }
     }
 }
@@ -389,6 +393,11 @@ impl ConfigBuilder {
         V: Into<String>,
     {
         self.config.extra_options.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn bulk_insert_threshold(mut self, threshold: usize) -> Self {
+        self.config.bulk_insert_threshold = threshold;
         self
     }
 

@@ -116,6 +116,7 @@ impl CdcClient {
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
+        manager.set_bulk_insert_config(config.bulk_insert_threshold);
 
         if destination_handler.supports_event_mode() {
             info!(

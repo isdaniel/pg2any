@@ -1,4 +1,8 @@
-#[cfg(feature = "mysql")]
+//! Shared bulk insert utilities: INSERT batch detection and multi-value INSERT generation.
+//!
+//! This module is conditionally compiled when either `mysql` or `sqlserver` feature is enabled.
+//! Destination-specific bulk load logic lives in each destination's own module.
+
 #[derive(Debug, Clone)]
 pub struct ParsedBulkInsert {
     pub table: String,
@@ -6,7 +10,6 @@ pub struct ParsedBulkInsert {
     pub rows: Vec<Vec<String>>,
 }
 
-#[cfg(feature = "mysql")]
 pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInsert> {
     if statements.is_empty() {
         return None;
@@ -34,7 +37,21 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
     })
 }
 
-#[cfg(feature = "mysql")]
+pub fn build_multi_value_insert(table: &str, columns: &[String], rows: &[Vec<String>]) -> String {
+    let col_list = columns.join(", ");
+    let mut sql = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        sql.push_str(&row.join(", "));
+        sql.push(')');
+    }
+    sql.push(';');
+    sql
+}
+
 fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     let trimmed = sql.trim();
     if !trimmed
@@ -63,7 +80,6 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     Some((prefix.to_string(), columns, table))
 }
 
-#[cfg(feature = "mysql")]
 fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {
     let trimmed = values_part
         .trim()
@@ -108,107 +124,9 @@ fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {
     Some(values)
 }
 
-#[cfg(feature = "mysql")]
-pub fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(rows.len() * 128);
-
-    for row in rows {
-        for (col_idx, value) in row.iter().enumerate() {
-            if col_idx > 0 {
-                buf.push(b'\t');
-            }
-            let trimmed = value.trim();
-            if trimmed.eq_ignore_ascii_case("NULL") {
-                buf.extend_from_slice(b"\\N");
-            } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-                let unquoted = &trimmed[1..trimmed.len() - 1];
-                tsv_escape_string(unquoted, &mut buf);
-            } else {
-                tsv_escape_raw(trimmed.as_bytes(), &mut buf);
-            }
-        }
-        buf.push(b'\n');
-    }
-
-    buf
-}
-
-#[cfg(feature = "mysql")]
-fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
-    let mut chars = s.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' => {
-                if chars.clone().next() == Some('\'') {
-                    chars.next();
-                }
-                buf.push(b'\'');
-            }
-            '\\' => buf.extend_from_slice(b"\\\\"),
-            '\t' => buf.extend_from_slice(b"\\t"),
-            '\n' => buf.extend_from_slice(b"\\n"),
-            '\r' => buf.extend_from_slice(b"\\r"),
-            '\0' => buf.extend_from_slice(b"\\0"),
-            _ => {
-                let mut bytes = [0u8; 4];
-                buf.extend_from_slice(ch.encode_utf8(&mut bytes).as_bytes());
-            }
-        }
-    }
-}
-
-#[cfg(feature = "mysql")]
-fn tsv_escape_raw(data: &[u8], buf: &mut Vec<u8>) {
-    for &b in data {
-        match b {
-            b'\\' => buf.extend_from_slice(b"\\\\"),
-            b'\t' => buf.extend_from_slice(b"\\t"),
-            b'\n' => buf.extend_from_slice(b"\\n"),
-            b'\r' => buf.extend_from_slice(b"\\r"),
-            0 => buf.extend_from_slice(b"\\0"),
-            _ => buf.push(b),
-        }
-    }
-}
-
-#[cfg(feature = "mysql")]
-pub fn build_multi_value_insert(table: &str, columns: &[String], rows: &[Vec<String>]) -> String {
-    let col_list = columns.join(", ");
-    let mut sql = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        sql.push('(');
-        sql.push_str(&row.join(", "));
-        sql.push(')');
-    }
-    sql.push(';');
-    sql
-}
-
-#[cfg(all(test, feature = "mysql"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tsv_generation_basic() {
-        let rows = vec![
-            vec!["1".to_string(), "'hello'".to_string(), "NULL".to_string()],
-            vec!["2".to_string(), "'world'".to_string(), "42".to_string()],
-        ];
-        let tsv = generate_tsv_buffer(&rows);
-        let output = String::from_utf8(tsv).unwrap();
-        assert_eq!(output, "1\thello\t\\N\n2\tworld\t42\n");
-    }
-
-    #[test]
-    fn test_tsv_generation_escaping() {
-        let rows = vec![vec!["3".to_string(), "'it''s escaped'".to_string()]];
-        let tsv = generate_tsv_buffer(&rows);
-        let output = String::from_utf8(tsv).unwrap();
-        assert!(output.contains("it's escaped"));
-    }
 
     #[test]
     fn test_detect_bulk_insert_same_table() {

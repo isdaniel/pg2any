@@ -225,7 +225,7 @@ impl MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("Bulk pool not initialized"))?;
 
-        let tsv_data = super::bulk_insert::generate_tsv_buffer(rows);
+        let tsv_data = generate_tsv_buffer(rows);
         let row_count = rows.len();
 
         debug!(
@@ -297,6 +297,66 @@ impl MySQLDestination {
     }
 }
 
+fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(rows.len() * 128);
+
+    for row in rows {
+        for (col_idx, value) in row.iter().enumerate() {
+            if col_idx > 0 {
+                buf.push(b'\t');
+            }
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("NULL") {
+                buf.extend_from_slice(b"\\N");
+            } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+                let unquoted = &trimmed[1..trimmed.len() - 1];
+                tsv_escape_string(unquoted, &mut buf);
+            } else {
+                tsv_escape_raw(trimmed.as_bytes(), &mut buf);
+            }
+        }
+        buf.push(b'\n');
+    }
+
+    buf
+}
+
+fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                if chars.clone().next() == Some('\'') {
+                    chars.next();
+                }
+                buf.push(b'\'');
+            }
+            '\\' => buf.extend_from_slice(b"\\\\"),
+            '\t' => buf.extend_from_slice(b"\\t"),
+            '\n' => buf.extend_from_slice(b"\\n"),
+            '\r' => buf.extend_from_slice(b"\\r"),
+            '\0' => buf.extend_from_slice(b"\\0"),
+            _ => {
+                let mut bytes = [0u8; 4];
+                buf.extend_from_slice(ch.encode_utf8(&mut bytes).as_bytes());
+            }
+        }
+    }
+}
+
+fn tsv_escape_raw(data: &[u8], buf: &mut Vec<u8>) {
+    for &b in data {
+        match b {
+            b'\\' => buf.extend_from_slice(b"\\\\"),
+            b'\t' => buf.extend_from_slice(b"\\t"),
+            b'\n' => buf.extend_from_slice(b"\\n"),
+            b'\r' => buf.extend_from_slice(b"\\r"),
+            0 => buf.extend_from_slice(b"\\0"),
+            _ => buf.push(b),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +374,49 @@ mod tests {
         let destination = MySQLDestination::new().with_session_tuning(true, 50);
         assert!(destination.session_tuning_enabled);
         assert_eq!(destination.session_tuning_threshold, 50);
+    }
+
+    #[test]
+    fn test_tsv_generation_basic() {
+        let rows = vec![
+            vec!["1".to_string(), "'hello'".to_string(), "NULL".to_string()],
+            vec!["2".to_string(), "'world'".to_string(), "42".to_string()],
+        ];
+        let tsv = generate_tsv_buffer(&rows);
+        let output = String::from_utf8(tsv).unwrap();
+        assert_eq!(output, "1\thello\t\\N\n2\tworld\t42\n");
+    }
+
+    #[test]
+    fn test_tsv_generation_escaping() {
+        let rows = vec![vec!["3".to_string(), "'it''s escaped'".to_string()]];
+        let tsv = generate_tsv_buffer(&rows);
+        let output = String::from_utf8(tsv).unwrap();
+        assert!(output.contains("it's escaped"));
+    }
+
+    #[test]
+    fn test_tsv_null_handling() {
+        let rows = vec![
+            vec!["1".to_string(), "NULL".to_string(), "'text'".to_string()],
+            vec!["2".to_string(), "'value'".to_string(), "NULL".to_string()],
+        ];
+        let tsv = generate_tsv_buffer(&rows);
+        let output = String::from_utf8(tsv).unwrap();
+        assert!(output.contains("\\N"));
+        assert!(output.contains("text"));
+        assert!(output.contains("value"));
+    }
+
+    #[test]
+    fn test_tsv_special_characters() {
+        let rows = vec![
+            vec!["1".to_string(), "'hello\\tworld'".to_string()],
+            vec!["2".to_string(), "'line1\\nline2'".to_string()],
+            vec!["3".to_string(), "'back\\\\slash'".to_string()],
+        ];
+        let tsv = generate_tsv_buffer(&rows);
+        let output = String::from_utf8(tsv).unwrap();
+        assert!(!output.contains('\t') || output.lines().all(|l| l.split('\t').count() == 2));
     }
 }

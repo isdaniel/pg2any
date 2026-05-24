@@ -1426,7 +1426,7 @@ impl TransactionManager {
         bulk_insert_enabled: bool,
         bulk_insert_threshold: usize,
     ) -> Result<()> {
-        #[cfg(feature = "mysql")]
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
         if bulk_insert_enabled
             && commands.len() >= bulk_insert_threshold
             && destination_handler.supports_bulk_insert()
@@ -1487,7 +1487,7 @@ impl TransactionManager {
             }
         }
 
-        #[cfg(not(feature = "mysql"))]
+        #[cfg(not(any(feature = "mysql", feature = "sqlserver")))]
         let _ = (bulk_insert_enabled, bulk_insert_threshold);
 
         self.execute_sql_batch(

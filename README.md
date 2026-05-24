@@ -25,7 +25,7 @@ A high-performance PostgreSQL Change Data Capture (CDC) tool that streams databa
 - **Schema mapping** - Configurable PostgreSQL schema to destination database/schema translation
 - **Prometheus metrics** - Built-in HTTP metrics endpoint (feature: `metrics`)
 - **Graceful shutdown** - Coordinated producer-consumer shutdown with LSN persistence
-- **Bulk insert optimization** - LOAD DATA LOCAL INFILE for MySQL + session tuning for large batches
+- **Bulk insert optimization** - LOAD DATA LOCAL INFILE for MySQL, TDS Bulk Load for SQL Server + session tuning for large batches
 - **DML coalescing** - Multi-value INSERT, CASE-WHEN UPDATE, OR-combined DELETE batching
 
 ## Quick Start
@@ -247,7 +247,7 @@ All configuration is via environment variables (ideal for containers) or the `Co
 | `CDC_LAST_LSN_FILE` | `./pg2any_last_lsn` | Base path for LSN metadata file |
 | `CDC_TRANSACTION_FILE_BASE_PATH` | `./` | Base directory for transaction files |
 | `PG2ANY_ENABLE_COMPRESSION` | `false` | Enable gzip compression for SQL files |
-| `CDC_BULK_INSERT_ENABLED` | `true` | Enable LOAD DATA LOCAL INFILE for MySQL |
+| `CDC_BULK_INSERT_ENABLED` | `true` | Enable bulk insert optimization (MySQL LOAD DATA / SQL Server TDS Bulk Load) |
 | `CDC_BULK_INSERT_THRESHOLD` | `500` | Minimum INSERTs to trigger bulk path |
 | `CDC_SESSION_TUNING_ENABLED` | `true` | Disable unique/FK checks during large batches |
 | `CDC_SESSION_TUNING_THRESHOLD` | `100` | Minimum commands to trigger session tuning |

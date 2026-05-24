@@ -24,6 +24,7 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - Destinations behind `DestinationHandler` trait; Kafka uses event mode, SQL destinations use SQL batch mode
 - `TransactionStorage` trait abstracts compressed vs uncompressed file I/O
 - MySQL uses dual pools: sqlx for normal SQL batches, mysql_async for LOAD DATA LOCAL INFILE
+- SQL Server uses TDS Bulk Load (tiberius `bulk_insert`) for homogeneous INSERT batches, falls back to multi-value INSERT
 - Consumer detects homogeneous INSERT batches and routes to bulk insert path when threshold met
 
 ## Important Files
@@ -32,7 +33,7 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - `pg2any-lib/src/transaction_manager.rs` - File-based transaction lifecycle + bulk insert routing
 - `pg2any-lib/src/destinations/destination_factory.rs` - `DestinationHandler` trait definition
 - `pg2any-lib/src/destinations/mysql.rs` - MySQL destination (sqlx + mysql_async dual pool)
-- `pg2any-lib/src/destinations/bulk_insert.rs` - TSV generation, INSERT detection, multi-value fallback
+- `pg2any-lib/src/destinations/bulk_insert.rs` - INSERT detection (backtick + bracket), TSV generation, multi-value INSERT fallback
 - `pg2any-lib/src/destinations/coalescing.rs` - DML coalescing (multi-value INSERT, CASE-WHEN UPDATE)
 - `pg2any-lib/src/config.rs` - All configuration fields and builder
 - `pg2any-lib/src/env.rs` - Environment variable mapping

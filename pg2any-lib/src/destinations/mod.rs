@@ -2,7 +2,7 @@ pub mod coalescing;
 pub mod common;
 
 /// Bulk insert utilities (TSV generation, INSERT detection)
-#[cfg(feature = "mysql")]
+#[cfg(any(feature = "mysql", feature = "sqlserver"))]
 pub mod bulk_insert;
 
 /// MySQL destination implementation

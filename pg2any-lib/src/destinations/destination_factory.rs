@@ -113,7 +113,7 @@ pub trait DestinationHandler: Send + Sync {
         if rows.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "mysql")]
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
         {
             let sql =
                 crate::destinations::bulk_insert::build_multi_value_insert(table, columns, rows);
@@ -121,10 +121,12 @@ pub trait DestinationHandler: Send + Sync {
                 .execute_sql_batch_with_hook(&[sql], pre_commit_hook)
                 .await;
         }
-        #[cfg(not(feature = "mysql"))]
+        #[cfg(not(any(feature = "mysql", feature = "sqlserver")))]
         {
             let _ = (table, columns, rows, pre_commit_hook);
-            Err(CdcError::unsupported("Bulk insert requires mysql feature"))
+            Err(CdcError::unsupported(
+                "Bulk insert not available without mysql or sqlserver feature",
+            ))
         }
     }
 }

@@ -3,7 +3,7 @@
 #[cfg(feature = "mysql")]
 mod bulk_insert_integration {
     use pg2any_lib::destinations::bulk_insert::{
-        build_multi_value_insert, detect_bulk_insert_batch, generate_tsv_buffer,
+        build_multi_value_insert, detect_bulk_insert_batch,
     };
 
     #[test]
@@ -26,31 +26,6 @@ mod bulk_insert_integration {
         assert_eq!(parsed.table, "`cdc_db`.`t1`");
         assert_eq!(parsed.columns.len(), 3);
         assert_eq!(parsed.rows.len(), 1000);
-    }
-
-    #[test]
-    fn test_tsv_null_handling() {
-        let rows = vec![
-            vec!["1".to_string(), "NULL".to_string(), "'text'".to_string()],
-            vec!["2".to_string(), "'value'".to_string(), "NULL".to_string()],
-        ];
-        let tsv = generate_tsv_buffer(&rows);
-        let output = String::from_utf8(tsv).unwrap();
-        assert!(output.contains("\\N"));
-        assert!(output.contains("text"));
-        assert!(output.contains("value"));
-    }
-
-    #[test]
-    fn test_tsv_special_characters() {
-        let rows = vec![
-            vec!["1".to_string(), "'hello\\tworld'".to_string()],
-            vec!["2".to_string(), "'line1\\nline2'".to_string()],
-            vec!["3".to_string(), "'back\\\\slash'".to_string()],
-        ];
-        let tsv = generate_tsv_buffer(&rows);
-        let output = String::from_utf8(tsv).unwrap();
-        assert!(!output.contains('\t') || output.lines().all(|l| l.split('\t').count() == 2));
     }
 
     #[test]

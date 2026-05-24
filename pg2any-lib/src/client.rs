@@ -116,6 +116,7 @@ impl CdcClient {
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
+        manager.set_bulk_insert_config(config.bulk_insert_threshold);
 
         if destination_handler.supports_event_mode() {
             info!(
@@ -311,6 +312,7 @@ impl CdcClient {
             lsn_tracker,
             shared_lsn_feedback_for_consumer,
             self.config.batch_size,
+            self.config.smart_batch_max_txns,
             rx_commit_notifier,
             producer_shutdown_rx,
         ));
@@ -935,6 +937,7 @@ impl CdcClient {
         lsn_tracker: Arc<LsnTracker>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
         batch_size: usize,
+        smart_batch_max_txns: usize,
         mut commit_receiver: mpsc::Receiver<PendingTransactionFile>,
         mut producer_shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
@@ -1016,6 +1019,7 @@ impl CdcClient {
                         &lsn_tracker,
                         &metrics_collector,
                         batch_size,
+                        smart_batch_max_txns,
                         &shared_lsn_feedback,
                         &mut retry_deadline,
                         &mut retry_count,
@@ -1063,6 +1067,7 @@ impl CdcClient {
                                 &lsn_tracker,
                                 &metrics_collector,
                                 batch_size,
+                                smart_batch_max_txns,
                                 &shared_lsn_feedback,
                                 &mut retry_deadline,
                                 &mut retry_count,
@@ -1126,10 +1131,32 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
+        smart_batch_max_txns: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         retry_deadline: &mut Option<tokio::time::Instant>,
         retry_count: &mut u32,
     ) -> bool {
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        if commit_queue.len() >= 2 && smart_batch_max_txns > 1 {
+            if Self::try_smart_batch(
+                commit_queue,
+                transaction_file_manager,
+                destination_handler,
+                lsn_tracker,
+                metrics_collector,
+                shared_lsn_feedback,
+                smart_batch_max_txns,
+            )
+            .await
+            {
+                *retry_deadline = None;
+                *retry_count = 0;
+                if commit_queue.is_empty() {
+                    return false;
+                }
+            }
+        }
+
         while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
             info!(
                 "Consumer processing transaction {} in commit_lsn order (LSN: {:?})",
@@ -1186,6 +1213,153 @@ impl CdcClient {
             *retry_count = 0;
         }
         false
+    }
+
+    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+    async fn try_smart_batch(
+        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
+        transaction_file_manager: &Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        smart_batch_max_txns: usize,
+    ) -> bool {
+        if commit_queue.len() < 2 || !destination_handler.supports_bulk_insert() {
+            return false;
+        }
+
+        let candidates: Vec<PendingTransactionFile> = commit_queue
+            .iter()
+            .take(smart_batch_max_txns)
+            .map(|std::cmp::Reverse(tx)| tx.clone())
+            .collect();
+
+        if candidates.len() < 2 {
+            return false;
+        }
+
+        let all_segments: Vec<_> = candidates
+            .iter()
+            .flat_map(|tx| tx.metadata.segments.iter().cloned())
+            .collect();
+
+        let analysis = match transaction_file_manager
+            .analyze_transaction_content(&all_segments)
+            .await
+        {
+            Ok(Some(result)) => result,
+            _ => return false,
+        };
+
+        let (table, columns) = analysis;
+
+        let mut all_rows: Vec<Vec<String>> = Vec::new();
+        for segment in &all_segments {
+            let content = match tokio::fs::read_to_string(&segment.path).await {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let stmts: Vec<String> = content
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if let Some(parsed) = crate::destinations::bulk_insert::detect_bulk_insert_batch(&stmts)
+            {
+                all_rows.extend(parsed.rows);
+            } else {
+                return false;
+            }
+        }
+
+        let total_rows = all_rows.len();
+        let batch_count = candidates.len();
+
+        info!(
+            "Smart batch: merging {} transactions ({} rows) into single bulk insert to {}",
+            batch_count, total_rows, table
+        );
+
+        let highest_lsn = candidates
+            .iter()
+            .filter_map(|tx| tx.metadata.commit_lsn)
+            .max();
+
+        let hook_lsn = highest_lsn;
+        let hook_tracker = Arc::clone(lsn_tracker);
+        let hook_feedback = Arc::clone(shared_lsn_feedback);
+
+        let pre_commit_hook: Option<crate::destinations::destination_factory::PreCommitHook> =
+            Some(Box::new(move || {
+                Box::pin(async move {
+                    if let Some(lsn) = hook_lsn {
+                        hook_tracker.commit_lsn(lsn.0);
+                        hook_feedback.update_applied_lsn(lsn.0);
+                        hook_feedback.update_flushed_lsn(lsn.0);
+                    }
+                    Ok(())
+                })
+            }));
+
+        match destination_handler
+            .execute_bulk_insert_with_hook(&table, &columns, &all_rows, pre_commit_hook)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Smart batch complete: {} transactions, {} rows merged",
+                    batch_count, total_rows
+                );
+
+                for candidate in &candidates {
+                    let mut tx = crate::types::Transaction::new(
+                        candidate.metadata.transaction_id,
+                        candidate.metadata.commit_timestamp,
+                    );
+                    tx.commit_lsn = candidate.metadata.commit_lsn;
+                    let dest_str = candidate.metadata.destination_type.to_string();
+                    metrics_collector.record_transaction_processed(&tx, &dest_str);
+                }
+
+                for _ in 0..batch_count {
+                    commit_queue.pop();
+                }
+
+                let all_paths: Vec<std::path::PathBuf> = candidates
+                    .iter()
+                    .flat_map(|tx| {
+                        let mut paths: Vec<std::path::PathBuf> = tx
+                            .metadata
+                            .segments
+                            .iter()
+                            .map(|s| s.path.clone())
+                            .collect();
+                        paths.push(tx.file_path.clone());
+                        paths
+                    })
+                    .collect();
+                transaction_file_manager
+                    .batch_delete_files(&all_paths)
+                    .await;
+
+                if let Some(lsn) = highest_lsn {
+                    lsn_tracker.commit_lsn(lsn.0);
+                    if let Err(e) = lsn_tracker.persist_async().await {
+                        warn!("Failed to persist LSN after smart batch: {}", e);
+                    }
+                }
+
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Smart batch failed, falling back to individual processing: {}",
+                    e
+                );
+                false
+            }
+        }
     }
 
     #[inline]

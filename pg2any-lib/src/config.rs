@@ -93,6 +93,18 @@ pub struct Config {
 
     /// Additional configuration options
     pub extra_options: HashMap<String, String>,
+
+    /// Enable bulk insert optimization for MySQL (LOAD DATA LOCAL INFILE)
+    pub bulk_insert_enabled: bool,
+
+    /// Minimum number of INSERT statements to trigger bulk insert mode
+    pub bulk_insert_threshold: usize,
+
+    /// Enable session-level tuning for large batches (unique_checks=0, foreign_key_checks=0)
+    pub session_tuning_enabled: bool,
+
+    /// Minimum batch command count to trigger session tuning
+    pub session_tuning_threshold: usize,
 }
 
 /// Origin filtering options
@@ -193,6 +205,10 @@ impl Default for Config {
             transaction_file_base_path: ".".to_string(),
             transaction_segment_size_bytes: 64 * 1024 * 1024,
             extra_options: HashMap::new(),
+            bulk_insert_enabled: true,
+            bulk_insert_threshold: 500,
+            session_tuning_enabled: true,
+            session_tuning_threshold: 100,
         }
     }
 }
@@ -389,6 +405,26 @@ impl ConfigBuilder {
         V: Into<String>,
     {
         self.config.extra_options.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn bulk_insert_enabled(mut self, enabled: bool) -> Self {
+        self.config.bulk_insert_enabled = enabled;
+        self
+    }
+
+    pub fn bulk_insert_threshold(mut self, threshold: usize) -> Self {
+        self.config.bulk_insert_threshold = threshold;
+        self
+    }
+
+    pub fn session_tuning_enabled(mut self, enabled: bool) -> Self {
+        self.config.session_tuning_enabled = enabled;
+        self
+    }
+
+    pub fn session_tuning_threshold(mut self, threshold: usize) -> Self {
+        self.config.session_tuning_threshold = threshold;
         self
     }
 

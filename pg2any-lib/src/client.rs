@@ -116,6 +116,7 @@ impl CdcClient {
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
+        manager.set_bulk_insert_config(config.bulk_insert_enabled, config.bulk_insert_threshold);
 
         if destination_handler.supports_event_mode() {
             info!(
@@ -293,6 +294,12 @@ impl CdcClient {
         if !schema_mappings.is_empty() {
             consumer_destination.set_schema_mappings(schema_mappings.clone());
         }
+
+        // Apply session tuning config
+        consumer_destination.set_session_tuning(
+            self.config.session_tuning_enabled,
+            self.config.session_tuning_threshold,
+        );
 
         info!("Consumer destination connection established");
 

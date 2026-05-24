@@ -23,12 +23,17 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - Shutdown coordination: `CancellationToken` + `oneshot` channel (producer -> consumer)
 - Destinations behind `DestinationHandler` trait; Kafka uses event mode, SQL destinations use SQL batch mode
 - `TransactionStorage` trait abstracts compressed vs uncompressed file I/O
+- MySQL uses dual pools: sqlx for normal SQL batches, mysql_async for LOAD DATA LOCAL INFILE
+- Consumer detects homogeneous INSERT batches and routes to bulk insert path when threshold met
 
 ## Important Files
 
 - `pg2any-lib/src/client.rs` - Core orchestration logic (~1500 lines), producer/consumer tasks
-- `pg2any-lib/src/transaction_manager.rs` - File-based transaction lifecycle
+- `pg2any-lib/src/transaction_manager.rs` - File-based transaction lifecycle + bulk insert routing
 - `pg2any-lib/src/destinations/destination_factory.rs` - `DestinationHandler` trait definition
+- `pg2any-lib/src/destinations/mysql.rs` - MySQL destination (sqlx + mysql_async dual pool)
+- `pg2any-lib/src/destinations/bulk_insert.rs` - TSV generation, INSERT detection, multi-value fallback
+- `pg2any-lib/src/destinations/coalescing.rs` - DML coalescing (multi-value INSERT, CASE-WHEN UPDATE)
 - `pg2any-lib/src/config.rs` - All configuration fields and builder
 - `pg2any-lib/src/env.rs` - Environment variable mapping
 - `pg2any-lib/src/error.rs` - Error types (transient vs permanent classification matters for retry logic)

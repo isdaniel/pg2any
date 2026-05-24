@@ -129,7 +129,7 @@ impl DestinationHandler for SQLiteDestination {
             );
         }
 
-        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite")
+        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite", false)
             .await
     }
 

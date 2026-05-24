@@ -10,12 +10,14 @@
 /// * `commands` - SQL commands to execute within a single transaction
 /// * `pre_commit_hook` - Optional async callback invoked BEFORE COMMIT (rolled back on failure)
 /// * `db_name` - Database name for error messages (e.g., "MySQL", "SQLite")
+/// * `session_tuning` - If true and db is MySQL, disable unique_checks and foreign_key_checks
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 pub(crate) async fn execute_sqlx_batch_with_hook<DB>(
     pool: &sqlx::Pool<DB>,
     commands: &[std::borrow::Cow<'_, str>],
     pre_commit_hook: Option<super::destination_factory::PreCommitHook>,
     db_name: &str,
+    session_tuning: bool,
 ) -> crate::error::Result<()>
 where
     DB: sqlx::Database,
@@ -26,6 +28,17 @@ where
     let mut tx = pool.begin().await.map_err(|e| {
         crate::error::CdcError::generic(format!("{db_name} BEGIN transaction failed: {e}"))
     })?;
+
+    if session_tuning && db_name == "MySQL" {
+        sqlx::query("SET unique_checks=0, foreign_key_checks=0")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                crate::error::CdcError::generic(format!(
+                    "{db_name} session tuning SET failed: {e}"
+                ))
+            })?;
+    }
 
     // Execute all commands in the transaction
     for (idx, sql) in commands.iter().enumerate() {
@@ -44,6 +57,17 @@ where
                 e
             )));
         }
+    }
+
+    if session_tuning && db_name == "MySQL" {
+        sqlx::query("SET unique_checks=1, foreign_key_checks=1")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                crate::error::CdcError::generic(format!(
+                    "{db_name} session tuning RESTORE failed: {e}"
+                ))
+            })?;
     }
 
     // Execute pre-commit hook BEFORE transaction COMMIT

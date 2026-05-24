@@ -42,12 +42,17 @@ use std::time::Duration;
 /// - `CDC_QUERY_TIMEOUT`: Query timeout in seconds (default: "10")
 ///
 /// ## Performance Configuration
-/// - `CDC_BUFFER_SIZE`: Capacity of the transaction channel between producer and consumer (default: "1000")
+/// - `CDC_CHANNEL_CAPACITY`: Capacity of the transaction channel between producer and consumer (default: "1000")
 ///   Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
-/// - `CDC_COMMIT_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
+///   (Deprecated alias: `CDC_BUFFER_SIZE`)
+/// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
 ///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
 ///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
+///   (Deprecated alias: `CDC_COMMIT_BATCH_SIZE`)
+/// - `CDC_MAX_ROWS_PER_INSERT`: Maximum rows per multi-value INSERT statement (default: "0" = no limit)
+///   SQL Server enforces a hard limit of 1000. Set to 1000 for SQL Server destinations.
+///   When set to 0, the destination's own default applies (SQL Server defaults to 1000 internally).
 ///
 /// # Errors
 ///
@@ -98,10 +103,15 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     // Timeout configurations
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
     let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
-    let buffer_size = parse_usize_env("CDC_BUFFER_SIZE", 1000)?;
-    let batch_size = parse_usize_env("CDC_COMMIT_BATCH_SIZE", 1000)?;
+    let buffer_size =
+        parse_usize_env_with_fallback("CDC_CHANNEL_CAPACITY", "CDC_BUFFER_SIZE", 1000)?;
+    let batch_size =
+        parse_usize_env_with_fallback("CDC_BATCH_SIZE", "CDC_COMMIT_BATCH_SIZE", 1000)?;
     let segment_size_mb = parse_usize_env("CDC_TRANSACTION_SEGMENT_SIZE_MB", 64)?;
     let segment_size_bytes = segment_size_mb.saturating_mul(1024 * 1024);
+
+    let bulk_insert_threshold = parse_usize_env("CDC_BULK_INSERT_THRESHOLD", 500)?;
+    let max_rows_per_insert = parse_usize_env("CDC_MAX_ROWS_PER_INSERT", 0)?;
 
     // Transaction file persistence configuration
     let transaction_file_base_path =
@@ -156,6 +166,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .batch_size(batch_size)
         .transaction_file_base_path(transaction_file_base_path)
         .transaction_segment_size_bytes(segment_size_bytes)
+        .bulk_insert_threshold(bulk_insert_threshold)
+        .max_rows_per_insert(max_rows_per_insert)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");
@@ -235,4 +247,25 @@ fn parse_usize_env(key: &str, default: usize) -> Result<usize, CdcError> {
             .map_err(|e| CdcError::config(format!("Invalid usize value for {key}: {value} ({e})"))),
         Err(_) => Ok(default),
     }
+}
+
+/// Parse a usize env var with a deprecated fallback name.
+/// Prefers `new_key`; if absent, checks `old_key` and logs a deprecation warning.
+fn parse_usize_env_with_fallback(
+    new_key: &str,
+    old_key: &str,
+    default: usize,
+) -> Result<usize, CdcError> {
+    if let Ok(value) = std::env::var(new_key) {
+        return value.parse::<usize>().map_err(|e| {
+            CdcError::config(format!("Invalid usize value for {new_key}: {value} ({e})"))
+        });
+    }
+    if let Ok(value) = std::env::var(old_key) {
+        tracing::warn!("Environment variable {old_key} is deprecated, use {new_key} instead");
+        return value.parse::<usize>().map_err(|e| {
+            CdcError::config(format!("Invalid usize value for {old_key}: {value} ({e})"))
+        });
+    }
+    Ok(default)
 }

@@ -11,7 +11,7 @@ A high-performance PostgreSQL Change Data Capture (CDC) tool that streams databa
 
 | Destination | Driver | Feature Flag |
 |-------------|--------|--------------|
-| MySQL | SQLx | `mysql` (default) |
+| MySQL | SQLx + mysql_async | `mysql` (default) |
 | SQL Server | Tiberius (TDS) | `sqlserver` (default) |
 | SQLite | SQLx | `sqlite` (default) |
 | Kafka | rdkafka (librdkafka) | `kafka` |
@@ -25,6 +25,9 @@ A high-performance PostgreSQL Change Data Capture (CDC) tool that streams databa
 - **Schema mapping** - Configurable PostgreSQL schema to destination database/schema translation
 - **Prometheus metrics** - Built-in HTTP metrics endpoint (feature: `metrics`)
 - **Graceful shutdown** - Coordinated producer-consumer shutdown with LSN persistence
+- **Bulk insert optimization** - LOAD DATA LOCAL INFILE for MySQL, TDS Bulk Load for SQL Server + session tuning for large batches
+- **DML coalescing** - Multi-value INSERT, CASE-WHEN UPDATE, OR-combined DELETE batching
+- **Smart batching** - Merges consecutive homogeneous INSERT-only transactions across boundaries for higher throughput
 
 ## Quick Start
 
@@ -237,14 +240,17 @@ All configuration is via environment variables (ideal for containers) or the `Co
 | `CDC_PROTOCOL_VERSION` | `1` | Replication protocol version (1-4) |
 | `CDC_STREAMING` | `true` | Stream in-progress transactions (requires protocol v2+) |
 | `CDC_SCHEMA_MAPPING` | | Schema translation, e.g. `public:cdc_db,sales:sales_db` |
-| `CDC_BUFFER_SIZE` | `500` | Transaction channel capacity |
+| `CDC_CHANNEL_CAPACITY` | `1000` | Transaction channel capacity between producer and consumer |
+| `CDC_BATCH_SIZE` | `1000` | SQL commands per batch execution |
 | `CDC_TRANSACTION_SEGMENT_SIZE_MB` | `64` | Max segment file size in MB |
 | `CDC_CONNECTION_TIMEOUT` | `30` | Connection timeout (seconds) |
 | `CDC_QUERY_TIMEOUT` | `10` | Query timeout (seconds) |
 | `CDC_LAST_LSN_FILE` | `./pg2any_last_lsn` | Base path for LSN metadata file |
 | `CDC_TRANSACTION_FILE_BASE_PATH` | `./` | Base directory for transaction files |
 | `PG2ANY_ENABLE_COMPRESSION` | `false` | Enable gzip compression for SQL files |
+| `CDC_BULK_INSERT_THRESHOLD` | `500` | Minimum INSERT statements to trigger bulk path |
 | `RUST_LOG` | `pg2any=debug` | Log level |
+
 
 ## Monitoring
 
@@ -289,7 +295,7 @@ make pgbench-test-mysql-full
 ```toml
 [features]
 default = ["mysql", "sqlserver", "sqlite"]
-mysql = ["sqlx/mysql"]
+mysql = ["sqlx/mysql", "mysql_async"]
 sqlserver = ["tiberius"]
 sqlite = ["sqlx/sqlite"]
 kafka = ["rdkafka", "futures-util", "base64"]
@@ -303,6 +309,7 @@ metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 | [pg_walstream](https://crates.io/crates/pg_walstream) | PostgreSQL logical replication protocol |
 | tokio | Async runtime |
 | sqlx | MySQL + SQLite async driver |
+| mysql_async | MySQL LOAD DATA LOCAL INFILE support |
 | tiberius | SQL Server TDS protocol |
 | rdkafka | Kafka producer (librdkafka wrapper) |
 | serde / serde_json | Serialization |

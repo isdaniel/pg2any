@@ -181,6 +181,15 @@ impl DestinationHandler for SqlServerDestination {
             .as_mut()
             .ok_or_else(|| CdcError::generic("SQL Server client not initialized"))?;
 
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!(
+                    "SQL Server BEGIN TRANSACTION failed for bulk load: {e}"
+                ))
+            })?;
+
         match client.bulk_insert(bulk_table).await {
             Ok(mut req) => {
                 for row_values in rows {
@@ -193,6 +202,7 @@ impl DestinationHandler for SqlServerDestination {
                             "TDS Bulk Load send failed, falling back to multi-value INSERT: {}",
                             e
                         );
+                        let _ = client.simple_query("ROLLBACK TRANSACTION").await;
                         return self
                             .fallback_multi_value_insert(table, columns, rows, pre_commit_hook)
                             .await;
@@ -209,12 +219,22 @@ impl DestinationHandler for SqlServerDestination {
 
                         if let Some(hook) = pre_commit_hook {
                             if let Err(e) = hook().await {
+                                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
                                 return Err(CdcError::generic(format!(
-                                    "SQL Server bulk insert pre-commit hook failed: {}",
+                                    "SQL Server bulk insert pre-commit hook failed, rolled back: {}",
                                     e
                                 )));
                             }
                         }
+
+                        client
+                            .simple_query("COMMIT TRANSACTION")
+                            .await
+                            .map_err(|e| {
+                                CdcError::generic(format!(
+                                    "SQL Server COMMIT TRANSACTION failed after bulk load: {e}"
+                                ))
+                            })?;
 
                         Ok(())
                     }
@@ -223,6 +243,7 @@ impl DestinationHandler for SqlServerDestination {
                             "TDS Bulk Load finalize failed, falling back to multi-value INSERT: {}",
                             e
                         );
+                        let _ = client.simple_query("ROLLBACK TRANSACTION").await;
                         self.fallback_multi_value_insert(table, columns, rows, pre_commit_hook)
                             .await
                     }
@@ -233,6 +254,7 @@ impl DestinationHandler for SqlServerDestination {
                     "TDS Bulk Load init failed, falling back to multi-value INSERT: {}",
                     e
                 );
+                let _ = client.simple_query("ROLLBACK TRANSACTION").await;
                 self.fallback_multi_value_insert(table, columns, rows, pre_commit_hook)
                     .await
             }

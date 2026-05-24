@@ -21,12 +21,15 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
     let table = first.2.clone();
 
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(statements.len());
-    for stmt in statements {
-        let parsed = parse_insert_prefix(stmt)?;
-        if &parsed.0 != expected_prefix {
+
+    let values = parse_values_tuple(&statements[0][expected_prefix.len()..])?;
+    rows.push(values);
+
+    for stmt in &statements[1..] {
+        if !stmt.trim().starts_with(expected_prefix.as_str()) {
             return None;
         }
-        let values = parse_values_tuple(&stmt[parsed.0.len()..])?;
+        let values = parse_values_tuple(&stmt[expected_prefix.len()..])?;
         rows.push(values);
     }
 

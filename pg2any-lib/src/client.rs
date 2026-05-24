@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -116,6 +117,7 @@ impl CdcClient {
         )
         .await?;
         manager.set_schema_mappings(config.schema_mappings.clone());
+        manager.set_bulk_insert_config(config.bulk_insert_threshold);
 
         if destination_handler.supports_event_mode() {
             info!(
@@ -311,6 +313,7 @@ impl CdcClient {
             lsn_tracker,
             shared_lsn_feedback_for_consumer,
             self.config.batch_size,
+            self.config.smart_batch_max_txns,
             rx_commit_notifier,
             producer_shutdown_rx,
         ));
@@ -935,6 +938,7 @@ impl CdcClient {
         lsn_tracker: Arc<LsnTracker>,
         shared_lsn_feedback: Arc<SharedLsnFeedback>,
         batch_size: usize,
+        smart_batch_max_txns: usize,
         mut commit_receiver: mpsc::Receiver<PendingTransactionFile>,
         mut producer_shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
@@ -963,21 +967,24 @@ impl CdcClient {
                             biased;
 
                             _ = &mut producer_shutdown_rx => {
-                                info!("Consumer: Received producer shutdown signal during retry wait, persisting position");
+                                info!("Consumer: Received producer shutdown signal during retry wait, draining queue");
 
                                 Self::drain_and_shutdown(
+                                    &mut commit_queue,
+                                    &mut commit_receiver,
                                     &transaction_file_manager,
+                                    &mut destination_handler,
                                     &lsn_tracker,
+                                    &metrics_collector,
+                                    batch_size,
                                     &shared_lsn_feedback,
                                 )
                                 .await;
-                                // Use a labeled block to break outer loop
                                 metrics_collector.update_destination_connection_status(&destination_type, false);
                                 info!("Consumer stopped gracefully");
                                 return Ok(());
                             }
 
-                            // Enqueue new notifications while waiting, but do NOT reset the timer
                             result = commit_receiver.recv() => {
                                 if let Some(notification) = result {
                                     commit_queue.push(std::cmp::Reverse(notification));
@@ -988,8 +995,13 @@ impl CdcClient {
                                     let _ = producer_shutdown_rx.await;
 
                                     Self::drain_and_shutdown(
+                                        &mut commit_queue,
+                                        &mut commit_receiver,
                                         &transaction_file_manager,
+                                        &mut destination_handler,
                                         &lsn_tracker,
+                                        &metrics_collector,
+                                        batch_size,
                                         &shared_lsn_feedback,
                                     )
                                     .await;
@@ -1008,7 +1020,7 @@ impl CdcClient {
                     retry_deadline = None;
 
                     // Backoff expired — process queue
-                    Self::process_commit_queue(
+                    let cancelled = Self::process_commit_queue(
                         &mut commit_queue,
                         &transaction_file_manager,
                         &mut destination_handler,
@@ -1016,11 +1028,31 @@ impl CdcClient {
                         &lsn_tracker,
                         &metrics_collector,
                         batch_size,
+                        smart_batch_max_txns,
                         &shared_lsn_feedback,
                         &mut retry_deadline,
                         &mut retry_count,
                     )
                     .await;
+
+                    if cancelled {
+                        info!("Consumer: cancellation detected during retry, draining remaining queue");
+                        Self::drain_and_shutdown(
+                            &mut commit_queue,
+                            &mut commit_receiver,
+                            &transaction_file_manager,
+                            &mut destination_handler,
+                            &lsn_tracker,
+                            &metrics_collector,
+                            batch_size,
+                            &shared_lsn_feedback,
+                        )
+                        .await;
+                        metrics_collector
+                            .update_destination_connection_status(&destination_type, false);
+                        info!("Consumer stopped gracefully");
+                        return Ok(());
+                    }
                     continue;
                 }
             }
@@ -1030,11 +1062,16 @@ impl CdcClient {
 
                 // Handle producer shutdown signal (producer stopped gracefully)
                 _ = &mut producer_shutdown_rx => {
-                    info!("Consumer: Received producer shutdown signal, persisting position");
+                    info!("Consumer: Received producer shutdown signal, draining queue");
 
                     Self::drain_and_shutdown(
+                        &mut commit_queue,
+                        &mut commit_receiver,
                         &transaction_file_manager,
+                        &mut destination_handler,
                         &lsn_tracker,
+                        &metrics_collector,
+                        batch_size,
                         &shared_lsn_feedback,
                     )
                     .await;
@@ -1055,7 +1092,7 @@ impl CdcClient {
                             commit_queue.push(std::cmp::Reverse(notification));
 
                             // Process all transactions that are ready (in commit_lsn order)
-                            Self::process_commit_queue(
+                            let cancelled = Self::process_commit_queue(
                                 &mut commit_queue,
                                 &transaction_file_manager,
                                 &mut destination_handler,
@@ -1063,11 +1100,28 @@ impl CdcClient {
                                 &lsn_tracker,
                                 &metrics_collector,
                                 batch_size,
+                                smart_batch_max_txns,
                                 &shared_lsn_feedback,
                                 &mut retry_deadline,
                                 &mut retry_count,
                             )
                             .await;
+
+                            if cancelled {
+                                info!("Consumer: cancellation detected, draining remaining queue");
+                                Self::drain_and_shutdown(
+                                    &mut commit_queue,
+                                    &mut commit_receiver,
+                                    &transaction_file_manager,
+                                    &mut destination_handler,
+                                    &lsn_tracker,
+                                    &metrics_collector,
+                                    batch_size,
+                                    &shared_lsn_feedback,
+                                )
+                                .await;
+                                break;
+                            }
                         }
                         None => {
                             // Channel closed - producer has dropped the sender
@@ -1076,8 +1130,13 @@ impl CdcClient {
                             let _ = producer_shutdown_rx.await;
 
                             Self::drain_and_shutdown(
+                                &mut commit_queue,
+                                &mut commit_receiver,
                                 &transaction_file_manager,
+                                &mut destination_handler,
                                 &lsn_tracker,
+                                &metrics_collector,
+                                batch_size,
                                 &shared_lsn_feedback,
                             )
                             .await;
@@ -1094,19 +1153,82 @@ impl CdcClient {
         Ok(())
     }
 
-    /// Persist current position and exit. Pending transaction files remain in
-    /// sql_pending_tx/ and will be recovered on the next restart.
+    /// Drain remaining channel messages, process all queued transactions, then
+    /// persist position and exit.
     ///
-    /// Does NOT attempt to process queued transactions — processing large
-    /// transactions during drain risks exceeding the docker stop grace period
-    /// and triggering SIGKILL before progress is persisted.
+    /// Uses a 90-second timeout to leave headroom within the Docker stop grace
+    /// period (typically 120s). If the timeout fires, processing stops and the
+    /// current position is persisted — unprocessed files remain in sql_pending_tx/
+    /// for recovery on the next restart.
     async fn drain_and_shutdown(
+        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
+        commit_receiver: &mut mpsc::Receiver<PendingTransactionFile>,
         transaction_file_manager: &Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
         lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
-        Self::flush_and_persist_on_shutdown(transaction_file_manager, lsn_tracker).await;
+        // Drain any remaining messages from the channel into the queue
+        while let Ok(notification) = commit_receiver.try_recv() {
+            commit_queue.push(std::cmp::Reverse(notification));
+        }
 
+        if commit_queue.is_empty() {
+            Self::flush_and_persist_on_shutdown(transaction_file_manager, lsn_tracker).await;
+            info!("Consumer: Shutdown complete, no pending transactions, position persisted");
+            shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
+            return;
+        }
+
+        info!(
+            "Consumer: Processing {} queued transaction(s) before shutdown",
+            commit_queue.len()
+        );
+
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+
+        while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
+            if tokio::time::Instant::now() >= drain_deadline {
+                warn!(
+                    "Consumer: Drain timeout reached with {} transaction(s) remaining, persisting position",
+                    commit_queue.len() + 1
+                );
+                commit_queue.push(std::cmp::Reverse(next_tx));
+                break;
+            }
+
+            info!(
+                "Consumer drain: processing transaction {} (LSN: {:?})",
+                next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
+            );
+
+            // Use a no-op cancellation token — we don't want cancellation during drain
+            let drain_token = CancellationToken::new();
+
+            if let Err(e) = transaction_file_manager
+                .clone()
+                .process_transaction_file(
+                    &next_tx,
+                    destination_handler,
+                    &drain_token,
+                    lsn_tracker,
+                    metrics_collector,
+                    batch_size,
+                    shared_lsn_feedback,
+                )
+                .await
+            {
+                warn!(
+                    "Consumer drain: failed to process transaction {}: {}. File remains in sql_pending_tx/ for recovery.",
+                    next_tx.metadata.transaction_id, e
+                );
+                break;
+            }
+        }
+
+        Self::flush_and_persist_on_shutdown(transaction_file_manager, lsn_tracker).await;
         info!("Consumer: Shutdown complete, position persisted");
         shared_lsn_feedback.log_state("Consumer shutdown - final LSN state");
     }
@@ -1116,8 +1238,7 @@ impl CdcClient {
     /// On failure, re-inserts the failed transaction and sets a retry delay
     /// with exponential backoff (1s, 2s, 4s, ... up to 30s).
     ///
-    /// Returns `true` if a transaction was cancelled by shutdown signal,
-    /// indicating that drain_and_shutdown must NOT process additional transactions.
+    /// Returns `true` if a transaction was cancelled by shutdown signal.
     async fn process_commit_queue(
         commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
         transaction_file_manager: &Arc<TransactionManager>,
@@ -1126,10 +1247,32 @@ impl CdcClient {
         lsn_tracker: &Arc<LsnTracker>,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
+        smart_batch_max_txns: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         retry_deadline: &mut Option<tokio::time::Instant>,
         retry_count: &mut u32,
     ) -> bool {
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        if commit_queue.len() >= 2 && smart_batch_max_txns > 1 {
+            if Self::try_smart_batch(
+                commit_queue,
+                transaction_file_manager,
+                destination_handler,
+                lsn_tracker,
+                metrics_collector,
+                shared_lsn_feedback,
+                smart_batch_max_txns,
+            )
+            .await
+            {
+                *retry_deadline = None;
+                *retry_count = 0;
+                if commit_queue.is_empty() {
+                    return false;
+                }
+            }
+        }
+
         while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
             info!(
                 "Consumer processing transaction {} in commit_lsn order (LSN: {:?})",
@@ -1154,7 +1297,11 @@ impl CdcClient {
                         "Consumer: transaction {} cancelled by shutdown, will be recovered on restart",
                         next_tx.metadata.transaction_id
                     );
-                    commit_queue.clear();
+                    // Push the cancelled transaction back — it wasn't committed to
+                    // the destination, so its sql_pending_tx/ file still exists for
+                    // recovery. Do NOT clear the queue: drain_and_shutdown will
+                    // process remaining items.
+                    commit_queue.push(std::cmp::Reverse(next_tx));
                     return true;
                 }
 
@@ -1186,6 +1333,192 @@ impl CdcClient {
             *retry_count = 0;
         }
         false
+    }
+
+    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+    async fn try_smart_batch(
+        commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
+        transaction_file_manager: &Arc<TransactionManager>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+        smart_batch_max_txns: usize,
+    ) -> bool {
+        if commit_queue.len() < 2 || !destination_handler.supports_bulk_insert() {
+            return false;
+        }
+
+        // Pop candidates from the heap to guarantee commit_lsn ordering.
+        // BinaryHeap::iter() does NOT return elements in sorted order.
+        let take_count = smart_batch_max_txns.min(commit_queue.len());
+        let mut candidates: Vec<PendingTransactionFile> = Vec::with_capacity(take_count);
+        for _ in 0..take_count {
+            if let Some(std::cmp::Reverse(tx)) = commit_queue.pop() {
+                candidates.push(tx);
+            }
+        }
+
+        if candidates.len() < 2 {
+            // Push back and abort
+            for tx in candidates {
+                commit_queue.push(std::cmp::Reverse(tx));
+            }
+            return false;
+        }
+
+        let all_segments: Vec<_> = candidates
+            .iter()
+            .flat_map(|tx| tx.metadata.segments.iter().cloned())
+            .collect();
+
+        let analysis = match transaction_file_manager
+            .analyze_transaction_content(&all_segments)
+            .await
+        {
+            Ok(Some(result)) => result,
+            _ => {
+                for tx in candidates {
+                    commit_queue.push(std::cmp::Reverse(tx));
+                }
+                return false;
+            }
+        };
+
+        let (table, columns) = analysis;
+
+        let mut all_rows: Vec<Vec<String>> = Vec::new();
+        let mut parse_ok = true;
+        for segment in &all_segments {
+            let file = match tokio::fs::File::open(&segment.path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    parse_ok = false;
+                    break;
+                }
+            };
+            let mut lines_reader = tokio::io::BufReader::new(file).lines();
+            let mut stmts: Vec<String> = Vec::new();
+            loop {
+                match lines_reader.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            stmts.push(trimmed);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        parse_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !parse_ok {
+                break;
+            }
+            if let Some(parsed) = crate::destinations::bulk_insert::detect_bulk_insert_batch(&stmts)
+            {
+                all_rows.extend(parsed.rows);
+            } else {
+                parse_ok = false;
+                break;
+            }
+        }
+
+        if !parse_ok {
+            for tx in candidates {
+                commit_queue.push(std::cmp::Reverse(tx));
+            }
+            return false;
+        }
+
+        let total_rows = all_rows.len();
+        let batch_count = candidates.len();
+
+        info!(
+            "Smart batch: merging {} transactions ({} rows) into single bulk insert to {}",
+            batch_count, total_rows, table
+        );
+
+        let highest_lsn = candidates
+            .iter()
+            .filter_map(|tx| tx.metadata.commit_lsn)
+            .max();
+
+        let hook_lsn = highest_lsn;
+        let hook_tracker = Arc::clone(lsn_tracker);
+        let hook_feedback = Arc::clone(shared_lsn_feedback);
+
+        let pre_commit_hook: Option<crate::destinations::destination_factory::PreCommitHook> =
+            Some(Box::new(move || {
+                Box::pin(async move {
+                    if let Some(lsn) = hook_lsn {
+                        hook_tracker.commit_lsn(lsn.0);
+                        hook_feedback.update_applied_lsn(lsn.0);
+                        hook_feedback.update_flushed_lsn(lsn.0);
+                    }
+                    Ok(())
+                })
+            }));
+
+        match destination_handler
+            .execute_bulk_insert_with_hook(&table, &columns, &all_rows, pre_commit_hook)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Smart batch complete: {} transactions, {} rows merged",
+                    batch_count, total_rows
+                );
+
+                for candidate in &candidates {
+                    let mut tx = crate::types::Transaction::new(
+                        candidate.metadata.transaction_id,
+                        candidate.metadata.commit_timestamp,
+                    );
+                    tx.commit_lsn = candidate.metadata.commit_lsn;
+                    let dest_str = candidate.metadata.destination_type.to_string();
+                    metrics_collector.record_transaction_processed(&tx, &dest_str);
+                }
+
+                let all_paths: Vec<std::path::PathBuf> = candidates
+                    .iter()
+                    .flat_map(|tx| {
+                        let mut paths: Vec<std::path::PathBuf> = tx
+                            .metadata
+                            .segments
+                            .iter()
+                            .map(|s| s.path.clone())
+                            .collect();
+                        paths.push(tx.file_path.clone());
+                        paths
+                    })
+                    .collect();
+                transaction_file_manager
+                    .batch_delete_files(&all_paths)
+                    .await;
+
+                if let Some(lsn) = highest_lsn {
+                    lsn_tracker.commit_lsn(lsn.0);
+                    if let Err(e) = lsn_tracker.persist_async().await {
+                        warn!("Failed to persist LSN after smart batch: {}", e);
+                    }
+                }
+
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Smart batch failed, falling back to individual processing: {}",
+                    e
+                );
+                for tx in candidates {
+                    commit_queue.push(std::cmp::Reverse(tx));
+                }
+                false
+            }
+        }
     }
 
     #[inline]

@@ -41,6 +41,10 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
+    /// Set the maximum number of rows per multi-value INSERT statement.
+    /// 0 means no limit (database default applies).
+    fn set_max_rows_per_insert(&mut self, _max_rows: usize) {}
+
     /// Execute a batch of SQL commands within a single transaction with optional pre-commit hook
     ///
     /// This is the primary method used by the consumer to execute transaction files.
@@ -94,6 +98,27 @@ pub trait DestinationHandler: Send + Sync {
         Err(CdcError::unsupported(
             "Event mode not supported by this destination",
         ))
+    }
+
+    fn supports_bulk_insert(&self) -> bool {
+        false
+    }
+
+    async fn execute_bulk_insert_with_hook(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<String>],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sqls = crate::destinations::bulk_insert::build_chunked_multi_value_inserts(
+            table, columns, rows, None, None,
+        );
+        self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
+            .await
     }
 }
 

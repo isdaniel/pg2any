@@ -15,7 +15,12 @@ pub enum CdcError {
     /// MySQL connection errors
     #[cfg(feature = "mysql")]
     #[error("MySQL connection error: {0}")]
-    MySQL(#[from] sqlx::Error),
+    MySQL(#[from] mysql_async::Error),
+
+    /// SQLite connection errors
+    #[cfg(feature = "sqlite")]
+    #[error("SQLite connection error: {0}")]
+    SQLite(#[from] sqlx::Error),
 
     /// Kafka producer errors
     #[cfg(feature = "kafka")]

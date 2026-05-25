@@ -276,8 +276,9 @@ impl SqlServerDestination {
         rows: &[Vec<String>],
         pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()> {
-        let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
-        self.execute_sql_batch_with_hook(&[sql], pre_commit_hook)
+        let sqls =
+            super::bulk_insert::build_chunked_multi_value_inserts(table, columns, rows, None);
+        self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }
 }

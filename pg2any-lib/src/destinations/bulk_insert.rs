@@ -62,6 +62,63 @@ pub fn build_multi_value_insert(table: &str, columns: &[String], rows: &[Vec<Str
     sql
 }
 
+/// Builds chunked multi-value INSERT statements that respect a maximum byte size per statement.
+/// MySQL's default `max_allowed_packet` is 64MB but can be as low as 4MB in some configurations.
+/// We use 4MB as a safe default to avoid exceeding the limit.
+const DEFAULT_MAX_STATEMENT_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn build_chunked_multi_value_inserts(
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<String>],
+    max_bytes: Option<usize>,
+) -> Vec<String> {
+    let max = max_bytes.unwrap_or(DEFAULT_MAX_STATEMENT_BYTES);
+    let col_list = columns.join(", ");
+    let prefix = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
+
+    let mut statements = Vec::new();
+    let mut current = prefix.clone();
+    let mut row_count = 0;
+
+    for row in rows {
+        let mut tuple = String::from("(");
+        for (j, val) in row.iter().enumerate() {
+            if j > 0 {
+                tuple.push_str(", ");
+            }
+            tuple.push_str(val);
+        }
+        tuple.push(')');
+
+        let addition_len = if row_count == 0 {
+            tuple.len()
+        } else {
+            2 + tuple.len() // ", " + tuple
+        };
+
+        if row_count > 0 && current.len() + addition_len + 1 > max {
+            current.push(';');
+            statements.push(current);
+            current = prefix.clone();
+            row_count = 0;
+        }
+
+        if row_count > 0 {
+            current.push_str(", ");
+        }
+        current.push_str(&tuple);
+        row_count += 1;
+    }
+
+    if row_count > 0 {
+        current.push(';');
+        statements.push(current);
+    }
+
+    statements
+}
+
 fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     let trimmed = sql.trim();
     if !trimmed
@@ -95,8 +152,9 @@ fn split_quoted_identifiers(col_list: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_quote = false;
     let mut quote_char = ' ';
+    let mut chars = col_list.chars().peekable();
 
-    for ch in col_list.chars() {
+    while let Some(ch) = chars.next() {
         match ch {
             '`' | '"' if !in_quote => {
                 in_quote = true;
@@ -107,6 +165,14 @@ fn split_quoted_identifiers(col_list: &str) -> Vec<String> {
                 in_quote = true;
                 quote_char = ']';
                 current.push(ch);
+            }
+            ']' if in_quote && quote_char == ']' => {
+                current.push(ch);
+                if chars.peek() == Some(&']') {
+                    current.push(chars.next().unwrap());
+                } else {
+                    in_quote = false;
+                }
             }
             c if in_quote && c == quote_char => {
                 in_quote = false;
@@ -272,6 +338,12 @@ mod tests {
     }
 
     #[test]
+    fn test_split_bracket_identifiers_with_escaped_bracket() {
+        let cols = split_quoted_identifiers("[normal], [has]]bracket], [another]");
+        assert_eq!(cols, vec!["[normal]", "[has]]bracket]", "[another]"]);
+    }
+
+    #[test]
     fn test_detect_bulk_insert_with_leading_whitespace() {
         let stmts = vec![
             "  INSERT INTO `db`.`t` (`id`) VALUES (1);  ".to_string(),
@@ -280,5 +352,39 @@ mod tests {
         let result = detect_bulk_insert_batch(&stmts);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn test_build_chunked_multi_value_inserts_single_chunk() {
+        let table = "`db`.`t`";
+        let columns = vec!["`id`".to_string(), "`name`".to_string()];
+        let rows = vec![
+            vec!["1".to_string(), "'a'".to_string()],
+            vec!["2".to_string(), "'b'".to_string()],
+        ];
+        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(1024));
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            "INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'a'), (2, 'b');"
+        );
+    }
+
+    #[test]
+    fn test_build_chunked_multi_value_inserts_splits_on_size() {
+        let table = "`db`.`t`";
+        let columns = vec!["`id`".to_string()];
+        let rows = vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["3".to_string()],
+        ];
+        // Set max to just above prefix + one row to force splitting
+        let prefix_len = "INSERT INTO `db`.`t` (`id`) VALUES ".len();
+        let max = prefix_len + "(1), (2);".len(); // fits 2 rows
+        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(max));
+        assert_eq!(result.len(), 2);
+        assert!(result[0].contains("(1), (2)"));
+        assert!(result[1].contains("(3)"));
     }
 }

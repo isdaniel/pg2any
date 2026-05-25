@@ -1020,7 +1020,7 @@ impl CdcClient {
                     retry_deadline = None;
 
                     // Backoff expired — process queue
-                    Self::process_commit_queue(
+                    let cancelled = Self::process_commit_queue(
                         &mut commit_queue,
                         &transaction_file_manager,
                         &mut destination_handler,
@@ -1034,6 +1034,25 @@ impl CdcClient {
                         &mut retry_count,
                     )
                     .await;
+
+                    if cancelled {
+                        info!("Consumer: cancellation detected during retry, draining remaining queue");
+                        Self::drain_and_shutdown(
+                            &mut commit_queue,
+                            &mut commit_receiver,
+                            &transaction_file_manager,
+                            &mut destination_handler,
+                            &lsn_tracker,
+                            &metrics_collector,
+                            batch_size,
+                            &shared_lsn_feedback,
+                        )
+                        .await;
+                        metrics_collector
+                            .update_destination_connection_status(&destination_type, false);
+                        info!("Consumer stopped gracefully");
+                        return Ok(());
+                    }
                     continue;
                 }
             }
@@ -1073,7 +1092,7 @@ impl CdcClient {
                             commit_queue.push(std::cmp::Reverse(notification));
 
                             // Process all transactions that are ready (in commit_lsn order)
-                            Self::process_commit_queue(
+                            let cancelled = Self::process_commit_queue(
                                 &mut commit_queue,
                                 &transaction_file_manager,
                                 &mut destination_handler,
@@ -1087,6 +1106,22 @@ impl CdcClient {
                                 &mut retry_count,
                             )
                             .await;
+
+                            if cancelled {
+                                info!("Consumer: cancellation detected, draining remaining queue");
+                                Self::drain_and_shutdown(
+                                    &mut commit_queue,
+                                    &mut commit_receiver,
+                                    &transaction_file_manager,
+                                    &mut destination_handler,
+                                    &lsn_tracker,
+                                    &metrics_collector,
+                                    batch_size,
+                                    &shared_lsn_feedback,
+                                )
+                                .await;
+                                break;
+                            }
                         }
                         None => {
                             // Channel closed - producer has dropped the sender
@@ -1262,7 +1297,11 @@ impl CdcClient {
                         "Consumer: transaction {} cancelled by shutdown, will be recovered on restart",
                         next_tx.metadata.transaction_id
                     );
-                    commit_queue.clear();
+                    // Push the cancelled transaction back — it wasn't committed to
+                    // the destination, so its sql_pending_tx/ file still exists for
+                    // recovery. Do NOT clear the queue: drain_and_shutdown will
+                    // process remaining items.
+                    commit_queue.push(std::cmp::Reverse(next_tx));
                     return true;
                 }
 

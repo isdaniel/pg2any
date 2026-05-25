@@ -10,6 +10,18 @@ pub struct ParsedBulkInsert {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Parse the INSERT prefix from a single SQL statement.
+/// Returns `(prefix_str, columns, table)` if the statement is a valid INSERT.
+pub fn extract_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
+    parse_insert_prefix(sql)
+}
+
+/// Extract just the VALUES tuple from a statement whose prefix is already known.
+/// `values_suffix` should be the part of the statement after the prefix (e.g., "(1, 'hello');").
+pub fn extract_values_from_suffix(values_suffix: &str) -> Option<Vec<String>> {
+    parse_values_tuple(values_suffix)
+}
+
 pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInsert> {
     if statements.is_empty() {
         return None;

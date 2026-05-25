@@ -2211,18 +2211,23 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Returns `Some((table, columns))` if ALL statements in ALL segments are INSERT
-    /// statements targeting the same table with the same columns. Returns `None` otherwise.
+    /// Analyzes AND extracts rows from transaction segments in a single pass.
+    /// Returns `Some((table, columns, rows))` if ALL statements are homogeneous INSERTs
+    /// targeting the same table with the same columns. Returns `None` otherwise.
+    ///
+    /// This combines what was previously two separate passes (analyze + extract) into one,
+    /// eliminating redundant I/O for large transactions.
     #[cfg(any(feature = "mysql", feature = "sqlserver"))]
-    pub async fn analyze_transaction_content(
+    pub async fn analyze_and_extract_rows(
         &self,
         segments: &[TransactionSegment],
-    ) -> Result<Option<(String, Vec<String>)>> {
-        use crate::destinations::bulk_insert::detect_bulk_insert_batch;
+    ) -> Result<Option<(String, Vec<String>, Vec<Vec<String>>)>> {
         use tokio::io::AsyncBufReadExt;
 
+        let mut expected_prefix: Option<String> = None;
         let mut expected_table: Option<String> = None;
         let mut expected_columns: Option<Vec<String>> = None;
+        let mut all_rows: Vec<Vec<String>> = Vec::new();
 
         for segment in segments {
             let is_compressed = segment
@@ -2262,57 +2267,89 @@ impl TransactionManager {
                 parser.parse_line(&line, &mut line_stmts)?;
 
                 for stmt in line_stmts.drain(..) {
-                    let trimmed = stmt.trim().to_string();
+                    let trimmed = stmt.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
-
-                    let batch = vec![trimmed];
-                    match detect_bulk_insert_batch(&batch) {
-                        Some(parsed) => match &expected_table {
-                            None => {
-                                expected_table = Some(parsed.table);
-                                expected_columns = Some(parsed.columns);
-                            }
-                            Some(t) if *t == parsed.table => {
-                                if expected_columns.as_ref() != Some(&parsed.columns) {
-                                    return Ok(None);
-                                }
-                            }
-                            Some(_) => return Ok(None),
-                        },
-                        None => return Ok(None),
+                    if !self.check_and_extract_row(
+                        trimmed,
+                        &mut expected_prefix,
+                        &mut expected_table,
+                        &mut expected_columns,
+                        &mut all_rows,
+                    ) {
+                        return Ok(None);
                     }
                 }
             }
 
-            // Handle any final statement without trailing semicolon
             if let Some(stmt) = parser.finish_statement() {
-                let trimmed = stmt.trim().to_string();
-                if !trimmed.is_empty() {
-                    let batch = vec![trimmed];
-                    match detect_bulk_insert_batch(&batch) {
-                        Some(parsed) => match &expected_table {
-                            None => {
-                                expected_table = Some(parsed.table);
-                                expected_columns = Some(parsed.columns);
-                            }
-                            Some(t) if *t == parsed.table => {
-                                if expected_columns.as_ref() != Some(&parsed.columns) {
-                                    return Ok(None);
-                                }
-                            }
-                            Some(_) => return Ok(None),
-                        },
-                        None => return Ok(None),
-                    }
+                let trimmed = stmt.trim();
+                if !trimmed.is_empty()
+                    && !self.check_and_extract_row(
+                        trimmed,
+                        &mut expected_prefix,
+                        &mut expected_table,
+                        &mut expected_columns,
+                        &mut all_rows,
+                    )
+                {
+                    return Ok(None);
                 }
             }
         }
 
         match (expected_table, expected_columns) {
-            (Some(t), Some(c)) => Ok(Some((t, c))),
+            (Some(t), Some(c)) => Ok(Some((t, c, all_rows))),
             _ => Ok(None),
+        }
+    }
+
+    /// Helper: validates a statement matches the expected INSERT prefix and extracts its row.
+    /// On first call, establishes the prefix. Returns false if statement doesn't match.
+    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+    fn check_and_extract_row(
+        &self,
+        stmt: &str,
+        expected_prefix: &mut Option<String>,
+        expected_table: &mut Option<String>,
+        expected_columns: &mut Option<Vec<String>>,
+        rows: &mut Vec<Vec<String>>,
+    ) -> bool {
+        use crate::destinations::bulk_insert::{extract_insert_prefix, extract_values_from_suffix};
+
+        match expected_prefix {
+            None => {
+                // First statement: parse fully to establish prefix
+                let (prefix, columns, table) = match extract_insert_prefix(stmt) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let values_suffix = &stmt[prefix.len()..];
+                let values = match extract_values_from_suffix(values_suffix) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                *expected_prefix = Some(prefix);
+                *expected_table = Some(table);
+                *expected_columns = Some(columns);
+                rows.push(values);
+                true
+            }
+            Some(prefix) => {
+                // Subsequent statements: fast prefix check then extract values
+                if !stmt.starts_with(prefix.as_str()) {
+                    return false;
+                }
+                let values_suffix = &stmt[prefix.len()..];
+                match extract_values_from_suffix(values_suffix) {
+                    Some(values) => {
+                        rows.push(values);
+                        true
+                    }
+                    None => false,
+                }
+            }
         }
     }
 

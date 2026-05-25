@@ -29,14 +29,14 @@ async fn test_analyze_homogeneous_inserts_single_segment() {
                    INSERT INTO `mydb`.`users` (`id`, `name`) VALUES (2, 'Bob');\n";
     let segment = write_segment(temp_dir.path(), "seg1.sql", content);
 
-    let result = manager
-        .analyze_transaction_content(&[segment])
-        .await
-        .unwrap();
+    let result = manager.analyze_and_extract_rows(&[segment]).await.unwrap();
     assert!(result.is_some());
-    let (table, columns) = result.unwrap();
+    let (table, columns, rows) = result.unwrap();
     assert_eq!(table, "`mydb`.`users`");
     assert_eq!(columns, vec!["`id`", "`name`"]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec!["1", "'Alice'"]);
+    assert_eq!(rows[1], vec!["2", "'Bob'"]);
 }
 
 #[tokio::test]
@@ -56,10 +56,12 @@ async fn test_analyze_homogeneous_inserts_multiple_segments() {
     );
 
     let result = manager
-        .analyze_transaction_content(&[seg1, seg2])
+        .analyze_and_extract_rows(&[seg1, seg2])
         .await
         .unwrap();
     assert!(result.is_some());
+    let (_, _, rows) = result.unwrap();
+    assert_eq!(rows.len(), 2);
 }
 
 #[tokio::test]
@@ -71,10 +73,7 @@ async fn test_analyze_mixed_operations_returns_none() {
                    DELETE FROM `mydb`.`users` WHERE `id` = 2;\n";
     let segment = write_segment(temp_dir.path(), "seg1.sql", content);
 
-    let result = manager
-        .analyze_transaction_content(&[segment])
-        .await
-        .unwrap();
+    let result = manager.analyze_and_extract_rows(&[segment]).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -87,10 +86,7 @@ async fn test_analyze_different_tables_returns_none() {
                    INSERT INTO `mydb`.`orders` (`id`, `total`) VALUES (1, 100);\n";
     let segment = write_segment(temp_dir.path(), "seg1.sql", content);
 
-    let result = manager
-        .analyze_transaction_content(&[segment])
-        .await
-        .unwrap();
+    let result = manager.analyze_and_extract_rows(&[segment]).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -100,10 +96,7 @@ async fn test_analyze_empty_segments() {
     let manager = create_test_manager(&temp_dir).await;
 
     let segment = write_segment(temp_dir.path(), "seg1.sql", "\n\n");
-    let result = manager
-        .analyze_transaction_content(&[segment])
-        .await
-        .unwrap();
+    let result = manager.analyze_and_extract_rows(&[segment]).await.unwrap();
     assert!(result.is_none());
 }
 
@@ -142,12 +135,10 @@ async fn test_analyze_sqlserver_bracket_inserts() {
                    INSERT INTO [dbo].[users] ([id], [name]) VALUES (2, 'Bob');\n";
     let segment = write_segment(temp_dir.path(), "seg1.sql", content);
 
-    let result = manager
-        .analyze_transaction_content(&[segment])
-        .await
-        .unwrap();
+    let result = manager.analyze_and_extract_rows(&[segment]).await.unwrap();
     assert!(result.is_some());
-    let (table, columns) = result.unwrap();
+    let (table, columns, rows) = result.unwrap();
     assert_eq!(table, "[dbo].[users]");
     assert_eq!(columns, vec!["[id]", "[name]"]);
+    assert_eq!(rows.len(), 2);
 }

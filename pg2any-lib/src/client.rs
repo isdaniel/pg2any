@@ -11,7 +11,6 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -956,6 +955,11 @@ impl CdcClient {
         let mut retry_deadline: Option<tokio::time::Instant> = None;
         let mut retry_count: u32 = 0;
 
+        // Track queue size when smart batch last failed analysis, to avoid redundant re-analysis
+        // of the same candidates when new transactions arrive one at a time.
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        let mut smart_batch_skip_until_size: usize = 0;
+
         loop {
             // If queue has pending work and we're in retry mode, wait for backoff to expire
             if !commit_queue.is_empty() {
@@ -1032,6 +1036,8 @@ impl CdcClient {
                         &shared_lsn_feedback,
                         &mut retry_deadline,
                         &mut retry_count,
+                        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+                        &mut smart_batch_skip_until_size,
                     )
                     .await;
 
@@ -1104,6 +1110,8 @@ impl CdcClient {
                                 &shared_lsn_feedback,
                                 &mut retry_deadline,
                                 &mut retry_count,
+                                #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+                                &mut smart_batch_skip_until_size,
                             )
                             .await;
 
@@ -1251,9 +1259,14 @@ impl CdcClient {
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         retry_deadline: &mut Option<tokio::time::Instant>,
         retry_count: &mut u32,
+        #[cfg(any(feature = "mysql", feature = "sqlserver"))]
+        smart_batch_skip_until_size: &mut usize,
     ) -> bool {
         #[cfg(any(feature = "mysql", feature = "sqlserver"))]
-        if !cancellation_token.is_cancelled() && commit_queue.len() >= 2 && smart_batch_max_txns > 1
+        if !cancellation_token.is_cancelled()
+            && commit_queue.len() >= 2
+            && smart_batch_max_txns > 1
+            && commit_queue.len() > *smart_batch_skip_until_size
         {
             if Self::try_smart_batch(
                 commit_queue,
@@ -1268,9 +1281,13 @@ impl CdcClient {
             {
                 *retry_deadline = None;
                 *retry_count = 0;
+                *smart_batch_skip_until_size = 0;
                 if commit_queue.is_empty() {
                     return false;
                 }
+            } else {
+                // Analysis failed — skip re-analysis until queue grows
+                *smart_batch_skip_until_size = commit_queue.len();
             }
         }
 
@@ -1373,8 +1390,8 @@ impl CdcClient {
             .flat_map(|tx| tx.metadata.segments.iter().cloned())
             .collect();
 
-        let analysis = match transaction_file_manager
-            .analyze_transaction_content(&all_segments)
+        let (table, columns, all_rows) = match transaction_file_manager
+            .analyze_and_extract_rows(&all_segments)
             .await
         {
             Ok(Some(result)) => result,
@@ -1386,82 +1403,7 @@ impl CdcClient {
             }
         };
 
-        let (table, columns) = analysis;
-
-        let mut all_rows: Vec<Vec<String>> = Vec::new();
-        let mut parse_ok = true;
-        for segment in &all_segments {
-            let is_compressed = segment
-                .path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("gz"))
-                .unwrap_or(false);
-
-            let file = match tokio::fs::File::open(&segment.path).await {
-                Ok(f) => f,
-                Err(_) => {
-                    parse_ok = false;
-                    break;
-                }
-            };
-
-            let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = if is_compressed {
-                let buf = tokio::io::BufReader::new(file);
-                let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(buf);
-                decoder.multiple_members(true);
-                Box::new(tokio::io::BufReader::new(decoder))
-            } else {
-                Box::new(tokio::io::BufReader::new(file))
-            };
-
-            let mut lines_reader = reader.lines();
-            let mut parser = crate::storage::SqlStreamParser::new();
-            let mut stmts: Vec<String> = Vec::new();
-            let mut line_stmts: Vec<String> = Vec::new();
-            loop {
-                match lines_reader.next_line().await {
-                    Ok(Some(line)) => {
-                        line_stmts.clear();
-                        if parser.parse_line(&line, &mut line_stmts).is_err() {
-                            parse_ok = false;
-                            break;
-                        }
-                        for stmt in line_stmts.drain(..) {
-                            let trimmed = stmt.trim().to_string();
-                            if !trimmed.is_empty() {
-                                stmts.push(trimmed);
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        parse_ok = false;
-                        break;
-                    }
-                }
-            }
-            if parse_ok {
-                if let Some(stmt) = parser.finish_statement() {
-                    let trimmed = stmt.trim().to_string();
-                    if !trimmed.is_empty() {
-                        stmts.push(trimmed);
-                    }
-                }
-            }
-            if !parse_ok {
-                break;
-            }
-            if let Some(parsed) = crate::destinations::bulk_insert::detect_bulk_insert_batch(&stmts)
-            {
-                all_rows.extend(parsed.rows);
-            } else {
-                parse_ok = false;
-                break;
-            }
-        }
-
-        if !parse_ok {
+        if all_rows.is_empty() {
             for tx in candidates {
                 commit_queue.push(std::cmp::Reverse(tx));
             }

@@ -295,14 +295,8 @@ fn parse_sql_value(value: &str) -> ColumnData<'static> {
         return ColumnData::String(Some(Cow::Owned(unescaped)));
     }
 
-    if let Ok(i) = trimmed.parse::<i64>() {
-        return ColumnData::I64(Some(i));
-    }
-
-    if let Ok(f) = trimmed.parse::<f64>() {
-        return ColumnData::F64(Some(f));
-    }
-
+    // Send all non-NULL values as strings — SQL Server handles implicit type conversion.
+    // Avoids f64 precision loss for large decimals in CDC data.
     ColumnData::String(Some(Cow::Owned(trimmed.to_string())))
 }
 
@@ -325,23 +319,28 @@ mod tests {
     #[test]
     fn test_parse_sql_value_integer() {
         let result = parse_sql_value("42");
-        assert!(matches!(result, ColumnData::I64(Some(42))));
+        assert_eq!(
+            result,
+            ColumnData::String(Some(Cow::Owned("42".to_string())))
+        );
     }
 
     #[test]
     fn test_parse_sql_value_negative_integer() {
         let result = parse_sql_value("-123");
-        assert!(matches!(result, ColumnData::I64(Some(-123))));
+        assert_eq!(
+            result,
+            ColumnData::String(Some(Cow::Owned("-123".to_string())))
+        );
     }
 
     #[test]
     fn test_parse_sql_value_float() {
         let result = parse_sql_value("3.14");
-        if let ColumnData::F64(Some(v)) = result {
-            assert!((v - 3.14).abs() < f64::EPSILON);
-        } else {
-            panic!("Expected F64");
-        }
+        assert_eq!(
+            result,
+            ColumnData::String(Some(Cow::Owned("3.14".to_string())))
+        );
     }
 
     #[test]

@@ -2242,13 +2242,30 @@ impl TransactionManager {
         let mut expected_columns: Option<Vec<String>> = None;
 
         for segment in segments {
+            let is_compressed = segment
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                .unwrap_or(false);
+
             let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
                 CdcError::generic(format!(
                     "Failed to open segment {:?} for analysis: {e}",
                     segment.path
                 ))
             })?;
-            let mut lines = tokio::io::BufReader::new(file).lines();
+
+            let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = if is_compressed {
+                let buf = tokio::io::BufReader::new(file);
+                let mut decoder = GzipDecoder::new(buf);
+                decoder.multiple_members(true);
+                Box::new(tokio::io::BufReader::new(decoder))
+            } else {
+                Box::new(tokio::io::BufReader::new(file))
+            };
+
+            let mut lines = reader.lines();
             let mut parser = SqlStreamParser::new();
             let mut line_stmts: Vec<String> = Vec::new();
 

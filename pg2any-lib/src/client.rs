@@ -1390,6 +1390,13 @@ impl CdcClient {
         let mut all_rows: Vec<Vec<String>> = Vec::new();
         let mut parse_ok = true;
         for segment in &all_segments {
+            let is_compressed = segment
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("gz"))
+                .unwrap_or(false);
+
             let file = match tokio::fs::File::open(&segment.path).await {
                 Ok(f) => f,
                 Err(_) => {
@@ -1397,7 +1404,17 @@ impl CdcClient {
                     break;
                 }
             };
-            let mut lines_reader = tokio::io::BufReader::new(file).lines();
+
+            let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = if is_compressed {
+                let buf = tokio::io::BufReader::new(file);
+                let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(buf);
+                decoder.multiple_members(true);
+                Box::new(tokio::io::BufReader::new(decoder))
+            } else {
+                Box::new(tokio::io::BufReader::new(file))
+            };
+
+            let mut lines_reader = reader.lines();
             let mut parser = crate::storage::SqlStreamParser::new();
             let mut stmts: Vec<String> = Vec::new();
             let mut line_stmts: Vec<String> = Vec::new();

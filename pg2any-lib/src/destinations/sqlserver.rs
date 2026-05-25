@@ -295,9 +295,29 @@ fn parse_sql_value(value: &str) -> ColumnData<'static> {
         return ColumnData::String(Some(Cow::Owned(unescaped)));
     }
 
-    // Send all non-NULL values as strings — SQL Server handles implicit type conversion.
+    if let Some(bytes) = decode_hex_0x(trimmed) {
+        return ColumnData::Binary(Some(Cow::Owned(bytes)));
+    }
+
+    // Send remaining values as strings — SQL Server handles implicit type conversion.
     // Avoids f64 precision loss for large decimals in CDC data.
     ColumnData::String(Some(Cow::Owned(trimmed.to_string())))
+}
+
+/// Decode SQL Server hex literal (0xDEADBEEF) into raw bytes.
+fn decode_hex_0x(s: &str) -> Option<Vec<u8>> {
+    if s.len() < 4 || !s.starts_with("0x") && !s.starts_with("0X") {
+        return None;
+    }
+    let hex_str = &s[2..];
+    if hex_str.len() % 2 != 0 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..hex_str.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap())
+        .collect();
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -368,5 +388,31 @@ mod tests {
             result,
             ColumnData::String(Some(Cow::Owned("some_value".to_string())))
         );
+    }
+
+    #[test]
+    fn test_parse_sql_value_hex_binary() {
+        let result = parse_sql_value("0xDEADBEEF");
+        assert_eq!(
+            result,
+            ColumnData::Binary(Some(Cow::Owned(vec![0xDE, 0xAD, 0xBE, 0xEF])))
+        );
+    }
+
+    #[test]
+    fn test_parse_sql_value_hex_binary_lowercase() {
+        let result = parse_sql_value("0xcafe");
+        assert_eq!(
+            result,
+            ColumnData::Binary(Some(Cow::Owned(vec![0xCA, 0xFE])))
+        );
+    }
+
+    #[test]
+    fn test_decode_hex_0x_invalid() {
+        assert!(decode_hex_0x("hello").is_none());
+        assert!(decode_hex_0x("0x").is_none());
+        assert!(decode_hex_0x("0xZZ").is_none());
+        assert!(decode_hex_0x("0xABC").is_none()); // odd length
     }
 }

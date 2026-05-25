@@ -50,7 +50,12 @@ pub fn build_multi_value_insert(table: &str, columns: &[String], rows: &[Vec<Str
             sql.push_str(", ");
         }
         sql.push('(');
-        sql.push_str(&row.join(", "));
+        for (j, val) in row.iter().enumerate() {
+            if j > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(val);
+        }
         sql.push(')');
     }
     sql.push(';');

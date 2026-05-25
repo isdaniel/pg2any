@@ -255,6 +255,7 @@ impl MySQLDestination {
         let result = tx.query_drop(&load_sql).await;
 
         if let Err(e) = result {
+            *self.infile_data.lock().unwrap() = None;
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
             drop(tx);
 

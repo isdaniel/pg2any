@@ -2236,7 +2236,7 @@ impl TransactionManager {
         segments: &[TransactionSegment],
     ) -> Result<Option<(String, Vec<String>)>> {
         use crate::destinations::bulk_insert::detect_bulk_insert_batch;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::AsyncBufReadExt;
 
         let mut expected_table: Option<String> = None;
         let mut expected_columns: Option<Vec<String>> = None;
@@ -2248,7 +2248,9 @@ impl TransactionManager {
                     segment.path
                 ))
             })?;
-            let mut lines = BufReader::new(file).lines();
+            let mut lines = tokio::io::BufReader::new(file).lines();
+            let mut parser = SqlStreamParser::new();
+            let mut line_stmts: Vec<String> = Vec::new();
 
             while let Some(line) = lines.next_line().await.map_err(|e| {
                 CdcError::generic(format!(
@@ -2256,26 +2258,54 @@ impl TransactionManager {
                     segment.path
                 ))
             })? {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
+                line_stmts.clear();
+                parser.parse_line(&line, &mut line_stmts)?;
 
-                let stmts = vec![trimmed];
-                match detect_bulk_insert_batch(&stmts) {
-                    Some(parsed) => match &expected_table {
-                        None => {
-                            expected_table = Some(parsed.table);
-                            expected_columns = Some(parsed.columns);
-                        }
-                        Some(t) if *t == parsed.table => {
-                            if expected_columns.as_ref() != Some(&parsed.columns) {
-                                return Ok(None);
+                for stmt in line_stmts.drain(..) {
+                    let trimmed = stmt.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let batch = vec![trimmed];
+                    match detect_bulk_insert_batch(&batch) {
+                        Some(parsed) => match &expected_table {
+                            None => {
+                                expected_table = Some(parsed.table);
+                                expected_columns = Some(parsed.columns);
                             }
-                        }
-                        Some(_) => return Ok(None),
-                    },
-                    None => return Ok(None),
+                            Some(t) if *t == parsed.table => {
+                                if expected_columns.as_ref() != Some(&parsed.columns) {
+                                    return Ok(None);
+                                }
+                            }
+                            Some(_) => return Ok(None),
+                        },
+                        None => return Ok(None),
+                    }
+                }
+            }
+
+            // Handle any final statement without trailing semicolon
+            if let Some(stmt) = parser.finish_statement() {
+                let trimmed = stmt.trim().to_string();
+                if !trimmed.is_empty() {
+                    let batch = vec![trimmed];
+                    match detect_bulk_insert_batch(&batch) {
+                        Some(parsed) => match &expected_table {
+                            None => {
+                                expected_table = Some(parsed.table);
+                                expected_columns = Some(parsed.columns);
+                            }
+                            Some(t) if *t == parsed.table => {
+                                if expected_columns.as_ref() != Some(&parsed.columns) {
+                                    return Ok(None);
+                                }
+                            }
+                            Some(_) => return Ok(None),
+                        },
+                        None => return Ok(None),
+                    }
                 }
             }
         }

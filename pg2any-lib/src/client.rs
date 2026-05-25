@@ -1398,19 +1398,36 @@ impl CdcClient {
                 }
             };
             let mut lines_reader = tokio::io::BufReader::new(file).lines();
+            let mut parser = crate::storage::SqlStreamParser::new();
             let mut stmts: Vec<String> = Vec::new();
+            let mut line_stmts: Vec<String> = Vec::new();
             loop {
                 match lines_reader.next_line().await {
                     Ok(Some(line)) => {
-                        let trimmed = line.trim().to_string();
-                        if !trimmed.is_empty() {
-                            stmts.push(trimmed);
+                        line_stmts.clear();
+                        if parser.parse_line(&line, &mut line_stmts).is_err() {
+                            parse_ok = false;
+                            break;
+                        }
+                        for stmt in line_stmts.drain(..) {
+                            let trimmed = stmt.trim().to_string();
+                            if !trimmed.is_empty() {
+                                stmts.push(trimmed);
+                            }
                         }
                     }
                     Ok(None) => break,
                     Err(_) => {
                         parse_ok = false;
                         break;
+                    }
+                }
+            }
+            if parse_ok {
+                if let Some(stmt) = parser.finish_statement() {
+                    let trimmed = stmt.trim().to_string();
+                    if !trimmed.is_empty() {
+                        stmts.push(trimmed);
                     }
                 }
             }

@@ -1,4 +1,7 @@
 use std::env;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn clear_env_vars() {
     for key in &[
@@ -37,6 +40,7 @@ fn set_required_env() {
 
 #[test]
 fn test_new_env_names_preferred() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_CHANNEL_CAPACITY", "2000");
@@ -51,6 +55,7 @@ fn test_new_env_names_preferred() {
 
 #[test]
 fn test_deprecated_env_names_still_work() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_BUFFER_SIZE", "4000");
@@ -65,6 +70,7 @@ fn test_deprecated_env_names_still_work() {
 
 #[test]
 fn test_new_name_takes_precedence_over_deprecated() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_CHANNEL_CAPACITY", "6000");
@@ -81,6 +87,7 @@ fn test_new_name_takes_precedence_over_deprecated() {
 
 #[test]
 fn test_defaults_when_no_env_set() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
 
@@ -95,6 +102,7 @@ fn test_defaults_when_no_env_set() {
 
 #[test]
 fn test_smart_batch_max_txns_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_SMART_BATCH_MAX_TXNS", "100");
@@ -107,6 +115,7 @@ fn test_smart_batch_max_txns_env() {
 
 #[test]
 fn test_schema_mapping_parsing() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_SCHEMA_MAPPING", "public:cdc_db,sales:sales_db");
@@ -120,6 +129,7 @@ fn test_schema_mapping_parsing() {
 
 #[test]
 fn test_invalid_schema_mapping_returns_error() {
+    let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
     set_required_env();
     env::set_var("CDC_SCHEMA_MAPPING", "invalid_no_colon");

@@ -2228,8 +2228,6 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Analyze a transaction's segments to determine if it contains only homogeneous INSERTs.
-    ///
     /// Returns `Some((table, columns))` if ALL statements in ALL segments are INSERT
     /// statements targeting the same table with the same columns. Returns `None` otherwise.
     #[cfg(any(feature = "mysql", feature = "sqlserver"))]

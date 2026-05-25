@@ -84,9 +84,45 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     let col_section = &after_into[col_paren_pos..];
     let close_paren = col_section.find(')')?;
     let col_list = &col_section[1..close_paren];
-    let columns: Vec<String> = col_list.split(',').map(|c| c.trim().to_string()).collect();
+    let columns = split_quoted_identifiers(col_list);
 
     Some((prefix.to_string(), columns, table))
+}
+
+/// Split a column list respecting quoted identifiers (backticks, brackets, double-quotes).
+fn split_quoted_identifiers(col_list: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+
+    for ch in col_list.chars() {
+        match ch {
+            '`' | '"' if !in_quote => {
+                in_quote = true;
+                quote_char = ch;
+                current.push(ch);
+            }
+            '[' if !in_quote => {
+                in_quote = true;
+                quote_char = ']';
+                current.push(ch);
+            }
+            c if in_quote && c == quote_char => {
+                in_quote = false;
+                current.push(c);
+            }
+            ',' if !in_quote => {
+                columns.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        columns.push(current.trim().to_string());
+    }
+    columns
 }
 
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -221,5 +257,28 @@ mod tests {
             sql,
             "INSERT INTO `cdc_db`.`t1` (`id`, `name`) VALUES (1, 'hello'), (2, 'world');"
         );
+    }
+
+    #[test]
+    fn test_split_quoted_identifiers_with_comma() {
+        let cols = split_quoted_identifiers("`normal`, `has,comma`, `another`");
+        assert_eq!(cols, vec!["`normal`", "`has,comma`", "`another`"]);
+    }
+
+    #[test]
+    fn test_split_bracket_identifiers_with_comma() {
+        let cols = split_quoted_identifiers("[normal], [has,comma], [another]");
+        assert_eq!(cols, vec!["[normal]", "[has,comma]", "[another]"]);
+    }
+
+    #[test]
+    fn test_detect_bulk_insert_with_leading_whitespace() {
+        let stmts = vec![
+            "  INSERT INTO `db`.`t` (`id`) VALUES (1);  ".to_string(),
+            "  INSERT INTO `db`.`t` (`id`) VALUES (2);  ".to_string(),
+        ];
+        let result = detect_bulk_insert_batch(&stmts);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().rows.len(), 2);
     }
 }

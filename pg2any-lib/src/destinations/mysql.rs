@@ -257,7 +257,7 @@ impl MySQLDestination {
         if let Err(e) = result {
             *self.infile_data.lock().unwrap() = None;
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
-            drop(tx);
+            let _ = tx.rollback().await;
 
             let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
             return self
@@ -267,7 +267,7 @@ impl MySQLDestination {
 
         if let Some(hook) = pre_commit_hook {
             if let Err(e) = hook().await {
-                drop(tx);
+                let _ = tx.rollback().await;
                 return Err(CdcError::generic(format!(
                     "MySQL bulk insert pre-commit hook failed, rolled back: {e}"
                 )));

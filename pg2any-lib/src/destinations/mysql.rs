@@ -300,6 +300,8 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
             } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
                 let unquoted = &trimmed[1..trimmed.len() - 1];
                 tsv_escape_string(unquoted, &mut buf);
+            } else if let Some(decoded) = decode_hex_literal(trimmed) {
+                tsv_escape_raw(&decoded, &mut buf);
             } else {
                 tsv_escape_raw(trimmed.as_bytes(), &mut buf);
             }
@@ -308,6 +310,25 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
     }
 
     buf
+}
+
+/// Decode MySQL hex literal (X'aabb' or x'aabb') into raw bytes.
+fn decode_hex_literal(s: &str) -> Option<Vec<u8>> {
+    if s.len() < 3 {
+        return None;
+    }
+    if !(s.starts_with("X'") || s.starts_with("x'")) || !s.ends_with('\'') {
+        return None;
+    }
+    let hex_str = &s[2..s.len() - 1];
+    if hex_str.len() % 2 != 0 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..hex_str.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap())
+        .collect();
+    Some(bytes)
 }
 
 /// Unescape MySQL SQL literal content and re-encode for TSV format.
@@ -426,5 +447,39 @@ mod tests {
         assert_eq!(lines[1], "2\tline1\\nline2");
         // SQL \\ → literal backslash → TSV \\
         assert_eq!(lines[2], "3\tback\\\\slash");
+    }
+
+    #[test]
+    fn test_tsv_hex_literal_decoding() {
+        let rows = vec![vec![
+            "1".to_string(),
+            "X'deadbeef'".to_string(),
+            "'text'".to_string(),
+        ]];
+        let tsv = generate_tsv_buffer(&rows);
+        assert_eq!(tsv, b"1\t\xde\xad\xbe\xef\ttext\n");
+    }
+
+    #[test]
+    fn test_tsv_hex_literal_lowercase() {
+        let rows = vec![vec!["1".to_string(), "x'cafe'".to_string()]];
+        let tsv = generate_tsv_buffer(&rows);
+        assert_eq!(tsv, b"1\t\xca\xfe\n");
+    }
+
+    #[test]
+    fn test_tsv_hex_literal_with_special_bytes() {
+        // Hex containing tab, newline, backslash bytes should be TSV-escaped
+        let rows = vec![vec!["1".to_string(), "X'090a5c00'".to_string()]];
+        let tsv = generate_tsv_buffer(&rows);
+        assert_eq!(tsv, b"1\t\\t\\n\\\\\\0\n");
+    }
+
+    #[test]
+    fn test_decode_hex_literal_invalid() {
+        assert!(decode_hex_literal("hello").is_none());
+        assert!(decode_hex_literal("X'zz'").is_none());
+        assert!(decode_hex_literal("X'abc'").is_none()); // odd length
+        assert!(decode_hex_literal("0xdead").is_none()); // 0x prefix is SQL Server style
     }
 }

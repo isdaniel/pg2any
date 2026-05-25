@@ -1253,7 +1253,8 @@ impl CdcClient {
         retry_count: &mut u32,
     ) -> bool {
         #[cfg(any(feature = "mysql", feature = "sqlserver"))]
-        if commit_queue.len() >= 2 && smart_batch_max_txns > 1 {
+        if !cancellation_token.is_cancelled() && commit_queue.len() >= 2 && smart_batch_max_txns > 1
+        {
             if Self::try_smart_batch(
                 commit_queue,
                 transaction_file_manager,
@@ -1481,14 +1482,12 @@ impl CdcClient {
             .max();
 
         let hook_lsn = highest_lsn;
-        let hook_tracker = Arc::clone(lsn_tracker);
         let hook_feedback = Arc::clone(shared_lsn_feedback);
 
         let pre_commit_hook: Option<crate::destinations::destination_factory::PreCommitHook> =
             Some(Box::new(move || {
                 Box::pin(async move {
                     if let Some(lsn) = hook_lsn {
-                        hook_tracker.commit_lsn(lsn.0);
                         hook_feedback.update_applied_lsn(lsn.0);
                         hook_feedback.update_flushed_lsn(lsn.0);
                     }
@@ -1516,6 +1515,16 @@ impl CdcClient {
                     metrics_collector.record_transaction_processed(&tx, &dest_str);
                 }
 
+                // Persist LSN BEFORE deleting files — if we crash between these,
+                // files remain and will be re-processed on restart (safe duplicate),
+                // rather than losing them with no position record.
+                if let Some(lsn) = highest_lsn {
+                    lsn_tracker.commit_lsn(lsn.0);
+                    if let Err(e) = lsn_tracker.persist_async().await {
+                        warn!("Failed to persist LSN after smart batch: {}", e);
+                    }
+                }
+
                 let all_paths: Vec<std::path::PathBuf> = candidates
                     .iter()
                     .flat_map(|tx| {
@@ -1532,13 +1541,6 @@ impl CdcClient {
                 transaction_file_manager
                     .batch_delete_files(&all_paths)
                     .await;
-
-                if let Some(lsn) = highest_lsn {
-                    lsn_tracker.commit_lsn(lsn.0);
-                    if let Err(e) = lsn_tracker.persist_async().await {
-                        warn!("Failed to persist LSN after smart batch: {}", e);
-                    }
-                }
 
                 true
             }

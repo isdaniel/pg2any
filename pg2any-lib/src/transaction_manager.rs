@@ -2236,27 +2236,32 @@ impl TransactionManager {
         segments: &[TransactionSegment],
     ) -> Result<Option<(String, Vec<String>)>> {
         use crate::destinations::bulk_insert::detect_bulk_insert_batch;
+        use tokio::io::{AsyncBufReadExt, BufReader};
 
         let mut expected_table: Option<String> = None;
         let mut expected_columns: Option<Vec<String>> = None;
 
         for segment in segments {
-            let content = tokio::fs::read_to_string(&segment.path)
-                .await
-                .map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to read segment {:?} for analysis: {e}",
-                        segment.path
-                    ))
-                })?;
+            let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to open segment {:?} for analysis: {e}",
+                    segment.path
+                ))
+            })?;
+            let mut lines = BufReader::new(file).lines();
 
-            for line in content.lines() {
-                let trimmed = line.trim();
+            while let Some(line) = lines.next_line().await.map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to read segment {:?} for analysis: {e}",
+                    segment.path
+                ))
+            })? {
+                let trimmed = line.trim().to_string();
                 if trimmed.is_empty() {
                     continue;
                 }
 
-                let stmts = vec![trimmed.to_string()];
+                let stmts = vec![trimmed];
                 match detect_bulk_insert_batch(&stmts) {
                     Some(parsed) => match &expected_table {
                         None => {

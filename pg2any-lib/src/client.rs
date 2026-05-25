@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use tokio::io::AsyncBufReadExt;
 
 /// Main CDC client for coordinating replication and destination writes
 ///
@@ -1305,17 +1306,27 @@ impl CdcClient {
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         smart_batch_max_txns: usize,
     ) -> bool {
+        
+
         if commit_queue.len() < 2 || !destination_handler.supports_bulk_insert() {
             return false;
         }
 
-        let candidates: Vec<PendingTransactionFile> = commit_queue
-            .iter()
-            .take(smart_batch_max_txns)
-            .map(|std::cmp::Reverse(tx)| tx.clone())
-            .collect();
+        // Pop candidates from the heap to guarantee commit_lsn ordering.
+        // BinaryHeap::iter() does NOT return elements in sorted order.
+        let take_count = smart_batch_max_txns.min(commit_queue.len());
+        let mut candidates: Vec<PendingTransactionFile> = Vec::with_capacity(take_count);
+        for _ in 0..take_count {
+            if let Some(std::cmp::Reverse(tx)) = commit_queue.pop() {
+                candidates.push(tx);
+            }
+        }
 
         if candidates.len() < 2 {
+            // Push back and abort
+            for tx in candidates {
+                commit_queue.push(std::cmp::Reverse(tx));
+            }
             return false;
         }
 
@@ -1329,28 +1340,60 @@ impl CdcClient {
             .await
         {
             Ok(Some(result)) => result,
-            _ => return false,
+            _ => {
+                for tx in candidates {
+                    commit_queue.push(std::cmp::Reverse(tx));
+                }
+                return false;
+            }
         };
 
         let (table, columns) = analysis;
 
         let mut all_rows: Vec<Vec<String>> = Vec::new();
+        let mut parse_ok = true;
         for segment in &all_segments {
-            let content = match tokio::fs::read_to_string(&segment.path).await {
-                Ok(c) => c,
-                Err(_) => return false,
+            let file = match tokio::fs::File::open(&segment.path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    parse_ok = false;
+                    break;
+                }
             };
-            let stmts: Vec<String> = content
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
+            let mut lines_reader = tokio::io::BufReader::new(file).lines();
+            let mut stmts: Vec<String> = Vec::new();
+            loop {
+                match lines_reader.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            stmts.push(trimmed);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        parse_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !parse_ok {
+                break;
+            }
             if let Some(parsed) = crate::destinations::bulk_insert::detect_bulk_insert_batch(&stmts)
             {
                 all_rows.extend(parsed.rows);
             } else {
-                return false;
+                parse_ok = false;
+                break;
             }
+        }
+
+        if !parse_ok {
+            for tx in candidates {
+                commit_queue.push(std::cmp::Reverse(tx));
+            }
+            return false;
         }
 
         let total_rows = all_rows.len();
@@ -1402,10 +1445,6 @@ impl CdcClient {
                     metrics_collector.record_transaction_processed(&tx, &dest_str);
                 }
 
-                for _ in 0..batch_count {
-                    commit_queue.pop();
-                }
-
                 let all_paths: Vec<std::path::PathBuf> = candidates
                     .iter()
                     .flat_map(|tx| {
@@ -1437,6 +1476,9 @@ impl CdcClient {
                     "Smart batch failed, falling back to individual processing: {}",
                     e
                 );
+                for tx in candidates {
+                    commit_queue.push(std::cmp::Reverse(tx));
+                }
                 false
             }
         }

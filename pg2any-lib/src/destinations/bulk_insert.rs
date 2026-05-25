@@ -85,12 +85,14 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
 }
 
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_len = needle.len();
-    if haystack.len() < needle_len {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let n_len = n.len();
+    if h.len() < n_len {
         return None;
     }
-    for i in 0..=(haystack.len() - needle_len) {
-        if haystack[i..i + needle_len].eq_ignore_ascii_case(needle) {
+    for i in 0..=(h.len() - n_len) {
+        if h[i..i + n_len].eq_ignore_ascii_case(n) {
             return Some(i);
         }
     }

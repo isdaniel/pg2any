@@ -1395,7 +1395,14 @@ impl CdcClient {
             .await
         {
             Ok(Some(result)) => result,
-            _ => {
+            Ok(None) => {
+                for tx in candidates {
+                    commit_queue.push(std::cmp::Reverse(tx));
+                }
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!("Smart batch analysis failed: {e}");
                 for tx in candidates {
                     commit_queue.push(std::cmp::Reverse(tx));
                 }

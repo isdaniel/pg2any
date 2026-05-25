@@ -56,7 +56,9 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
 
 pub fn build_multi_value_insert(table: &str, columns: &[String], rows: &[Vec<String>]) -> String {
     let col_list = columns.join(", ");
-    let mut sql = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
+    let prefix = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
+    let mut sql = String::with_capacity(prefix.len() + rows.len() * 64);
+    sql.push_str(&prefix);
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");

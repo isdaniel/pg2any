@@ -2224,10 +2224,11 @@ impl TransactionManager {
     ) -> Result<Option<(String, Vec<String>, Vec<Vec<String>>)>> {
         use tokio::io::AsyncBufReadExt;
 
+        let total_statements: usize = segments.iter().map(|s| s.statement_count).sum();
         let mut expected_prefix: Option<String> = None;
         let mut expected_table: Option<String> = None;
         let mut expected_columns: Option<Vec<String>> = None;
-        let mut all_rows: Vec<Vec<String>> = Vec::new();
+        let mut all_rows: Vec<Vec<String>> = Vec::with_capacity(total_statements);
 
         for segment in segments {
             let is_compressed = segment

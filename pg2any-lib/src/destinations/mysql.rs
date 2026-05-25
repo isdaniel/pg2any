@@ -160,9 +160,14 @@ impl DestinationHandler for MySQLDestination {
         }
 
         if !self.load_data_available {
-            let sql = super::bulk_insert::build_multi_value_insert(table, columns, rows);
+            let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
+                table,
+                columns,
+                rows,
+                Some(self.max_allowed_packet as usize),
+            );
             return self
-                .execute_sql_batch_with_hook(&[sql], pre_commit_hook)
+                .execute_sql_batch_with_hook(&sqls, pre_commit_hook)
                 .await;
         }
 
@@ -259,8 +264,12 @@ impl MySQLDestination {
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
             let _ = tx.rollback().await;
 
-            let sqls =
-                super::bulk_insert::build_chunked_multi_value_inserts(table, columns, rows, None);
+            let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
+                table,
+                columns,
+                rows,
+                Some(self.max_allowed_packet as usize),
+            );
             return self
                 .execute_sql_batch_with_hook(&sqls, pre_commit_hook)
                 .await;

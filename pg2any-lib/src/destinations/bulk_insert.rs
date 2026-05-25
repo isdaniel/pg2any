@@ -147,6 +147,7 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
 }
 
 /// Split a column list respecting quoted identifiers (backticks, brackets, double-quotes).
+/// Handles escaped quotes: `]]` in brackets, `` `` `` in backticks, `""` in double-quotes.
 fn split_quoted_identifiers(col_list: &str) -> Vec<String> {
     let mut columns = Vec::new();
     let mut current = String::new();
@@ -175,8 +176,12 @@ fn split_quoted_identifiers(col_list: &str) -> Vec<String> {
                 }
             }
             c if in_quote && c == quote_char => {
-                in_quote = false;
                 current.push(c);
+                if chars.peek() == Some(&quote_char) {
+                    current.push(chars.next().unwrap());
+                } else {
+                    in_quote = false;
+                }
             }
             ',' if !in_quote => {
                 columns.push(current.trim().to_string());
@@ -341,6 +346,18 @@ mod tests {
     fn test_split_bracket_identifiers_with_escaped_bracket() {
         let cols = split_quoted_identifiers("[normal], [has]]bracket], [another]");
         assert_eq!(cols, vec!["[normal]", "[has]]bracket]", "[another]"]);
+    }
+
+    #[test]
+    fn test_split_backtick_identifiers_with_escaped_backtick() {
+        let cols = split_quoted_identifiers("`normal`, `has``tick`, `another`");
+        assert_eq!(cols, vec!["`normal`", "`has``tick`", "`another`"]);
+    }
+
+    #[test]
+    fn test_split_double_quote_identifiers_with_escaped_quote() {
+        let cols = split_quoted_identifiers("\"normal\", \"has\"\"quote\", \"another\"");
+        assert_eq!(cols, vec!["\"normal\"", "\"has\"\"quote\"", "\"another\""]);
     }
 
     #[test]

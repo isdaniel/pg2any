@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use tokio::io::AsyncBufReadExt;
 
 /// Main CDC client for coordinating replication and destination writes
 ///
@@ -1306,8 +1306,6 @@ impl CdcClient {
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
         smart_batch_max_txns: usize,
     ) -> bool {
-        
-
         if commit_queue.len() < 2 || !destination_handler.supports_bulk_insert() {
             return false;
         }

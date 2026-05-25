@@ -2212,7 +2212,7 @@ impl TransactionManager {
     }
 
     /// Analyzes AND extracts rows from transaction segments in a single pass.
-    /// Returns `Some((table, columns, rows))` if ALL statements are homogeneous INSERTs
+    /// Returns `Some((table, columns, rows))` if ALL statements are homogeneous insert
     /// targeting the same table with the same columns. Returns `None` otherwise.
     ///
     /// This combines what was previously two separate passes (analyze + extract) into one,

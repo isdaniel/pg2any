@@ -705,9 +705,41 @@ impl TransactionManager {
 
     /// Move metadata from sql_received_tx to sql_pending_tx
     /// Flushes any pending buffered events before marking transaction as committed
+    ///
+    /// If a pending metadata file already exists with `last_executed_command_index` set
+    /// (indicating a previous run already applied this transaction to the destination),
+    /// the existing file is preserved to prevent duplicate re-execution on recovery.
     pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
+
+        // CRASH SAFETY: If pending file already exists with execution progress,
+        // a previous run already applied this transaction. Don't overwrite — the
+        // consumer's dedup check or recovery finalize will handle it correctly.
+        if fs::metadata(&pending_metadata_path).await.is_ok() {
+            if let Ok(existing) = self.read_metadata(&pending_metadata_path).await {
+                if existing.last_executed_command_index.is_some() {
+                    info!(
+                        "Transaction {} already has pending file with execution progress, preserving existing state",
+                        tx_id
+                    );
+                    // Clean up received file and flush active writer
+                    let _ = self.remove_received_metadata(&received_metadata_path).await;
+                    let tx_state = self
+                        .take_and_flush_active_transaction(tx_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    // Delete orphaned data segment files from this duplicate write
+                    if let Some(state) = tx_state {
+                        for seg_path in &state.segments {
+                            let _ = fs::remove_file(seg_path).await;
+                        }
+                    }
+                    return Ok(pending_metadata_path);
+                }
+            }
+        }
 
         let mut metadata = self.read_received_metadata(&received_metadata_path).await?;
         let tx_state = self.take_and_flush_active_transaction(tx_id).await?;
@@ -890,6 +922,31 @@ impl TransactionManager {
             })?;
 
         Ok(())
+    }
+
+    /// Mark a pending transaction file as fully executed on disk.
+    ///
+    /// Called by the smart-batch path AFTER the destination commits, so that
+    /// crash-recovery sees `last_executed_command_index == total - 1` and skips
+    /// re-execution (jumping straight to `finalize_transaction_file`).
+    pub async fn mark_pending_fully_executed(
+        &self,
+        pending_tx: &PendingTransactionFile,
+    ) -> Result<()> {
+        let total_statements: usize = pending_tx
+            .metadata
+            .segments
+            .iter()
+            .map(|s| s.statement_count)
+            .sum();
+        if total_statements == 0 {
+            return Ok(());
+        }
+        let mut metadata = self.read_metadata(&pending_tx.file_path).await?;
+        metadata.last_executed_command_index = Some(total_statements - 1);
+        metadata.last_update_timestamp = Some(chrono::Utc::now());
+        self.write_pending_metadata(&pending_tx.file_path, &metadata)
+            .await
     }
 
     /// Stage progress updates for a pending transaction (persisted on shutdown)

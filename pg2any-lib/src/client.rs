@@ -1460,6 +1460,20 @@ impl CdcClient {
                     batch_count, total_rows
                 );
 
+                // CRASH SAFETY: Mark all candidate files as fully executed BEFORE
+                // persisting LSN. If the process crashes between MySQL commit and LSN persist, recovery will see last_executed_command_index == total-1 and skip re-execution (jumping straight to finalize_transaction_file).
+                for candidate in &candidates {
+                    if let Err(e) = transaction_file_manager
+                        .mark_pending_fully_executed(candidate)
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark transaction {} as fully executed: {}",
+                            candidate.metadata.transaction_id, e
+                        );
+                    }
+                }
+
                 for candidate in &candidates {
                     let mut tx = crate::types::Transaction::new(
                         candidate.metadata.transaction_id,

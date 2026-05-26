@@ -932,6 +932,12 @@ pub(crate) fn coalesce_commands<'a>(
     // Carry-over from a group's lookahead: the statement at `i` has already been classified.
     let mut pending: Option<ParsedCmd<'a>> = None;
 
+    let effective_max = if max_rows_per_insert == 0 {
+        usize::MAX
+    } else {
+        max_rows_per_insert
+    };
+
     while i < commands.len() {
         let start_i = i;
         let current = pending
@@ -944,11 +950,6 @@ pub(crate) fn coalesce_commands<'a>(
                 let mut group_values: Vec<&str> = vec![values];
                 let mut group_size = prefix.len() + values.len() + 1;
                 i += 1;
-                let effective_max = if max_rows_per_insert == 0 {
-                    usize::MAX
-                } else {
-                    max_rows_per_insert
-                };
 
                 while i < commands.len() && group_values.len() < effective_max {
                     let next = classify(&commands[i], quote_style);
@@ -996,7 +997,7 @@ pub(crate) fn coalesce_commands<'a>(
                 let mut group_size = commands[start_i].len();
                 i += 1;
 
-                while i < commands.len() {
+                while i < commands.len() && group.len() < effective_max {
                     let next = classify(&commands[i], quote_style);
                     if let ParsedCmd::Update(nu) = next {
                         if nu.table == table && columns_match(&group[0].set_pairs, &nu.set_pairs) {
@@ -1042,7 +1043,7 @@ pub(crate) fn coalesce_commands<'a>(
                 let mut group_size = commands[start_i].len();
                 i += 1;
 
-                while i < commands.len() {
+                while i < commands.len() && group.len() < effective_max {
                     let next = classify(&commands[i], quote_style);
                     if let ParsedCmd::Delete(next_del) = next {
                         if next_del.prefix == prefix {

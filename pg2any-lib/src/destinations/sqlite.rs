@@ -28,7 +28,7 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
-            max_rows_per_insert: 1000,
+            max_rows_per_insert: 500,
         }
     }
 }

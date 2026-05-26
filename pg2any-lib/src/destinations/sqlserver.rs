@@ -335,8 +335,21 @@ fn parse_sql_value(value: &str) -> ColumnData<'static> {
         return ColumnData::Binary(Some(Cow::Owned(bytes)));
     }
 
-    // Send remaining values as strings — SQL Server handles implicit type conversion.
-    // Avoids f64 precision loss for large decimals in CDC data.
+    if trimmed.eq_ignore_ascii_case("true") {
+        return ColumnData::Bit(Some(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return ColumnData::Bit(Some(false));
+    }
+
+    if let Ok(val) = trimmed.parse::<i64>() {
+        return ColumnData::I64(Some(val));
+    }
+
+    if let Ok(val) = trimmed.parse::<f64>() {
+        return ColumnData::F64(Some(val));
+    }
+
     ColumnData::String(Some(Cow::Owned(trimmed.to_string())))
 }
 
@@ -375,28 +388,19 @@ mod tests {
     #[test]
     fn test_parse_sql_value_integer() {
         let result = parse_sql_value("42");
-        assert_eq!(
-            result,
-            ColumnData::String(Some(Cow::Owned("42".to_string())))
-        );
+        assert_eq!(result, ColumnData::I64(Some(42)));
     }
 
     #[test]
     fn test_parse_sql_value_negative_integer() {
         let result = parse_sql_value("-123");
-        assert_eq!(
-            result,
-            ColumnData::String(Some(Cow::Owned("-123".to_string())))
-        );
+        assert_eq!(result, ColumnData::I64(Some(-123)));
     }
 
     #[test]
     fn test_parse_sql_value_float() {
         let result = parse_sql_value("3.14");
-        assert_eq!(
-            result,
-            ColumnData::String(Some(Cow::Owned("3.14".to_string())))
-        );
+        assert_eq!(result, ColumnData::F64(Some(3.14)));
     }
 
     #[test]
@@ -442,6 +446,18 @@ mod tests {
             result,
             ColumnData::Binary(Some(Cow::Owned(vec![0xCA, 0xFE])))
         );
+    }
+
+    #[test]
+    fn test_parse_sql_value_boolean_true() {
+        let result = parse_sql_value("true");
+        assert_eq!(result, ColumnData::Bit(Some(true)));
+    }
+
+    #[test]
+    fn test_parse_sql_value_boolean_false() {
+        let result = parse_sql_value("false");
+        assert_eq!(result, ColumnData::Bit(Some(false)));
     }
 
     #[test]

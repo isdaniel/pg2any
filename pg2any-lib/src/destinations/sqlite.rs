@@ -146,6 +146,27 @@ impl DestinationHandler for SQLiteDestination {
             .await
     }
 
+    async fn execute_bulk_insert_with_hook(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<String>],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
+            table,
+            columns,
+            rows,
+            None,
+            Some(self.max_rows_per_insert),
+        );
+        self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
+            .await
+    }
+
     async fn close(&mut self) -> Result<()> {
         if let Some(pool) = &self.pool {
             pool.close().await;

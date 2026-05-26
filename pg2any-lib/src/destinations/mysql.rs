@@ -129,7 +129,12 @@ impl DestinationHandler for MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
 
-        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick, usize::MAX);
+        let coalesced = coalesce_commands(
+            commands,
+            self.max_allowed_packet,
+            QuoteStyle::Backtick,
+            usize::MAX,
+        );
 
         if coalesced.len() < commands.len() {
             debug!(
@@ -365,6 +370,8 @@ fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
                     Some('t') => buf.extend_from_slice(b"\\t"),   // SQL \t → tab → TSV \t
                     Some('r') => buf.extend_from_slice(b"\\r"),   // SQL \r → CR → TSV \r
                     Some('0') => buf.extend_from_slice(b"\\0"),   // SQL \0 → null → TSV \0
+                    Some('b') => buf.extend_from_slice(b"\\b"),   // SQL \b → backspace → TSV \b
+                    Some('Z') => buf.extend_from_slice(b"\\Z"),   // SQL \Z → Control-Z → TSV \Z
                     Some(other) => {
                         // MySQL: \x → x for any unrecognized escape
                         let mut bytes = [0u8; 4];

@@ -1728,6 +1728,23 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
+        // Skip transactions already applied (position-tracking based deduplication)
+        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
+            let current_flush_lsn = lsn_tracker.get();
+            if commit_lsn.0 <= current_flush_lsn && current_flush_lsn > 0 {
+                info!(
+                    "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
+                    pending_tx.metadata.transaction_id,
+                    commit_lsn,
+                    pg_walstream::format_lsn(current_flush_lsn)
+                );
+                if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
+                    warn!("Failed to delete duplicate pending file: {}", e);
+                }
+                return Ok(());
+            }
+        }
+
         if self.event_mode {
             return self
                 .process_transaction_file_event_mode(

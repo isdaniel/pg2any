@@ -276,8 +276,13 @@ impl SqlServerDestination {
         rows: &[Vec<String>],
         pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()> {
-        let sqls =
-            super::bulk_insert::build_chunked_multi_value_inserts(table, columns, rows, None, Some(1000));
+        let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
+            table,
+            columns,
+            rows,
+            None,
+            Some(1000),
+        );
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }

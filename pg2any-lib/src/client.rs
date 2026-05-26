@@ -1185,6 +1185,16 @@ impl CdcClient {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) {
+        // Flush any staged progress to disk BEFORE re-processing transactions.
+        // Without this, partially-executed transactions would restart from index 0
+        // because their in-memory progress was never persisted.
+        if let Err(e) = transaction_file_manager
+            .flush_staged_pending_progress()
+            .await
+        {
+            warn!("Failed to flush staged progress before drain: {}", e);
+        }
+
         // Drain any remaining messages from the channel into the queue
         while let Ok(notification) = commit_receiver.try_recv() {
             commit_queue.push(std::cmp::Reverse(notification));

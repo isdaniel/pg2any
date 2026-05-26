@@ -1,34 +1,20 @@
-/// Execute a batch of SQL commands within a single sqlx transaction with optional pre-commit hook.
-///
-/// This is the shared implementation used by both MySQL and SQLite destinations.
-/// All commands are executed atomically — if any command fails, the entire batch is rolled back.
-///
-/// # Arguments
-/// * `pool` - sqlx connection pool for the target database
-/// * `commands` - SQL commands to execute within a single transaction
-/// * `pre_commit_hook` - Optional async callback invoked BEFORE COMMIT (rolled back on failure)
-/// * `db_name` - Database name for error messages (e.g., "MySQL", "SQLite")
-#[cfg(any(feature = "mysql", feature = "sqlite"))]
-pub(crate) async fn execute_sqlx_batch_with_hook<DB>(
-    pool: &sqlx::Pool<DB>,
+#[cfg(feature = "sqlite")]
+pub(crate) async fn execute_sqlx_batch_with_hook(
+    pool: &sqlx::SqlitePool,
     commands: &[std::borrow::Cow<'_, str>],
     pre_commit_hook: Option<super::destination_factory::PreCommitHook>,
     db_name: &str,
-) -> crate::error::Result<()>
-where
-    DB: sqlx::Database,
-    for<'c> &'c mut <DB as sqlx::Database>::Connection: sqlx::Executor<'c, Database = DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
-{
-    // Begin a transaction
+) -> crate::error::Result<()> {
     let mut tx = pool.begin().await.map_err(|e| {
         crate::error::CdcError::generic(format!("{db_name} BEGIN transaction failed: {e}"))
     })?;
 
-    // Execute all commands in the transaction
     for (idx, sql) in commands.iter().enumerate() {
-        if let Err(e) = sqlx::query(sql.as_ref()).execute(&mut *tx).await {
-            // Rollback on error
+        let owned = sql.to_string();
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(owned))
+            .execute(&mut *tx)
+            .await
+        {
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(
                     "{db_name} ROLLBACK failed after execution error: {}",
@@ -44,10 +30,8 @@ where
         }
     }
 
-    // Execute pre-commit hook BEFORE transaction COMMIT
     if let Some(hook) = pre_commit_hook {
         if let Err(e) = hook().await {
-            // Rollback transaction if hook fails
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(
                     "{db_name} ROLLBACK failed after pre-commit hook error: {}",
@@ -61,7 +45,6 @@ where
         }
     }
 
-    // Commit the transaction
     tx.commit().await.map_err(|e| {
         crate::error::CdcError::generic(format!("{db_name} COMMIT transaction failed: {e}"))
     })?;

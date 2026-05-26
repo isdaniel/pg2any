@@ -7,6 +7,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.94"
 authors = ["danielshih <dog830228@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/isdaniel/pg2any"
@@ -30,8 +31,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 pg_walstream = { version = "0.6.3", default-features = false, features = ["rustls-tls"] }
 tiberius = { version = "0.12.3", features = ["tds73", "sql-browser-tokio", "bigdecimal", "rust_decimal", "time", "chrono"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "sqlite", "chrono", "uuid"] }
-mysql_async = { version = "0.36.2", default-features = false, features = ["default-rustls"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "uuid"] }
+mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls"] }
 flate2 = "1.1.9"
 async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }

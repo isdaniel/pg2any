@@ -1,7 +1,7 @@
 use super::destination_factory::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
-use sqlx::MySqlPool;
+use mysql_async::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -18,8 +18,7 @@ impl Drop for InfileDataGuard {
 }
 
 pub struct MySQLDestination {
-    pool: Option<MySqlPool>,
-    bulk_pool: Option<mysql_async::Pool>,
+    pool: Option<mysql_async::Pool>,
     infile_data: Arc<Mutex<Option<bytes::Bytes>>>,
     schema_mappings: HashMap<String, String>,
     max_allowed_packet: u64,
@@ -30,7 +29,6 @@ impl MySQLDestination {
     pub fn new() -> Self {
         Self {
             pool: None,
-            bulk_pool: None,
             infile_data: Arc::new(Mutex::new(None)),
             schema_mappings: HashMap::new(),
             max_allowed_packet: 67108864,
@@ -48,26 +46,8 @@ impl Default for MySQLDestination {
 #[async_trait]
 impl DestinationHandler for MySQLDestination {
     async fn connect(&mut self, connection_string: &str) -> Result<()> {
-        let pool = MySqlPool::connect(connection_string).await?;
-
-        let row: (String, String) = sqlx::query_as("SHOW VARIABLES LIKE 'max_allowed_packet'")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to query max_allowed_packet: {e}")))?;
-
-        self.max_allowed_packet = row.1.parse::<u64>().unwrap_or(67108864);
-
-        info!(
-            "MySQL max_allowed_packet: {} bytes ({:.2} MB)",
-            self.max_allowed_packet,
-            self.max_allowed_packet as f64 / 1_048_576.0
-        );
-
-        self.pool = Some(pool);
-
-        let opts = mysql_async::Opts::from_url(connection_string).map_err(|e| {
-            CdcError::generic(format!("Failed to parse MySQL URL for bulk pool: {e}"))
-        })?;
+        let opts = mysql_async::Opts::from_url(connection_string)
+            .map_err(|e| CdcError::generic(format!("Failed to parse MySQL URL: {e}")))?;
 
         let infile_data = self.infile_data.clone();
         let opts = mysql_async::OptsBuilder::from_opts(opts).local_infile_handler(Some(
@@ -90,8 +70,30 @@ impl DestinationHandler for MySQLDestination {
             },
         ));
 
-        let bulk_pool = mysql_async::Pool::new(opts);
-        self.bulk_pool = Some(bulk_pool);
+        let pool = mysql_async::Pool::new(opts);
+
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to connect to MySQL: {e}")))?;
+
+        let result: Option<(String, String)> = conn
+            .query_first("SHOW VARIABLES LIKE 'max_allowed_packet'")
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to query max_allowed_packet: {e}")))?;
+
+        if let Some((_, value)) = result {
+            self.max_allowed_packet = value.parse::<u64>().unwrap_or(67108864);
+        }
+
+        info!(
+            "MySQL max_allowed_packet: {} bytes ({:.2} MB)",
+            self.max_allowed_packet,
+            self.max_allowed_packet as f64 / 1_048_576.0
+        );
+
+        drop(conn);
+        self.pool = Some(pool);
 
         match self.check_load_data_available().await {
             Ok(available) => {
@@ -154,8 +156,38 @@ impl DestinationHandler for MySQLDestination {
             );
         }
 
-        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "MySQL")
+        let mut tx = pool
+            .start_transaction(mysql_async::TxOpts::default())
             .await
+            .map_err(|e| CdcError::generic(format!("MySQL BEGIN transaction failed: {e}")))?;
+
+        for (idx, sql) in coalesced.iter().enumerate() {
+            if let Err(e) = tx.query_drop(sql.as_ref()).await {
+                let _ = tx.rollback().await;
+                return Err(CdcError::generic(format!(
+                    "MySQL execute_sql_batch failed at command {}/{}: {}",
+                    idx + 1,
+                    coalesced.len(),
+                    e
+                )));
+            }
+        }
+
+        if let Some(hook) = pre_commit_hook {
+            if let Err(e) = hook().await {
+                let _ = tx.rollback().await;
+                return Err(CdcError::generic(format!(
+                    "MySQL pre-commit hook failed, transaction rolled back: {}",
+                    e
+                )));
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CdcError::generic(format!("MySQL COMMIT transaction failed: {e}")))?;
+
+        Ok(())
     }
 
     fn supports_bulk_insert(&self) -> bool {
@@ -191,15 +223,10 @@ impl DestinationHandler for MySQLDestination {
     }
 
     async fn close(&mut self) -> Result<()> {
-        if let Some(pool) = &self.pool {
-            pool.close().await;
-        }
-        self.pool = None;
-
-        if let Some(pool) = self.bulk_pool.take() {
-            pool.disconnect().await.map_err(|e| {
-                CdcError::generic(format!("Failed to disconnect mysql_async pool: {e}"))
-            })?;
+        if let Some(pool) = self.pool.take() {
+            pool.disconnect()
+                .await
+                .map_err(|e| CdcError::generic(format!("Failed to disconnect MySQL pool: {e}")))?;
         }
 
         info!("MySQL connection closed successfully");
@@ -209,17 +236,15 @@ impl DestinationHandler for MySQLDestination {
 
 impl MySQLDestination {
     async fn check_load_data_available(&self) -> Result<bool> {
-        use mysql_async::prelude::*;
-
         let pool = self
-            .bulk_pool
+            .pool
             .as_ref()
-            .ok_or_else(|| CdcError::generic("Bulk pool not initialized"))?;
+            .ok_or_else(|| CdcError::generic("Pool not initialized"))?;
 
         let mut conn = pool
             .get_conn()
             .await
-            .map_err(|e| CdcError::generic(format!("Failed to get bulk connection: {e}")))?;
+            .map_err(|e| CdcError::generic(format!("Failed to get connection: {e}")))?;
 
         let result: Option<(String, String)> = conn
             .query_first("SHOW VARIABLES LIKE 'local_infile'")
@@ -241,12 +266,10 @@ impl MySQLDestination {
         rows: &[Vec<String>],
         pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()> {
-        use mysql_async::prelude::*;
-
         let pool = self
-            .bulk_pool
+            .pool
             .as_ref()
-            .ok_or_else(|| CdcError::generic("Bulk pool not initialized"))?;
+            .ok_or_else(|| CdcError::generic("Pool not initialized"))?;
 
         let tsv_data = generate_tsv_buffer(rows);
         let row_count = rows.len();
@@ -347,7 +370,6 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
     buf
 }
 
-/// Decode MySQL hex literal (X'aabb' or x'aabb') into raw bytes.
 fn decode_hex_literal(s: &str) -> Option<Vec<u8>> {
     if s.len() < 3 {
         return None;
@@ -366,10 +388,6 @@ fn decode_hex_literal(s: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Unescape MySQL SQL literal content and re-encode for TSV format.
-/// Input is the content between single quotes from a MySQL SQL literal.
-/// MySQL SQL literals use backslash escaping: \\ → \, \n → newline, \t → tab, etc.
-/// TSV format uses: \\ → \, \n → newline, \t → tab, \N → NULL.
 fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -380,23 +398,20 @@ fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
                 }
                 buf.push(b'\'');
             }
-            '\\' => {
-                match chars.next() {
-                    Some('\\') => buf.extend_from_slice(b"\\\\"), // SQL \\ → literal \ → TSV \\
-                    Some('n') => buf.extend_from_slice(b"\\n"),   // SQL \n → newline → TSV \n
-                    Some('t') => buf.extend_from_slice(b"\\t"),   // SQL \t → tab → TSV \t
-                    Some('r') => buf.extend_from_slice(b"\\r"),   // SQL \r → CR → TSV \r
-                    Some('0') => buf.extend_from_slice(b"\\0"),   // SQL \0 → null → TSV \0
-                    Some('b') => buf.extend_from_slice(b"\\b"),   // SQL \b → backspace → TSV \b
-                    Some('Z') => buf.extend_from_slice(b"\\Z"),   // SQL \Z → Control-Z → TSV \Z
-                    Some(other) => {
-                        // MySQL: \x → x for any unrecognized escape
-                        let mut bytes = [0u8; 4];
-                        buf.extend_from_slice(other.encode_utf8(&mut bytes).as_bytes());
-                    }
-                    None => buf.extend_from_slice(b"\\\\"), // trailing backslash
+            '\\' => match chars.next() {
+                Some('\\') => buf.extend_from_slice(b"\\\\"),
+                Some('n') => buf.extend_from_slice(b"\\n"),
+                Some('t') => buf.extend_from_slice(b"\\t"),
+                Some('r') => buf.extend_from_slice(b"\\r"),
+                Some('0') => buf.extend_from_slice(b"\\0"),
+                Some('b') => buf.extend_from_slice(b"\\b"),
+                Some('Z') => buf.extend_from_slice(b"\\Z"),
+                Some(other) => {
+                    let mut bytes = [0u8; 4];
+                    buf.extend_from_slice(other.encode_utf8(&mut bytes).as_bytes());
                 }
-            }
+                None => buf.extend_from_slice(b"\\\\"),
+            },
             '\t' => buf.extend_from_slice(b"\\t"),
             '\n' => buf.extend_from_slice(b"\\n"),
             '\r' => buf.extend_from_slice(b"\\r"),
@@ -430,7 +445,6 @@ mod tests {
     fn test_mysql_destination_creation() {
         let destination = MySQLDestination::new();
         assert!(destination.pool.is_none());
-        assert!(destination.bulk_pool.is_none());
         assert!(destination.infile_data.lock().unwrap().is_none());
         assert!(!destination.load_data_available);
     }
@@ -472,17 +486,13 @@ mod tests {
         let rows = vec![
             vec!["1".to_string(), "'hello\\tworld'".to_string()],
             vec!["2".to_string(), "'line1\\nline2'".to_string()],
-            // SQL literal '\\' means one backslash; TSV should produce \\
             vec!["3".to_string(), "'back\\\\slash'".to_string()],
         ];
         let tsv = generate_tsv_buffer(&rows);
         let output = String::from_utf8(tsv).unwrap();
         let lines: Vec<&str> = output.lines().collect();
-        // SQL \t → literal tab → TSV \t
         assert_eq!(lines[0], "1\thello\\tworld");
-        // SQL \n → literal newline → TSV \n
         assert_eq!(lines[1], "2\tline1\\nline2");
-        // SQL \\ → literal backslash → TSV \\
         assert_eq!(lines[2], "3\tback\\\\slash");
     }
 
@@ -506,7 +516,6 @@ mod tests {
 
     #[test]
     fn test_tsv_hex_literal_with_special_bytes() {
-        // Hex containing tab, newline, backslash bytes should be TSV-escaped
         let rows = vec![vec!["1".to_string(), "X'090a5c00'".to_string()]];
         let tsv = generate_tsv_buffer(&rows);
         assert_eq!(tsv, b"1\t\\t\\n\\\\\\0\n");
@@ -516,7 +525,7 @@ mod tests {
     fn test_decode_hex_literal_invalid() {
         assert!(decode_hex_literal("hello").is_none());
         assert!(decode_hex_literal("X'zz'").is_none());
-        assert!(decode_hex_literal("X'abc'").is_none()); // odd length
-        assert!(decode_hex_literal("0xdead").is_none()); // 0x prefix is SQL Server style
+        assert!(decode_hex_literal("X'abc'").is_none());
+        assert!(decode_hex_literal("0xdead").is_none());
     }
 }

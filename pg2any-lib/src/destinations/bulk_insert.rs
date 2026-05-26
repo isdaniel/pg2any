@@ -241,6 +241,8 @@ fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {
     let mut values = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
+    let mut paren_depth = 0;
+    let mut bracket_depth = 0;
     let mut chars = inner.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -263,7 +265,27 @@ fn parse_values_tuple(values_part: &str) -> Option<Vec<String>> {
                     in_quotes = false;
                 }
             }
-            ',' if !in_quotes => {
+            '(' if !in_quotes => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_quotes => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+                current.push(ch);
+            }
+            '[' if !in_quotes => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' if !in_quotes => {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                }
+                current.push(ch);
+            }
+            ',' if !in_quotes && paren_depth == 0 && bracket_depth == 0 => {
                 values.push(current.trim().to_string());
                 current.clear();
             }

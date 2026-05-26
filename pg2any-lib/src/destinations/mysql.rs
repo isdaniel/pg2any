@@ -264,9 +264,9 @@ impl MySQLDestination {
         *self.infile_data.lock().unwrap() = Some(bytes::Bytes::from(tsv_data));
 
         let result = tx.query_drop(&load_sql).await;
+        *self.infile_data.lock().unwrap() = None;
 
         if let Err(e) = result {
-            *self.infile_data.lock().unwrap() = None;
             debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
             let _ = tx.rollback().await;
 

@@ -166,6 +166,11 @@ impl CdcClient {
                 handler.set_schema_mappings(self.config.schema_mappings.clone());
                 info!("Schema mappings applied: {:?}", self.config.schema_mappings);
             }
+
+            // Set max rows per INSERT if configured
+            if self.config.max_rows_per_insert > 0 {
+                handler.set_max_rows_per_insert(self.config.max_rows_per_insert);
+            }
         }
 
         Ok(())
@@ -293,6 +298,11 @@ impl CdcClient {
         // Apply schema mappings to the handler
         if !schema_mappings.is_empty() {
             consumer_destination.set_schema_mappings(schema_mappings.clone());
+        }
+
+        // Apply max rows per INSERT
+        if self.config.max_rows_per_insert > 0 {
+            consumer_destination.set_max_rows_per_insert(self.config.max_rows_per_insert);
         }
 
         info!("Consumer destination connection established");

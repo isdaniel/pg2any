@@ -99,6 +99,11 @@ pub struct Config {
 
     /// Maximum number of consecutive INSERT-only transactions to merge in smart batching
     pub smart_batch_max_txns: usize,
+
+    /// Maximum number of rows per multi-value INSERT statement.
+    /// SQL Server enforces a hard limit of 1000 rows per INSERT VALUES.
+    /// Set to 0 for no limit (e.g., MySQL/SQLite have no row count limit).
+    pub max_rows_per_insert: usize,
 }
 
 /// Origin filtering options
@@ -201,6 +206,7 @@ impl Default for Config {
             extra_options: HashMap::new(),
             bulk_insert_threshold: 500,
             smart_batch_max_txns: 50,
+            max_rows_per_insert: 0,
         }
     }
 }
@@ -407,6 +413,11 @@ impl ConfigBuilder {
 
     pub fn smart_batch_max_txns(mut self, max: usize) -> Self {
         self.config.smart_batch_max_txns = max.max(1);
+        self
+    }
+
+    pub fn max_rows_per_insert(mut self, max: usize) -> Self {
+        self.config.max_rows_per_insert = max;
         self
     }
 

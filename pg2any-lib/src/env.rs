@@ -50,6 +50,9 @@ use std::time::Duration;
 ///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
 ///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
 ///   (Deprecated alias: `CDC_COMMIT_BATCH_SIZE`)
+/// - `CDC_MAX_ROWS_PER_INSERT`: Maximum rows per multi-value INSERT statement (default: "0" = no limit)
+///   SQL Server enforces a hard limit of 1000. Set to 1000 for SQL Server destinations.
+///   When set to 0, the destination's own default applies (SQL Server defaults to 1000 internally).
 ///
 /// # Errors
 ///
@@ -109,6 +112,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
 
     let bulk_insert_threshold = parse_usize_env("CDC_BULK_INSERT_THRESHOLD", 500)?;
     let smart_batch_max_txns = parse_usize_env("CDC_SMART_BATCH_MAX_TXNS", 50)?;
+    let max_rows_per_insert = parse_usize_env("CDC_MAX_ROWS_PER_INSERT", 0)?;
 
     // Transaction file persistence configuration
     let transaction_file_base_path =
@@ -165,6 +169,7 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .transaction_segment_size_bytes(segment_size_bytes)
         .bulk_insert_threshold(bulk_insert_threshold)
         .smart_batch_max_txns(smart_batch_max_txns)
+        .max_rows_per_insert(max_rows_per_insert)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");

@@ -14,6 +14,8 @@ pub struct SqlServerDestination {
     client: Option<Client<Compat<TcpStream>>>,
     /// Schema mappings: maps source schema to destination schema
     schema_mappings: HashMap<String, String>,
+    /// Maximum rows per INSERT VALUES statement (SQL Server hard limit: 1000)
+    max_rows_per_insert: usize,
 }
 
 impl SqlServerDestination {
@@ -22,6 +24,7 @@ impl SqlServerDestination {
         Self {
             client: None,
             schema_mappings: HashMap::new(),
+            max_rows_per_insert: 1000,
         }
     }
 }
@@ -58,6 +61,12 @@ impl DestinationHandler for SqlServerDestination {
         }
     }
 
+    fn set_max_rows_per_insert(&mut self, max_rows: usize) {
+        if max_rows > 0 {
+            self.max_rows_per_insert = max_rows;
+        }
+    }
+
     async fn execute_sql_batch_with_hook(
         &mut self,
         commands: &[String],
@@ -76,7 +85,12 @@ impl DestinationHandler for SqlServerDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket, 1000);
+        let coalesced = coalesce_commands(
+            commands,
+            u64::MAX,
+            QuoteStyle::Bracket,
+            self.max_rows_per_insert,
+        );
 
         if coalesced.len() < commands.len() {
             debug!(
@@ -281,7 +295,7 @@ impl SqlServerDestination {
             columns,
             rows,
             None,
-            Some(1000),
+            Some(self.max_rows_per_insert),
         );
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await

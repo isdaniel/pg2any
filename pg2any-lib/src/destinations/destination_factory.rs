@@ -41,6 +41,10 @@ pub trait DestinationHandler: Send + Sync {
     /// Maps source schema (e.g., PostgreSQL "public") to destination schema/database (e.g., MySQL "cdc_db")
     fn set_schema_mappings(&mut self, mappings: HashMap<String, String>);
 
+    /// Set the maximum number of rows per multi-value INSERT statement.
+    /// 0 means no limit (database default applies).
+    fn set_max_rows_per_insert(&mut self, _max_rows: usize) {}
+
     /// Execute a batch of SQL commands within a single transaction with optional pre-commit hook
     ///
     /// This is the primary method used by the consumer to execute transaction files.

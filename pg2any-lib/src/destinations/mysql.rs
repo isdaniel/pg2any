@@ -389,38 +389,65 @@ fn decode_hex_literal(s: &str) -> Option<Vec<u8>> {
 }
 
 fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' => {
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 1;
                 }
                 buf.push(b'\'');
             }
-            '\\' => match chars.next() {
-                Some('\\') => buf.extend_from_slice(b"\\\\"),
-                Some('n') => buf.extend_from_slice(b"\\n"),
-                Some('t') => buf.extend_from_slice(b"\\t"),
-                Some('r') => buf.extend_from_slice(b"\\r"),
-                Some('0') => buf.extend_from_slice(b"\\0"),
-                Some('b') => buf.extend_from_slice(b"\\b"),
-                Some('Z') => buf.extend_from_slice(b"\\Z"),
-                Some(other) => {
-                    let mut bytes = [0u8; 4];
-                    buf.extend_from_slice(other.encode_utf8(&mut bytes).as_bytes());
+            b'\\' => {
+                if i + 1 < bytes.len() {
+                    let next = bytes[i + 1];
+                    match next {
+                        b'\\' => {
+                            buf.extend_from_slice(b"\\\\");
+                            i += 1;
+                        }
+                        b'n' => {
+                            buf.extend_from_slice(b"\\n");
+                            i += 1;
+                        }
+                        b't' => {
+                            buf.extend_from_slice(b"\\t");
+                            i += 1;
+                        }
+                        b'r' => {
+                            buf.extend_from_slice(b"\\r");
+                            i += 1;
+                        }
+                        b'0' => {
+                            buf.extend_from_slice(b"\\0");
+                            i += 1;
+                        }
+                        b'b' => {
+                            buf.extend_from_slice(b"\\b");
+                            i += 1;
+                        }
+                        b'Z' => {
+                            buf.extend_from_slice(b"\\Z");
+                            i += 1;
+                        }
+                        _ => {
+                            buf.push(next);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    buf.extend_from_slice(b"\\\\");
                 }
-                None => buf.extend_from_slice(b"\\\\"),
-            },
-            '\t' => buf.extend_from_slice(b"\\t"),
-            '\n' => buf.extend_from_slice(b"\\n"),
-            '\r' => buf.extend_from_slice(b"\\r"),
-            '\0' => buf.extend_from_slice(b"\\0"),
-            _ => {
-                let mut bytes = [0u8; 4];
-                buf.extend_from_slice(ch.encode_utf8(&mut bytes).as_bytes());
             }
+            b'\t' => buf.extend_from_slice(b"\\t"),
+            b'\n' => buf.extend_from_slice(b"\\n"),
+            b'\r' => buf.extend_from_slice(b"\\r"),
+            0 => buf.extend_from_slice(b"\\0"),
+            _ => buf.push(b),
         }
+        i += 1;
     }
 }
 

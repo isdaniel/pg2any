@@ -295,7 +295,7 @@ fn parse_sql_value(value: &str) -> ColumnData<'static> {
         return ColumnData::String(None);
     }
 
-    if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
         let inner = &trimmed[1..trimmed.len() - 1];
         let unescaped = inner.replace("''", "'");
         return ColumnData::String(Some(Cow::Owned(unescaped)));

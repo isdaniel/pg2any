@@ -1282,7 +1282,7 @@ impl CdcClient {
             *smart_batch_skip_until_size = 0;
         }
 
-        if !cancellation_token.is_cancelled()
+        while !cancellation_token.is_cancelled()
             && commit_queue.len() >= 2
             && smart_batch_max_txns > 1
             && commit_queue.len() > *smart_batch_skip_until_size
@@ -1301,13 +1301,15 @@ impl CdcClient {
                 *retry_deadline = None;
                 *retry_count = 0;
                 *smart_batch_skip_until_size = 0;
-                if commit_queue.is_empty() {
-                    return false;
-                }
             } else {
                 // Analysis failed — skip re-analysis until queue grows
                 *smart_batch_skip_until_size = commit_queue.len();
+                break;
             }
+        }
+
+        if commit_queue.is_empty() {
+            return false;
         }
 
         while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {

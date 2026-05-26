@@ -76,7 +76,7 @@ impl DestinationHandler for SqlServerDestination {
         // - INSERT → multi-value INSERT
         // - UPDATE → CASE-WHEN batch UPDATE
         // - DELETE → OR-combined WHERE clause
-        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket);
+        let coalesced = coalesce_commands(commands, u64::MAX, QuoteStyle::Bracket, 1000);
 
         if coalesced.len() < commands.len() {
             debug!(
@@ -277,7 +277,7 @@ impl SqlServerDestination {
         pre_commit_hook: Option<PreCommitHook>,
     ) -> Result<()> {
         let sqls =
-            super::bulk_insert::build_chunked_multi_value_inserts(table, columns, rows, None);
+            super::bulk_insert::build_chunked_multi_value_inserts(table, columns, rows, None, Some(1000));
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }

@@ -129,7 +129,7 @@ impl DestinationHandler for MySQLDestination {
             .as_ref()
             .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
 
-        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick);
+        let coalesced = coalesce_commands(commands, self.max_allowed_packet, QuoteStyle::Backtick, usize::MAX);
 
         if coalesced.len() < commands.len() {
             debug!(
@@ -165,6 +165,7 @@ impl DestinationHandler for MySQLDestination {
                 columns,
                 rows,
                 Some(self.max_allowed_packet as usize),
+                None,
             );
             return self
                 .execute_sql_batch_with_hook(&sqls, pre_commit_hook)
@@ -269,6 +270,7 @@ impl MySQLDestination {
                 columns,
                 rows,
                 Some(self.max_allowed_packet as usize),
+                None,
             );
             return self
                 .execute_sql_batch_with_hook(&sqls, pre_commit_hook)

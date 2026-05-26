@@ -86,8 +86,10 @@ pub fn build_chunked_multi_value_inserts(
     columns: &[String],
     rows: &[Vec<String>],
     max_bytes: Option<usize>,
+    max_rows: Option<usize>,
 ) -> Vec<String> {
     let max = max_bytes.unwrap_or(DEFAULT_MAX_STATEMENT_BYTES);
+    let max_row_count = max_rows.unwrap_or(usize::MAX);
     let col_list = columns.join(", ");
     let prefix = format!("INSERT INTO {} ({}) VALUES ", table, col_list);
 
@@ -111,7 +113,7 @@ pub fn build_chunked_multi_value_inserts(
             2 + tuple.len() // ", " + tuple
         };
 
-        if row_count > 0 && current.len() + addition_len + 1 > max {
+        if row_count > 0 && (current.len() + addition_len + 1 > max || row_count >= max_row_count) {
             current.push(';');
             statements.push(current);
             current = prefix.clone();
@@ -393,7 +395,7 @@ mod tests {
             vec!["1".to_string(), "'a'".to_string()],
             vec!["2".to_string(), "'b'".to_string()],
         ];
-        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(1024));
+        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(1024), None);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
@@ -413,7 +415,7 @@ mod tests {
         // Set max to just above prefix + one row to force splitting
         let prefix_len = "INSERT INTO `db`.`t` (`id`) VALUES ".len();
         let max = prefix_len + "(1), (2);".len(); // fits 2 rows
-        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(max));
+        let result = build_chunked_multi_value_inserts(table, &columns, &rows, Some(max), None);
         assert_eq!(result.len(), 2);
         assert!(result[0].contains("(1), (2)"));
         assert!(result[1].contains("(3)"));

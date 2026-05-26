@@ -113,7 +113,7 @@ pub trait DestinationHandler: Send + Sync {
         #[cfg(any(feature = "mysql", feature = "sqlserver"))]
         {
             let sqls = crate::destinations::bulk_insert::build_chunked_multi_value_inserts(
-                table, columns, rows, None,
+                table, columns, rows, None, None,
             );
             return self
                 .execute_sql_batch_with_hook(&sqls, pre_commit_hook)

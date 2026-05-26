@@ -158,6 +158,9 @@ fn parse_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
     let after_into = &trimmed[into_pos + 5..];
 
     let col_paren_pos = after_into.find('(')?;
+    if into_pos + 5 + col_paren_pos >= values_pos {
+        return None;
+    }
     let table = after_into[..col_paren_pos].trim().to_string();
 
     let col_section = &after_into[col_paren_pos..];

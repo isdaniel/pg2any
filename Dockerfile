@@ -1,6 +1,6 @@
 # Use multi-stage build for smaller final image
 # Build stage
-FROM rust:1.94-slim AS builder
+FROM rust:1.94-slim-bookworm AS builder
 
 # Destination features to compile (default: mysql,metrics)
 ARG DEST_FEATURES=mysql,metrics

@@ -2342,6 +2342,9 @@ impl TransactionManager {
                     Some(v) => v,
                     None => return false,
                 };
+                if values.len() != columns.len() {
+                    return false;
+                }
                 *expected_prefix = Some(prefix);
                 *expected_table = Some(table);
                 *expected_columns = Some(columns);
@@ -2356,6 +2359,9 @@ impl TransactionManager {
                 let values_suffix = &stmt[prefix.len()..];
                 match extract_values_from_suffix(values_suffix) {
                     Some(values) => {
+                        if values.len() != expected_columns.as_ref().unwrap().len() {
+                            return false;
+                        }
                         rows.push(values);
                         true
                     }

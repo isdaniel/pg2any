@@ -36,6 +36,9 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
 
     let first_trimmed = statements[0].trim();
     let values = parse_values_tuple(&first_trimmed[expected_prefix.len()..])?;
+    if values.len() != columns.len() {
+        return None;
+    }
     rows.push(values);
 
     for stmt in &statements[1..] {
@@ -44,6 +47,9 @@ pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInser
             return None;
         }
         let values = parse_values_tuple(&trimmed_stmt[expected_prefix.len()..])?;
+        if values.len() != columns.len() {
+            return None;
+        }
         rows.push(values);
     }
 

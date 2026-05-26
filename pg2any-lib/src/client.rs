@@ -1440,22 +1440,8 @@ impl CdcClient {
             .filter_map(|tx| tx.metadata.commit_lsn)
             .max();
 
-        let hook_lsn = highest_lsn;
-        let hook_feedback = Arc::clone(shared_lsn_feedback);
-
-        let pre_commit_hook: Option<crate::destinations::destination_factory::PreCommitHook> =
-            Some(Box::new(move || {
-                Box::pin(async move {
-                    if let Some(lsn) = hook_lsn {
-                        hook_feedback.update_applied_lsn(lsn.0);
-                        hook_feedback.update_flushed_lsn(lsn.0);
-                    }
-                    Ok(())
-                })
-            }));
-
         match destination_handler
-            .execute_bulk_insert_with_hook(&table, &columns, &all_rows, pre_commit_hook)
+            .execute_bulk_insert_with_hook(&table, &columns, &all_rows, None)
             .await
         {
             Ok(()) => {
@@ -1474,10 +1460,9 @@ impl CdcClient {
                     metrics_collector.record_transaction_processed(&tx, &dest_str);
                 }
 
-                // Persist LSN BEFORE deleting files — if we crash between these,
-                // files remain and will be re-processed on restart (safe duplicate),
-                // rather than losing them with no position record.
                 if let Some(lsn) = highest_lsn {
+                    shared_lsn_feedback.update_applied_lsn(lsn.0);
+                    shared_lsn_feedback.update_flushed_lsn(lsn.0);
                     lsn_tracker.commit_lsn(lsn.0);
                     if let Err(e) = lsn_tracker.persist_async().await {
                         warn!("Failed to persist LSN after smart batch: {}", e);

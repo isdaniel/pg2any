@@ -45,7 +45,7 @@ pub(crate) async fn run_consumer_loop(
     let mut retry_count: u32 = 0;
 
     loop {
-        let delay = retry_deadline.map(tokio::time::sleep_until);
+        let sleep_deadline = retry_deadline.unwrap_or_else(tokio::time::Instant::now);
 
         tokio::select! {
             biased;
@@ -72,13 +72,7 @@ pub(crate) async fn run_consumer_loop(
                 }
             }
 
-            _ = async {
-                if let Some(d) = delay {
-                    d.await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            }, if retry_deadline.is_some() => {
+            _ = tokio::time::sleep_until(sleep_deadline), if retry_deadline.is_some() => {
                 retry_deadline = None;
             }
         }

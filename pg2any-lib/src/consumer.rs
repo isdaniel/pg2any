@@ -39,8 +39,7 @@ pub(crate) async fn run_consumer_loop(
 
     metrics_collector.update_destination_connection_status(&destination_type, true);
 
-    let mut commit_queue: BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> =
-        BinaryHeap::new();
+    let mut commit_queue: BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> = BinaryHeap::new();
 
     let mut retry_deadline: Option<tokio::time::Instant> = None;
     let mut retry_count: u32 = 0;

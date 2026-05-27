@@ -68,6 +68,8 @@ pub mod lsn_tracker;
 
 // High-level client interface
 pub mod client;
+mod consumer;
+mod producer;
 
 // Transaction file persistence
 pub mod transaction_manager;

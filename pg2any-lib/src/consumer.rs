@@ -21,8 +21,8 @@ use tracing::{debug, error, info, warn};
 /// - **Producer oneshot**: producer has flushed and stopped — drain remaining work.
 /// - **mpsc channel closed**: producer dropped the sender — wait for oneshot, then drain.
 ///
-/// In both cases, `drain_and_shutdown` processes all queued transactions before
-/// persisting the final position.
+/// After the main loop exits (for any reason), `drain_and_shutdown` is called once
+/// to process all remaining queued transactions and persist the final position.
 pub(crate) async fn run_consumer_loop(
     transaction_file_manager: Arc<TransactionManager>,
     mut destination_handler: Box<dyn DestinationHandler>,
@@ -39,124 +39,20 @@ pub(crate) async fn run_consumer_loop(
 
     metrics_collector.update_destination_connection_status(&destination_type, true);
 
-    let mut commit_queue: BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> = BinaryHeap::new();
+    let mut commit_queue: BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> =
+        BinaryHeap::new();
 
     let mut retry_deadline: Option<tokio::time::Instant> = None;
     let mut retry_count: u32 = 0;
 
     loop {
-        // If queue has pending work and we're in retry mode, wait for backoff to expire
-        if !commit_queue.is_empty() {
-            if let Some(deadline) = retry_deadline {
-                let delay = tokio::time::sleep_until(deadline);
-                tokio::pin!(delay);
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        _ = &mut producer_shutdown_rx => {
-                            info!("Consumer: Received producer shutdown signal during retry wait, draining queue");
-
-                            drain_and_shutdown(
-                                &mut commit_queue,
-                                &mut commit_receiver,
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &lsn_tracker,
-                                &metrics_collector,
-                                batch_size,
-                                &shared_lsn_feedback,
-                            )
-                            .await;
-                            metrics_collector.update_destination_connection_status(&destination_type, false);
-                            info!("Consumer stopped gracefully");
-                            return Ok(());
-                        }
-
-                        result = commit_receiver.recv() => {
-                            if let Some(notification) = result {
-                                commit_queue.push(std::cmp::Reverse(notification));
-                                continue;
-                            } else {
-                                warn!("Consumer: mpsc channel closed during retry wait, awaiting producer shutdown signal");
-                                let _ = producer_shutdown_rx.await;
-
-                                drain_and_shutdown(
-                                    &mut commit_queue,
-                                    &mut commit_receiver,
-                                    &transaction_file_manager,
-                                    &mut destination_handler,
-                                    &lsn_tracker,
-                                    &metrics_collector,
-                                    batch_size,
-                                    &shared_lsn_feedback,
-                                )
-                                .await;
-                                return Ok(());
-                            }
-                        }
-
-                        _ = &mut delay => {
-                            break;
-                        }
-                    }
-                }
-
-                retry_deadline = None;
-
-                let cancelled = process_commit_queue(
-                    &mut commit_queue,
-                    &transaction_file_manager,
-                    &mut destination_handler,
-                    &cancellation_token,
-                    &lsn_tracker,
-                    &metrics_collector,
-                    batch_size,
-                    &shared_lsn_feedback,
-                    &mut retry_deadline,
-                    &mut retry_count,
-                )
-                .await;
-
-                if cancelled {
-                    info!("Consumer: cancellation detected during retry, draining remaining queue");
-                    drain_and_shutdown(
-                        &mut commit_queue,
-                        &mut commit_receiver,
-                        &transaction_file_manager,
-                        &mut destination_handler,
-                        &lsn_tracker,
-                        &metrics_collector,
-                        batch_size,
-                        &shared_lsn_feedback,
-                    )
-                    .await;
-                    metrics_collector
-                        .update_destination_connection_status(&destination_type, false);
-                    info!("Consumer stopped gracefully");
-                    return Ok(());
-                }
-                continue;
-            }
-        }
+        let delay = retry_deadline.map(tokio::time::sleep_until);
 
         tokio::select! {
             biased;
 
             _ = &mut producer_shutdown_rx => {
                 info!("Consumer: Received producer shutdown signal, draining queue");
-
-                drain_and_shutdown(
-                    &mut commit_queue,
-                    &mut commit_receiver,
-                    &transaction_file_manager,
-                    &mut destination_handler,
-                    &lsn_tracker,
-                    &metrics_collector,
-                    batch_size,
-                    &shared_lsn_feedback,
-                )
-                .await;
                 break;
             }
 
@@ -167,61 +63,61 @@ pub(crate) async fn run_consumer_loop(
                             "Consumer received commit notification for transaction {} (commit_lsn: {:?}) with file {:?}",
                             notification.metadata.transaction_id, notification.metadata.commit_lsn, notification.file_path
                         );
-
                         commit_queue.push(std::cmp::Reverse(notification));
-
-                        let cancelled = process_commit_queue(
-                            &mut commit_queue,
-                            &transaction_file_manager,
-                            &mut destination_handler,
-                            &cancellation_token,
-                            &lsn_tracker,
-                            &metrics_collector,
-                            batch_size,
-                            &shared_lsn_feedback,
-                            &mut retry_deadline,
-                            &mut retry_count,
-                        )
-                        .await;
-
-                        if cancelled {
-                            info!("Consumer: cancellation detected, draining remaining queue");
-                            drain_and_shutdown(
-                                &mut commit_queue,
-                                &mut commit_receiver,
-                                &transaction_file_manager,
-                                &mut destination_handler,
-                                &lsn_tracker,
-                                &metrics_collector,
-                                batch_size,
-                                &shared_lsn_feedback,
-                            )
-                            .await;
-                            break;
-                        }
                     }
                     None => {
                         warn!("Consumer: mpsc channel closed, waiting for producer shutdown signal");
-
                         let _ = producer_shutdown_rx.await;
-
-                        drain_and_shutdown(
-                            &mut commit_queue,
-                            &mut commit_receiver,
-                            &transaction_file_manager,
-                            &mut destination_handler,
-                            &lsn_tracker,
-                            &metrics_collector,
-                            batch_size,
-                            &shared_lsn_feedback,
-                        )
-                        .await;
                         break;
                     }
                 }
             }
+
+            _ = async {
+                if let Some(d) = delay {
+                    d.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if retry_deadline.is_some() => {
+                retry_deadline = None;
+            }
+        }
+
+        // Process queue when not in backoff and there's work to do
+        if retry_deadline.is_none() && !commit_queue.is_empty() {
+            let cancelled = process_commit_queue(
+                &mut commit_queue,
+                &transaction_file_manager,
+                &mut destination_handler,
+                &cancellation_token,
+                &lsn_tracker,
+                &metrics_collector,
+                batch_size,
+                &shared_lsn_feedback,
+                &mut retry_deadline,
+                &mut retry_count,
+            )
+            .await;
+
+            if cancelled {
+                info!("Consumer: cancellation detected, draining remaining queue");
+                break;
+            }
         }
     }
+
+    drain_and_shutdown(
+        &mut commit_queue,
+        &mut commit_receiver,
+        &transaction_file_manager,
+        &mut destination_handler,
+        &lsn_tracker,
+        &metrics_collector,
+        batch_size,
+        &shared_lsn_feedback,
+    )
+    .await;
 
     metrics_collector.update_destination_connection_status(&destination_type, false);
 

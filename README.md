@@ -116,6 +116,18 @@ On restart, pg2any:
 - Resumes from `last_executed_command_index` within partially-executed transaction files
 - Starts replication from the persisted `flush_lsn`
 
+### Graceful Shutdown
+
+pg2any implements coordinated producer-consumer shutdown to prevent data loss or duplicate application:
+
+1. **Signal received** (SIGINT/SIGTERM) — cancels the `CancellationToken`
+2. **Producer exits** — flushes buffers, drops mpsc sender, sends oneshot signal to consumer
+3. **Consumer drains** — processes all queued transactions within a 90-second deadline
+4. **Position persisted** — `flush_lsn` written to disk via atomic temp-file rename
+5. **Final ACK** — sends confirmed position to PostgreSQL so the WAL slot advances
+
+On next startup, any transaction with `commit_lsn <= flush_lsn` is skipped automatically (position-tracking deduplication). No `ON CONFLICT DO NOTHING` or `INSERT IGNORE` is used — correctness relies on tracking the exact position.
+
 ### Workflow Diagrams
 
 #### Transaction Processing Detail Flow

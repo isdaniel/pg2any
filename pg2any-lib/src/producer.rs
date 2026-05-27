@@ -182,6 +182,7 @@ pub(crate) async fn run_producer(
                                 );
                                 metrics_collector
                                     .record_error("transaction_file_create_failed", "producer");
+                                return Err(e);
                             }
                         }
                     }
@@ -204,6 +205,7 @@ pub(crate) async fn run_producer(
                                     "Failed to handle normal transaction commit for tx {}: {}",
                                     tx_id, e
                                 );
+                                return Err(e);
                             }
                         } else {
                             warn!("Received COMMIT without active normal transaction, ignoring");
@@ -241,6 +243,7 @@ pub(crate) async fn run_producer(
                                     );
                                     metrics_collector
                                         .record_error("transaction_file_create_failed", "producer");
+                                    return Err(e);
                                 }
                             }
                         }
@@ -277,6 +280,7 @@ pub(crate) async fn run_producer(
                                     "Failed to handle streaming transaction commit for tx {}: {}",
                                     transaction_id, e
                                 );
+                                return Err(e);
                             }
                         } else {
                             warn!("StreamCommit for unknown transaction {}", transaction_id);
@@ -344,6 +348,7 @@ pub(crate) async fn run_producer(
                                 error!("Failed to append event to transaction {}: {}", tx_id, e);
                                 metrics_collector
                                     .record_error("transaction_file_append_failed", "producer");
+                                return Err(e);
                             }
                         }
                     }

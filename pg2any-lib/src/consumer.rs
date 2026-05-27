@@ -112,6 +112,10 @@ pub(crate) async fn run_consumer_loop(
     )
     .await;
 
+    if let Err(e) = destination_handler.close().await {
+        error!("Failed to close consumer destination handler: {}", e);
+    }
+
     metrics_collector.update_destination_connection_status(&destination_type, false);
 
     info!("Consumer stopped gracefully");

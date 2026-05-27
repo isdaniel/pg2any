@@ -1746,7 +1746,7 @@ impl TransactionManager {
     /// and can resume from where it left off if interrupted.
     ///
     /// Checks cancellation token between batches to support graceful shutdown.
-    pub(crate) async fn process_transaction_file(
+    pub async fn process_transaction_file(
         self: Arc<Self>,
         pending_tx: &PendingTransactionFile,
         destination_handler: &mut Box<dyn DestinationHandler>,

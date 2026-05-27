@@ -29,7 +29,9 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 
 ## Important Files
 
-- `pg2any-lib/src/client.rs` - Core orchestration logic, producer/consumer tasks
+- `pg2any-lib/src/client.rs` - Core orchestration logic, startup, recovery, shutdown
+- `pg2any-lib/src/producer.rs` - WAL reader, transaction file writer (extracted from client.rs)
+- `pg2any-lib/src/consumer.rs` - File executor, drain_and_shutdown, retry logic (extracted from client.rs)
 - `pg2any-lib/src/transaction_manager.rs` - File-based transaction lifecycle + bulk insert routing + `analyze_transaction_content`
 - `pg2any-lib/src/destinations/destination_factory.rs` - `DestinationHandler` trait definition
 - `pg2any-lib/src/destinations/mysql.rs` - MySQL destination (sqlx + mysql_async dual pool)

@@ -31,7 +31,9 @@ pg2any/                          # Cargo workspace root
     src/
       lib.rs                     # Public API: re-exports CdcApp, CdcClient, Config, etc.
       app.rs                     # CdcApp - high-level runner with signal handling
-      client.rs                  # CdcClient - producer/consumer orchestration (largest file, ~1500 lines)
+      client.rs                  # CdcClient - orchestration, startup, recovery, shutdown (~400 lines)
+      producer.rs                # run_producer - WAL reader, transaction file writer
+      consumer.rs                # run_consumer_loop - file executor, drain_and_shutdown, retry logic
       config.rs                  # Config struct + ConfigBuilder pattern
       env.rs                     # load_config_from_env() - maps env vars to Config
       error.rs                   # CdcError enum with thiserror

@@ -55,6 +55,10 @@ pub(crate) async fn run_consumer_loop(
                 break;
             }
 
+            _ = tokio::time::sleep_until(sleep_deadline), if retry_deadline.is_some() => {
+                retry_deadline = None;
+            }
+
             result = commit_receiver.recv() => {
                 match result {
                     Some(notification) => {
@@ -70,10 +74,6 @@ pub(crate) async fn run_consumer_loop(
                         break;
                     }
                 }
-            }
-
-            _ = tokio::time::sleep_until(sleep_deadline), if retry_deadline.is_some() => {
-                retry_deadline = None;
             }
         }
 
@@ -125,10 +125,8 @@ pub(crate) async fn run_consumer_loop(
 /// Drain remaining channel messages, process all queued transactions, then
 /// persist position and exit.
 ///
-/// Uses a 90-second timeout to leave headroom within the Docker stop grace
-/// period (typically 120s). If the timeout fires, processing stops and the
-/// current position is persisted — unprocessed files remain in `sql_pending_tx/`
-/// for recovery on the next restart.
+/// Waits for all queued transactions to complete without any timeout,
+/// ensuring the final LSN is persisted and no replay occurs on restart.
 async fn drain_and_shutdown(
     commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
     commit_receiver: &mut mpsc::Receiver<PendingTransactionFile>,
@@ -162,18 +160,7 @@ async fn drain_and_shutdown(
         commit_queue.len()
     );
 
-    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-
     while let Some(std::cmp::Reverse(next_tx)) = commit_queue.pop() {
-        if tokio::time::Instant::now() >= drain_deadline {
-            warn!(
-                "Consumer: Drain timeout reached with {} transaction(s) remaining, persisting position",
-                commit_queue.len() + 1
-            );
-            commit_queue.push(std::cmp::Reverse(next_tx));
-            break;
-        }
-
         info!(
             "Consumer drain: processing transaction {} (LSN: {:?})",
             next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn

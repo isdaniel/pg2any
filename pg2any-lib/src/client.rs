@@ -282,7 +282,7 @@ impl CdcClient {
 
     /// Process pending transaction files on startup (recovery).
     ///
-    /// Processes all committed files from `sql_pending_tx/` in commit timestamp order
+    /// Processes all committed files from `sql_pending_tx/` in commit_lsn (WAL) order
     /// before starting normal replication. Respects cancellation token.
     async fn process_pending_transaction_files(
         file_mgr: &Arc<TransactionManager>,

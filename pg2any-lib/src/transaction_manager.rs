@@ -847,8 +847,9 @@ impl TransactionManager {
             }
         }
 
-        // Sort by commit_lsn to ensure recovery processes in WAL order, using timestamp would allow a lower-LSN tx to be skipped if a higher-LSN tx with an earlier timestamp advances flush_lsn past it.
-        files.sort_by_key(|f| f.metadata.commit_lsn);
+        // Sort using the custom Ord impl: commit_lsn ascending (None treated as
+        // infinity) with transaction_id tiebreaker for deterministic WAL-order recovery.
+        files.sort();
 
         Ok(files)
     }

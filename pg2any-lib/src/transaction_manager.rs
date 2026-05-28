@@ -849,7 +849,7 @@ impl TransactionManager {
 
         // Sort using the custom Ord impl: commit_lsn ascending (None treated as
         // infinity) with transaction_id tiebreaker for deterministic WAL-order recovery.
-        files.sort();
+        files.sort_unstable();
 
         Ok(files)
     }

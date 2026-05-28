@@ -847,8 +847,9 @@ impl TransactionManager {
             }
         }
 
-        // Sort by commit timestamp
-        files.sort_by_key(|f| f.metadata.commit_timestamp);
+        // Sort using the custom Ord impl: commit_lsn ascending (None treated as
+        // infinity) with transaction_id tiebreaker for deterministic WAL-order recovery.
+        files.sort_unstable();
 
         Ok(files)
     }

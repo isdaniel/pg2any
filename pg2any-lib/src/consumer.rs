@@ -125,9 +125,15 @@ pub(crate) async fn run_consumer_loop(
 /// Drain remaining channel messages, process all queued transactions, then
 /// persist position and exit.
 ///
-/// Waits for all queued transactions to complete without any timeout,
-/// ensuring the final LSN is persisted and no replay occurs on restart.
-async fn drain_and_shutdown(
+/// **Shutdown correctness guarantee:** This function uses an uncancellable
+/// `CancellationToken` (one that is never cancelled) when processing queued
+/// transactions. This ensures all in-progress work completes to maintain
+/// position-tracking correctness — if a transaction is partially applied
+/// without LSN advancement, the next restart would replay it.
+///
+/// On error, processing stops and the failing transaction's file remains in
+/// `sql_pending_tx/` for recovery on the next restart.
+pub async fn drain_and_shutdown(
     commit_queue: &mut BinaryHeap<std::cmp::Reverse<PendingTransactionFile>>,
     commit_receiver: &mut mpsc::Receiver<PendingTransactionFile>,
     transaction_file_manager: &Arc<TransactionManager>,
@@ -166,14 +172,14 @@ async fn drain_and_shutdown(
             next_tx.metadata.transaction_id, next_tx.metadata.commit_lsn
         );
 
-        let drain_token = CancellationToken::new();
+        let uncancellable_token = CancellationToken::new();
 
         if let Err(e) = transaction_file_manager
             .clone()
             .process_transaction_file(
                 &next_tx,
                 destination_handler,
-                &drain_token,
+                &uncancellable_token,
                 lsn_tracker,
                 metrics_collector,
                 batch_size,

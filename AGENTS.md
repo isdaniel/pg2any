@@ -114,6 +114,39 @@ Destinations are conditionally compiled via `#[cfg(feature = "...")]`.
 - **Graceful shutdown**: `CancellationToken` + `oneshot` channel coordination between producer and consumer
 - All async, Tokio-based. No blocking I/O on the hot path.
 
+## Graceful Shutdown
+
+pg2any implements coordinated producer-consumer shutdown with zero data loss:
+
+### Sequence
+
+1. **Signal** (SIGINT/SIGTERM) → `CancellationToken` cancelled
+2. **Producer** exits WAL read loop → flushes buffers → drops mpsc sender → sends oneshot
+3. **Consumer** receives oneshot → breaks main loop → calls `drain_and_shutdown()`
+4. **Drain** uses a fresh (uncancellable) token → processes ALL remaining queued transactions
+5. **Finalize** each transaction: commit to destination → update `flush_lsn` → persist to disk → delete file
+6. **Client.stop()** joins handles → sends final ACK to PostgreSQL → closes destination → final persist
+
+### Invariant
+
+The on-disk LSN metadata represents the last transaction **fully applied** to the destination. On restart, any transaction with `commit_lsn <= flush_lsn` is skipped (position-tracking deduplication). Files in `sql_pending_tx/` with `commit_lsn > flush_lsn` are replayed.
+
+### Why NOT duplicate-key ignore
+
+Position-tracking (not `ON CONFLICT DO NOTHING` / `INSERT IGNORE`) is the correct approach because:
+- It handles UPDATE and DELETE (not just INSERT)
+- It avoids masking legitimate duplicate-key bugs in the source
+- It works identically across all destination types (MySQL, SQL Server, SQLite, Kafka)
+
+### Recovery scenarios
+
+| Scenario | What's on disk | What happens on restart |
+|----------|---------------|------------------------|
+| Clean shutdown | No pending files, LSN persisted | Resume from `flush_lsn` |
+| Crash mid-transaction | Files in `sql_received_tx/` | Incomplete transactions cleaned up |
+| Crash after commit, before execute | Files in `sql_pending_tx/` | Replayed from start (or `last_executed_command_index`) |
+| Crash after partial execution | File in `sql_pending_tx/` with progress | Resumed from checkpoint |
+
 ## Error Handling
 
 `CdcError` in `error.rs` classifies errors as:

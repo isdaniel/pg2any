@@ -26,6 +26,8 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - MySQL uses dual pools: sqlx for normal SQL batches, mysql_async for LOAD DATA LOCAL INFILE
 - SQL Server uses TDS Bulk Load (tiberius `bulk_insert`) for homogeneous INSERT batches, falls back to multi-value INSERT
 - Consumer detects homogeneous INSERT batches and routes to bulk insert path when threshold met
+- Graceful shutdown invariant: `drain_and_shutdown` completes all queued transactions using an uncancellable token before persisting final LSN. The on-disk LSN represents the last FULLY APPLIED transaction. Recovery skips files with `commit_lsn <= flush_lsn`.
+- Never pass the main `CancellationToken` to `drain_and_shutdown` — it must use its own fresh (never-cancelled) token
 
 ## Important Files
 

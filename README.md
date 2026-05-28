@@ -122,11 +122,13 @@ pg2any implements coordinated producer-consumer shutdown to prevent data loss or
 
 1. **Signal received** (SIGINT/SIGTERM) — cancels the `CancellationToken`
 2. **Producer exits** — flushes buffers, drops mpsc sender, sends oneshot signal to consumer
-3. **Consumer drains** — processes all queued transactions within a 90-second deadline
-4. **Position persisted** — `flush_lsn` written to disk via atomic temp-file rename
+3. **Consumer drains** — processes ALL queued transactions using an uncancellable token (no timeout)
+4. **Position persisted** — `flush_lsn` written to disk via atomic temp-file rename after each transaction
 5. **Final ACK** — sends confirmed position to PostgreSQL so the WAL slot advances
 
 On next startup, any transaction with `commit_lsn <= flush_lsn` is skipped automatically (position-tracking deduplication). No `ON CONFLICT DO NOTHING` or `INSERT IGNORE` is used — correctness relies on tracking the exact position.
+
+If the final ACK to PostgreSQL fails (network issue), the local position is still safe — PostgreSQL will re-send from its slot's `confirmed_flush_lsn`, and local position-tracking skips already-applied transactions.
 
 ### Workflow Diagrams
 

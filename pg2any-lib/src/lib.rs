@@ -84,6 +84,7 @@ pub mod monitoring;
 pub use app::{run_cdc_app, CdcApp, CdcAppConfig};
 pub use client::CdcClient;
 pub use config::{Config, ConfigBuilder};
+pub use consumer::drain_and_shutdown;
 pub use env::load_config_from_env;
 pub use error::CdcError;
 pub use lsn_tracker::{create_lsn_tracker_with_load, LsnTracker};

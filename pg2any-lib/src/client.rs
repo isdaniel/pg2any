@@ -282,7 +282,7 @@ impl CdcClient {
 
     /// Process pending transaction files on startup (recovery).
     ///
-    /// Processes all committed files from `sql_pending_tx/` in commit timestamp order
+    /// Processes all committed files from `sql_pending_tx/` in commit_lsn (WAL) order
     /// before starting normal replication. Respects cancellation token.
     async fn process_pending_transaction_files(
         file_mgr: &Arc<TransactionManager>,
@@ -357,6 +357,13 @@ impl CdcClient {
     }
 
     /// Stop the CDC replication process gracefully.
+    ///
+    /// Shutdown ordering (each step depends on the previous):
+    /// 1. Cancel token → producer and consumer detect shutdown
+    /// 2. Join handles → wait for both tasks to complete (consumer drains queue)
+    /// 3. Final ACK → send confirmed_flush_lsn to PostgreSQL so WAL slot advances
+    /// 4. Close destination → release connection pool
+    /// 5. Persist LSN → final atomic write to disk (idempotent, consumer already persisted)
     pub async fn stop(&mut self) -> Result<()> {
         info!("Initiating graceful shutdown of CDC replication");
 

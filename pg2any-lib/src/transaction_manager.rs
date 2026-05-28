@@ -847,8 +847,8 @@ impl TransactionManager {
             }
         }
 
-        // Sort by commit timestamp
-        files.sort_by_key(|f| f.metadata.commit_timestamp);
+        // Sort by commit_lsn to ensure recovery processes in WAL order, using timestamp would allow a lower-LSN tx to be skipped if a higher-LSN tx with an earlier timestamp advances flush_lsn past it.
+        files.sort_by_key(|f| f.metadata.commit_lsn);
 
         Ok(files)
     }

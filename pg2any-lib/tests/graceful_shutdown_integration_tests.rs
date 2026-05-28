@@ -324,3 +324,260 @@ async fn test_cancellation_prevents_lsn_advance() {
     assert!(result.unwrap_err().is_cancelled());
     assert_eq!(lsn_tracker.get(), 0);
 }
+
+#[tokio::test]
+async fn test_mid_batch_cancellation_completes_drain() {
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_drain");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
+            .await
+            .unwrap(),
+    );
+
+    let mut pending_txs = Vec::new();
+    for (i, lsn) in [(1u32, 10000u64), (2, 20000), (3, 30000)].iter() {
+        let timestamp = Utc::now();
+        manager
+            .begin_transaction(*i, timestamp, "normal")
+            .await
+            .unwrap();
+        let event = create_insert_event(*lsn);
+        manager.append_event(*i, &event).await.unwrap();
+        manager.flush_all_buffers().await.unwrap();
+        let pending_path = manager
+            .commit_transaction(*i, Some(Lsn(*lsn)))
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
+        let metadata = serde_json::from_str(&content).unwrap();
+        pending_txs.push(PendingTransactionFile {
+            file_path: pending_path,
+            metadata,
+        });
+    }
+
+    let mut commit_queue: std::collections::BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> =
+        std::collections::BinaryHeap::new();
+    for tx in pending_txs {
+        commit_queue.push(std::cmp::Reverse(tx));
+    }
+
+    let (_tx_sender, mut rx_receiver) = tokio::sync::mpsc::channel::<PendingTransactionFile>(10);
+    drop(_tx_sender);
+
+    let mock = MockDestination::new();
+    let executed = mock.executed_batches.clone();
+    let mut dest: Box<dyn DestinationHandler> = Box::new(mock);
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+
+    pg2any_lib::drain_and_shutdown(
+        &mut commit_queue,
+        &mut rx_receiver,
+        &manager,
+        &mut dest,
+        &lsn_tracker,
+        &metrics,
+        100,
+        &shared_feedback,
+    )
+    .await;
+
+    assert_eq!(executed.load(Ordering::SeqCst), 3);
+    assert_eq!(lsn_tracker.get(), 30000);
+    let (_, loaded_lsn) = LsnTracker::new_with_load(Some(lsn_path)).await;
+    assert_eq!(loaded_lsn, Some(Lsn(30000)));
+}
+
+#[tokio::test]
+async fn test_committed_but_undelivered_recovered_on_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_undelivered");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
+            .await
+            .unwrap(),
+    );
+
+    let timestamp = Utc::now();
+    manager
+        .begin_transaction(42, timestamp, "normal")
+        .await
+        .unwrap();
+    let event = create_insert_event(55000);
+    manager.append_event(42, &event).await.unwrap();
+    manager.flush_all_buffers().await.unwrap();
+    let _pending_path = manager
+        .commit_transaction(42, Some(Lsn(55000)))
+        .await
+        .unwrap();
+
+    let pending_txs = manager.list_pending_transactions().await.unwrap();
+    assert_eq!(pending_txs.len(), 1);
+    assert_eq!(pending_txs[0].metadata.transaction_id, 42);
+
+    let mock = MockDestination::new();
+    let executed = mock.executed_batches.clone();
+    let mut dest: Box<dyn DestinationHandler> = Box::new(mock);
+    let token = CancellationToken::new();
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+
+    for pending_tx in &pending_txs {
+        manager
+            .clone()
+            .process_transaction_file(
+                pending_tx,
+                &mut dest,
+                &token,
+                &lsn_tracker,
+                &metrics,
+                100,
+                &shared_feedback,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(executed.load(Ordering::SeqCst) >= 1);
+    assert_eq!(lsn_tracker.get(), 55000);
+    let remaining = manager.list_pending_transactions().await.unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[tokio::test]
+async fn test_final_ack_failure_still_persists_local_lsn() {
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_ack_fail");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    let (manager, pending_tx) =
+        setup_pending_transaction_with_events(&temp_dir, 600, 90000, 3).await;
+
+    let mut dest: Box<dyn DestinationHandler> = Box::new(MockDestination::new());
+    let token = CancellationToken::new();
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+
+    manager
+        .clone()
+        .process_transaction_file(
+            &pending_tx,
+            &mut dest,
+            &token,
+            &lsn_tracker,
+            &metrics,
+            100,
+            &shared_feedback,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(lsn_tracker.get(), 90000);
+
+    let (tracker_after_restart, loaded_lsn) = LsnTracker::new_with_load(Some(lsn_path)).await;
+    assert_eq!(loaded_lsn, Some(Lsn(90000)));
+
+    let temp_dir2 = TempDir::new().unwrap();
+    let (manager2, pending_tx_replay) =
+        setup_pending_transaction_with_events(&temp_dir2, 601, 90000, 2).await;
+
+    let mock2 = MockDestination::new();
+    let executed2 = mock2.executed_batches.clone();
+    let mut dest2: Box<dyn DestinationHandler> = Box::new(mock2);
+
+    manager2
+        .clone()
+        .process_transaction_file(
+            &pending_tx_replay,
+            &mut dest2,
+            &token,
+            &tracker_after_restart,
+            &metrics,
+            100,
+            &shared_feedback,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(executed2.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_drain_on_error_preserves_file_for_recovery() {
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_drain_err");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
+            .await
+            .unwrap(),
+    );
+
+    let mut pending_txs = Vec::new();
+    for (i, lsn) in [(10u32, 40000u64), (11, 50000)].iter() {
+        let timestamp = Utc::now();
+        manager
+            .begin_transaction(*i, timestamp, "normal")
+            .await
+            .unwrap();
+        let event = create_insert_event(*lsn);
+        manager.append_event(*i, &event).await.unwrap();
+        manager.flush_all_buffers().await.unwrap();
+        let pending_path = manager
+            .commit_transaction(*i, Some(Lsn(*lsn)))
+            .await
+            .unwrap();
+        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
+        let metadata = serde_json::from_str(&content).unwrap();
+        pending_txs.push(PendingTransactionFile {
+            file_path: pending_path,
+            metadata,
+        });
+    }
+
+    let mut commit_queue: std::collections::BinaryHeap<std::cmp::Reverse<PendingTransactionFile>> =
+        std::collections::BinaryHeap::new();
+    for tx in pending_txs {
+        commit_queue.push(std::cmp::Reverse(tx));
+    }
+
+    let (_tx_sender, mut rx_receiver) = tokio::sync::mpsc::channel::<PendingTransactionFile>(10);
+    drop(_tx_sender);
+
+    let mut dest: Box<dyn DestinationHandler> = Box::new(MockDestination::new_failing_at(2));
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+
+    pg2any_lib::drain_and_shutdown(
+        &mut commit_queue,
+        &mut rx_receiver,
+        &manager,
+        &mut dest,
+        &lsn_tracker,
+        &metrics,
+        100,
+        &shared_feedback,
+    )
+    .await;
+
+    assert_eq!(lsn_tracker.get(), 40000);
+
+    let remaining = manager.list_pending_transactions().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].metadata.transaction_id, 11);
+
+    let (tracker_restart, loaded_lsn) = LsnTracker::new_with_load(Some(lsn_path)).await;
+    assert_eq!(loaded_lsn, Some(Lsn(40000)));
+    assert!(50000 > tracker_restart.get());
+}

@@ -74,6 +74,9 @@ mod producer;
 // Transaction file persistence
 pub mod transaction_manager;
 
+// Pure SQL rendering (extracted from transaction_manager)
+pub mod sql_renderer;
+
 // Storage abstraction for transaction files
 pub mod storage;
 
@@ -144,8 +147,21 @@ pub use crate::destinations::SQLiteDestination;
 #[cfg(feature = "kafka")]
 pub use crate::destinations::KafkaDestination;
 
-pub use crate::destinations::{DestinationFactory, DestinationHandler};
+pub use crate::destinations::{DestinationFactoryFn, DestinationHandler, PreCommitHook};
 pub use crate::types::{DestinationType, Transaction};
+
+// SQL dialect customization for external destinations.
+//
+// Custom destinations registered via `Config::register_destination` can
+// override `DestinationHandler::dialect()` to return one of the built-in
+// dialects (e.g. `MySqlDialect`), the generic `AnsiDialect`, or a fully
+// custom `SqlDialect` impl. See `destinations::dialect` for the integration
+// guide and `examples/src/bin/custom_destination.rs` for a worked example.
+pub use crate::destinations::dialect::SqlDialect;
+pub use crate::destinations::dialects::{
+    AnsiDialect, KafkaDialect, MySqlDialect, SqlServerDialect, SqliteDialect,
+};
+pub use crate::sql_renderer::{RenderContext, RenderedStatement};
 
 // Conditionally export metrics server functionality
 #[cfg(feature = "metrics")]

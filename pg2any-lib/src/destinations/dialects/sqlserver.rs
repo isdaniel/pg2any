@@ -1,0 +1,174 @@
+use crate::destinations::dialect::SqlDialect;
+use pg_walstream::ColumnValue;
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SqlServerDialect;
+
+impl SqlDialect for SqlServerDialect {
+    fn quote_identifier(&self, ident: &str, out: &mut String) {
+        out.reserve(ident.len() + 2);
+        out.push('[');
+        if ident.contains(']') {
+            for ch in ident.chars() {
+                if ch == ']' {
+                    out.push(']');
+                }
+                out.push(ch);
+            }
+        } else {
+            out.push_str(ident);
+        }
+        out.push(']');
+    }
+
+    fn qualify_table(&self, schema: &str, table: &str, out: &mut String) {
+        self.quote_identifier(schema, out);
+        out.push('.');
+        self.quote_identifier(table, out);
+    }
+
+    fn render_hex_literal(&self, bytes: &[u8], out: &mut String) {
+        out.push_str("0x");
+        crate::destinations::dialect::push_hex_ascii(out, bytes);
+    }
+
+    fn render_value(&self, value: &ColumnValue, out: &mut String) {
+        match value {
+            ColumnValue::Null => out.push_str("NULL"),
+            ColumnValue::Text(_) => match value.as_str() {
+                Some(s) => {
+                    if s == "t" {
+                        out.push('1');
+                        return;
+                    }
+                    if s == "f" {
+                        out.push('0');
+                        return;
+                    }
+                    out.reserve(s.len() + 2);
+                    out.push('\'');
+                    if s.contains('\'') {
+                        for ch in s.chars() {
+                            if ch == '\'' {
+                                out.push_str("''");
+                            } else {
+                                out.push(ch);
+                            }
+                        }
+                    } else {
+                        out.push_str(s);
+                    }
+                    out.push('\'');
+                }
+                None => self.render_hex_literal(value.as_bytes(), out),
+            },
+            ColumnValue::Binary(_) => self.render_hex_literal(value.as_bytes(), out),
+        }
+    }
+
+    fn truncate_table_sql(&self, schema: &str, table: &str) -> Option<String> {
+        let mut sql = String::new();
+        sql.push_str("TRUNCATE TABLE ");
+        self.qualify_table(schema, table, &mut sql);
+        sql.push(';');
+        Some(sql)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(f: impl Fn(&mut String)) -> String {
+        let mut o = String::new();
+        f(&mut o);
+        o
+    }
+
+    #[test]
+    fn quote_identifier() {
+        assert_eq!(
+            s(|o| SqlServerDialect.quote_identifier("users", o)),
+            "[users]"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.quote_identifier("back`tick", o)),
+            "[back`tick]"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.quote_identifier("bra]cket", o)),
+            "[bra]]cket]"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.quote_identifier("double\"quote", o)),
+            "[double\"quote]"
+        );
+    }
+
+    #[test]
+    fn qualify_table() {
+        assert_eq!(
+            s(|o| SqlServerDialect.qualify_table("public", "users", o)),
+            "[public].[users]"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.qualify_table("custom", "items", o)),
+            "[custom].[items]"
+        );
+    }
+
+    #[test]
+    fn render_hex_literal() {
+        assert_eq!(s(|o| SqlServerDialect.render_hex_literal(&[], o)), "0x");
+        assert_eq!(
+            s(|o| SqlServerDialect.render_hex_literal(&[0xde, 0xad, 0xbe, 0xef], o)),
+            "0xdeadbeef"
+        );
+    }
+
+    #[test]
+    fn render_value() {
+        use bytes::Bytes;
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::Null, o)),
+            "NULL"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::text("t"), o)),
+            "1"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::text("f"), o)),
+            "0"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::text("hello"), o)),
+            "'hello'"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::text("o'reilly"), o)),
+            "'o''reilly'"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(&ColumnValue::text("back\\slash"), o)),
+            "'back\\slash'"
+        );
+        assert_eq!(
+            s(|o| SqlServerDialect.render_value(
+                &ColumnValue::Binary(Bytes::from_static(&[0x00, 0xff, 0xab])),
+                o
+            )),
+            "0x00ffab"
+        );
+    }
+
+    #[test]
+    fn truncate_table_sql() {
+        assert_eq!(
+            SqlServerDialect
+                .truncate_table_sql("public", "users")
+                .as_deref(),
+            Some("TRUNCATE TABLE [public].[users];")
+        );
+    }
+}

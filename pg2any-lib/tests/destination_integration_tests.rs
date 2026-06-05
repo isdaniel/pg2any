@@ -1,10 +1,16 @@
 use pg2any_lib::{
-    destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationFactory},
+    destinations::{mysql::MySQLDestination, sqlserver::SqlServerDestination, DestinationHandler},
     types::{ChangeEvent, EventType, ReplicaIdentity},
     DestinationType,
 };
 use pg_walstream::{ColumnValue, Lsn, RowData};
 use std::sync::Arc;
+
+fn make(dt: DestinationType) -> pg2any_lib::CdcResult<Box<dyn DestinationHandler>> {
+    let mut cfg = pg2any_lib::Config::default();
+    cfg.destination_type = dt;
+    cfg.create_destination()
+}
 
 /// Test that destination handlers have consistent interfaces
 #[tokio::test]
@@ -17,7 +23,7 @@ async fn test_destination_handler_interface() {
 
     #[cfg(feature = "mysql")]
     {
-        let mut destination = DestinationFactory::create(&DestinationType::MySQL).unwrap();
+        let mut destination = make(DestinationType::MySQL).unwrap();
 
         // Test execute_sql_batch interface with empty batch (should succeed)
         let empty_batch_result = destination.execute_sql_batch_with_hook(&[], None).await;
@@ -37,7 +43,7 @@ async fn test_destination_handler_interface() {
 
     #[cfg(feature = "sqlserver")]
     {
-        let mut destination = DestinationFactory::create(&DestinationType::SqlServer).unwrap();
+        let mut destination = make(DestinationType::SqlServer).unwrap();
 
         // Test execute_sql_batch interface with empty batch (should succeed)
         let empty_batch_result = destination.execute_sql_batch_with_hook(&[], None).await;
@@ -88,14 +94,14 @@ fn test_unsupported_destination_types() {
     // SQLite is now supported, so it should succeed
     #[cfg(feature = "sqlite")]
     {
-        let sqlite_result = DestinationFactory::create(&DestinationType::SQLite);
+        let sqlite_result = make(DestinationType::SQLite);
         assert!(sqlite_result.is_ok());
     }
 
     // If SQLite feature is not enabled, it should fail
     #[cfg(not(feature = "sqlite"))]
     {
-        let sqlite_result = DestinationFactory::create(&DestinationType::SQLite);
+        let sqlite_result = make(DestinationType::SQLite);
         assert!(sqlite_result.is_err());
     }
 }

@@ -16,6 +16,59 @@ A high-performance PostgreSQL Change Data Capture (CDC) tool that streams databa
 | SQLite | SQLx | `sqlite` (default) |
 | Kafka | rdkafka (librdkafka) | `kafka` |
 
+## Custom Destinations
+
+Built-in destinations self-register in `Config::default()`. External users can plug in their own `DestinationHandler` implementations through the per-`Config` registry — no fork required.
+
+Three ergonomic forms (pick the shortest that fits):
+
+```rust,ignore
+// 1) Type implements Default — zero arguments
+Config::builder()
+    .use_destination::<MyDest>()
+    .destination_connection_string("...")
+    .build()?;
+
+// 2) Construction takes args — supply a factory closure (no Box, no Result)
+Config::builder()
+    .custom_destination(|| MyDest::with_options(opts.clone()))
+    .destination_connection_string("...")
+    .build()?;
+
+// 3) Multi-key / runtime selection — register under a named key
+Config::builder()
+    .register_destination("my-dest", || MyDest::new())
+    .destination_type(DestinationType::Custom("my-dest".into()))
+    .build()?;
+```
+
+Minimal handler:
+
+```rust,ignore
+use async_trait::async_trait;
+use pg2any_lib::destinations::{DestinationHandler, PreCommitHook};
+use pg2any_lib::CdcResult;
+use std::collections::HashMap;
+
+#[derive(Default)]
+struct MyDest;
+
+#[async_trait]
+impl DestinationHandler for MyDest {
+    async fn connect(&mut self, _conn: &str) -> CdcResult<()> { Ok(()) }
+    fn set_schema_mappings(&mut self, _m: HashMap<String, String>) {}
+    async fn execute_sql_batch_with_hook(
+        &mut self, _cmds: &[String], hook: Option<PreCommitHook>,
+    ) -> CdcResult<()> {
+        if let Some(h) = hook { h().await?; }
+        Ok(())
+    }
+    async fn close(&mut self) -> CdcResult<()> { Ok(()) }
+}
+```
+
+The factory closure must return a fresh handler each call (it is invoked once for the main pipeline and once for the consumer). See the [`DestinationHandler`](pg2any-lib/src/destinations/destination_factory.rs) trait for the full surface (event mode, bulk insert hooks, pre-commit checkpoint integration). 
+
 ## Key Features
 
 - **Crash-safe persistence** - File-based producer-consumer with automatic crash recovery

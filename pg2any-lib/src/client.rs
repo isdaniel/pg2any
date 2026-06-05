@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::consumer;
-use crate::destinations::{DestinationFactory, DestinationHandler};
+use crate::destinations::DestinationHandler;
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
@@ -54,7 +54,9 @@ impl CdcClient {
     pub async fn new(config: Config, lsn_file_path: Option<&str>) -> Result<(Self, Option<Lsn>)> {
         info!("Creating CDC client");
 
-        let destination_handler = DestinationFactory::create(&config.destination_type)?;
+        let destination_handler = config.create_destination()?;
+
+        let dialect_override = Some(destination_handler.dialect());
 
         info!(
             "Transaction file persistence enabled at: {}",
@@ -63,6 +65,7 @@ impl CdcClient {
         let mut manager = TransactionManager::new(
             &config.transaction_file_base_path,
             config.destination_type.clone(),
+            dialect_override,
             config.transaction_segment_size_bytes,
         )
         .await?;
@@ -224,7 +227,7 @@ impl CdcClient {
 
         info!("Starting file-based consumer for transaction processing");
 
-        let mut consumer_destination = DestinationFactory::create(dest_type)?;
+        let mut consumer_destination = self.config.create_destination()?;
         consumer_destination
             .connect(&self.config.destination_connection_string)
             .await?;

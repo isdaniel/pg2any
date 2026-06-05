@@ -22,7 +22,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["compat", "io-util"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 bytes = "1.11.1"
 async-trait = "0.1.89"
 thiserror = "2.0.18"
@@ -41,7 +41,7 @@ base64 = "0.22.1"
 
 # Monitoring and metrics
 prometheus = { version = "0.14.0", features = ["process"] }
-hyper = { version = "1.10.0", features = ["full"] }
+hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 http-body-util = "0.1.3"
 

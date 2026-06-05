@@ -86,9 +86,14 @@ async fn setup_pending_transaction_with_events(
     event_count: usize,
 ) -> (Arc<TransactionManager>, PendingTransactionFile) {
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     let timestamp = Utc::now();
@@ -221,9 +226,14 @@ async fn test_incomplete_transaction_not_in_pending() {
     let temp_dir = TempDir::new().unwrap();
 
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     let timestamp = Utc::now();
@@ -332,9 +342,14 @@ async fn test_mid_batch_cancellation_completes_drain() {
     let lsn_path = lsn_file.to_str().unwrap();
 
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     let mut pending_txs = Vec::new();
@@ -400,9 +415,14 @@ async fn test_committed_but_undelivered_recovered_on_restart() {
     let lsn_path = lsn_file.to_str().unwrap();
 
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     let timestamp = Utc::now();
@@ -518,9 +538,14 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
     let lsn_path = lsn_file.to_str().unwrap();
 
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     let mut pending_txs = Vec::new();

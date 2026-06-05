@@ -22,6 +22,7 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - LSN tracking: `flush_lsn` = last WAL position committed to destination. Updated by consumer only.
 - Shutdown coordination: `CancellationToken` + `oneshot` channel (producer -> consumer)
 - Destinations behind `DestinationHandler` trait; Kafka uses event mode, SQL destinations use SQL batch mode
+- Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::register_destination` / `custom_destination`.
 - `TransactionStorage` trait abstracts compressed vs uncompressed file I/O
 - MySQL uses dual pools: sqlx for normal SQL batches, mysql_async for LOAD DATA LOCAL INFILE
 - SQL Server uses TDS Bulk Load (tiberius `bulk_insert`) for homogeneous INSERT batches, falls back to multi-value INSERT

@@ -59,9 +59,14 @@ async fn test_lsn_zero_is_ignored() {
 async fn test_transaction_file_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
     let manager = Arc::new(
-        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, 64 * 1024 * 1024)
-            .await
-            .unwrap(),
+        TransactionManager::new(
+            temp_dir.path(),
+            DestinationType::MySQL,
+            None,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap(),
     );
 
     // Directories should have been created

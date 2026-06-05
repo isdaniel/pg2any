@@ -3,11 +3,12 @@ mod kafka_tests {
     use pg2any_lib::destinations::destination_factory::DestinationHandler;
     use pg2any_lib::destinations::kafka::KafkaDestination;
     use pg2any_lib::types::DestinationType;
-    use pg2any_lib::DestinationFactory;
 
     #[test]
     fn test_destination_factory_creates_kafka() {
-        let result = DestinationFactory::create(&DestinationType::Kafka);
+        let mut cfg = pg2any_lib::Config::default();
+        cfg.destination_type = DestinationType::Kafka;
+        let result = cfg.create_destination();
         assert!(result.is_ok());
     }
 

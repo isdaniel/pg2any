@@ -1,5 +1,6 @@
 use super::coalescing::{coalesce_commands, QuoteStyle};
 use super::destination_factory::{DestinationHandler, PreCommitHook};
+use crate::destinations::dialect::SqlDialect;
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -172,6 +173,12 @@ impl DestinationHandler for SqlServerDestination {
 
     fn supports_bulk_insert(&self) -> bool {
         true
+    }
+
+    fn dialect(&self) -> &'static dyn SqlDialect {
+        use crate::destinations::dialects::SqlServerDialect;
+        static D: SqlServerDialect = SqlServerDialect;
+        &D
     }
 
     async fn execute_bulk_insert_with_hook(

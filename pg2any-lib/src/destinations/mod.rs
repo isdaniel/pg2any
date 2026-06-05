@@ -1,5 +1,7 @@
 pub mod coalescing;
 pub mod common;
+pub mod dialect;
+pub mod dialects;
 
 /// Bulk insert utilities (TSV generation, INSERT detection)
 pub mod bulk_insert;
@@ -37,4 +39,4 @@ pub use sqlite::SQLiteDestination;
 pub use kafka::KafkaDestination;
 
 // Re-export factory and trait
-pub use destination_factory::{DestinationFactory, DestinationHandler, PreCommitHook};
+pub use destination_factory::{DestinationFactoryFn, DestinationHandler, PreCommitHook};

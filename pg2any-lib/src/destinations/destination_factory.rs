@@ -1,24 +1,22 @@
 use crate::{
+    destinations::dialect::SqlDialect,
+    destinations::dialects::AnsiDialect,
     error::{CdcError, Result},
-    types::{DestinationType, Lsn},
+    types::Lsn,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_walstream::ChangeEvent;
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 pub type PreCommitHook =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
 
-// Import destination implementations
-#[cfg(feature = "mysql")]
-use super::mysql::MySQLDestination;
-
-#[cfg(feature = "sqlserver")]
-use super::sqlserver::SqlServerDestination;
-
-#[cfg(feature = "sqlite")]
-use super::sqlite::SQLiteDestination;
+/// Factory closure for constructing a destination handler.
+///
+/// `Fn` (not `FnOnce`) — the consumer creates an additional handler during
+/// `start_file_based_workflow`, so the factory may be invoked multiple times.
+pub type DestinationFactoryFn = Arc<dyn Fn() -> Result<Box<dyn DestinationHandler>> + Send + Sync>;
 
 /// Trait for database destination handlers
 ///
@@ -44,6 +42,20 @@ pub trait DestinationHandler: Send + Sync {
     /// Set the maximum number of rows per multi-value INSERT statement.
     /// 0 means no limit (database default applies).
     fn set_max_rows_per_insert(&mut self, _max_rows: usize) {}
+
+    /// Return the SQL dialect this destination renders for.
+    ///
+    /// Defaults to a generic ANSI-flavored dialect — matches the historical
+    /// `DestinationType::Custom(_)` fallback in `TransactionManager`, so
+    /// existing custom destinations registered via
+    /// `Config::register_destination` keep working without any changes.
+    ///
+    /// Override this to provide destination-specific quoting, hex literals,
+    /// value rendering, and TRUNCATE strategy.
+    fn dialect(&self) -> &'static dyn SqlDialect {
+        static ANSI: AnsiDialect = AnsiDialect;
+        &ANSI
+    }
 
     /// Execute a batch of SQL commands within a single transaction with optional pre-commit hook
     ///
@@ -119,78 +131,5 @@ pub trait DestinationHandler: Send + Sync {
         );
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
-    }
-}
-
-/// Factory for creating destination handlers
-pub struct DestinationFactory;
-
-impl DestinationFactory {
-    /// Create a new destination handler for the specified type
-    pub fn create(destination_type: &DestinationType) -> Result<Box<dyn DestinationHandler>> {
-        match *destination_type {
-            #[cfg(feature = "mysql")]
-            DestinationType::MySQL => Ok(Box::new(MySQLDestination::new())),
-
-            #[cfg(feature = "sqlserver")]
-            DestinationType::SqlServer => Ok(Box::new(SqlServerDestination::new())),
-
-            #[cfg(feature = "sqlite")]
-            DestinationType::SQLite => Ok(Box::new(SQLiteDestination::new())),
-
-            #[cfg(feature = "kafka")]
-            DestinationType::Kafka => Ok(Box::new(super::kafka::KafkaDestination::new())),
-
-            #[allow(unreachable_patterns)]
-            _ => Err(CdcError::unsupported(format!(
-                "Destination type {destination_type:?} is not supported or not enabled"
-            ))),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_destination_factory_create() {
-        // Test factory creation for different destination types
-        #[cfg(feature = "mysql")]
-        {
-            let result = DestinationFactory::create(&DestinationType::MySQL);
-            assert!(result.is_ok());
-        }
-
-        #[cfg(feature = "sqlserver")]
-        {
-            let result = DestinationFactory::create(&DestinationType::SqlServer);
-            assert!(result.is_ok());
-        }
-
-        #[cfg(feature = "sqlite")]
-        {
-            let result = DestinationFactory::create(&DestinationType::SQLite);
-            assert!(result.is_ok());
-        }
-    }
-
-    #[test]
-    fn test_destination_types_serialization() {
-        use serde_json;
-
-        let mysql_type = DestinationType::MySQL;
-        let json = serde_json::to_string(&mysql_type).unwrap();
-        assert_eq!(json, "\"MySQL\"");
-
-        let deserialized: DestinationType = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, mysql_type);
-
-        let sqlite_type = DestinationType::SQLite;
-        let sqlite_json = serde_json::to_string(&sqlite_type).unwrap();
-        assert_eq!(sqlite_json, "\"SQLite\"");
-
-        let sqlite_deserialized: DestinationType = serde_json::from_str(&sqlite_json).unwrap();
-        assert_eq!(sqlite_deserialized, sqlite_type);
     }
 }

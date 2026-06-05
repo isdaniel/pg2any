@@ -1,12 +1,14 @@
 use pg_walstream::RetryConfig;
 
+use crate::destinations::{DestinationFactoryFn, DestinationHandler};
 use crate::error::{CdcError, Result};
 use crate::types::DestinationType;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Configuration for the CDC client
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Source PostgreSQL connection string
     pub source_connection_string: String,
@@ -101,6 +103,125 @@ pub struct Config {
     /// SQL Server enforces a hard limit of 1000 rows per INSERT VALUES.
     /// Set to 0 for no limit (e.g., MySQL/SQLite have no row count limit).
     pub max_rows_per_insert: usize,
+
+    /// Per-Config registry of destination factories keyed by `DestinationType::registry_key()`.
+    /// Built-ins self-register in `Config::default()`; external users add their own via
+    /// `ConfigBuilder::register_destination` / `custom_destination`.
+    pub(crate) destination_registry: HashMap<String, DestinationFactoryFn>,
+}
+
+/// Masks credentials in a connection string for safe logging.
+///
+/// Handles two formats:
+/// - URI style: `scheme://user:password@host/...` → password replaced with `********`
+/// - Key/value style (e.g. SQL Server ADO.NET): `key=value;...` → values for
+///   `password`/`pwd` (case-insensitive) replaced with `********`
+fn sanitize_connection_string(s: &str) -> String {
+    if let Some(scheme_end) = s.find("://") {
+        let after_scheme = scheme_end + 3;
+        let authority_end = s[after_scheme..]
+            .find(|c| c == '/' || c == '?' || c == '#')
+            .map(|idx| after_scheme + idx)
+            .unwrap_or(s.len());
+        if let Some(rel_at) = s[after_scheme..authority_end].rfind('@') {
+            let at_pos = after_scheme + rel_at;
+            let userinfo = &s[after_scheme..at_pos];
+            if let Some(colon) = userinfo.find(':') {
+                let user = &userinfo[..colon];
+                return format!(
+                    "{}://{}:********@{}",
+                    &s[..scheme_end],
+                    user,
+                    &s[at_pos + 1..]
+                );
+            }
+        }
+        return s.to_string();
+    }
+    // Walk the byte stream tracking quote state so that semicolons inside a
+    // quoted value (e.g. ADO.NET `Password="my;pwd"`) are not treated as
+    // delimiters — otherwise the second half of the password would leak.
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut start = 0;
+    let mut in_quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match in_quote {
+            Some(q) if b == q => in_quote = None,
+            Some(_) => {}
+            None => match b {
+                b'"' | b'\'' => in_quote = Some(b),
+                b';' => {
+                    append_sanitized_kv(&mut result, &s[start..i]);
+                    result.push(';');
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    append_sanitized_kv(&mut result, &s[start..]);
+    result
+}
+
+fn append_sanitized_kv(out: &mut String, part: &str) {
+    if let Some(eq) = part.find('=') {
+        let key = part[..eq].trim();
+        if key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("pwd") {
+            out.push_str(&part[..eq]);
+            out.push_str("=********");
+            return;
+        }
+    }
+    out.push_str(part);
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sanitized_source = sanitize_connection_string(&self.source_connection_string);
+        let sanitized_dest = sanitize_connection_string(&self.destination_connection_string);
+        f.debug_struct("Config")
+            .field("source_connection_string", &sanitized_source)
+            .field("destination_type", &self.destination_type)
+            .field("destination_connection_string", &sanitized_dest)
+            .field("replication_slot_name", &self.replication_slot_name)
+            .field("publication_name", &self.publication_name)
+            .field("protocol_version", &self.protocol_version)
+            .field("binary_format", &self.binary_format)
+            .field("streaming", &self.streaming)
+            .field("include_messages", &self.include_messages)
+            .field("two_phase", &self.two_phase)
+            .field("origin", &self.origin)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("query_timeout", &self.query_timeout)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("max_retry_attempts", &self.max_retry_attempts)
+            .field("initial_retry_delay", &self.initial_retry_delay)
+            .field("max_retry_delay", &self.max_retry_delay)
+            .field("retry_multiplier", &self.retry_multiplier)
+            .field("max_retry_duration", &self.max_retry_duration)
+            .field("retry_jitter", &self.retry_jitter)
+            .field("buffer_size", &self.buffer_size)
+            .field("table_mappings", &self.table_mappings)
+            .field("schema_mappings", &self.schema_mappings)
+            .field("batch_size", &self.batch_size)
+            .field(
+                "transaction_file_base_path",
+                &self.transaction_file_base_path,
+            )
+            .field(
+                "transaction_segment_size_bytes",
+                &self.transaction_segment_size_bytes,
+            )
+            .field("extra_options", &self.extra_options)
+            .field("bulk_insert_threshold", &self.bulk_insert_threshold)
+            .field("max_rows_per_insert", &self.max_rows_per_insert)
+            .field(
+                "destination_registry",
+                &format_args!("<{} entries>", self.destination_registry.len()),
+            )
+            .finish()
+    }
 }
 
 /// Origin filtering options
@@ -173,6 +294,44 @@ pub enum TransformationType {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut destination_registry: HashMap<String, DestinationFactoryFn> = HashMap::new();
+
+        #[cfg(feature = "mysql")]
+        destination_registry.insert(
+            "mysql".to_string(),
+            Arc::new(|| {
+                Ok(Box::new(crate::destinations::MySQLDestination::new())
+                    as Box<dyn DestinationHandler>)
+            }),
+        );
+
+        #[cfg(feature = "sqlserver")]
+        destination_registry.insert(
+            "sqlserver".to_string(),
+            Arc::new(|| {
+                Ok(Box::new(crate::destinations::SqlServerDestination::new())
+                    as Box<dyn DestinationHandler>)
+            }),
+        );
+
+        #[cfg(feature = "sqlite")]
+        destination_registry.insert(
+            "sqlite".to_string(),
+            Arc::new(|| {
+                Ok(Box::new(crate::destinations::SQLiteDestination::new())
+                    as Box<dyn DestinationHandler>)
+            }),
+        );
+
+        #[cfg(feature = "kafka")]
+        destination_registry.insert(
+            "kafka".to_string(),
+            Arc::new(|| {
+                Ok(Box::new(crate::destinations::KafkaDestination::new())
+                    as Box<dyn DestinationHandler>)
+            }),
+        );
+
         Self {
             source_connection_string: String::new(),
             destination_type: DestinationType::MySQL,
@@ -203,6 +362,7 @@ impl Default for Config {
             extra_options: HashMap::new(),
             bulk_insert_threshold: 500,
             max_rows_per_insert: 0,
+            destination_registry,
         }
     }
 }
@@ -412,6 +572,64 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sentinel registry key used by `custom_destination` / `use_destination`.
+    const CUSTOM_DESTINATION_KEY: &'static str = "__custom__";
+
+    /// Register a destination factory under `key`. Use this for advanced multi-key
+    /// scenarios (e.g. swapping handlers per `DestinationType` at runtime).
+    /// For the common case of a single user-supplied destination, prefer
+    /// [`custom_destination`](Self::custom_destination) or
+    /// [`use_destination`](Self::use_destination).
+    ///
+    /// The closure may be invoked more than once (main + consumer handlers).
+    pub fn register_destination<F, H>(mut self, key: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn() -> H + Send + Sync + 'static,
+        H: DestinationHandler + 'static,
+    {
+        let f: DestinationFactoryFn = Arc::new(move || Ok(Box::new(factory()) as _));
+        self.config.destination_registry.insert(key.into(), f);
+        self
+    }
+
+    /// Inject a custom `DestinationHandler` factory and switch `destination_type`
+    /// to `DestinationType::Custom`. The closure must return a fresh handler each
+    /// call (invoked once for the main pipeline and once for the consumer).
+    ///
+    /// ```ignore
+    /// Config::builder()
+    ///     .custom_destination(|| MyHandler::new())
+    ///     .build()?;
+    /// ```
+    pub fn custom_destination<F, H>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> H + Send + Sync + 'static,
+        H: DestinationHandler + 'static,
+    {
+        let f: DestinationFactoryFn = Arc::new(move || Ok(Box::new(factory()) as _));
+        self.config
+            .destination_registry
+            .insert(Self::CUSTOM_DESTINATION_KEY.to_string(), f);
+        self.config.destination_type =
+            DestinationType::Custom(Self::CUSTOM_DESTINATION_KEY.to_string());
+        self
+    }
+
+    /// Zero-arg shortcut for any `DestinationHandler` that implements `Default`.
+    /// Useful for swapping in a built-in or a custom type with no construction args.
+    ///
+    /// ```ignore
+    /// Config::builder()
+    ///     .use_destination::<MySQLDestination>()
+    ///     .build()?;
+    /// ```
+    pub fn use_destination<H>(self) -> Self
+    where
+        H: DestinationHandler + Default + 'static,
+    {
+        self.custom_destination(H::default)
+    }
+
     /// Build the configuration
     pub fn build(self) -> Result<Config> {
         // Validate the configuration
@@ -467,6 +685,19 @@ impl Config {
     /// Create a new config builder
     pub fn builder() -> ConfigBuilder {
         ConfigBuilder::new()
+    }
+
+    /// Construct a destination handler by looking up `self.destination_type.registry_key()`
+    /// in the per-Config registry.
+    pub fn create_destination(&self) -> Result<Box<dyn DestinationHandler>> {
+        let key = self.destination_type.registry_key();
+        match self.destination_registry.get(key) {
+            Some(factory) => factory(),
+            None => Err(CdcError::unsupported(format!(
+                "No destination registered for key '{}'",
+                key
+            ))),
+        }
     }
 }
 

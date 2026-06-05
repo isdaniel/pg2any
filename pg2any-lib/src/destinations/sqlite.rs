@@ -1,5 +1,6 @@
 use super::coalescing::{coalesce_commands, QuoteStyle};
 use super::destination_factory::{DestinationHandler, PreCommitHook};
+use crate::destinations::dialect::SqlDialect;
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
@@ -106,6 +107,12 @@ impl DestinationHandler for SQLiteDestination {
         if max_rows > 0 {
             self.max_rows_per_insert = max_rows;
         }
+    }
+
+    fn dialect(&self) -> &'static dyn SqlDialect {
+        use crate::destinations::dialects::SqliteDialect;
+        static D: SqliteDialect = SqliteDialect;
+        &D
     }
 
     async fn execute_sql_batch_with_hook(

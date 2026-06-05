@@ -45,11 +45,9 @@ use std::time::Duration;
 /// - `CDC_CHANNEL_CAPACITY`: Capacity of the transaction channel between producer and consumer (default: "1000")
 ///   Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
-///   (Deprecated alias: `CDC_BUFFER_SIZE`)
 /// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
 ///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
 ///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
-///   (Deprecated alias: `CDC_COMMIT_BATCH_SIZE`)
 /// - `CDC_MAX_ROWS_PER_INSERT`: Maximum rows per multi-value INSERT statement (default: "0" = no limit)
 ///   SQL Server enforces a hard limit of 1000. Set to 1000 for SQL Server destinations.
 ///   When set to 0, the destination's own default applies (SQL Server defaults to 1000 internally).

@@ -3,7 +3,7 @@ mod common;
 use chrono::Utc;
 use common::{format_column_value, wrap_in_transaction};
 use pg2any_lib::{
-    destinations::{DestinationFactory, DestinationHandler},
+    destinations::DestinationHandler,
     types::{ChangeEvent, DestinationType, ReplicaIdentity},
     Transaction,
 };
@@ -1142,7 +1142,11 @@ async fn test_sqlite_complete_crud_cycle() {
 #[tokio::test]
 async fn test_sqlite_destination_factory_integration() {
     // Test that the factory creates a working SQLite destination
-    let mut destination = DestinationFactory::create(&DestinationType::SQLite).unwrap();
+    let mut destination = {
+        let mut cfg = pg2any_lib::Config::default();
+        cfg.destination_type = DestinationType::SQLite;
+        cfg.create_destination().unwrap()
+    };
 
     let temp_db = TempDatabase::new("factory_integration");
     let connection_string = temp_db.connection_string();

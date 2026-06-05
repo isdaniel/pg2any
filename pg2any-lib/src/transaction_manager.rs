@@ -36,14 +36,19 @@
 //! - Metadata in sql_received_tx/ are incomplete transactions (can be cleaned up with data files)
 //! - Metadata in sql_pending_tx/ are committed but not yet executed (must be processed)
 
+use crate::destinations::dialect::SqlDialect;
+use crate::destinations::dialects::{
+    AnsiDialect, KafkaDialect, MySqlDialect, SqlServerDialect, SqliteDialect,
+};
 use crate::destinations::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, TransactionStorage};
-use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, ReplicaIdentity, RowData};
+use crate::types::{ChangeEvent, DestinationType, EventType, Lsn};
 use async_compression::tokio::bufread::GzipDecoder;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +69,31 @@ const PENDING_TX_DIR: &str = "sql_pending_tx";
 const DATA_TX_DIR: &str = "sql_data_tx";
 /// Default buffer size for event accumulation (8MB)
 const DEFAULT_BUFFER_SIZE: usize = 8 * MB;
+
+fn dialect_for(dt: &DestinationType) -> &'static dyn SqlDialect {
+    match dt {
+        DestinationType::MySQL => {
+            static D: MySqlDialect = MySqlDialect;
+            &D
+        }
+        DestinationType::SqlServer => {
+            static D: SqlServerDialect = SqlServerDialect;
+            &D
+        }
+        DestinationType::SQLite => {
+            static D: SqliteDialect = SqliteDialect;
+            &D
+        }
+        DestinationType::Kafka => {
+            static D: KafkaDialect = KafkaDialect;
+            &D
+        }
+        DestinationType::Custom(_) => {
+            static D: AnsiDialect = AnsiDialect;
+            &D
+        }
+    }
+}
 struct BufferedEventWriter {
     /// File path being written to
     file_path: PathBuf,
@@ -266,6 +296,8 @@ pub struct TransactionManager {
     /// Whether bulk insert optimization is enabled
     /// Minimum INSERT count to trigger bulk insert path
     bulk_insert_threshold: usize,
+    /// SQL dialect for this destination (selected from `destination_type`).
+    dialect: &'static dyn SqlDialect,
 }
 
 impl TransactionManager {
@@ -273,6 +305,7 @@ impl TransactionManager {
     pub async fn new(
         base_path: impl AsRef<Path>,
         destination_type: DestinationType,
+        dialect_override: Option<&'static dyn SqlDialect>,
         segment_size_bytes: usize,
     ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
@@ -294,6 +327,8 @@ impl TransactionManager {
             base_path, destination_type, segment_size_bytes
         );
 
+        let dialect = dialect_override.unwrap_or_else(|| dialect_for(&destination_type));
+
         Ok(Self {
             base_path,
             destination_type,
@@ -305,6 +340,7 @@ impl TransactionManager {
             storage,
             event_mode: false,
             bulk_insert_threshold: 500,
+            dialect,
         })
     }
 
@@ -1075,273 +1111,43 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Build a `RenderContext` borrowing this manager's dialect + schema mappings.
+    #[inline]
+    fn render_ctx(&self) -> crate::sql_renderer::RenderContext<'_> {
+        crate::sql_renderer::RenderContext {
+            dialect: self.dialect,
+            schema_mappings: &self.schema_mappings,
+        }
+    }
+
     /// Generate SQL command for a change event
     fn generate_sql_for_event(&self, event: &ChangeEvent) -> Result<String> {
-        match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => self.generate_insert_sql(schema, table, data),
-            EventType::Update {
-                schema,
-                table,
-                old_data,
-                new_data,
-                replica_identity,
-                key_columns,
-                ..
-            } => self.generate_update_sql(
-                schema,
-                table,
-                new_data,
-                old_data.as_ref(),
-                replica_identity,
-                key_columns,
-            ),
-            EventType::Delete {
-                schema,
-                table,
-                old_data,
-                replica_identity,
-                key_columns,
-                ..
-            } => self.generate_delete_sql(schema, table, old_data, replica_identity, key_columns),
-            EventType::Truncate(tables) => self.generate_truncate_sql(tables),
-            _ => {
-                // Skip non-DML events
-                Ok(String::new())
-            }
-        }
-    }
-
-    /// Generate INSERT SQL command
-    ///
-    /// Accepts `&RowData` directly. Uses `iter()` for column iteration.
-    fn generate_insert_sql(&self, schema: &str, table: &str, new_data: &RowData) -> Result<String> {
-        let schema = self.map_schema(Some(schema));
-
-        // Pre-size: assume ~32 bytes per (column, value) pair + overhead
-        let mut sql = String::with_capacity(64 + new_data.len() * 48);
-        sql.push_str("INSERT INTO ");
-        self.append_qualified_table(&mut sql, schema, table);
-        sql.push_str(" (");
-        for (i, (k, _)) in new_data.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            self.append_quoted_identifier(&mut sql, k);
-        }
-        sql.push_str(") VALUES (");
-        for (i, (_, v)) in new_data.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            self.append_value(&mut sql, v);
-        }
-        sql.push_str(");");
-
-        Ok(sql)
-    }
-
-    /// Generate UPDATE SQL command
-    fn generate_update_sql(
-        &self,
-        schema: &str,
-        table: &str,
-        new_data: &RowData,
-        old_data: Option<&RowData>,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[Arc<str>],
-    ) -> Result<String> {
-        let schema = self.map_schema(Some(schema));
-
-        let mut sql = String::with_capacity(64 + new_data.len() * 64);
-        sql.push_str("UPDATE ");
-        self.append_qualified_table(&mut sql, schema, table);
-        sql.push_str(" SET ");
-        for (i, (col, val)) in new_data.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            self.append_quoted_identifier(&mut sql, col);
-            sql.push_str(" = ");
-            self.append_value(&mut sql, val);
-        }
-        sql.push_str(" WHERE ");
-        self.append_where_clause(&mut sql, replica_identity, key_columns, old_data, new_data)?;
-        sql.push(';');
-
-        Ok(sql)
-    }
-
-    /// Generate DELETE SQL command
-    ///
-    /// Accepts `&RowData` directly. For Default/Index replica identity (the most
-    /// common case), this avoids cloning RowData entirely — only `RowData::get()`
-    /// lookups are performed, with zero allocations.
-    fn generate_delete_sql(
-        &self,
-        schema: &str,
-        table: &str,
-        old_data: &RowData,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[Arc<str>],
-    ) -> Result<String> {
-        let schema = self.map_schema(Some(schema));
-
-        let mut sql = String::with_capacity(64 + key_columns.len() * 32);
-        sql.push_str("DELETE FROM ");
-        self.append_qualified_table(&mut sql, schema, table);
-        sql.push_str(" WHERE ");
-        self.append_where_clause(
-            &mut sql,
-            replica_identity,
-            key_columns,
-            Some(old_data),
-            old_data,
-        )?;
-        sql.push(';');
-
-        Ok(sql)
+        crate::sql_renderer::generate_sql_for_event(&self.render_ctx(), event)
     }
 
     /// Generate TRUNCATE SQL command
+    #[cfg(test)]
     fn generate_truncate_sql(&self, tables: &[Arc<str>]) -> Result<String> {
-        // Build all TRUNCATE statements into a single `String` — no intermediate Vec.
-        // Pre-size for ~48 bytes per table (keyword + identifiers + punctuation).
-        let mut sql = String::with_capacity(tables.len() * 48);
-
-        for (i, table_spec) in tables.iter().enumerate() {
-            let table_spec: &str = table_spec;
-            let (schema, table) = match table_spec.split_once('.') {
-                Some((s, t)) if !t.contains('.') => (self.map_schema(Some(s)), t),
-                _ => (self.map_schema(Some("public")), table_spec),
-            };
-
-            if i > 0 {
-                sql.push('\n');
-            }
-            match self.destination_type {
-                DestinationType::MySQL | DestinationType::SqlServer => {
-                    sql.push_str("TRUNCATE TABLE ");
-                    self.append_quoted_identifier(&mut sql, &schema);
-                    sql.push('.');
-                    self.append_quoted_identifier(&mut sql, table);
-                    sql.push(';');
-                }
-                DestinationType::SQLite => {
-                    sql.push_str("DELETE FROM ");
-                    self.append_quoted_identifier(&mut sql, table);
-                    sql.push(';');
-                }
-                DestinationType::Kafka => {}
-            }
-        }
-
-        Ok(sql)
-    }
-
-    /// Append WHERE clause conditions directly into the provided buffer
-    fn append_where_clause(
-        &self,
-        out: &mut String,
-        replica_identity: &ReplicaIdentity,
-        key_columns: &[Arc<str>],
-        old_data: Option<&RowData>,
-        new_data: &RowData,
-    ) -> Result<()> {
-        match replica_identity {
-            ReplicaIdentity::Default | ReplicaIdentity::Index => {
-                let data = old_data.unwrap_or(new_data);
-                for (i, col) in key_columns.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(" AND ");
-                    }
-                    let col_str: &str = col;
-                    let val = data.get(col_str).ok_or_else(|| {
-                        CdcError::Generic(format!("Key column {col_str} not found"))
-                    })?;
-                    self.append_quoted_identifier(out, col_str);
-                    out.push_str(" = ");
-                    self.append_value(out, val);
-                }
-            }
-            ReplicaIdentity::Full => {
-                let data = old_data.ok_or_else(|| {
-                    CdcError::Generic("FULL replica identity requires old data".to_string())
-                })?;
-                for (i, (col, val)) in data.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(" AND ");
-                    }
-                    self.append_quoted_identifier(out, col);
-                    if val.is_null() {
-                        out.push_str(" IS NULL");
-                    } else {
-                        out.push_str(" = ");
-                        self.append_value(out, val);
-                    }
-                }
-            }
-            ReplicaIdentity::Nothing => {
-                return Err(CdcError::Generic(
-                    "Cannot generate WHERE clause with NOTHING replica identity".to_string(),
-                ));
-            }
-        }
-        Ok(())
+        crate::sql_renderer::generate_truncate_sql(&self.render_ctx(), tables)
     }
 
     /// Append a quoted qualified table `schema.table` (or just table for SQLite) to `out`.
     #[inline]
+    #[cfg(test)]
     fn append_qualified_table(&self, out: &mut String, schema: &str, table: &str) {
-        match self.destination_type {
-            DestinationType::MySQL | DestinationType::SqlServer => {
-                self.append_quoted_identifier(out, schema);
-                out.push('.');
-                self.append_quoted_identifier(out, table);
-            }
-            DestinationType::SQLite => {
-                self.append_quoted_identifier(out, table);
-            }
-            DestinationType::Kafka => {
-                self.append_quoted_identifier(out, table);
-            }
-        }
+        self.dialect.qualify_table(schema, table, out);
     }
 
     /// Append a quoted identifier (schema/table/column) to `out`, performing
     /// destination-specific escaping of embedded quote characters.
     #[inline]
+    #[cfg(test)]
     fn append_quoted_identifier(&self, out: &mut String, name: &str) {
-        let (open, close, escape_ch) = match self.destination_type {
-            DestinationType::MySQL => ('`', '`', '`'),
-            DestinationType::SqlServer => ('[', ']', ']'),
-            DestinationType::SQLite | DestinationType::Kafka => ('"', '"', '"'),
-        };
-        out.reserve(name.len() + 2);
-        out.push(open);
-        if name.as_bytes().contains(&(escape_ch as u8)) {
-            for ch in name.chars() {
-                if ch == escape_ch {
-                    out.push(escape_ch);
-                }
-                out.push(ch);
-            }
-        } else {
-            out.push_str(name);
-        }
-        out.push(close);
+        self.dialect.quote_identifier(name, out);
     }
 
     /// Escape a database identifier (schema, table, or column name) for safe
     /// inclusion in generated SQL, preventing SQL injection via malicious names.
-    ///
-    /// - MySQL:      wraps in backticks, doubling any embedded backticks.
-    /// - SQL Server: wraps in brackets, doubling any embedded closing brackets.
-    /// - SQLite:     wraps in double quotes, doubling any embedded double quotes.
     #[cfg(test)]
     fn quote_identifier(&self, name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 2);
@@ -1350,97 +1156,23 @@ impl TransactionManager {
     }
 
     /// Append a hex literal for raw bytes directly into `out`.
+    #[cfg(test)]
     fn append_hex_literal(&self, out: &mut String, bytes: &[u8]) {
-        static HEX: &[u8; 16] = b"0123456789abcdef";
-        let (prefix, suffix) = match self.destination_type {
-            DestinationType::SqlServer => ("0x", ""),
-            DestinationType::MySQL | DestinationType::SQLite | DestinationType::Kafka => {
-                ("X'", "'")
-            }
-        };
-        out.reserve(prefix.len() + bytes.len() * 2 + suffix.len());
-        out.push_str(prefix);
-        // Safety: we only push ASCII hex chars + prefix/suffix which are ASCII.
-        let buf = unsafe { out.as_mut_vec() };
-        for &b in bytes {
-            buf.push(HEX[(b >> 4) as usize]);
-            buf.push(HEX[(b & 0x0f) as usize]);
-        }
-        out.push_str(suffix);
+        self.dialect.render_hex_literal(bytes, out);
     }
 
     /// Append a `ColumnValue` literal directly into `out`.
+    #[cfg(test)]
     fn append_value(&self, out: &mut String, value: &ColumnValue) {
-        match value {
-            ColumnValue::Null => out.push_str("NULL"),
-            ColumnValue::Text(_) => match value.as_str() {
-                Some(s) => {
-                    if s == "t" {
-                        out.push('1');
-                        return;
-                    }
-                    if s == "f" {
-                        out.push('0');
-                        return;
-                    }
-                    out.reserve(s.len() + 2);
-                    out.push('\'');
-                    let escape_backslash = matches!(self.destination_type, DestinationType::MySQL);
-                    let needs_escape = if escape_backslash {
-                        s.as_bytes().iter().any(|&b| b == b'\'' || b == b'\\')
-                    } else {
-                        s.as_bytes().contains(&b'\'')
-                    };
-                    if needs_escape {
-                        for ch in s.chars() {
-                            match ch {
-                                '\'' => out.push_str("''"),
-                                '\\' if escape_backslash => out.push_str("\\\\"),
-                                _ => out.push(ch),
-                            }
-                        }
-                    } else {
-                        out.push_str(s);
-                    }
-                    out.push('\'');
-                }
-                None => {
-                    self.append_hex_literal(out, value.as_bytes());
-                }
-            },
-            ColumnValue::Binary(_) => self.append_hex_literal(out, value.as_bytes()),
-        }
+        self.dialect.render_value(value, out);
     }
 
     /// Format a `ColumnValue` as a SQL literal.
-    ///
-    /// Handles the three upstream variants correctly:
-    /// - `Null`   → SQL `NULL`
-    /// - `Text`   → UTF-8 string; PostgreSQL pgoutput booleans (`"t"` / `"f"`)
-    ///              are converted to `1` / `0`. All other text is always quoted
-    ///              to preserve values like leading-zero strings (e.g. zip codes).
-    ///              Falls back to a hex literal when the payload is not valid UTF-8.
-    /// - `Binary` → destination-specific hex literal (`X'…'` or `0x…`).
     #[cfg(test)]
     fn format_value(&self, value: &ColumnValue) -> String {
         let mut out = String::new();
         self.append_value(&mut out, value);
         out
-    }
-
-    /// Map source schema to destination schema.
-    ///
-    /// Returns a borrow from the mapping table, the caller's input, or the
-    /// `"public"` literal — no per-call allocation.
-    fn map_schema<'a>(&'a self, source_schema: Option<&'a str>) -> &'a str {
-        match source_schema {
-            Some(schema) => self
-                .schema_mappings
-                .get(schema)
-                .map(String::as_str)
-                .unwrap_or(schema),
-            None => "public",
-        }
     }
 }
 
@@ -2273,7 +2005,7 @@ mod tests {
             std::process::id()
         ));
         let _ = tokio::fs::create_dir_all(&dir).await;
-        TransactionManager::new(&dir, dest, 10 * 1024 * 1024)
+        TransactionManager::new(&dir, dest, None, 10 * 1024 * 1024)
             .await
             .expect("test manager creation should succeed")
     }
@@ -2458,5 +2190,302 @@ mod tests {
     async fn test_empty_string_is_quoted() {
         let mgr = test_manager(DestinationType::MySQL).await;
         assert_eq!(mgr.format_value(&ColumnValue::text("")), "''");
+    }
+
+    // ── Dialect snapshot safety net ─────────────────────────────────
+    //
+    // These five tests pin byte-exact output of the dialect-leaking helpers
+    // (`append_quoted_identifier`, `append_value`, `append_qualified_table`,
+    // `append_hex_literal`, `generate_truncate_sql`) across every
+    // `DestinationType`. They exist to gate the upcoming `SqlDialect`
+    // extraction refactor: any change in observable SQL output will fail
+    // these tests. Expected strings were captured verbatim from the current
+    // implementation — do not hand-edit, regenerate from the scratch test.
+
+    fn all_dests() -> [(&'static str, DestinationType); 5] {
+        [
+            ("MySQL", DestinationType::MySQL),
+            ("SqlServer", DestinationType::SqlServer),
+            ("SQLite", DestinationType::SQLite),
+            ("Kafka", DestinationType::Kafka),
+            ("Custom", DestinationType::Custom("test".to_string())),
+        ]
+    }
+
+    #[tokio::test]
+    async fn snapshot_quote_identifier() {
+        let ids = ["users", "back`tick", "bra]cket", "double\"quote"];
+        let expected: &[(&str, [&str; 4])] = &[
+            // MySQL — backtick quoting, only backticks escaped
+            (
+                "MySQL",
+                ["`users`", "`back``tick`", "`bra]cket`", "`double\"quote`"],
+            ),
+            // SqlServer — bracket quoting, only `]` escaped
+            (
+                "SqlServer",
+                ["[users]", "[back`tick]", "[bra]]cket]", "[double\"quote]"],
+            ),
+            // SQLite — double-quote quoting, only `"` escaped
+            (
+                "SQLite",
+                [
+                    "\"users\"",
+                    "\"back`tick\"",
+                    "\"bra]cket\"",
+                    "\"double\"\"quote\"",
+                ],
+            ),
+            // Kafka — double-quote quoting (same as SQLite)
+            (
+                "Kafka",
+                [
+                    "\"users\"",
+                    "\"back`tick\"",
+                    "\"bra]cket\"",
+                    "\"double\"\"quote\"",
+                ],
+            ),
+            // Custom — double-quote quoting (same as SQLite)
+            (
+                "Custom",
+                [
+                    "\"users\"",
+                    "\"back`tick\"",
+                    "\"bra]cket\"",
+                    "\"double\"\"quote\"",
+                ],
+            ),
+        ];
+        for (name, dest) in all_dests().iter() {
+            let mgr = test_manager(dest.clone()).await;
+            let row = expected.iter().find(|(n, _)| n == name).unwrap();
+            for (i, id) in ids.iter().enumerate() {
+                assert_eq!(
+                    mgr.quote_identifier(id),
+                    row.1[i],
+                    "quote_identifier({:?}) for {}",
+                    id,
+                    name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_format_value() {
+        use bytes::Bytes;
+        let vals: Vec<(&str, ColumnValue)> = vec![
+            ("Null", ColumnValue::Null),
+            ("text_t", ColumnValue::text("t")),
+            ("text_f", ColumnValue::text("f")),
+            ("text_hello", ColumnValue::text("hello")),
+            ("text_oreilly", ColumnValue::text("o'reilly")),
+            ("text_backslash", ColumnValue::text("back\\slash")),
+            (
+                "binary",
+                ColumnValue::Binary(Bytes::from_static(&[0x00, 0xff, 0xab])),
+            ),
+        ];
+        let expected: &[(&str, [&str; 7])] = &[
+            // MySQL — pgoutput booleans → 1/0, single quotes doubled, backslash doubled, binary → X'…'
+            (
+                "MySQL",
+                [
+                    "NULL",
+                    "1",
+                    "0",
+                    "'hello'",
+                    "'o''reilly'",
+                    "'back\\\\slash'",
+                    "X'00ffab'",
+                ],
+            ),
+            // SqlServer — booleans → 1/0, single quote doubled, backslash NOT doubled, binary → 0x…
+            (
+                "SqlServer",
+                [
+                    "NULL",
+                    "1",
+                    "0",
+                    "'hello'",
+                    "'o''reilly'",
+                    "'back\\slash'",
+                    "0x00ffab",
+                ],
+            ),
+            // SQLite — booleans → 1/0, single quote doubled, backslash NOT doubled, binary → X'…'
+            (
+                "SQLite",
+                [
+                    "NULL",
+                    "1",
+                    "0",
+                    "'hello'",
+                    "'o''reilly'",
+                    "'back\\slash'",
+                    "X'00ffab'",
+                ],
+            ),
+            // Kafka — same as SQLite (text formatting path is not dialect-specific outside MySQL)
+            (
+                "Kafka",
+                [
+                    "NULL",
+                    "1",
+                    "0",
+                    "'hello'",
+                    "'o''reilly'",
+                    "'back\\slash'",
+                    "X'00ffab'",
+                ],
+            ),
+            // Custom — same as SQLite
+            (
+                "Custom",
+                [
+                    "NULL",
+                    "1",
+                    "0",
+                    "'hello'",
+                    "'o''reilly'",
+                    "'back\\slash'",
+                    "X'00ffab'",
+                ],
+            ),
+        ];
+        for (name, dest) in all_dests().iter() {
+            let mgr = test_manager(dest.clone()).await;
+            let row = expected.iter().find(|(n, _)| n == name).unwrap();
+            for (i, (vname, val)) in vals.iter().enumerate() {
+                assert_eq!(
+                    mgr.format_value(val),
+                    row.1[i],
+                    "format_value({}) for {}",
+                    vname,
+                    name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_qualified_table() {
+        let tables = [("public", "users"), ("custom", "items")];
+        let expected: &[(&str, [&str; 2])] = &[
+            // MySQL — schema.table both backticked
+            ("MySQL", ["`public`.`users`", "`custom`.`items`"]),
+            // SqlServer — schema.table both bracketed
+            ("SqlServer", ["[public].[users]", "[custom].[items]"]),
+            // SQLite — schema dropped, table-only
+            ("SQLite", ["\"users\"", "\"items\""]),
+            // Kafka — schema dropped, table-only (same as SQLite)
+            ("Kafka", ["\"users\"", "\"items\""]),
+            // Custom — schema.table both double-quoted (schema preserved)
+            ("Custom", ["\"public\".\"users\"", "\"custom\".\"items\""]),
+        ];
+        for (name, dest) in all_dests().iter() {
+            let mgr = test_manager(dest.clone()).await;
+            let row = expected.iter().find(|(n, _)| n == name).unwrap();
+            for (i, (s, t)) in tables.iter().enumerate() {
+                let mut out = String::new();
+                mgr.append_qualified_table(&mut out, s, t);
+                assert_eq!(
+                    out, row.1[i],
+                    "append_qualified_table({}.{}) for {}",
+                    s, t, name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_hex_literal() {
+        let blobs: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", vec![]),
+            ("deadbeef", vec![0xde, 0xad, 0xbe, 0xef]),
+        ];
+        let expected: &[(&str, [&str; 2])] = &[
+            // MySQL — X'…' literal
+            ("MySQL", ["X''", "X'deadbeef'"]),
+            // SqlServer — 0x… literal (no prefix/suffix quotes)
+            ("SqlServer", ["0x", "0xdeadbeef"]),
+            // SQLite — X'…' literal
+            ("SQLite", ["X''", "X'deadbeef'"]),
+            // Kafka — X'…' literal
+            ("Kafka", ["X''", "X'deadbeef'"]),
+            // Custom — X'…' literal
+            ("Custom", ["X''", "X'deadbeef'"]),
+        ];
+        for (name, dest) in all_dests().iter() {
+            let mgr = test_manager(dest.clone()).await;
+            let row = expected.iter().find(|(n, _)| n == name).unwrap();
+            for (i, (bname, bytes)) in blobs.iter().enumerate() {
+                let mut out = String::new();
+                mgr.append_hex_literal(&mut out, bytes);
+                assert_eq!(out, row.1[i], "append_hex_literal({}) for {}", bname, name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_truncate_sql() {
+        let inputs: Vec<(&str, Vec<Arc<str>>)> = vec![
+            ("public.users", vec![Arc::from("public.users")]),
+            ("users_bare", vec![Arc::from("users")]),
+            ("two_tables", vec![Arc::from("a.b"), Arc::from("c.d")]),
+        ];
+        let expected: &[(&str, [&str; 3])] = &[
+            // MySQL — TRUNCATE TABLE `schema`.`table`; bare-name implicitly `public`
+            (
+                "MySQL",
+                [
+                    "TRUNCATE TABLE `public`.`users`;",
+                    "TRUNCATE TABLE `public`.`users`;",
+                    "TRUNCATE TABLE `a`.`b`;\nTRUNCATE TABLE `c`.`d`;",
+                ],
+            ),
+            // SqlServer — TRUNCATE TABLE [schema].[table];
+            (
+                "SqlServer",
+                [
+                    "TRUNCATE TABLE [public].[users];",
+                    "TRUNCATE TABLE [public].[users];",
+                    "TRUNCATE TABLE [a].[b];\nTRUNCATE TABLE [c].[d];",
+                ],
+            ),
+            // SQLite — DELETE FROM "table"; (schema dropped)
+            (
+                "SQLite",
+                [
+                    "DELETE FROM \"users\";",
+                    "DELETE FROM \"users\";",
+                    "DELETE FROM \"b\";\nDELETE FROM \"d\";",
+                ],
+            ),
+            // Kafka — no-op: empty string per table (no statements emitted)
+            ("Kafka", ["", "", ""]),
+            // Custom — TRUNCATE TABLE "schema"."table";
+            (
+                "Custom",
+                [
+                    "TRUNCATE TABLE \"public\".\"users\";",
+                    "TRUNCATE TABLE \"public\".\"users\";",
+                    "TRUNCATE TABLE \"a\".\"b\";\nTRUNCATE TABLE \"c\".\"d\";",
+                ],
+            ),
+        ];
+        for (name, dest) in all_dests().iter() {
+            let mgr = test_manager(dest.clone()).await;
+            let row = expected.iter().find(|(n, _)| n == name).unwrap();
+            for (i, (iname, tables)) in inputs.iter().enumerate() {
+                let out = mgr.generate_truncate_sql(tables).unwrap();
+                assert_eq!(
+                    out, row.1[i],
+                    "generate_truncate_sql({}) for {}",
+                    iname, name
+                );
+            }
+        }
     }
 }

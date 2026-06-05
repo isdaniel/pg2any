@@ -1,4 +1,5 @@
 use super::destination_factory::{DestinationHandler, PreCommitHook};
+use crate::destinations::dialect::SqlDialect;
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use mysql_async::prelude::*;
@@ -192,6 +193,12 @@ impl DestinationHandler for MySQLDestination {
 
     fn supports_bulk_insert(&self) -> bool {
         self.load_data_available
+    }
+
+    fn dialect(&self) -> &'static dyn SqlDialect {
+        use crate::destinations::dialects::MySqlDialect;
+        static D: MySqlDialect = MySqlDialect;
+        &D
     }
 
     async fn execute_bulk_insert_with_hook(

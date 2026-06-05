@@ -1,4 +1,5 @@
 use super::destination_factory::{DestinationHandler, PreCommitHook};
+use crate::destinations::dialect::SqlDialect;
 use crate::error::{CdcError, Result};
 use async_trait::async_trait;
 use base64::prelude::*;
@@ -520,6 +521,12 @@ impl DestinationHandler for KafkaDestination {
 
     fn supports_event_mode(&self) -> bool {
         true
+    }
+
+    fn dialect(&self) -> &'static dyn SqlDialect {
+        use crate::destinations::dialects::KafkaDialect;
+        static D: KafkaDialect = KafkaDialect;
+        &D
     }
 
     async fn execute_events_batch_with_hook(

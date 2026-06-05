@@ -41,7 +41,7 @@ pg2any/                          # Cargo workspace root
       lsn_tracker.rs             # LsnTracker - flush_lsn persistence to disk
       transaction_manager.rs     # TransactionManager - file lifecycle (begin/append/commit/abort/process)
       destinations/
-        destination_factory.rs   # DestinationHandler trait (core interface) + DestinationFactory
+        destination_factory.rs   # DestinationHandler trait + DestinationFactoryFn type alias
         mysql.rs                 # MySQL impl via SQLx + mysql_async (LOAD DATA LOCAL INFILE)
         sqlserver.rs             # SQL Server impl via Tiberius
         sqlite.rs                # SQLite impl via SQLx
@@ -87,6 +87,7 @@ pub trait DestinationHandler: Send + Sync {
 - MySQL additionally supports `execute_bulk_insert_with_hook` for LOAD DATA LOCAL INFILE
 - SQL Server supports `execute_bulk_insert_with_hook` for TDS Bulk Load (with multi-value INSERT fallback)
 - Kafka uses event mode (`supports_event_mode() = true`, `execute_events_batch_with_hook`)
+- Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::register_destination` / `custom_destination`.
 
 ### TransactionStorage (trait) - `storage/traits.rs`
 
@@ -185,6 +186,6 @@ Config env vars: `CDC_BULK_INSERT_THRESHOLD`
 1. Create `pg2any-lib/src/destinations/your_dest.rs`
 2. Implement `DestinationHandler` trait
 3. Add feature flag to `pg2any-lib/Cargo.toml`
-4. Register in `destination_factory.rs` `DestinationFactory::create()` match arm
+4. Register in `Config::default()` (config.rs) under the appropriate registry key, gated by feature flag
 5. Add variant to `DestinationType` enum in `types.rs`
 6. Add `#[cfg(feature = "your_dest")]` guards in `destinations/mod.rs` and `lib.rs`

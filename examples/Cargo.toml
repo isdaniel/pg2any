@@ -20,6 +20,8 @@ metrics = ["pg2any_lib/metrics"]
 
 [dependencies]
 pg2any_lib = { path = "../pg2any-lib", default-features = false }
+pg_walstream = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }

@@ -2,7 +2,7 @@ mod common;
 
 use common::{format_column_value, wrap_in_transaction};
 use pg2any_lib::{
-    destinations::{DestinationFactory, DestinationHandler},
+    destinations::DestinationHandler,
     types::{ChangeEvent, DestinationType, EventType, ReplicaIdentity},
     Transaction,
 };
@@ -217,7 +217,9 @@ async fn create_test_table(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_sqlite_destination_factory() {
-    let destination = DestinationFactory::create(&DestinationType::SQLite);
+    let mut cfg = pg2any_lib::Config::default();
+    cfg.destination_type = DestinationType::SQLite;
+    let destination = cfg.create_destination();
     assert!(destination.is_ok());
 }
 

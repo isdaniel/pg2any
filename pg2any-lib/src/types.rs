@@ -9,16 +9,26 @@ pub enum DestinationType {
     SqlServer,
     SQLite,
     Kafka,
+    /// Externally registered destination identified by registry key
+    Custom(String),
+}
+
+impl DestinationType {
+    /// Returns the registry key used to look up this destination's factory.
+    pub fn registry_key(&self) -> &str {
+        match self {
+            DestinationType::MySQL => "mysql",
+            DestinationType::SqlServer => "sqlserver",
+            DestinationType::SQLite => "sqlite",
+            DestinationType::Kafka => "kafka",
+            DestinationType::Custom(key) => key.as_str(),
+        }
+    }
 }
 
 impl std::fmt::Display for DestinationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DestinationType::MySQL => write!(f, "mysql"),
-            DestinationType::SqlServer => write!(f, "sqlserver"),
-            DestinationType::SQLite => write!(f, "sqlite"),
-            DestinationType::Kafka => write!(f, "kafka"),
-        }
+        f.write_str(self.registry_key())
     }
 }
 

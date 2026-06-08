@@ -20,8 +20,6 @@ A high-performance PostgreSQL Change Data Capture (CDC) tool that streams databa
 
 Built-in destinations self-register in `Config::default()`. External users can plug in their own `DestinationHandler` implementations through the per-`Config` registry — no fork required.
 
-Three ergonomic forms (pick the shortest that fits):
-
 ```rust,ignore
 // 1) Type implements Default — zero arguments
 Config::builder()
@@ -33,12 +31,6 @@ Config::builder()
 Config::builder()
     .custom_destination(|| MyDest::with_options(opts.clone()))
     .destination_connection_string("...")
-    .build()?;
-
-// 3) Multi-key / runtime selection — register under a named key
-Config::builder()
-    .register_destination("my-dest", || MyDest::new())
-    .destination_type(DestinationType::Custom("my-dest".into()))
     .build()?;
 ```
 

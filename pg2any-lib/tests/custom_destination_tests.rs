@@ -179,3 +179,76 @@ async fn test_config_clone_preserves_registry() {
     let recorded = calls.lock().unwrap().clone();
     assert_eq!(recorded, vec!["connect".to_string()]);
 }
+
+#[derive(Default)]
+struct DefaultableHandler;
+
+#[async_trait]
+impl DestinationHandler for DefaultableHandler {
+    async fn connect(&mut self, _connection_string: &str) -> pg2any_lib::CdcResult<()> {
+        Ok(())
+    }
+    fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        _commands: &[String],
+        _pre_commit_hook: Option<PreCommitHook>,
+    ) -> pg2any_lib::CdcResult<()> {
+        Ok(())
+    }
+    async fn close(&mut self) -> pg2any_lib::CdcResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_use_destination_default_shortcut() {
+    let config = base_builder()
+        .use_destination::<DefaultableHandler>()
+        .build()
+        .expect("config builds");
+
+    assert!(matches!(
+        config.destination_type,
+        DestinationType::Custom(_)
+    ));
+
+    let mut handler = config
+        .create_destination()
+        .expect("use_destination registers a factory");
+    handler.connect("ignored").await.unwrap();
+    handler.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_factory_produces_fresh_handler_per_call() {
+    // The factory must return a new handler each call: the consumer
+    // constructs its own handler in addition to the main pipeline.
+    let calls: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_factory = calls.clone();
+    let invocations = Arc::new(Mutex::new(0usize));
+    let invocations_inner = invocations.clone();
+
+    let config = base_builder()
+        .custom_destination(move || {
+            *invocations_inner.lock().unwrap() += 1;
+            MockHandler::new(calls_for_factory.clone())
+        })
+        .build()
+        .unwrap();
+
+    let mut h1 = config.create_destination().unwrap();
+    let mut h2 = config.create_destination().unwrap();
+
+    h1.connect("a").await.unwrap();
+    h2.connect("b").await.unwrap();
+
+    assert_eq!(
+        *invocations.lock().unwrap(),
+        2,
+        "factory called per handler"
+    );
+    let recorded = calls.lock().unwrap().clone();
+    // Both handlers share the same recorder — two connects observed.
+    assert_eq!(recorded, vec!["connect".to_string(), "connect".to_string()]);
+}

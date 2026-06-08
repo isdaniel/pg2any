@@ -87,7 +87,7 @@ pub trait DestinationHandler: Send + Sync {
 - MySQL additionally supports `execute_bulk_insert_with_hook` for LOAD DATA LOCAL INFILE
 - SQL Server supports `execute_bulk_insert_with_hook` for TDS Bulk Load (with multi-value INSERT fallback)
 - Kafka uses event mode (`supports_event_mode() = true`, `execute_events_batch_with_hook`)
-- Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::register_destination` / `custom_destination`.
+- Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::custom_destination` (factory closure) or `ConfigBuilder::use_destination::<H>()` (for `H: Default`).
 
 ### TransactionStorage (trait) - `storage/traits.rs`
 

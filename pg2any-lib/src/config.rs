@@ -106,7 +106,7 @@ pub struct Config {
 
     /// Per-Config registry of destination factories keyed by `DestinationType::registry_key()`.
     /// Built-ins self-register in `Config::default()`; external users add their own via
-    /// `ConfigBuilder::register_destination` / `custom_destination`.
+    /// `ConfigBuilder::custom_destination` / `use_destination`.
     pub(crate) destination_registry: HashMap<String, DestinationFactoryFn>,
 }
 
@@ -574,23 +574,6 @@ impl ConfigBuilder {
 
     /// Sentinel registry key used by `custom_destination` / `use_destination`.
     const CUSTOM_DESTINATION_KEY: &'static str = "__custom__";
-
-    /// Register a destination factory under `key`. Use this for advanced multi-key
-    /// scenarios (e.g. swapping handlers per `DestinationType` at runtime).
-    /// For the common case of a single user-supplied destination, prefer
-    /// [`custom_destination`](Self::custom_destination) or
-    /// [`use_destination`](Self::use_destination).
-    ///
-    /// The closure may be invoked more than once (main + consumer handlers).
-    pub fn register_destination<F, H>(mut self, key: impl Into<String>, factory: F) -> Self
-    where
-        F: Fn() -> H + Send + Sync + 'static,
-        H: DestinationHandler + 'static,
-    {
-        let f: DestinationFactoryFn = Arc::new(move || Ok(Box::new(factory()) as _));
-        self.config.destination_registry.insert(key.into(), f);
-        self
-    }
 
     /// Inject a custom `DestinationHandler` factory and switch `destination_type`
     /// to `DestinationType::Custom`. The closure must return a fresh handler each

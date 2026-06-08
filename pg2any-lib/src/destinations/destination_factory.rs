@@ -48,7 +48,7 @@ pub trait DestinationHandler: Send + Sync {
     /// Defaults to a generic ANSI-flavored dialect — matches the historical
     /// `DestinationType::Custom(_)` fallback in `TransactionManager`, so
     /// existing custom destinations registered via
-    /// `Config::register_destination` keep working without any changes.
+    /// `Config::custom_destination` keep working without any changes.
     ///
     /// Override this to provide destination-specific quoting, hex literals,
     /// value rendering, and TRUNCATE strategy.

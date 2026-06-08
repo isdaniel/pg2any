@@ -1,7 +1,7 @@
 //! # Per-destination SQL dialect abstraction
 //!
-//! External destinations registered via [`crate::config::ConfigBuilder::register_destination`]
-//! (or `custom_destination` / `use_destination`) can supply their own SQL
+//! External destinations registered via [`crate::config::ConfigBuilder::custom_destination`]
+//! (or `use_destination`) can supply their own SQL
 //! dialect by overriding
 //! [`crate::destinations::destination_factory::DestinationHandler::dialect`].
 //!
@@ -45,7 +45,7 @@ use pg_walstream::ColumnValue;
 /// The four built-in implementations (`MySqlDialect`, `SqlServerDialect`,
 /// `SqliteDialect`, `KafkaDialect`) plus the generic `AnsiDialect` cover the
 /// pre-refactor branches that lived inside `TransactionManager`. External
-/// destinations registered via `Config::register_destination` may either reuse
+/// destinations registered via `Config::custom_destination` may either reuse
 /// one of these or supply their own.
 pub trait SqlDialect: Send + Sync {
     /// Append a quoted identifier (schema/table/column) into `out`.

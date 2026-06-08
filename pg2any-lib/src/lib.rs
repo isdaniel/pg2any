@@ -152,7 +152,7 @@ pub use crate::types::{DestinationType, Transaction};
 
 // SQL dialect customization for external destinations.
 //
-// Custom destinations registered via `Config::register_destination` can
+// Custom destinations registered via `Config::custom_destination` can
 // override `DestinationHandler::dialect()` to return one of the built-in
 // dialects (e.g. `MySqlDialect`), the generic `AnsiDialect`, or a fully
 // custom `SqlDialect` impl. See `destinations::dialect` for the integration

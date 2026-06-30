@@ -9,7 +9,7 @@ use crate::storage::traits::TransactionStorage;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::debug;
 
 /// Uncompressed storage handler for transaction files
@@ -67,54 +67,27 @@ impl TransactionStorage for UncompressedStorage {
         Ok(file_path.to_path_buf())
     }
 
-    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        let file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;
-
-        let reader = tokio::io::BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut parser = SqlStreamParser::new();
-        let mut statement_count = 0usize;
-        let mut statements: Vec<String> = Vec::new();
-
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
-        {
-            statements.clear();
-            parser.parse_line(&line, &mut statements)?;
-            statement_count += statements.len();
-        }
-
-        if parser.finish_statement().is_some() {
-            statement_count += 1;
-        }
-
-        Ok((file_path.to_path_buf(), statement_count))
+    async fn write_transaction_from_file(
+        &self,
+        file_path: &Path,
+        known_statement_count: usize,
+    ) -> Result<PathBuf> {
+        // Uncompressed files are already final — no transform needed and the
+        // statement count is supplied by the producer (segment_statement_counts),
+        // so we never re-read or re-parse the file here.
+        debug!(
+            "Uncompressed finalize: {:?} ({} statements, no re-read)",
+            file_path, known_statement_count
+        );
+        Ok(file_path.to_path_buf())
     }
 
-    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        let file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to open file {file_path:?}: {e}")))?;
-
-        let reader = tokio::io::BufReader::new(file);
-        let mut lines = reader.lines();
-        let mut line_count = 0usize;
-
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
-        {
-            if !line.trim().is_empty() {
-                line_count += 1;
-            }
-        }
-
-        Ok((file_path.to_path_buf(), line_count))
+    async fn write_raw_lines_from_file(
+        &self,
+        file_path: &Path,
+        _known_line_count: usize,
+    ) -> Result<PathBuf> {
+        Ok(file_path.to_path_buf())
     }
 
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
@@ -231,6 +204,29 @@ mod tests {
         );
 
         // Clean up
+        storage.delete_transaction(&file_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_from_file_uses_known_count_without_reading() {
+        let temp_dir = create_temp_dir().await;
+        let file_path = temp_dir.join("count.sql");
+        let storage = UncompressedStorage::new();
+
+        // File content deliberately does NOT match the known count:
+        // proves the function trusts the passed count and does not re-parse.
+        let statements = vec!["INSERT INTO t VALUES (1);".to_string()];
+        storage
+            .write_transaction(&file_path, &statements)
+            .await
+            .unwrap();
+
+        let path = storage
+            .write_transaction_from_file(&file_path, 999)
+            .await
+            .unwrap();
+
+        assert_eq!(path, file_path);
         storage.delete_transaction(&file_path).await.unwrap();
     }
 

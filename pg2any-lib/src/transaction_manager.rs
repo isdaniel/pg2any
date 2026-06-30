@@ -53,6 +53,7 @@ use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::{self, File};
@@ -260,6 +261,8 @@ struct ActiveTransactionState {
     current_segment_size_bytes: usize,
     /// Buffered writer for the current segment
     writer: BufferedEventWriter,
+    /// Reused render buffer for SQL-mode events, avoids a per-event allocation.
+    render_buf: String,
 }
 
 struct StatementProcessingState<'a> {
@@ -298,6 +301,10 @@ pub struct TransactionManager {
     bulk_insert_threshold: usize,
     /// SQL dialect for this destination (selected from `destination_type`).
     dialect: &'static dyn SqlDialect,
+    /// In-memory count of transactions in sql_pending_tx/ (committed, not yet
+    /// finalized). Seeded at startup from the dir scan; kept in sync on
+    /// commit (+1) and finalize/delete (-1). Avoids a per-transaction dir scan.
+    pending_tx_count: AtomicUsize,
 }
 
 impl TransactionManager {
@@ -341,6 +348,7 @@ impl TransactionManager {
             event_mode: false,
             bulk_insert_threshold: 500,
             dialect,
+            pending_tx_count: AtomicUsize::new(0),
         })
     }
 
@@ -357,6 +365,16 @@ impl TransactionManager {
     /// Configure bulk insert optimization parameters
     pub fn set_bulk_insert_config(&mut self, threshold: usize) {
         self.bulk_insert_threshold = threshold;
+    }
+
+    /// Current in-memory count of committed-but-not-finalized pending transactions.
+    pub fn pending_count(&self) -> usize {
+        self.pending_tx_count.load(Ordering::Relaxed)
+    }
+
+    /// Seed the pending counter at startup from the authoritative dir scan.
+    pub fn seed_pending_count(&self, n: usize) {
+        self.pending_tx_count.store(n, Ordering::Relaxed);
     }
 
     /// Flush all pending buffered writes
@@ -480,6 +498,7 @@ impl TransactionManager {
                 current_segment_index: 0,
                 current_segment_size_bytes: 0,
                 writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
+                render_buf: String::new(),
             },
         );
 
@@ -536,25 +555,49 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Count statements in an already-rendered SQL `line` exactly as the
+    /// consumer's `SqlStreamParser` would read them back from disk.
+    ///
+    /// This MUST mirror the consumer read path (and the legacy
+    /// `UncompressedStorage::write_transaction_from_file` counting loop): split
+    /// on physical newlines, feed each line to a fresh parser, then count any
+    /// trailing statement at EOF. A single event-line may contain multiple
+    /// `;`-terminated statements (e.g. a multi-table TRUNCATE), so the producer
+    /// must count per-statement to keep crash-resume skip arithmetic correct.
+    fn count_rendered_statements(line: &str) -> Result<usize> {
+        let mut parser = SqlStreamParser::new();
+        let mut count = 0usize;
+        for physical_line in line.split('\n') {
+            count += parser.count_line(physical_line);
+        }
+        if parser.finish_count() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Append a change event to a running transaction file
     /// Uses buffered I/O to accumulate events in memory before flushing to disk
     /// Automatically flushes when buffer reaches capacity
     pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
-        let line = if self.event_mode {
+        // Event mode serializes JSON into its own owned String before locking
+        // (out of scope for buffer reuse). For SQL mode we render into the
+        // per-transaction reusable buffer AFTER locking, so `event_line` stays
+        // `None` here and the line is borrowed from `tx_state.render_buf`.
+        let event_line: Option<String> = if self.event_mode {
             match &event.event_type {
                 EventType::Insert { .. }
                 | EventType::Update { .. }
                 | EventType::Delete { .. }
-                | EventType::Truncate(_) => serde_json::to_string(event)
-                    .map_err(|e| CdcError::generic(format!("Failed to serialize event: {e}")))?,
+                | EventType::Truncate(_) => {
+                    Some(serde_json::to_string(event).map_err(|e| {
+                        CdcError::generic(format!("Failed to serialize event: {e}"))
+                    })?)
+                }
                 _ => return Ok(()),
             }
         } else {
-            let sql = self.generate_sql_for_event(event)?;
-            if sql.is_empty() {
-                return Ok(());
-            }
-            sql
+            None
         };
 
         let mut transactions = self.active_transactions.lock().await;
@@ -565,6 +608,20 @@ impl TransactionManager {
                 tx_id
             ))
         })?;
+
+        // Resolve the line to append as a `&str`, shared by both paths below.
+        // SQL mode renders into the reusable per-transaction buffer; event mode
+        // borrows the owned JSON String computed above.
+        let line: &str = if let Some(ref json) = event_line {
+            json.as_str()
+        } else {
+            let ctx = self.render_ctx();
+            crate::sql_renderer::render_sql_for_event_into(&ctx, event, &mut tx_state.render_buf)?;
+            if tx_state.render_buf.is_empty() {
+                return Ok(());
+            }
+            tx_state.render_buf.as_str()
+        };
 
         let line_bytes = line.len() + 1; // include newline
         let estimated_size =
@@ -604,12 +661,29 @@ impl TransactionManager {
             );
         }
 
-        let should_flush = tx_state.writer.append(&line);
+        // Count statements EXACTLY as the consumer will read them back, computed
+        // in-memory from the already-rendered `line` (no file re-read — that would
+        // undo the Fix 1.1 perf win). The producer-tracked count is authoritative
+        // for `TransactionSegment.statement_count`, which drives crash-resume
+        // segment-skip arithmetic measured in parser-statement units. A single
+        // event-line can render MULTIPLE `;`-terminated statements (e.g. a
+        // multi-table TRUNCATE), so a naive +1 would under-count and cause the
+        // consumer to re-execute already-applied statements after a mid-tx crash.
+        let stmt_count = if self.event_mode {
+            // Event mode mirrors `write_raw_lines_from_file`: one non-empty
+            // physical line == one event (normally exactly 1).
+            line.split('\n').filter(|l| !l.trim().is_empty()).count()
+        } else {
+            // SQL mode mirrors `write_transaction_from_file` / the consumer's
+            // `SqlStreamParser` read path.
+            Self::count_rendered_statements(line)?
+        };
+        let should_flush = tx_state.writer.append(line);
         if let Some(count) = tx_state
             .segment_statement_counts
             .get_mut(tx_state.current_segment_index)
         {
-            *count += 1;
+            *count += stmt_count;
         }
         if should_flush {
             let buffered_bytes = tx_state.writer.buffer_size();
@@ -667,24 +741,20 @@ impl TransactionManager {
         let mut final_segments = Vec::new();
 
         for (idx, segment_path) in segment_paths.iter().enumerate() {
-            let (final_data_path, statement_count) = if self.event_mode {
-                self.storage.write_raw_lines_from_file(segment_path).await?
+            let known_count = segment_counts.get(idx).copied().unwrap_or(0);
+            let final_data_path = if self.event_mode {
+                self.storage
+                    .write_raw_lines_from_file(segment_path, known_count)
+                    .await?
             } else {
                 self.storage
-                    .write_transaction_from_file(segment_path)
+                    .write_transaction_from_file(segment_path, known_count)
                     .await?
-            };
-
-            let fallback_count = segment_counts.get(idx).copied().unwrap_or(0);
-            let final_count = if statement_count == 0 {
-                fallback_count
-            } else {
-                statement_count
             };
 
             final_segments.push(TransactionSegment {
                 path: final_data_path,
-                statement_count: final_count,
+                statement_count: known_count,
             });
         }
 
@@ -745,7 +815,11 @@ impl TransactionManager {
     /// If a pending metadata file already exists with `last_executed_command_index` set
     /// (indicating a previous run already applied this transaction to the destination),
     /// the existing file is preserved to prevent duplicate re-execution on recovery.
-    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
+    pub async fn commit_transaction(
+        &self,
+        tx_id: u32,
+        commit_lsn: Option<Lsn>,
+    ) -> Result<(PathBuf, TransactionFileMetadata)> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
 
@@ -772,7 +846,7 @@ impl TransactionManager {
                             let _ = fs::remove_file(seg_path).await;
                         }
                     }
-                    return Ok(pending_metadata_path);
+                    return Ok((pending_metadata_path, existing));
                 }
             }
         }
@@ -805,7 +879,9 @@ impl TransactionManager {
             tx_id, commit_lsn
         );
 
-        Ok(pending_metadata_path)
+        self.pending_tx_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok((pending_metadata_path, metadata))
     }
 
     /// Delete transaction files (metadata and data) on abort
@@ -1074,6 +1150,7 @@ impl TransactionManager {
                 current_segment_index,
                 current_segment_size_bytes: current_size,
                 writer: BufferedEventWriter::new(current_segment_path, self.buffer_size),
+                render_buf: String::new(),
             },
         );
 
@@ -1118,11 +1195,6 @@ impl TransactionManager {
             dialect: self.dialect,
             schema_mappings: &self.schema_mappings,
         }
-    }
-
-    /// Generate SQL command for a change event
-    fn generate_sql_for_event(&self, event: &ChangeEvent) -> Result<String> {
-        crate::sql_renderer::generate_sql_for_event(&self.render_ctx(), event)
     }
 
     /// Generate TRUNCATE SQL command
@@ -1972,8 +2044,16 @@ impl TransactionManager {
         self.clear_staged_pending_progress(&pending_tx.file_path)
             .await;
 
+        // Decrement unconditionally to match the unconditional increment in
+        // `commit_transaction`: any transaction that reached the committed/pending
+        // state was counted, so it must be uncounted here regardless of
+        // `commit_lsn`. saturating_sub guards against underflow if a recovery
+        // path finalizes a tx that wasn't counted at startup.
+        let prev = self.pending_tx_count.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "pending counter underflow");
+        let pending_count = prev.saturating_sub(1);
+
         if pending_tx.metadata.commit_lsn.is_some() {
-            let pending_count = self.list_pending_transactions().await?.len();
             lsn_tracker.update_consumer_state(
                 tx_id,
                 pending_tx.metadata.commit_timestamp,
@@ -1981,7 +2061,7 @@ impl TransactionManager {
             );
 
             debug!(
-                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
+                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (in-memory)",
                 tx_id, pending_count
             );
         }
@@ -1994,7 +2074,8 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use pg_walstream::ColumnValue;
+    use pg_walstream::{ColumnValue, RowData};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Create a minimal `TransactionManager` for unit-testing `format_value`
     /// and SQL generation helpers without filesystem side-effects.
@@ -2008,6 +2089,139 @@ mod tests {
         TransactionManager::new(&dir, dest, None, 10 * 1024 * 1024)
             .await
             .expect("test manager creation should succeed")
+    }
+
+    /// Build a `TransactionManager` in a unique temp dir for tests that need
+    /// real filesystem transaction lifecycle (begin/append/commit).
+    async fn test_manager_fs() -> (TransactionManager, std::path::PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pg2any_tx_lifecycle_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let mgr = TransactionManager::new(&dir, DestinationType::MySQL, None, 10 * 1024 * 1024)
+            .await
+            .expect("test manager creation should succeed");
+        (mgr, dir)
+    }
+
+    /// Begin a normal transaction, append one INSERT event, and flush buffers so
+    /// the transaction is ready to commit.
+    async fn seed_simple_transaction(manager: &TransactionManager, tx_id: u32) {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("test")),
+        ]);
+        let event = ChangeEvent::insert("public", "test", 12345, data, crate::types::Lsn(1));
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .expect("begin_transaction should succeed");
+        manager
+            .append_event(tx_id, &event)
+            .await
+            .expect("append_event should succeed");
+        manager
+            .flush_all_buffers()
+            .await
+            .expect("flush_all_buffers should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_returns_inmemory_metadata() {
+        let (manager, _tmp) = test_manager_fs().await;
+        let tx_id = 42;
+        seed_simple_transaction(&manager, tx_id).await;
+
+        let (path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+
+        // Returned in-memory metadata must match what was persisted to disk.
+        let on_disk = manager.read_metadata(&path).await.unwrap();
+        assert_eq!(metadata.transaction_id, tx_id);
+        assert_eq!(metadata.transaction_id, on_disk.transaction_id);
+        assert_eq!(metadata.commit_lsn, on_disk.commit_lsn);
+        assert_eq!(metadata.segments.len(), on_disk.segments.len());
+    }
+
+    #[tokio::test]
+    async fn test_pending_counter_tracks_commit_and_finalize() {
+        let (manager, _tmp) = test_manager_fs().await;
+        assert_eq!(manager.pending_count(), 0);
+
+        seed_simple_transaction(&manager, 1).await;
+        manager
+            .commit_transaction(1, Some(crate::types::Lsn(10)))
+            .await
+            .unwrap();
+        assert_eq!(manager.pending_count(), 1, "commit should increment");
+
+        // Counter must equal the authoritative dir-scan count.
+        let scanned = manager.list_pending_transactions().await.unwrap().len();
+        assert_eq!(manager.pending_count(), scanned);
+    }
+
+    /// Regression: producer-tracked `statement_count` must equal what the
+    /// consumer's `SqlStreamParser` reads back. A multi-table TRUNCATE renders
+    /// ONE event-line containing N `;`-terminated statements, so a naive +1
+    /// per event would under-count and corrupt crash-resume skip arithmetic.
+    #[tokio::test]
+    async fn test_statement_count_matches_parser_for_multi_table_truncate() {
+        use crate::storage::SqlStreamParser;
+
+        let (manager, _tmp) = test_manager_fs().await;
+        let tx_id = 7;
+
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+
+        // An ordinary INSERT (1 statement) ...
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let insert = ChangeEvent::insert("public", "test", 12345, data, crate::types::Lsn(1));
+        manager.append_event(tx_id, &insert).await.unwrap();
+
+        // ... alongside a multi-table TRUNCATE that renders 3 statements in one
+        // event-line.
+        let truncate = ChangeEvent {
+            event_type: EventType::Truncate(vec![
+                std::sync::Arc::from("public.a"),
+                std::sync::Arc::from("public.b"),
+                std::sync::Arc::from("public.c"),
+            ]),
+            lsn: crate::types::Lsn(2),
+            metadata: None,
+        };
+        manager.append_event(tx_id, &truncate).await.unwrap();
+
+        manager.flush_all_buffers().await.unwrap();
+        let (_path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+
+        // Stored metadata count (producer-tracked, authoritative since Fix 1.1).
+        let stored: usize = metadata.segments.iter().map(|s| s.statement_count).sum();
+
+        // Read the data file(s) back exactly as the consumer does and count.
+        let mut parsed = 0usize;
+        for seg in &metadata.segments {
+            let mut p = SqlStreamParser::new();
+            let stmts = p.parse_file_from_index_collect(&seg.path, 0).await.unwrap();
+            parsed += stmts.len();
+        }
+
+        // 1 INSERT + 3 TRUNCATE statements = 4.
+        assert_eq!(parsed, 4, "consumer should read back 4 statements");
+        assert_eq!(
+            stored, parsed,
+            "stored statement_count must match what the consumer parser reads back"
+        );
     }
 
     // ── SQL injection prevention ──────────────────────────────────────

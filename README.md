@@ -73,6 +73,7 @@ The factory closure must return a fresh handler each call (it is invoked once fo
 - **Bulk insert optimization** - LOAD DATA LOCAL INFILE for MySQL, TDS Bulk Load for SQL Server + session tuning for large batches
 - **DML coalescing** - Multi-value INSERT, CASE-WHEN UPDATE, OR-combined DELETE batching
 - **Smart batching** - Merges consecutive homogeneous INSERT-only transactions across boundaries for higher throughput
+- **Low-overhead commit path** - Per-transaction finalize avoids redundant work: no file re-read just to count statements, no `.meta` re-parse after writing it, and an in-memory pending counter instead of a per-transaction directory scan
 
 ## Quick Start
 

@@ -365,8 +365,8 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
                 .and_then(|s| s.strip_suffix('\''))
             {
                 tsv_escape_string(unquoted, &mut buf);
-            } else if let Some(decoded) = decode_hex_literal(trimmed) {
-                tsv_escape_raw(&decoded, &mut buf);
+            } else if decode_hex_into(trimmed, &mut buf) {
+                // decoded + escaped directly into buf
             } else {
                 tsv_escape_raw(trimmed.as_bytes(), &mut buf);
             }
@@ -377,22 +377,24 @@ fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
     buf
 }
 
-fn decode_hex_literal(s: &str) -> Option<Vec<u8>> {
+fn decode_hex_into(s: &str, out: &mut Vec<u8>) -> bool {
     if s.len() < 3 {
-        return None;
+        return false;
     }
     if !(s.starts_with("X'") || s.starts_with("x'")) || !s.ends_with('\'') {
-        return None;
+        return false;
     }
     let hex_str = &s[2..s.len() - 1];
     if hex_str.len() % 2 != 0 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
+        return false;
     }
-    let bytes: Vec<u8> = (0..hex_str.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap())
-        .collect();
-    Some(bytes)
+    let mut i = 0;
+    while i < hex_str.len() {
+        let byte = u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap();
+        tsv_escape_byte(byte, out);
+        i += 2;
+    }
+    true
 }
 
 fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
@@ -458,16 +460,20 @@ fn tsv_escape_string(s: &str, buf: &mut Vec<u8>) {
     }
 }
 
+fn tsv_escape_byte(b: u8, buf: &mut Vec<u8>) {
+    match b {
+        b'\\' => buf.extend_from_slice(b"\\\\"),
+        b'\t' => buf.extend_from_slice(b"\\t"),
+        b'\n' => buf.extend_from_slice(b"\\n"),
+        b'\r' => buf.extend_from_slice(b"\\r"),
+        0 => buf.extend_from_slice(b"\\0"),
+        _ => buf.push(b),
+    }
+}
+
 fn tsv_escape_raw(data: &[u8], buf: &mut Vec<u8>) {
     for &b in data {
-        match b {
-            b'\\' => buf.extend_from_slice(b"\\\\"),
-            b'\t' => buf.extend_from_slice(b"\\t"),
-            b'\n' => buf.extend_from_slice(b"\\n"),
-            b'\r' => buf.extend_from_slice(b"\\r"),
-            0 => buf.extend_from_slice(b"\\0"),
-            _ => buf.push(b),
-        }
+        tsv_escape_byte(b, buf);
     }
 }
 
@@ -557,9 +563,26 @@ mod tests {
 
     #[test]
     fn test_decode_hex_literal_invalid() {
-        assert!(decode_hex_literal("hello").is_none());
-        assert!(decode_hex_literal("X'zz'").is_none());
-        assert!(decode_hex_literal("X'abc'").is_none());
-        assert!(decode_hex_literal("0xdead").is_none());
+        let mut out = Vec::new();
+        assert!(!decode_hex_into("hello", &mut out));
+        assert!(!decode_hex_into("X'zz'", &mut out));
+        assert!(!decode_hex_into("X'abc'", &mut out));
+        assert!(!decode_hex_into("0xdead", &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_tsv_hex_decode_into_matches_previous() {
+        // A row with a bytea hex literal, a NULL, a quoted string, and a bare value.
+        let rows = vec![vec![
+            "X'48656C6C6F'".to_string(), // "Hello"
+            "NULL".to_string(),
+            "'a\tb'".to_string(), // tab must be escaped
+            "42".to_string(),
+        ]];
+        let buf = generate_tsv_buffer(&rows);
+        // Expected bytes: Hello \t \N \t a\\tb \t 42 \n
+        let expected = b"Hello\t\\N\ta\\tb\t42\n";
+        assert_eq!(buf, expected);
     }
 }

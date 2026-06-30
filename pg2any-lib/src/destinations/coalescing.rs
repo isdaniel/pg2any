@@ -930,6 +930,11 @@ pub(crate) fn coalesce_commands<'a>(
     let mut result: Vec<Cow<'a, str>> = Vec::with_capacity(commands.len());
     let mut i = 0;
     // Carry-over from a group's lookahead: the statement at `i` has already been classified.
+    // ponytail: this guarantees single-pass classification — every lookahead that fails to
+    // join its group is stashed here and consumed by the next outer-loop iteration via
+    // `pending.take()`, so no statement is ever passed through `classify` twice. (The only
+    // lookahead-loop exits that store nothing are `i >= len` and the row/group cap, both of
+    // which leave `commands[i]` un-classified.) No double-classification redundancy exists.
     let mut pending: Option<ParsedCmd<'a>> = None;
 
     let effective_max = if max_rows_per_insert == 0 {

@@ -300,6 +300,11 @@ impl CdcClient {
 
         let pending_txs = file_mgr.list_pending_transactions().await?;
 
+        // Seed the in-memory pending counter from the authoritative dir scan.
+        // The recovery loop below finalizes each of these, decrementing the
+        // counter back toward 0 (dedup-skipped duplicates decrement on delete too).
+        file_mgr.seed_pending_count(pending_txs.len());
+
         if pending_txs.is_empty() {
             info!("No pending transaction files found");
             return Ok(());

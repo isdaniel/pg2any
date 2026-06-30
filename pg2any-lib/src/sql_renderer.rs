@@ -63,13 +63,29 @@ pub fn append_value(ctx: &RenderContext, out: &mut String, value: &ColumnValue) 
 
 /// Generate SQL command for a change event
 pub fn generate_sql_for_event(ctx: &RenderContext, event: &ChangeEvent) -> Result<String> {
+    let mut out = String::new();
+    render_sql_for_event_into(ctx, event, &mut out)?;
+    Ok(out)
+}
+
+/// Render the SQL for a change event into `out`. No allocation when `out`
+/// already has capacity — enables buffer reuse across events.
+///
+/// Each per-type `render_*_into` helper clears `out` at its top (single
+/// source of truth), so this dispatcher does NOT clear; the non-DML arm
+/// clears explicitly so `out` ends empty for skipped events.
+pub fn render_sql_for_event_into(
+    ctx: &RenderContext,
+    event: &ChangeEvent,
+    out: &mut String,
+) -> Result<()> {
     match &event.event_type {
         EventType::Insert {
             schema,
             table,
             data,
             ..
-        } => generate_insert_sql(ctx, schema, table, data),
+        } => render_insert_into(ctx, schema, table, data, out),
         EventType::Update {
             schema,
             table,
@@ -78,7 +94,7 @@ pub fn generate_sql_for_event(ctx: &RenderContext, event: &ChangeEvent) -> Resul
             replica_identity,
             key_columns,
             ..
-        } => generate_update_sql(
+        } => render_update_into(
             ctx,
             schema,
             table,
@@ -86,6 +102,7 @@ pub fn generate_sql_for_event(ctx: &RenderContext, event: &ChangeEvent) -> Resul
             old_data.as_ref(),
             replica_identity,
             key_columns,
+            out,
         ),
         EventType::Delete {
             schema,
@@ -94,11 +111,20 @@ pub fn generate_sql_for_event(ctx: &RenderContext, event: &ChangeEvent) -> Resul
             replica_identity,
             key_columns,
             ..
-        } => generate_delete_sql(ctx, schema, table, old_data, replica_identity, key_columns),
-        EventType::Truncate(tables) => generate_truncate_sql(ctx, tables),
+        } => render_delete_into(
+            ctx,
+            schema,
+            table,
+            old_data,
+            replica_identity,
+            key_columns,
+            out,
+        ),
+        EventType::Truncate(tables) => render_truncate_into(ctx, tables, out),
         _ => {
-            // Skip non-DML events
-            Ok(String::new())
+            // Skip non-DML events; ensure `out` ends empty.
+            out.clear();
+            Ok(())
         }
     }
 }
@@ -112,29 +138,42 @@ pub fn generate_insert_sql(
     table: &str,
     new_data: &RowData,
 ) -> Result<String> {
+    // Pre-size: assume ~48 bytes per (column, value) pair + overhead
+    let mut sql = String::with_capacity(64 + new_data.len() * 48);
+    render_insert_into(ctx, schema, table, new_data, &mut sql)?;
+    Ok(sql)
+}
+
+/// Render INSERT SQL into `out` (cleared first).
+fn render_insert_into(
+    ctx: &RenderContext,
+    schema: &str,
+    table: &str,
+    new_data: &RowData,
+    out: &mut String,
+) -> Result<()> {
     let schema = ctx.map_schema(Some(schema));
 
-    // Pre-size: assume ~32 bytes per (column, value) pair + overhead
-    let mut sql = String::with_capacity(64 + new_data.len() * 48);
-    sql.push_str("INSERT INTO ");
-    append_qualified_table(ctx, &mut sql, schema, table);
-    sql.push_str(" (");
+    out.clear();
+    out.push_str("INSERT INTO ");
+    append_qualified_table(ctx, out, schema, table);
+    out.push_str(" (");
     for (i, (k, _)) in new_data.iter().enumerate() {
         if i > 0 {
-            sql.push_str(", ");
+            out.push_str(", ");
         }
-        append_quoted_identifier(ctx, &mut sql, k);
+        append_quoted_identifier(ctx, out, k);
     }
-    sql.push_str(") VALUES (");
+    out.push_str(") VALUES (");
     for (i, (_, v)) in new_data.iter().enumerate() {
         if i > 0 {
-            sql.push_str(", ");
+            out.push_str(", ");
         }
-        append_value(ctx, &mut sql, v);
+        append_value(ctx, out, v);
     }
-    sql.push_str(");");
+    out.push_str(");");
 
-    Ok(sql)
+    Ok(())
 }
 
 /// Generate UPDATE SQL command
@@ -147,32 +186,51 @@ pub fn generate_update_sql(
     replica_identity: &ReplicaIdentity,
     key_columns: &[Arc<str>],
 ) -> Result<String> {
-    let schema = ctx.map_schema(Some(schema));
-
     let mut sql = String::with_capacity(64 + new_data.len() * 64);
-    sql.push_str("UPDATE ");
-    append_qualified_table(ctx, &mut sql, schema, table);
-    sql.push_str(" SET ");
-    for (i, (col, val)) in new_data.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        append_quoted_identifier(ctx, &mut sql, col);
-        sql.push_str(" = ");
-        append_value(ctx, &mut sql, val);
-    }
-    sql.push_str(" WHERE ");
-    append_where_clause(
+    render_update_into(
         ctx,
-        &mut sql,
+        schema,
+        table,
+        new_data,
+        old_data,
         replica_identity,
         key_columns,
-        old_data,
-        new_data,
+        &mut sql,
     )?;
-    sql.push(';');
-
     Ok(sql)
+}
+
+/// Render UPDATE SQL into `out` (cleared first).
+#[allow(clippy::too_many_arguments)]
+fn render_update_into(
+    ctx: &RenderContext,
+    schema: &str,
+    table: &str,
+    new_data: &RowData,
+    old_data: Option<&RowData>,
+    replica_identity: &ReplicaIdentity,
+    key_columns: &[Arc<str>],
+    out: &mut String,
+) -> Result<()> {
+    let schema = ctx.map_schema(Some(schema));
+
+    out.clear();
+    out.push_str("UPDATE ");
+    append_qualified_table(ctx, out, schema, table);
+    out.push_str(" SET ");
+    for (i, (col, val)) in new_data.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        append_quoted_identifier(ctx, out, col);
+        out.push_str(" = ");
+        append_value(ctx, out, val);
+    }
+    out.push_str(" WHERE ");
+    append_where_clause(ctx, out, replica_identity, key_columns, old_data, new_data)?;
+    out.push(';');
+
+    Ok(())
 }
 
 /// Generate DELETE SQL command
@@ -188,30 +246,60 @@ pub fn generate_delete_sql(
     replica_identity: &ReplicaIdentity,
     key_columns: &[Arc<str>],
 ) -> Result<String> {
+    let mut sql = String::with_capacity(64 + key_columns.len() * 32);
+    render_delete_into(
+        ctx,
+        schema,
+        table,
+        old_data,
+        replica_identity,
+        key_columns,
+        &mut sql,
+    )?;
+    Ok(sql)
+}
+
+/// Render DELETE SQL into `out` (cleared first).
+fn render_delete_into(
+    ctx: &RenderContext,
+    schema: &str,
+    table: &str,
+    old_data: &RowData,
+    replica_identity: &ReplicaIdentity,
+    key_columns: &[Arc<str>],
+    out: &mut String,
+) -> Result<()> {
     let schema = ctx.map_schema(Some(schema));
 
-    let mut sql = String::with_capacity(64 + key_columns.len() * 32);
-    sql.push_str("DELETE FROM ");
-    append_qualified_table(ctx, &mut sql, schema, table);
-    sql.push_str(" WHERE ");
+    out.clear();
+    out.push_str("DELETE FROM ");
+    append_qualified_table(ctx, out, schema, table);
+    out.push_str(" WHERE ");
     append_where_clause(
         ctx,
-        &mut sql,
+        out,
         replica_identity,
         key_columns,
         Some(old_data),
         old_data,
     )?;
-    sql.push(';');
+    out.push(';');
 
-    Ok(sql)
+    Ok(())
 }
 
 /// Generate TRUNCATE SQL command
 pub fn generate_truncate_sql(ctx: &RenderContext, tables: &[Arc<str>]) -> Result<String> {
-    // Build all TRUNCATE statements into a single `String` — no intermediate Vec.
     // Pre-size for ~48 bytes per table (keyword + identifiers + punctuation).
     let mut sql = String::with_capacity(tables.len() * 48);
+    render_truncate_into(ctx, tables, &mut sql)?;
+    Ok(sql)
+}
+
+/// Render TRUNCATE SQL into `out` (cleared first).
+fn render_truncate_into(ctx: &RenderContext, tables: &[Arc<str>], out: &mut String) -> Result<()> {
+    // Build all TRUNCATE statements into a single `String` — no intermediate Vec.
+    out.clear();
 
     for table_spec in tables.iter() {
         let table_spec: &str = table_spec;
@@ -221,14 +309,14 @@ pub fn generate_truncate_sql(ctx: &RenderContext, tables: &[Arc<str>]) -> Result
         };
 
         if let Some(stmt) = ctx.dialect.truncate_table_sql(schema, table) {
-            if !sql.is_empty() {
-                sql.push('\n');
+            if !out.is_empty() {
+                out.push('\n');
             }
-            sql.push_str(&stmt);
+            out.push_str(&stmt);
         }
     }
 
-    Ok(sql)
+    Ok(())
 }
 
 /// Append WHERE clause conditions directly into the provided buffer
@@ -515,6 +603,40 @@ mod tests {
             vec![Arc::from("id")],
             Lsn::new(0x101),
         )
+    }
+
+    fn sample_delete() -> ChangeEvent {
+        let old_data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("alice")),
+        ]);
+        ChangeEvent::delete(
+            "public",
+            "users",
+            42,
+            old_data,
+            ReplicaIdentity::Default,
+            vec![Arc::from("id")],
+            Lsn::new(0x102),
+        )
+    }
+
+    #[test]
+    fn test_render_into_matches_string_variant() {
+        let (d, m) = ctx();
+        let rc = make_render_ctx(&d, &m);
+        let event = sample_insert();
+        let owned = generate_sql_for_event(&rc, &event).unwrap();
+
+        let mut buf = String::from("STALE-PRELOAD"); // must be cleared by the fn
+        render_sql_for_event_into(&rc, &event, &mut buf).unwrap();
+        assert_eq!(buf, owned);
+
+        // Reuse the same buffer for a second event — no leftover bytes.
+        let event2 = sample_delete();
+        let owned2 = generate_sql_for_event(&rc, &event2).unwrap();
+        render_sql_for_event_into(&rc, &event2, &mut buf).unwrap();
+        assert_eq!(buf, owned2);
     }
 
     #[test]

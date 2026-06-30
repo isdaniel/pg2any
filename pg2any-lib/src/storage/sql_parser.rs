@@ -42,6 +42,9 @@ pub struct SqlStreamParser {
     statement_buffer: Vec<u8>,
     /// Total statements parsed
     statement_count: usize,
+    /// Non-whitespace byte count of the in-progress statement, for count-only
+    /// parsing (see `count_line`). Parallel to `statement_buffer` but allocation-free.
+    count_nonws: usize,
 }
 
 impl SqlStreamParser {
@@ -51,6 +54,7 @@ impl SqlStreamParser {
             state: ParseState::Normal,
             statement_buffer: Vec::with_capacity(512),
             statement_count: 0,
+            count_nonws: 0,
         }
     }
 
@@ -203,6 +207,105 @@ impl SqlStreamParser {
         Ok(())
     }
 
+    /// Count completed statements in `line` WITHOUT allocating per statement.
+    /// Mirrors `parse_line`'s state machine exactly (quotes/brackets/escapes),
+    /// but instead of buffering bytes it tracks whether the in-progress
+    /// statement contains any non-whitespace byte, so a trailing `;` on a
+    /// blank/whitespace-only buffer is not counted (parity with
+    /// `take_trimmed_statement` returning None on empty).
+    pub fn count_line(&mut self, line: &str) -> usize {
+        let mut completed = 0usize;
+        // Iterate by `char` (not byte) so emptiness uses the SAME Unicode
+        // whitespace definition as `str::trim` (`char::is_whitespace`) on the
+        // read path. All delimiters/quote chars dispatched on below are ASCII
+        // single-byte, so matching on a `char` is identical to matching a byte
+        // for those cases. `peekable` lets us look ahead for doubled-quote
+        // escapes, mirroring `parse_line`'s `bytes[i + 1]` lookahead.
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match self.state {
+                ParseState::Normal => match ch {
+                    '\'' => {
+                        self.state = ParseState::SingleQuote;
+                        self.count_nonws += 1;
+                    }
+                    '"' => {
+                        self.state = ParseState::DoubleQuote;
+                        self.count_nonws += 1;
+                    }
+                    '`' => {
+                        self.state = ParseState::Backtick;
+                        self.count_nonws += 1;
+                    }
+                    '[' => {
+                        self.state = ParseState::Bracket;
+                        self.count_nonws += 1;
+                    }
+                    ';' => {
+                        if self.count_nonws > 0 {
+                            completed += 1;
+                        }
+                        self.count_nonws = 0;
+                    }
+                    _ => {
+                        if !ch.is_whitespace() {
+                            self.count_nonws += 1;
+                        }
+                    }
+                },
+                ParseState::SingleQuote => {
+                    self.count_nonws += 1;
+                    if ch == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                            self.count_nonws += 1;
+                        } else {
+                            self.state = ParseState::Normal;
+                        }
+                    }
+                }
+                ParseState::DoubleQuote => {
+                    self.count_nonws += 1;
+                    if ch == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            self.count_nonws += 1;
+                        } else {
+                            self.state = ParseState::Normal;
+                        }
+                    }
+                }
+                ParseState::Backtick => {
+                    self.count_nonws += 1;
+                    if ch == '`' {
+                        if chars.peek() == Some(&'`') {
+                            chars.next();
+                            self.count_nonws += 1;
+                        } else {
+                            self.state = ParseState::Normal;
+                        }
+                    }
+                }
+                ParseState::Bracket => {
+                    self.count_nonws += 1;
+                    if ch == ']' {
+                        self.state = ParseState::Normal;
+                    }
+                }
+            }
+        }
+        // parse_line pushes a trailing '\n' into the buffer; '\n' is whitespace
+        // so it does not affect count_nonws. Nothing to do here.
+        completed
+    }
+
+    /// Mirror of `finish_statement().is_some()` for the count-only path.
+    pub fn finish_count(&mut self) -> bool {
+        let has = self.count_nonws > 0;
+        self.count_nonws = 0;
+        has
+    }
+
     /// Finalize parsing at EOF and return the remaining statement, if any
     pub fn finish_statement(&mut self) -> Option<String> {
         if self.statement_buffer.is_empty() {
@@ -265,6 +368,83 @@ mod tests {
         file.write_all(content.as_bytes()).await.unwrap();
         file.flush().await.unwrap();
         (file_path.to_string_lossy().to_string(), temp_dir)
+    }
+
+    #[test]
+    fn test_count_line_matches_parse_line_statement_count() {
+        // Compute the reference statement count via the real read path
+        // (parse_line + finish_statement) — two independent paths, not a
+        // tautology.
+        fn ref_count(case: &str) -> usize {
+            let mut p_ref = SqlStreamParser::new();
+            let mut n = 0usize;
+            for physical in case.split('\n') {
+                let mut o = Vec::new();
+                p_ref.parse_line(physical, &mut o).unwrap();
+                n += o.len();
+            }
+            if p_ref.finish_statement().is_some() {
+                n += 1;
+            }
+            n
+        }
+
+        fn new_count(case: &str) -> usize {
+            let mut p2 = SqlStreamParser::new();
+            let mut n = 0usize;
+            for physical in case.split('\n') {
+                n += p2.count_line(physical);
+            }
+            if p2.finish_count() {
+                n += 1;
+            }
+            n
+        }
+
+        // Cases that must agree, including a semicolon inside a quoted literal
+        // (must NOT be counted as a terminator) and a multi-statement line.
+        let cases = [
+            "INSERT INTO t (a) VALUES (1);",
+            "INSERT INTO t (a) VALUES ('a;b');", // ; inside quotes -> 1 stmt
+            "TRUNCATE TABLE a;\nTRUNCATE TABLE b;\nTRUNCATE TABLE c;", // 3 stmts
+            "UPDATE t SET a = '' WHERE id = 2;",
+            "", // 0 stmts
+            // Unicode-whitespace cases: NBSP / ideographic space are whitespace
+            // under str::trim (char::is_whitespace) but NOT is_ascii_whitespace.
+            "\u{a0};",        // all-whitespace before ; -> 0 stmts
+            "\u{3000}",       // hits finish_count, all-whitespace -> 0 stmts
+            "\u{a0}x\u{a0};", // interior content -> non-empty -> 1 stmt
+            "  \u{a0}  ;",    // mixed all-whitespace -> 0 stmts
+        ];
+        for case in cases {
+            assert_eq!(
+                new_count(case),
+                ref_count(case),
+                "count mismatch for case: {case:?}"
+            );
+        }
+
+        // Deterministic fuzz over an alphabet that INCLUDES a multibyte
+        // whitespace char (\u{a0}). Generate every string up to length 4 and
+        // assert the count-only path equals the read path. This FAILS before
+        // the Unicode-aware fix and PASSES after.
+        let alphabet = ['a', ';', '\'', '"', '`', '[', ']', ' ', '\t', '\u{a0}'];
+        let n = alphabet.len();
+        for len in 0..=4usize {
+            let total = n.pow(len as u32);
+            for mut idx in 0..total {
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(alphabet[idx % n]);
+                    idx /= n;
+                }
+                assert_eq!(
+                    new_count(&s),
+                    ref_count(&s),
+                    "fuzz count mismatch for input: {s:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

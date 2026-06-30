@@ -20,6 +20,15 @@ const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 const DELIVERY_FUTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Per-table cached names, built once per table and reused across all events
+/// for that table. Keyed by the per-event `source_table_key` ("{schema}.{table}").
+#[cfg_attr(test, derive(Clone))]
+struct TableNames {
+    topic: String,
+    key_schema: String,
+    envelope: String,
+}
+
 pub struct KafkaDestination {
     producer: Option<FutureProducer>,
     topic_prefix: String,
@@ -27,14 +36,13 @@ pub struct KafkaDestination {
     schema_mappings: HashMap<String, String>,
     key_columns_config: HashMap<String, Vec<String>>,
     field_schema_cache: HashMap<String, Value>,
-    topic_cache: HashMap<String, String>,
+    /// Cached per-table names (topic, key schema, envelope schema) keyed by
+    /// `source_table_key` ("{schema}.{table}"). Built once per table; zero key
+    /// allocation on the cache-hit (hot) path.
+    table_names_cache: HashMap<String, TableNames>,
     /// Cached key columns from Update/Delete events, used as fallback for Insert events
     /// that don't carry key_columns in the replication protocol.
     stream_key_columns: HashMap<String, Vec<Arc<str>>>,
-    /// Cached per-table key schema name ("{prefix}.{schema}.{table}.Key")
-    key_schema_name_cache: HashMap<String, String>,
-    /// Cached per-table envelope schema name ("{prefix}.{schema}.{table}.Envelope")
-    envelope_schema_name_cache: HashMap<String, String>,
     /// Cached static source schema fields (constant across all events)
     source_schema_fields: Value,
 }
@@ -48,10 +56,8 @@ impl KafkaDestination {
             schema_mappings: HashMap::new(),
             key_columns_config: HashMap::new(),
             field_schema_cache: HashMap::new(),
-            topic_cache: HashMap::new(),
+            table_names_cache: HashMap::new(),
             stream_key_columns: HashMap::new(),
-            key_schema_name_cache: HashMap::new(),
-            envelope_schema_name_cache: HashMap::new(),
             source_schema_fields: Self::build_source_schema_fields(),
         }
     }
@@ -70,25 +76,27 @@ impl KafkaDestination {
         ], "optional": false, "field": "source"})
     }
 
-    fn get_key_schema_name(&mut self, schema: &str, table: &str) -> &str {
-        let cache_key = format!("{}.{}", schema, table);
-        self.key_schema_name_cache
-            .entry(cache_key)
-            .or_insert_with_key(|_| format!("{}.{}.{}.Key", self.topic_prefix, schema, table))
-    }
-
-    fn get_envelope_schema_name(&mut self, schema: &str, table: &str) -> &str {
-        let cache_key = format!("{}.{}", schema, table);
-        self.envelope_schema_name_cache
-            .entry(cache_key)
-            .or_insert_with_key(|_| format!("{}.{}.{}.Envelope", self.topic_prefix, schema, table))
-    }
-
-    fn topic_name(&mut self, schema: &str, table: &str) -> &str {
-        let cache_key = format!("{}.{}", schema, table);
-        self.topic_cache
-            .entry(cache_key)
-            .or_insert_with_key(|_| format!("{}.{}.{}", self.topic_prefix, schema, table))
+    /// Returns cached per-table names, building them once on a cache miss.
+    /// On a cache hit this performs a single borrowed-key lookup with zero
+    /// key allocation; on a miss it allocates one owned key (`source_table_key`)
+    /// plus the three name strings.
+    fn table_names(
+        &mut self,
+        source_table_key: &str,
+        mapped_schema: &str,
+        table: &str,
+    ) -> &TableNames {
+        if !self.table_names_cache.contains_key(source_table_key) {
+            let prefix = &self.topic_prefix;
+            let names = TableNames {
+                topic: format!("{}.{}.{}", prefix, mapped_schema, table),
+                key_schema: format!("{}.{}.{}.Key", prefix, mapped_schema, table),
+                envelope: format!("{}.{}.{}.Envelope", prefix, mapped_schema, table),
+            };
+            self.table_names_cache
+                .insert(source_table_key.to_owned(), names);
+        }
+        &self.table_names_cache[source_table_key]
     }
 
     fn map_schema<'a>(&'a self, source_schema: &'a str) -> &'a str {
@@ -156,9 +164,8 @@ impl KafkaDestination {
     }
 
     fn build_key_for_insert(
-        &mut self,
-        schema: &str,
-        table: &str,
+        &self,
+        key_schema_name: &str,
         table_key: &str,
         data: &pg_walstream::RowData,
     ) -> Result<Option<String>> {
@@ -189,7 +196,7 @@ impl KafkaDestination {
             return Ok(None);
         }
 
-        let key_schema_name = self.get_key_schema_name(schema, table).to_owned();
+        let key_schema_name = key_schema_name.to_owned();
         let key = json!({
             "schema": {
                 "type": "struct",
@@ -231,6 +238,7 @@ impl KafkaDestination {
         op: &str,
         schema: &str,
         table: &str,
+        envelope_name: &str,
         before: Option<Value>,
         after: Option<Value>,
         before_fields: Option<Value>,
@@ -240,7 +248,6 @@ impl KafkaDestination {
         lsn: Option<Lsn>,
     ) -> Value {
         let source = self.build_source_block(schema, table, transaction_id, commit_timestamp, lsn);
-        let envelope_name = self.get_envelope_schema_name(schema, table).to_owned();
 
         let unified_fields = after_fields
             .as_ref()
@@ -285,9 +292,8 @@ impl KafkaDestination {
     }
 
     fn build_key_from_data(
-        &mut self,
-        schema: &str,
-        table: &str,
+        &self,
+        key_schema_name: &str,
         source_table_key: &str,
         data: &pg_walstream::RowData,
         key_columns: &[Arc<str>],
@@ -321,7 +327,7 @@ impl KafkaDestination {
             return Ok(None);
         }
 
-        let key_schema_name = self.get_key_schema_name(schema, table).to_owned();
+        let key_schema_name = key_schema_name.to_owned();
         let key = json!({
             "schema": {
                 "type": "struct",
@@ -556,16 +562,19 @@ impl DestinationHandler for KafkaDestination {
                 } => {
                     let mapped_schema = self.map_schema(schema).to_owned();
                     let source_table_key = format!("{}.{}", schema, table);
-                    let topic = self.topic_name(&mapped_schema, table).to_owned();
+                    let names = self.table_names(&source_table_key, &mapped_schema, table);
+                    let topic = names.topic.clone();
+                    let key_schema = names.key_schema.clone();
+                    let envelope_name = names.envelope.clone();
                     let after_fields =
                         Some(self.get_or_build_field_schema(&source_table_key, data));
                     let after = Some(Self::row_data_to_json(data));
-                    let key =
-                        self.build_key_for_insert(&mapped_schema, table, &source_table_key, data)?;
+                    let key = self.build_key_for_insert(&key_schema, &source_table_key, data)?;
                     let envelope = self.build_change_envelope(
                         "c",
                         &mapped_schema,
                         table,
+                        &envelope_name,
                         None,
                         after,
                         None,
@@ -595,7 +604,10 @@ impl DestinationHandler for KafkaDestination {
                             .entry(source_table_key.clone())
                             .or_insert_with(|| key_columns.clone());
                     }
-                    let topic = self.topic_name(&mapped_schema, table).to_owned();
+                    let names = self.table_names(&source_table_key, &mapped_schema, table);
+                    let topic = names.topic.clone();
+                    let key_schema = names.key_schema.clone();
+                    let envelope_name = names.envelope.clone();
                     let before_fields = old_data
                         .as_ref()
                         .map(|d| self.get_or_build_field_schema(&source_table_key, d));
@@ -605,8 +617,7 @@ impl DestinationHandler for KafkaDestination {
                     let after = Some(Self::row_data_to_json(new_data));
                     let key_data = old_data.as_ref().unwrap_or(new_data);
                     let key = self.build_key_from_data(
-                        &mapped_schema,
-                        table,
+                        &key_schema,
                         &source_table_key,
                         key_data,
                         key_columns,
@@ -615,6 +626,7 @@ impl DestinationHandler for KafkaDestination {
                         "u",
                         &mapped_schema,
                         table,
+                        &envelope_name,
                         before,
                         after,
                         before_fields,
@@ -643,13 +655,15 @@ impl DestinationHandler for KafkaDestination {
                             .entry(source_table_key.clone())
                             .or_insert_with(|| key_columns.clone());
                     }
-                    let topic = self.topic_name(&mapped_schema, table).to_owned();
+                    let names = self.table_names(&source_table_key, &mapped_schema, table);
+                    let topic = names.topic.clone();
+                    let key_schema = names.key_schema.clone();
+                    let envelope_name = names.envelope.clone();
                     let before_fields =
                         Some(self.get_or_build_field_schema(&source_table_key, old_data));
                     let before = Some(Self::row_data_to_json(old_data));
                     let key = self.build_key_from_data(
-                        &mapped_schema,
-                        table,
+                        &key_schema,
                         &source_table_key,
                         old_data,
                         key_columns,
@@ -658,6 +672,7 @@ impl DestinationHandler for KafkaDestination {
                         "d",
                         &mapped_schema,
                         table,
+                        &envelope_name,
                         before,
                         None,
                         before_fields,
@@ -678,11 +693,15 @@ impl DestinationHandler for KafkaDestination {
                             Some((s, t)) if !t.contains('.') => (self.map_schema(s).to_owned(), t),
                             _ => (self.map_schema("public").to_owned(), table_spec.as_ref()),
                         };
-                        let topic = self.topic_name(&schema, table).to_owned();
+                        let source_table_key = format!("{}.{}", schema, table);
+                        let names = self.table_names(&source_table_key, &schema, table);
+                        let topic = names.topic.clone();
+                        let envelope_name = names.envelope.clone();
                         let envelope = self.build_change_envelope(
                             "t",
                             &schema,
                             table,
+                            &envelope_name,
                             None,
                             None,
                             None,
@@ -747,13 +766,27 @@ mod tests {
     fn test_topic_name() {
         let mut dest = test_destination();
         assert_eq!(
-            dest.topic_name("public", "users"),
+            dest.table_names("public.users", "public", "users").topic,
             "test_prefix.public.users"
         );
         assert_eq!(
-            dest.topic_name("myschema", "orders"),
+            dest.table_names("myschema.orders", "myschema", "orders")
+                .topic,
             "test_prefix.myschema.orders"
         );
+    }
+
+    #[test]
+    fn test_topic_and_schema_name_caches_are_stable() {
+        let mut dest = test_destination();
+        let names1 = dest.table_names("public.users", "public", "users").clone();
+        let names2 = dest.table_names("public.users", "public", "users").clone();
+        assert_eq!(names1.topic, names2.topic);
+        assert_eq!(names1.key_schema, names2.key_schema);
+        assert_eq!(names1.envelope, names2.envelope);
+        assert_eq!(names1.topic, "test_prefix.public.users");
+        assert_eq!(names1.key_schema, "test_prefix.public.users.Key");
+        assert_eq!(names1.envelope, "test_prefix.public.users.Envelope");
     }
 
     #[test]
@@ -821,6 +854,7 @@ mod tests {
             "c",
             "public",
             "users",
+            "test_prefix.public.users.Envelope",
             None,
             Some(after_data.clone()),
             None,
@@ -855,6 +889,7 @@ mod tests {
             "d",
             "public",
             "users",
+            "test_prefix.public.users.Envelope",
             Some(before_data.clone()),
             None,
             Some(json!([{"type": "string", "optional": true, "field": "id"}])),
@@ -879,6 +914,7 @@ mod tests {
             "t",
             "public",
             "users",
+            "test_prefix.public.users.Envelope",
             None,
             None,
             None,
@@ -895,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_build_key_from_data_with_keys() {
-        let mut dest = test_destination();
+        let dest = test_destination();
         let data = RowData::from_pairs(vec![
             ("id", ColumnValue::text("42")),
             ("name", ColumnValue::text("Alice")),
@@ -903,7 +939,12 @@ mod tests {
         let key_columns = vec![Arc::from("id")];
 
         let key = dest
-            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
+            .build_key_from_data(
+                "test_prefix.public.users.Key",
+                "public.users",
+                &data,
+                &key_columns,
+            )
             .unwrap();
         assert!(key.is_some());
 
@@ -917,19 +958,24 @@ mod tests {
 
     #[test]
     fn test_build_key_from_data_no_keys() {
-        let mut dest = test_destination();
+        let dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
         let key_columns: Vec<Arc<str>> = vec![];
 
         let key = dest
-            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
+            .build_key_from_data(
+                "test_prefix.public.users.Key",
+                "public.users",
+                &data,
+                &key_columns,
+            )
             .unwrap();
         assert!(key.is_none());
     }
 
     #[test]
     fn test_build_key_composite() {
-        let mut dest = test_destination();
+        let dest = test_destination();
         let data = RowData::from_pairs(vec![
             ("tenant_id", ColumnValue::text("t1")),
             ("user_id", ColumnValue::text("u1")),
@@ -938,7 +984,12 @@ mod tests {
         let key_columns = vec![Arc::from("tenant_id"), Arc::from("user_id")];
 
         let key = dest
-            .build_key_from_data("public", "users", "public.users", &data, &key_columns)
+            .build_key_from_data(
+                "test_prefix.public.users.Key",
+                "public.users",
+                &data,
+                &key_columns,
+            )
             .unwrap();
         assert!(key.is_some());
 
@@ -968,8 +1019,7 @@ mod tests {
 
         let key = dest
             .build_key_from_data(
-                "public",
-                "users",
+                "test_prefix.public.users.Key",
                 "public.users",
                 &data,
                 &stream_key_columns,
@@ -1048,7 +1098,7 @@ mod tests {
         ]);
 
         let key = dest
-            .build_key_for_insert("public", "users", "public.users", &data)
+            .build_key_for_insert("test_prefix.public.users.Key", "public.users", &data)
             .unwrap();
         assert!(key.is_some());
         let key_json: Value = serde_json::from_str(key.as_ref().unwrap()).unwrap();
@@ -1057,11 +1107,11 @@ mod tests {
 
     #[test]
     fn test_build_key_for_insert_no_config() {
-        let mut dest = test_destination();
+        let dest = test_destination();
         let data = RowData::from_pairs(vec![("id", ColumnValue::text("42"))]);
 
         let key = dest
-            .build_key_for_insert("public", "users", "public.users", &data)
+            .build_key_for_insert("test_prefix.public.users.Key", "public.users", &data)
             .unwrap();
         assert!(key.is_none());
     }

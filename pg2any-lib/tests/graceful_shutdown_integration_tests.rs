@@ -109,13 +109,10 @@ async fn setup_pending_transaction_with_events(
 
     manager.flush_all_buffers().await.unwrap();
 
-    let pending_path = manager
+    let (pending_path, metadata) = manager
         .commit_transaction(tx_id, Some(Lsn(commit_lsn)))
         .await
         .unwrap();
-
-    let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-    let metadata = serde_json::from_str(&content).unwrap();
 
     let pending_tx = PendingTransactionFile {
         file_path: pending_path,
@@ -362,12 +359,10 @@ async fn test_mid_batch_cancellation_completes_drain() {
         let event = create_insert_event(*lsn);
         manager.append_event(*i, &event).await.unwrap();
         manager.flush_all_buffers().await.unwrap();
-        let pending_path = manager
+        let (pending_path, metadata) = manager
             .commit_transaction(*i, Some(Lsn(*lsn)))
             .await
             .unwrap();
-        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-        let metadata = serde_json::from_str(&content).unwrap();
         pending_txs.push(PendingTransactionFile {
             file_path: pending_path,
             metadata,
@@ -433,7 +428,7 @@ async fn test_committed_but_undelivered_recovered_on_restart() {
     let event = create_insert_event(55000);
     manager.append_event(42, &event).await.unwrap();
     manager.flush_all_buffers().await.unwrap();
-    let _pending_path = manager
+    let _pending = manager
         .commit_transaction(42, Some(Lsn(55000)))
         .await
         .unwrap();
@@ -558,12 +553,10 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
         let event = create_insert_event(*lsn);
         manager.append_event(*i, &event).await.unwrap();
         manager.flush_all_buffers().await.unwrap();
-        let pending_path = manager
+        let (pending_path, metadata) = manager
             .commit_transaction(*i, Some(Lsn(*lsn)))
             .await
             .unwrap();
-        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-        let metadata = serde_json::from_str(&content).unwrap();
         pending_txs.push(PendingTransactionFile {
             file_path: pending_path,
             metadata,

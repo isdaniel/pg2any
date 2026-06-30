@@ -11,10 +11,10 @@ fn test_buffer_operations() {
     let mut writer = BufferWriter::new();
 
     // Write test data
-    writer.write_u8(0x42).unwrap();
-    writer.write_u16(0x1234).unwrap();
-    writer.write_u32(0x12345678).unwrap();
-    writer.write_u64(0x123456789ABCDEF0).unwrap();
+    writer.write_u8(0x42);
+    writer.write_u16(0x1234);
+    writer.write_u32(0x12345678);
+    writer.write_u64(0x123456789ABCDEF0);
 
     let buffer = writer.freeze();
 

@@ -31,10 +31,15 @@ pub trait TransactionStorage: Send + Sync {
     ///
     /// # Arguments
     /// * `file_path` - Uncompressed file path
+    /// * `known_statement_count` - Producer-tracked statement count (avoids re-parsing)
     ///
     /// # Returns
-    /// * `(PathBuf, usize)` - Actual path where data was written and total statements
-    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)>;
+    /// * `PathBuf` - Actual path where data was written (may differ for compressed storage)
+    async fn write_transaction_from_file(
+        &self,
+        file_path: &Path,
+        known_statement_count: usize,
+    ) -> Result<PathBuf>;
 
     /// Write a raw-lines file (event mode) from an existing uncompressed file
     ///
@@ -44,11 +49,17 @@ pub trait TransactionStorage: Send + Sync {
     ///
     /// # Arguments
     /// * `file_path` - Uncompressed file path containing newline-delimited records
+    /// * `known_line_count` - Producer-tracked line count (avoids re-parsing)
     ///
     /// # Returns
-    /// * `(PathBuf, usize)` - Actual path where data was written and total line count
-    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
-        self.write_transaction_from_file(file_path).await
+    /// * `PathBuf` - Actual path where data was written (may differ for compressed storage)
+    async fn write_raw_lines_from_file(
+        &self,
+        file_path: &Path,
+        known_line_count: usize,
+    ) -> Result<PathBuf> {
+        self.write_transaction_from_file(file_path, known_line_count)
+            .await
     }
 
     /// Read SQL commands from a transaction file, starting from a specific index

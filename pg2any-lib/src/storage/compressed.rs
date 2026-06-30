@@ -233,7 +233,11 @@ impl TransactionStorage for CompressedStorage {
         Ok(compressed_path)
     }
 
-    async fn write_transaction_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+    async fn write_transaction_from_file(
+        &self,
+        file_path: &Path,
+        _known_statement_count: usize,
+    ) -> Result<PathBuf> {
         let compressed_path = file_path.with_extension("sql.gz");
 
         info!(
@@ -331,10 +335,14 @@ impl TransactionStorage for CompressedStorage {
             total_statements
         );
 
-        Ok((compressed_path, total_statements))
+        Ok(compressed_path)
     }
 
-    async fn write_raw_lines_from_file(&self, file_path: &Path) -> Result<(PathBuf, usize)> {
+    async fn write_raw_lines_from_file(
+        &self,
+        file_path: &Path,
+        _known_line_count: usize,
+    ) -> Result<PathBuf> {
         let compressed_path = file_path.with_extension("sql.gz");
 
         info!(
@@ -401,7 +409,7 @@ impl TransactionStorage for CompressedStorage {
 
         if total_lines == 0 {
             let _ = fs::remove_file(&compressed_path).await;
-            return Ok((compressed_path, 0));
+            return Ok(compressed_path);
         }
 
         dest_file
@@ -421,7 +429,7 @@ impl TransactionStorage for CompressedStorage {
             total_lines
         );
 
-        Ok((compressed_path, total_lines))
+        Ok(compressed_path)
     }
 
     async fn read_transaction(&self, file_path: &Path, start_index: usize) -> Result<Vec<String>> {
@@ -719,8 +727,8 @@ mod tests {
         tokio::fs::write(&source_path, &content).await.unwrap();
 
         let storage = CompressedStorage::new();
-        let (compressed_path, _) = storage
-            .write_transaction_from_file(&source_path)
+        let compressed_path = storage
+            .write_transaction_from_file(&source_path, 1)
             .await
             .unwrap();
 
@@ -774,12 +782,11 @@ mod tests {
         tokio::fs::write(&source_path, &content).await.unwrap();
 
         let storage = CompressedStorage::new();
-        let (compressed_path, line_count) = storage
-            .write_raw_lines_from_file(&source_path)
+        let compressed_path = storage
+            .write_raw_lines_from_file(&source_path, 3)
             .await
             .unwrap();
 
-        assert_eq!(line_count, 3);
         assert!(compressed_path.to_string_lossy().ends_with(".sql.gz"));
 
         // Read back using the same path the event-mode consumer uses:
@@ -829,12 +836,10 @@ mod tests {
         tokio::fs::write(&source_path, &content).await.unwrap();
 
         let storage = CompressedStorage::new();
-        let (compressed_path, line_count) = storage
-            .write_raw_lines_from_file(&source_path)
+        let compressed_path = storage
+            .write_raw_lines_from_file(&source_path, 1500)
             .await
             .unwrap();
-
-        assert_eq!(line_count, 1500);
 
         // Verify index has 2 sync points (0 and 1000)
         let index_path = CompressedStorage::index_path(&compressed_path);

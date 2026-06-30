@@ -1,8 +1,6 @@
 use crate::error::Result;
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
-use crate::transaction_manager::{
-    PendingTransactionFile, TransactionFileMetadata, TransactionManager,
-};
+use crate::transaction_manager::{PendingTransactionFile, TransactionManager};
 use crate::types::{EventType, Lsn};
 use chrono::{DateTime, Utc};
 use pg_walstream::LogicalReplicationStream;
@@ -29,35 +27,21 @@ pub(crate) async fn handle_transaction_commit(
         .commit_transaction(transaction_id, event_lsn)
         .await
     {
-        Ok(pending_path) => {
+        Ok((pending_path, metadata)) => {
             info!(
                 "Committed {} transaction file to: {:?} (commit_lsn: {:?})",
                 transaction_type, pending_path, event_lsn
             );
 
-            match tokio::fs::read_to_string(&pending_path).await {
-                Ok(content) => match serde_json::from_str::<TransactionFileMetadata>(&content) {
-                    Ok(metadata) => {
-                        let notification = PendingTransactionFile {
-                            file_path: pending_path.clone(),
-                            metadata,
-                        };
-                        if let Err(e) = commit_notifier.send(notification).await {
-                            warn!(
-                                    "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
-                                    e
-                                );
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse metadata from {:?}: {}", pending_path, e);
-                        metrics_collector.record_error("metadata_parse_failed", "producer");
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read metadata from {:?}: {}", pending_path, e);
-                    metrics_collector.record_error("metadata_read_failed", "producer");
-                }
+            let notification = PendingTransactionFile {
+                file_path: pending_path,
+                metadata,
+            };
+            if let Err(e) = commit_notifier.send(notification).await {
+                warn!(
+                    "Failed to send commit notification to consumer: {}. Consumer may have stopped.",
+                    e
+                );
             }
             Ok(())
         }

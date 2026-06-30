@@ -50,10 +50,8 @@ pg2any/                          # Cargo workspace root
         coalescing.rs            # DML batch coalescing (multi-row INSERT, CASE-WHEN UPDATE)
         common.rs                # Shared transaction execution with session tuning
       storage/
-        traits.rs                # TransactionStorage trait
-        compressed.rs            # Gzip storage impl
-        uncompressed.rs          # Plain file storage impl
-        sql_parser.rs            # Streaming SQL statement parser
+        binary_record.rs         # Length-framed MessagePack ChangeEvent records (on-disk format)
+        mod.rs                   # Storage module exports
       monitoring/
         metrics.rs               # Prometheus metric definitions
         metrics_abstraction.rs   # MetricsCollector trait (allows no-op when metrics disabled)
@@ -89,9 +87,11 @@ pub trait DestinationHandler: Send + Sync {
 - Kafka uses event mode (`supports_event_mode() = true`, `execute_events_batch_with_hook`)
 - Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::custom_destination` (factory closure) or `ConfigBuilder::use_destination::<H>()` (for `H: Default`).
 
-### TransactionStorage (trait) - `storage/traits.rs`
+### Binary record format - `storage/binary_record.rs`
 
-Abstracts file I/O for compressed vs uncompressed transaction files.
+`encode_record`/`decode_record`: each transaction event is a length-framed
+(`u32` LE + payload) MessagePack-serialized `ChangeEvent`. This is the on-disk
+transaction data format (`.mpk` segment files).
 
 ### Config - `config.rs`
 

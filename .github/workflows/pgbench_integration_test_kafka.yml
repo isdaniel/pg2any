@@ -14,7 +14,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        compression: ["true", "false"]
       fail-fast: false
 
     runs-on: ${{ matrix.os }}
@@ -102,7 +101,6 @@ jobs:
         echo "Starting PGBench Chaos Integration Test (Kafka)"
         echo "=========================================="
         echo "OS: ${{ matrix.os }}"
-        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
         echo ""
 
         cd tests/chaos/scripts
@@ -117,7 +115,6 @@ jobs:
         CDC_KAFKA_BROKER: 127.0.0.1:9094
         CDC_KAFKA_TOPIC: pg2any.public.t1
         CDC_CONTAINER_NAME: cdc_application
-        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
         PGBENCH_SCALE: 32
         PGBENCH_CLIENTS: 100
         PGBENCH_THREADS: 8
@@ -214,7 +211,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: cdc-pgbench-kafka-logs-${{ matrix.os }}-${{ matrix.compression }}
+        name: cdc-pgbench-kafka-logs-${{ matrix.os }}
         path: cdc_application_log.txt
         retention-days: 30
 
@@ -222,7 +219,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: pgbench-kafka-results-${{ matrix.os }}-${{ matrix.compression }}
+        name: pgbench-kafka-results-${{ matrix.os }}
         path: tests/chaos/scripts/pgbench_chaos_kafka_results_*.log
         retention-days: 30
 

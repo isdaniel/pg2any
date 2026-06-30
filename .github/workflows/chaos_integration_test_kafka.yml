@@ -14,7 +14,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        compression: ["true", "false"]
       fail-fast: false
 
     runs-on: ${{ matrix.os }}
@@ -102,7 +101,6 @@ jobs:
         echo "Starting Chaos Integration Test (Kafka)"
         echo "=========================================="
         echo "OS: ${{ matrix.os }}"
-        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
         echo ""
 
         cd tests/chaos/scripts
@@ -117,7 +115,6 @@ jobs:
         CDC_KAFKA_BROKER: 127.0.0.1:9094
         CDC_KAFKA_TOPIC: pg2any.public.t1
         CDC_CONTAINER_NAME: cdc_application
-        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
 
     - name: Show Kafka topic info
       if: always()
@@ -174,7 +171,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: cdc-chaos-kafka-logs-${{ matrix.os }}-${{ matrix.compression }}
+        name: cdc-chaos-kafka-logs-${{ matrix.os }}
         path: cdc_application_log.txt
         retention-days: 30
 

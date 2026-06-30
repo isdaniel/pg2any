@@ -132,4 +132,64 @@ pub trait DestinationHandler: Send + Sync {
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }
+
+    /// Bulk-insert a homogeneous run of INSERT rows DIRECTLY from structured
+    /// `RowData`, skipping the render-SQL-then-reparse-SQL round trip.
+    ///
+    /// `table` is the already-mapped, dialect-qualified target table reference
+    /// (the consumer applies `RenderContext::map_schema` + `qualify_table`, so
+    /// it matches the SQL path exactly). `columns` are the raw source column
+    /// names (in row order); each destination quotes them with its own dialect.
+    /// `rows` borrows each event's `&RowData`.
+    ///
+    /// The default impl renders each `ColumnValue` to the SQL value string the
+    /// dialect would produce and delegates to `execute_bulk_insert_with_hook`,
+    /// so every destination keeps working unchanged. Destinations with a native
+    /// bulk path (MySQL `LOAD DATA`) override this to build the load buffer
+    /// directly from the structured rows.
+    async fn execute_bulk_insert_rows_with_hook(
+        &mut self,
+        table: &str,
+        columns: &[Arc<str>],
+        rows: &[&pg_walstream::RowData],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let dialect = self.dialect();
+
+        // Quote columns once with this destination's dialect.
+        let quoted_columns: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let mut s = String::with_capacity(c.len() + 2);
+                dialect.quote_identifier(c, &mut s);
+                s
+            })
+            .collect();
+
+        // Render each ColumnValue to its SQL literal, aligning to `columns` BY NAME. The trait contract takes `columns` and `rows` separately; a custom caller may pass rows whose `(name, value)` order differs from  `columns`. Looking up by name (absent column → Null) prevents silently writing a value into the wrong column.
+        let mut rendered_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut rendered = Vec::with_capacity(columns.len());
+            for col in columns {
+                let mut s = String::new();
+                match row
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == col.as_ref())
+                    .map(|(_, value)| value)
+                {
+                    Some(value) => dialect.render_value(value, &mut s),
+                    None => dialect.render_value(&pg_walstream::ColumnValue::Null, &mut s),
+                }
+                rendered.push(s);
+            }
+            rendered_rows.push(rendered);
+        }
+
+        self.execute_bulk_insert_with_hook(table, &quoted_columns, &rendered_rows, pre_commit_hook)
+            .await
+    }
 }

@@ -14,7 +14,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        compression: ["true", "false"]
       fail-fast: false
 
     runs-on: ${{ matrix.os }}
@@ -99,7 +98,6 @@ jobs:
         echo "Starting CDC Chaos Integration Tests (SQLite)"
         echo "=========================================="
         echo "OS: ${{ matrix.os }}"
-        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
         echo ""
 
         cd tests/chaos/scripts
@@ -111,7 +109,6 @@ jobs:
         CDC_POSTGRES_PASSWORD: test.123
         CDC_POSTGRES_DB: postgres
         CDC_CONTAINER_NAME: cdc_application
-        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
 
     - name: Show PostgreSQL logs on failure
       if: failure()
@@ -151,7 +148,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: cdc-sqlite-chaos-logs-${{ matrix.os }}-${{ matrix.compression }}
+        name: cdc-sqlite-chaos-logs-${{ matrix.os }}
         path: cdc_application_log.txt
         retention-days: 30
 

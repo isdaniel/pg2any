@@ -44,21 +44,18 @@ use crate::destinations::{DestinationHandler, PreCommitHook};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
-use crate::storage::{CompressionIndex, SqlStreamParser, StorageFactory, TransactionStorage};
-use crate::types::{ChangeEvent, DestinationType, EventType, Lsn};
-use async_compression::tokio::bufread::GzipDecoder;
+use crate::types::{ChangeEvent, DestinationType, EventType, Lsn, RowData};
 use chrono::{DateTime, Utc};
 #[cfg(test)]
 use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::{self, File};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, SeekFrom,
-};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -97,8 +94,8 @@ fn dialect_for(dt: &DestinationType) -> &'static dyn SqlDialect {
 struct BufferedEventWriter {
     /// File path being written to
     file_path: PathBuf,
-    /// In-memory buffer for accumulating SQL statements
-    buffer: String,
+    /// In-memory buffer accumulating length-framed MessagePack event records
+    buffer: Vec<u8>,
     /// Maximum buffer size before forced flush
     max_buffer_size: usize,
     /// Persistent writer opened lazily on first flush. Reusing the handle
@@ -111,31 +108,27 @@ impl BufferedEventWriter {
     fn new(file_path: PathBuf, max_buffer_size: usize) -> Self {
         Self {
             file_path,
-            buffer: String::with_capacity(max_buffer_size),
+            buffer: Vec::with_capacity(max_buffer_size),
             max_buffer_size,
             writer: None,
         }
     }
 
-    /// Append SQL statement to the buffer
-    /// Returns true if buffer should be flushed (reached capacity)
-    fn append(&mut self, sql: &str) -> bool {
-        self.buffer.reserve(sql.len() + 1);
-        self.buffer.push_str(sql);
-        self.buffer.push('\n');
-
-        // Check if we should flush
+    /// Append a pre-encoded length-framed record to the buffer (the caller
+    /// already encoded it once for the rotation-size check, so we reuse those
+    /// bytes instead of re-encoding). Returns true if the buffer reached
+    /// capacity and should be flushed.
+    fn append_encoded(&mut self, encoded: &[u8]) -> bool {
+        self.buffer.extend_from_slice(encoded);
         self.buffer.len() >= self.max_buffer_size
     }
 
     /// Flush the buffer to disk
-    /// Always writes uncompressed data - compression happens on commit if enabled
     async fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
-        // Always write uncompressed to avoid multiple gzip stream problem
         if self.writer.is_none() {
             let file = fs::OpenOptions::new()
                 .append(true)
@@ -145,7 +138,7 @@ impl BufferedEventWriter {
         }
 
         let writer = self.writer.as_mut().unwrap();
-        writer.write_all(self.buffer.as_bytes()).await?;
+        writer.write_all(&self.buffer).await?;
         writer.flush().await?;
 
         debug!(
@@ -262,8 +255,19 @@ struct ActiveTransactionState {
     writer: BufferedEventWriter,
 }
 
-struct StatementProcessingState<'a> {
-    batch: &'a mut Vec<String>,
+/// Mutable accumulator threaded through `process_segment_records` across all
+/// segments of one transaction. Holds the SQL-render batch and the event-mode
+/// batch (only one is used per transaction, chosen by `render_sql`), plus the
+/// running record-unit indices shared with the caller.
+struct RecordProcessingState<'a> {
+    /// SQL-render batch (SQL destinations)
+    sql_batch: &'a mut Vec<String>,
+    /// Structured events aligned 1:1 with `sql_batch` (SQL destinations).
+    /// Used to route homogeneous-INSERT runs through the structured bulk path
+    /// (`execute_bulk_insert_rows_with_hook`), bypassing SQL render + reparse.
+    sql_event_batch: &'a mut Vec<ChangeEvent>,
+    /// Event batch (event-mode destinations)
+    event_batch: &'a mut Vec<ChangeEvent>,
     current_command_index: &'a mut usize,
     processed_count: &'a mut usize,
     batch_count: &'a mut usize,
@@ -273,6 +277,24 @@ struct StatementProcessingState<'a> {
 struct PendingProgress {
     last_executed_command_index: usize,
     last_update_timestamp: DateTime<Utc>,
+}
+
+/// Delete a transaction data file, ignoring the case where it is already gone.
+///
+/// A missing file is not an error: recovery and finalize paths may both attempt
+/// to remove the same segment, and an already-deleted file means the desired
+/// post-condition already holds.
+async fn delete_transaction_file(file_path: &Path) -> Result<()> {
+    match fs::remove_file(file_path).await {
+        Ok(()) => {
+            debug!("Deleted transaction data file: {:?}", file_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CdcError::generic(format!(
+            "Failed to delete file {file_path:?}: {e}"
+        ))),
+    }
 }
 
 /// Transaction File Manager for persisting and executing transactions
@@ -289,8 +311,6 @@ pub struct TransactionManager {
     buffer_size: usize,
     /// Maximum segment size before rotating to a new file
     segment_size_bytes: usize,
-    /// Storage implementation (compressed or uncompressed)
-    storage: Arc<dyn TransactionStorage>,
     /// When true, stores raw ChangeEvent JSON instead of generated SQL
     event_mode: bool,
     /// Whether bulk insert optimization is enabled
@@ -298,6 +318,10 @@ pub struct TransactionManager {
     bulk_insert_threshold: usize,
     /// SQL dialect for this destination (selected from `destination_type`).
     dialect: &'static dyn SqlDialect,
+    /// In-memory count of transactions in sql_pending_tx/ (committed, not yet
+    /// finalized). Seeded at startup from the dir scan; kept in sync on
+    /// commit (+1) and finalize/delete (-1). Avoids a per-transaction dir scan.
+    pending_tx_count: AtomicUsize,
 }
 
 impl TransactionManager {
@@ -319,9 +343,6 @@ impl TransactionManager {
         fs::create_dir_all(&pending_tx_dir).await?;
         fs::create_dir_all(&data_tx_dir).await?;
 
-        // Create storage based on environment variable
-        let storage = StorageFactory::from_env();
-
         info!(
             "Transaction file manager initialized at {:?} for {:?}, segment_size_bytes={:?}",
             base_path, destination_type, segment_size_bytes
@@ -337,10 +358,10 @@ impl TransactionManager {
             staged_pending_progress: Arc::new(Mutex::new(HashMap::new())),
             buffer_size: DEFAULT_BUFFER_SIZE,
             segment_size_bytes,
-            storage,
             event_mode: false,
             bulk_insert_threshold: 500,
             dialect,
+            pending_tx_count: AtomicUsize::new(0),
         })
     }
 
@@ -357,6 +378,16 @@ impl TransactionManager {
     /// Configure bulk insert optimization parameters
     pub fn set_bulk_insert_config(&mut self, threshold: usize) {
         self.bulk_insert_threshold = threshold;
+    }
+
+    /// Current in-memory count of committed-but-not-finalized pending transactions.
+    pub fn pending_count(&self) -> usize {
+        self.pending_tx_count.load(Ordering::Relaxed)
+    }
+
+    /// Seed the pending counter at startup from the authoritative dir scan.
+    pub fn seed_pending_count(&self, n: usize) {
+        self.pending_tx_count.store(n, Ordering::Relaxed);
     }
 
     /// Flush all pending buffered writes
@@ -400,9 +431,9 @@ impl TransactionManager {
     }
 
     /// Get the file path for a specific segment of a transaction
-    /// Segment index is 0-based but file names are 1-based (txid_000001.sql)
+    /// Segment index is 0-based but file names are 1-based (txid_000001.mpk)
     fn get_segment_data_file_path(&self, tx_id: u32, segment_index: usize) -> PathBuf {
-        let filename = format!("{}_{:06}.sql", tx_id, segment_index + 1);
+        let filename = format!("{}_{:06}.mpk", tx_id, segment_index + 1);
         self.base_path.join(DATA_TX_DIR).join(filename)
     }
 
@@ -539,23 +570,28 @@ impl TransactionManager {
     /// Append a change event to a running transaction file
     /// Uses buffered I/O to accumulate events in memory before flushing to disk
     /// Automatically flushes when buffer reaches capacity
+    ///
+    /// Each event is serialized as a length-framed MessagePack record (see
+    /// `storage::binary_record`). Only DML/Truncate events are persisted; other
+    /// event types are skipped. Exactly ONE record is written per persisted
+    /// event, so `segment_statement_counts` counts records (1 per event), which
+    /// is the unit the consumer's record-resume arithmetic uses.
     pub async fn append_event(&self, tx_id: u32, event: &ChangeEvent) -> Result<()> {
-        let line = if self.event_mode {
-            match &event.event_type {
-                EventType::Insert { .. }
-                | EventType::Update { .. }
-                | EventType::Delete { .. }
-                | EventType::Truncate(_) => serde_json::to_string(event)
-                    .map_err(|e| CdcError::generic(format!("Failed to serialize event: {e}")))?,
-                _ => return Ok(()),
-            }
-        } else {
-            let sql = self.generate_sql_for_event(event)?;
-            if sql.is_empty() {
-                return Ok(());
-            }
-            sql
-        };
+        // Only DML and Truncate events are persisted to disk. Other event types
+        // (Begin/Commit/Relation/...) carry no row data and are skipped.
+        match &event.event_type {
+            EventType::Insert { .. }
+            | EventType::Update { .. }
+            | EventType::Delete { .. }
+            | EventType::Truncate(_) => {}
+            _ => return Ok(()),
+        }
+
+        // Encode the record once into a scratch buffer so we know its on-disk
+        // size for the rotation decision (segments stay <= segment_size_bytes).
+        let mut encoded = Vec::new();
+        crate::storage::binary_record::encode_record(event, &mut encoded)?;
+        let encoded_len = encoded.len();
 
         let mut transactions = self.active_transactions.lock().await;
 
@@ -566,15 +602,14 @@ impl TransactionManager {
             ))
         })?;
 
-        let line_bytes = line.len() + 1; // include newline
         let estimated_size =
-            tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + line_bytes;
+            tx_state.current_segment_size_bytes + tx_state.writer.buffer.len() + encoded_len;
 
         let should_rotate = estimated_size > self.segment_size_bytes
-            && (tx_state.current_segment_size_bytes > 0 || tx_state.writer.buffer_size() > 0);
+            && (tx_state.current_segment_size_bytes > 0 || !tx_state.writer.buffer.is_empty());
 
         if should_rotate {
-            let buffered_bytes = tx_state.writer.buffer_size();
+            let buffered_bytes = tx_state.writer.buffer.len();
             tx_state.writer.flush().await?;
             tx_state.current_segment_size_bytes += buffered_bytes;
 
@@ -604,7 +639,12 @@ impl TransactionManager {
             );
         }
 
-        let should_flush = tx_state.writer.append(&line);
+        // Append the already-encoded MessagePack record (reusing the bytes from
+        // the rotation-size check above — no second encode) and count it as
+        // exactly one record. The consumer reads back one ChangeEvent per
+        // record, so this 1-per-event count is the authoritative unit for
+        // crash-resume skip arithmetic.
+        let should_flush = tx_state.writer.append_encoded(&encoded);
         if let Some(count) = tx_state
             .segment_statement_counts
             .get_mut(tx_state.current_segment_index)
@@ -612,7 +652,7 @@ impl TransactionManager {
             *count += 1;
         }
         if should_flush {
-            let buffered_bytes = tx_state.writer.buffer_size();
+            let buffered_bytes = tx_state.writer.buffer.len();
             tx_state.writer.flush().await?;
             tx_state.current_segment_size_bytes += buffered_bytes;
         }
@@ -667,24 +707,13 @@ impl TransactionManager {
         let mut final_segments = Vec::new();
 
         for (idx, segment_path) in segment_paths.iter().enumerate() {
-            let (final_data_path, statement_count) = if self.event_mode {
-                self.storage.write_raw_lines_from_file(segment_path).await?
-            } else {
-                self.storage
-                    .write_transaction_from_file(segment_path)
-                    .await?
-            };
-
-            let fallback_count = segment_counts.get(idx).copied().unwrap_or(0);
-            let final_count = if statement_count == 0 {
-                fallback_count
-            } else {
-                statement_count
-            };
-
+            let known_count = segment_counts.get(idx).copied().unwrap_or(0);
+            // Binary MessagePack segments are never SQL-parsed at finalize: the
+            // file is already final and the producer-tracked record count is
+            // authoritative, so finalizing is a no-op passthrough.
             final_segments.push(TransactionSegment {
-                path: final_data_path,
-                statement_count: final_count,
+                path: segment_path.clone(),
+                statement_count: known_count,
             });
         }
 
@@ -745,7 +774,11 @@ impl TransactionManager {
     /// If a pending metadata file already exists with `last_executed_command_index` set
     /// (indicating a previous run already applied this transaction to the destination),
     /// the existing file is preserved to prevent duplicate re-execution on recovery.
-    pub async fn commit_transaction(&self, tx_id: u32, commit_lsn: Option<Lsn>) -> Result<PathBuf> {
+    pub async fn commit_transaction(
+        &self,
+        tx_id: u32,
+        commit_lsn: Option<Lsn>,
+    ) -> Result<(PathBuf, TransactionFileMetadata)> {
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
 
@@ -772,7 +805,7 @@ impl TransactionManager {
                             let _ = fs::remove_file(seg_path).await;
                         }
                     }
-                    return Ok(pending_metadata_path);
+                    return Ok((pending_metadata_path, existing));
                 }
             }
         }
@@ -805,7 +838,9 @@ impl TransactionManager {
             tx_id, commit_lsn
         );
 
-        Ok(pending_metadata_path)
+        self.pending_tx_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok((pending_metadata_path, metadata))
     }
 
     /// Delete transaction files (metadata and data) on abort
@@ -852,7 +887,7 @@ impl TransactionManager {
 
         // Delete data files
         for path in segment_paths {
-            self.storage.delete_transaction(&path).await?;
+            delete_transaction_file(&path).await?;
         }
 
         info!(
@@ -1099,9 +1134,9 @@ impl TransactionManager {
             fs::remove_file(metadata_file_path).await?;
         }
 
-        // Delete data files using storage trait (handles both compressed and uncompressed)
+        // Delete data files
         for path in data_file_paths.iter() {
-            self.storage.delete_transaction(path).await?;
+            delete_transaction_file(path).await?;
         }
 
         info!(
@@ -1118,11 +1153,6 @@ impl TransactionManager {
             dialect: self.dialect,
             schema_mappings: &self.schema_mappings,
         }
-    }
-
-    /// Generate SQL command for a change event
-    fn generate_sql_for_event(&self, event: &ChangeEvent) -> Result<String> {
-        crate::sql_renderer::generate_sql_for_event(&self.render_ctx(), event)
     }
 
     /// Generate TRUNCATE SQL command
@@ -1176,19 +1206,142 @@ impl TransactionManager {
     }
 }
 
+/// Borrowed result of [`detect_homogeneous_insert_run`]:
+/// `(schema, table, ordered column names, per-event row borrows)`.
+type HomogeneousInsertRun<'a> = (&'a str, &'a str, Vec<Arc<str>>, Vec<&'a RowData>);
+
+/// Detect a homogeneous INSERT run in a SQL-render batch's structured events.
+///
+/// Returns `Some((schema, table, columns, rows))` when EVERY event is an
+/// `EventType::Insert` with the SAME `(schema, table)` and the SAME ordered
+/// column-name set; `rows` borrows each event's `&RowData`. Returns `None`
+/// otherwise (mixed event types, differing tables, or differing column sets),
+/// so the caller falls back to the SQL-string path.
+fn detect_homogeneous_insert_run(events: &[ChangeEvent]) -> Option<HomogeneousInsertRun<'_>> {
+    let first = events.first()?;
+    let (schema, table, data) = match &first.event_type {
+        EventType::Insert {
+            schema,
+            table,
+            data,
+            ..
+        } => (schema.as_ref(), table.as_ref(), data),
+        _ => return None,
+    };
+
+    let columns: Vec<Arc<str>> = data.iter().map(|(name, _)| name.clone()).collect();
+
+    let mut rows: Vec<&RowData> = Vec::with_capacity(events.len());
+    rows.push(data);
+
+    for event in &events[1..] {
+        match &event.event_type {
+            EventType::Insert {
+                schema: s,
+                table: t,
+                data: d,
+                ..
+            } => {
+                if s.as_ref() != schema || t.as_ref() != table {
+                    return None;
+                }
+                // Column set (names + order) must match the first row exactly.
+                if d.len() != columns.len() {
+                    return None;
+                }
+                if d.iter()
+                    .zip(columns.iter())
+                    .any(|((name, _), expected)| name.as_ref() != expected.as_ref())
+                {
+                    return None;
+                }
+                rows.push(d);
+            }
+            _ => return None,
+        }
+    }
+
+    Some((schema, table, columns, rows))
+}
+
 impl TransactionManager {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_batch_with_bulk_detection(
         self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
         metadata_path: &Path,
         commands: &[String],
+        events: &[ChangeEvent],
         last_executed_index: usize,
         batch_idx: usize,
         metrics_collector: &Arc<MetricsCollector>,
         bulk_insert_threshold: usize,
     ) -> Result<()> {
         if commands.len() >= bulk_insert_threshold && destination_handler.supports_bulk_insert() {
-            if let Some(parsed) =
+            // STRUCTURED FAST PATH (Phase 3 Stage 5): if the batch is a
+            // homogeneous INSERT run, build the bulk load DIRECTLY from the
+            // structured `RowData`, bypassing SQL render + reparse. `events` is
+            // aligned 1:1 with `commands`, so the resume index is identical.
+            if let Some((schema, table, columns, rows)) = detect_homogeneous_insert_run(events) {
+                // Apply the SAME schema/table mapping the SQL renderer uses, so
+                // the bulk target table matches the rendered INSERT exactly.
+                let ctx = self.render_ctx();
+                let mapped_schema = ctx.map_schema(Some(schema));
+                let mut qualified_table = String::new();
+                ctx.dialect
+                    .qualify_table(mapped_schema, table, &mut qualified_table);
+
+                debug!(
+                    "Structured bulk insert detected: {} rows into {} (batch {})",
+                    rows.len(),
+                    qualified_table,
+                    batch_idx
+                );
+
+                let batch_start_time = Instant::now();
+                let metadata_path_owned = metadata_path.to_path_buf();
+                let file_manager_for_hook = self.clone();
+                let staged_index = last_executed_index;
+
+                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+                    let metadata_path = metadata_path_owned;
+                    let file_manager_for_hook = file_manager_for_hook;
+                    Box::pin(async move {
+                        file_manager_for_hook
+                            .stage_pending_metadata_progress(&metadata_path, staged_index)
+                            .await?;
+                        Ok(())
+                    })
+                }));
+
+                match destination_handler
+                    .execute_bulk_insert_rows_with_hook(
+                        &qualified_table,
+                        &columns,
+                        &rows,
+                        pre_commit_hook,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let duration = batch_start_time.elapsed();
+                        debug!(
+                            "Structured bulk insert batch {} complete: {} rows in {:?}",
+                            batch_idx,
+                            rows.len(),
+                            duration
+                        );
+                        self.flush_staged_pending_progress().await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Structured bulk insert failed for batch {}, falling back to SQL batch: {}",
+                            batch_idx, e
+                        );
+                    }
+                }
+            } else if let Some(parsed) =
                 crate::destinations::bulk_insert::detect_bulk_insert_batch(commands)
             {
                 debug!(
@@ -1313,163 +1466,164 @@ impl TransactionManager {
         Ok(())
     }
 
-    async fn process_reader_statements<R>(
+    /// Read one binary `.mpk` segment file and dispatch its records.
+    ///
+    /// The whole segment is read into memory (bounded by `segment_size_bytes`,
+    /// default 64MB) and decoded as a stream of length-framed MessagePack records via
+    /// `binary_record::decode_record`. Records before `start_record_index` are
+    /// skipped (record-unit crash resume). For each remaining record:
+    ///   * SQL destinations (`render_sql = true`) render the event to SQL and
+    ///     accumulate into the `Vec<String>` batch, flushing via
+    ///     `execute_batch_with_bulk_detection` when the batch fills.
+    ///   * Event-mode destinations (`render_sql = false`) accumulate the raw
+    ///     `ChangeEvent` and flush via `execute_events_batch_with_hook`.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_segment_records(
         self: &Arc<Self>,
-        reader: R,
-        initial_statement_index: usize,
-        start_index: usize,
+        segment_path: &Path,
+        start_record_index: usize,
+        render_sql: bool,
         pending_tx: &PendingTransactionFile,
         destination_handler: &mut Box<dyn DestinationHandler>,
         cancellation_token: &CancellationToken,
         metrics_collector: &Arc<MetricsCollector>,
         batch_size: usize,
-        state: &mut StatementProcessingState<'_>,
-    ) -> Result<()>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let mut parser = SqlStreamParser::new();
-        let mut statement_index = initial_statement_index;
+        state: &mut RecordProcessingState<'_>,
+    ) -> Result<()> {
+        // Binary segments are size-bounded; read-to-end is safe here. (Streaming
+        // decode is a future refinement, see Phase 3 plan.)
+        let bytes = tokio::fs::read(segment_path).await.map_err(|e| {
+            CdcError::generic(format!("Failed to read segment {segment_path:?}: {e}"))
+        })?;
 
-        let buf_reader = BufReader::new(reader);
-        let mut lines = buf_reader.lines();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut record_index = 0usize;
 
-        let mut statements: Vec<String> = Vec::new();
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CdcError::generic(format!("Failed to read line: {e}")))?
+        while let Some(event) =
+            crate::storage::binary_record::decode_record(&mut cursor).map_err(|e| {
+                CdcError::generic(format!(
+                    "Failed to decode record {record_index} in segment {segment_path:?}: {e}"
+                ))
+            })?
         {
-            statements.clear();
-            parser.parse_line(&line, &mut statements)?;
-            for stmt in statements.drain(..) {
-                if statement_index >= start_index {
-                    state.batch.push(stmt);
+            if record_index < start_record_index {
+                record_index += 1;
+                continue;
+            }
 
-                    if state.batch.len() >= batch_size {
-                        if cancellation_token.is_cancelled() {
-                            return Err(CdcError::cancelled(
-                                "Transaction file processing cancelled by shutdown signal",
-                            ));
-                        }
-
-                        let batch_len = state.batch.len();
-                        let next_command_index = *state.current_command_index + batch_len;
-                        let last_executed_index = next_command_index - 1;
-                        *state.batch_count += 1;
-
-                        self.execute_batch_with_bulk_detection(
-                            destination_handler,
-                            &pending_tx.file_path,
-                            state.batch,
-                            last_executed_index,
-                            *state.batch_count,
-                            metrics_collector,
-                            self.bulk_insert_threshold,
-                        )
-                        .await?;
-
-                        *state.current_command_index = next_command_index;
-                        *state.processed_count += batch_len;
-                        state.batch.clear();
-                    }
+            if render_sql {
+                let ctx = self.render_ctx();
+                let mut sql = String::new();
+                crate::sql_renderer::render_sql_for_event_into(&ctx, &event, &mut sql)?;
+                if !sql.is_empty() {
+                    state.sql_batch.push(sql);
+                    // Keep the structured event aligned 1:1 with `sql_batch` so
+                    // the flush can route homogeneous INSERT runs through the
+                    // structured bulk path without desyncing the resume index.
+                    state.sql_event_batch.push(event);
                 }
 
-                statement_index += 1;
-            }
-        }
+                if state.sql_batch.len() >= batch_size {
+                    if cancellation_token.is_cancelled() {
+                        return Err(CdcError::cancelled(
+                            "Transaction file processing cancelled by shutdown signal",
+                        ));
+                    }
 
-        if let Some(stmt) = parser.finish_statement() {
-            if statement_index >= start_index {
-                state.batch.push(stmt);
+                    let batch_len = state.sql_batch.len();
+                    let next_command_index = *state.current_command_index + batch_len;
+                    let last_executed_index = next_command_index - 1;
+                    *state.batch_count += 1;
+
+                    self.execute_batch_with_bulk_detection(
+                        destination_handler,
+                        &pending_tx.file_path,
+                        state.sql_batch,
+                        state.sql_event_batch,
+                        last_executed_index,
+                        *state.batch_count,
+                        metrics_collector,
+                        self.bulk_insert_threshold,
+                    )
+                    .await?;
+
+                    *state.current_command_index = next_command_index;
+                    *state.processed_count += batch_len;
+                    state.sql_batch.clear();
+                    state.sql_event_batch.clear();
+                }
+            } else {
+                state.event_batch.push(event);
+
+                if state.event_batch.len() >= batch_size {
+                    if cancellation_token.is_cancelled() {
+                        return Err(CdcError::cancelled(
+                            "Transaction file processing cancelled by shutdown signal",
+                        ));
+                    }
+
+                    let batch_len = state.event_batch.len();
+                    let next_command_index = *state.current_command_index + batch_len;
+                    let last_executed_index = next_command_index - 1;
+                    *state.batch_count += 1;
+
+                    self.execute_event_batch(
+                        destination_handler,
+                        pending_tx,
+                        state.event_batch,
+                        last_executed_index,
+                    )
+                    .await?;
+
+                    *state.current_command_index = next_command_index;
+                    *state.processed_count += batch_len;
+                    state.event_batch.clear();
+                }
             }
+
+            record_index += 1;
         }
 
         Ok(())
     }
 
-    async fn process_segment_statements(
+    /// Execute a batch of `ChangeEvent`s against an event-mode destination,
+    /// staging resume progress (`last_executed_command_index` in record units)
+    /// via the pre-commit hook so the on-disk index advances atomically with
+    /// the destination commit.
+    async fn execute_event_batch(
         self: &Arc<Self>,
-        segment_path: &Path,
-        start_index: usize,
-        pending_tx: &PendingTransactionFile,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        cancellation_token: &CancellationToken,
-        metrics_collector: &Arc<MetricsCollector>,
-        batch_size: usize,
-        state: &mut StatementProcessingState<'_>,
+        pending_tx: &PendingTransactionFile,
+        events: &[ChangeEvent],
+        last_executed_index: usize,
     ) -> Result<()> {
-        let is_compressed = segment_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("gz"))
-            .unwrap_or(false);
+        let metadata_path = pending_tx.file_path.clone();
+        let file_manager = self.clone();
+        let staged_index = last_executed_index;
 
-        if !is_compressed {
-            let file = tokio::fs::File::open(segment_path).await.map_err(|e| {
-                CdcError::generic(format!("Failed to open SQL file {segment_path:?}: {e}"))
-            })?;
+        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
+            let metadata_path = metadata_path.clone();
+            let file_manager = file_manager.clone();
+            Box::pin(async move {
+                file_manager
+                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                    .await?;
+                Ok(())
+            })
+        }));
 
-            return self
-                .process_reader_statements(
-                    file,
-                    0,
-                    start_index,
-                    pending_tx,
-                    destination_handler,
-                    cancellation_token,
-                    metrics_collector,
-                    batch_size,
-                    state,
-                )
-                .await;
-        }
-
-        let index_path = segment_path.with_extension("sql.gz.idx");
-        let mut initial_statement_index = 0usize;
-        let mut start_offset = 0u64;
-
-        if tokio::fs::metadata(&index_path).await.is_ok() {
-            if let Ok(index) = CompressionIndex::load_from_file(&index_path).await {
-                if let Some(sync_point) = index.find_sync_point_for_index(start_index) {
-                    initial_statement_index = sync_point.statement_index;
-                    start_offset = sync_point.compressed_offset;
-                }
-            }
-        }
-
-        let mut file = tokio::fs::File::open(segment_path).await.map_err(|e| {
-            CdcError::generic(format!(
-                "Failed to open compressed file {segment_path:?}: {e}"
-            ))
-        })?;
-
-        if start_offset > 0 {
-            file.seek(SeekFrom::Start(start_offset))
-                .await
-                .map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to seek compressed file {segment_path:?}: {e}"
-                    ))
-                })?;
-        }
-
-        let buf_reader = BufReader::new(file);
-        let mut decoder = GzipDecoder::new(buf_reader);
-        decoder.multiple_members(true);
-
-        self.process_reader_statements(
-            decoder,
-            initial_statement_index,
-            start_index,
-            pending_tx,
-            destination_handler,
-            cancellation_token,
-            metrics_collector,
-            batch_size,
-            state,
-        )
-        .await
+        destination_handler
+            .execute_events_batch_with_hook(
+                events,
+                pending_tx.metadata.transaction_id,
+                pending_tx.metadata.commit_timestamp,
+                pending_tx.metadata.commit_lsn,
+                pre_commit_hook,
+            )
+            .await?;
+        self.flush_staged_pending_progress().await?;
+        Ok(())
     }
 
     /// Process a single transaction file
@@ -1502,39 +1656,39 @@ impl TransactionManager {
                 if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
                     warn!("Failed to delete duplicate pending file: {}", e);
                 }
+                // This file was counted at startup seed (`list_pending_transactions().len()`) but bypasses the normal finalize decrement path, so decrement here to keep the monitoring counter accurate. (Dedup-skip path only.)
+                self.pending_tx_count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        Some(c.saturating_sub(1))
+                    })
+                    .ok();
                 return Ok(());
             }
-        }
-
-        if self.event_mode {
-            return self
-                .process_transaction_file_event_mode(
-                    pending_tx,
-                    destination_handler,
-                    cancellation_token,
-                    lsn_tracker,
-                    metrics_collector,
-                    batch_size,
-                    shared_lsn_feedback,
-                )
-                .await;
         }
 
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
 
+        // RENDER MODE (not storage format): SQL destinations render each
+        // ChangeEvent to SQL lazily; event-mode destinations (Kafka) pass the
+        // ChangeEvent through. Storage is uniformly binary MessagePack for both.
+        let render_sql = !self.event_mode;
+
         let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        // Resume is uniform in RECORD units: last_executed_command_index counts
+        // records (1 per event), so the next record to apply is +1.
         let start_index = latest_metadata
             .last_executed_command_index
             .map(|idx| idx + 1)
             .unwrap_or(0);
 
         info!(
-            "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_index: {})",
+            "Processing transaction file: {} (tx_id: {}, lsn: {:?}, start_record_index: {}, render_sql: {})",
             pending_tx.file_path.display(),
             tx_id,
             pending_tx.metadata.commit_lsn,
-            start_index
+            start_index,
+            render_sql
         );
 
         let mut segments = if !latest_metadata.segments.is_empty() {
@@ -1550,20 +1704,27 @@ impl TransactionManager {
             )));
         }
 
-        let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        let mut sql_batch: Vec<String> = Vec::with_capacity(batch_size);
+        let mut sql_event_batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
+        let mut event_batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
         let mut batch_count = 0usize;
         let mut processed_count = 0usize;
         let mut current_command_index = start_index;
         let mut remaining_start_index = start_index;
 
-        let mut state = StatementProcessingState {
-            batch: &mut batch,
+        let mut state = RecordProcessingState {
+            sql_batch: &mut sql_batch,
+            sql_event_batch: &mut sql_event_batch,
+            event_batch: &mut event_batch,
             current_command_index: &mut current_command_index,
             processed_count: &mut processed_count,
             batch_count: &mut batch_count,
         };
 
         for segment in segments.drain(..) {
+            // Per-segment skip arithmetic, now in RECORD units (segment
+            // statement_count == record count, 1 per event from the producer).
+            // A fully-applied segment is skipped without opening the file.
             if remaining_start_index > 0
                 && segment.statement_count > 0
                 && remaining_start_index >= segment.statement_count
@@ -1575,55 +1736,75 @@ impl TransactionManager {
             let segment_start_index = remaining_start_index;
             remaining_start_index = 0;
 
-            let stream_result = self
-                .process_segment_statements(
-                    &segment.path,
-                    segment_start_index,
-                    pending_tx,
-                    destination_handler,
-                    cancellation_token,
-                    metrics_collector,
-                    batch_size,
-                    &mut state,
-                )
-                .await;
-
-            stream_result?;
+            self.process_segment_records(
+                &segment.path,
+                segment_start_index,
+                render_sql,
+                pending_tx,
+                destination_handler,
+                cancellation_token,
+                metrics_collector,
+                batch_size,
+                &mut state,
+            )
+            .await?;
         }
 
-        if !batch.is_empty() {
+        // Flush the trailing partial batch (SQL or event mode).
+        if !sql_batch.is_empty() || !event_batch.is_empty() {
             if cancellation_token.is_cancelled() {
                 return Err(CdcError::cancelled(
                     "Transaction file processing cancelled by shutdown signal",
                 ));
             }
 
-            let batch_len = batch.len();
-            let next_command_index = current_command_index + batch_len;
-            let last_executed_index = next_command_index - 1;
-            batch_count += 1;
+            if render_sql {
+                let batch_len = sql_batch.len();
+                let next_command_index = current_command_index + batch_len;
+                let last_executed_index = next_command_index - 1;
+                batch_count += 1;
 
-            self.execute_batch_with_bulk_detection(
-                destination_handler,
-                &pending_tx.file_path,
-                &batch,
-                last_executed_index,
-                batch_count,
-                metrics_collector,
-                self.bulk_insert_threshold,
-            )
-            .await?;
+                self.execute_batch_with_bulk_detection(
+                    destination_handler,
+                    &pending_tx.file_path,
+                    &sql_batch,
+                    &sql_event_batch,
+                    last_executed_index,
+                    batch_count,
+                    metrics_collector,
+                    self.bulk_insert_threshold,
+                )
+                .await?;
 
-            current_command_index = next_command_index;
-            processed_count += batch_len;
-            batch.clear();
+                current_command_index = next_command_index;
+                processed_count += batch_len;
+                sql_batch.clear();
+                sql_event_batch.clear();
+            } else {
+                let batch_len = event_batch.len();
+                let next_command_index = current_command_index + batch_len;
+                let last_executed_index = next_command_index - 1;
+                batch_count += 1;
+
+                self.execute_event_batch(
+                    destination_handler,
+                    pending_tx,
+                    &event_batch,
+                    last_executed_index,
+                )
+                .await?;
+
+                current_command_index = next_command_index;
+                processed_count += batch_len;
+                event_batch.clear();
+            }
         }
 
         let total_commands = current_command_index;
 
         if processed_count == 0 {
             info!(
-                "All commands already executed for transaction file: {} (tx_id: {})",
+                "All records already executed for transaction file: {} (tx_id: {})",
                 pending_tx.file_path.display(),
                 tx_id
             );
@@ -1642,7 +1823,7 @@ impl TransactionManager {
 
         let duration = start_time.elapsed();
         info!(
-            "Successfully executed {} remaining commands ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
+            "Successfully executed {} remaining records ({} total) in {} batches in {:?} (tx_id: {}, avg: {:?}/batch)",
             processed_count,
             total_commands,
             batch_count,
@@ -1657,233 +1838,6 @@ impl TransactionManager {
             lsn_tracker,
             metrics_collector,
             total_commands,
-            shared_lsn_feedback,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn process_event_lines<R: AsyncRead + Unpin>(
-        self: &Arc<Self>,
-        mut lines: tokio::io::Lines<BufReader<R>>,
-        segment_path: &Path,
-        batch: &mut Vec<ChangeEvent>,
-        batch_count: &mut usize,
-        total_events: &mut usize,
-        events_seen: &mut usize,
-        skip_until: usize,
-        batch_size: usize,
-        tx_id: u32,
-        pending_tx: &PendingTransactionFile,
-        destination_handler: &mut Box<dyn DestinationHandler>,
-        cancellation_token: &CancellationToken,
-    ) -> Result<()> {
-        while let Some(line) = lines.next_line().await.map_err(|e| {
-            CdcError::generic(format!("Failed to read segment {:?}: {e}", segment_path))
-        })? {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            *events_seen += 1;
-            if *events_seen <= skip_until {
-                continue;
-            }
-
-            let event: ChangeEvent = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Err(CdcError::generic(format!(
-                        "Corrupted event line in segment {:?} at index {}: {e}. \
-                         Stopping to prevent silent data loss.",
-                        segment_path, events_seen
-                    )));
-                }
-            };
-            batch.push(event);
-
-            if batch.len() >= batch_size {
-                if cancellation_token.is_cancelled() {
-                    return Err(CdcError::cancelled(
-                        "Event-mode processing cancelled by shutdown signal",
-                    ));
-                }
-                *batch_count += 1;
-                *total_events += batch.len();
-                let metadata_path = pending_tx.file_path.clone();
-                let file_manager = self.clone();
-                let staged_index = *events_seen;
-
-                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                    let metadata_path = metadata_path.clone();
-                    let file_manager = file_manager.clone();
-                    Box::pin(async move {
-                        file_manager
-                            .stage_pending_metadata_progress(&metadata_path, staged_index)
-                            .await?;
-                        Ok(())
-                    })
-                }));
-
-                destination_handler
-                    .execute_events_batch_with_hook(
-                        batch,
-                        tx_id,
-                        pending_tx.metadata.commit_timestamp,
-                        pending_tx.metadata.commit_lsn,
-                        pre_commit_hook,
-                    )
-                    .await?;
-                self.flush_staged_pending_progress().await?;
-                batch.clear();
-            }
-        }
-        Ok(())
-    }
-
-    /// Process a transaction file in event-mode (for non-SQL destinations like Kafka).
-    /// Reads JSON-serialized ChangeEvents from segment files and calls
-    /// execute_events_batch_with_hook() on the destination handler.
-    pub(crate) async fn process_transaction_file_event_mode(
-        self: Arc<Self>,
-        pending_tx: &PendingTransactionFile,
-        destination_handler: &mut Box<dyn DestinationHandler>,
-        cancellation_token: &CancellationToken,
-        lsn_tracker: &Arc<LsnTracker>,
-        metrics_collector: &Arc<MetricsCollector>,
-        batch_size: usize,
-        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
-    ) -> Result<()> {
-        let tx_id = pending_tx.metadata.transaction_id;
-        let start_time = Instant::now();
-
-        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
-        let segments = if !latest_metadata.segments.is_empty() {
-            latest_metadata.segments
-        } else {
-            pending_tx.metadata.segments.clone()
-        };
-
-        let skip_until = latest_metadata.last_executed_command_index.unwrap_or(0);
-
-        if skip_until > 0 {
-            info!(
-                "Event-mode: resuming tx {} from event index {} (skipping already processed)",
-                tx_id, skip_until
-            );
-        }
-
-        let mut batch: Vec<ChangeEvent> = Vec::with_capacity(batch_size);
-        let mut batch_count = 0usize;
-        let mut total_events = 0usize;
-        let mut events_seen = 0usize;
-
-        for segment in &segments {
-            let is_compressed = segment
-                .path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("gz"))
-                .unwrap_or(false);
-
-            if is_compressed {
-                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!(
-                        "Failed to open compressed segment {:?}: {e}",
-                        segment.path
-                    ))
-                })?;
-                let buf_reader = BufReader::new(file);
-                let mut decoder = GzipDecoder::new(buf_reader);
-                decoder.multiple_members(true);
-                let lines = BufReader::new(decoder).lines();
-                self.process_event_lines(
-                    lines,
-                    &segment.path,
-                    &mut batch,
-                    &mut batch_count,
-                    &mut total_events,
-                    &mut events_seen,
-                    skip_until,
-                    batch_size,
-                    tx_id,
-                    pending_tx,
-                    destination_handler,
-                    cancellation_token,
-                )
-                .await?;
-            } else {
-                let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
-                    CdcError::generic(format!("Failed to open segment {:?}: {e}", segment.path))
-                })?;
-                let lines = BufReader::new(file).lines();
-                self.process_event_lines(
-                    lines,
-                    &segment.path,
-                    &mut batch,
-                    &mut batch_count,
-                    &mut total_events,
-                    &mut events_seen,
-                    skip_until,
-                    batch_size,
-                    tx_id,
-                    pending_tx,
-                    destination_handler,
-                    cancellation_token,
-                )
-                .await?;
-            }
-        }
-
-        // Flush remaining events
-        if !batch.is_empty() {
-            if cancellation_token.is_cancelled() {
-                return Err(CdcError::cancelled(
-                    "Event-mode processing cancelled by shutdown signal",
-                ));
-            }
-            batch_count += 1;
-            total_events += batch.len();
-            let metadata_path = pending_tx.file_path.clone();
-            let file_manager = self.clone();
-            let staged_index = events_seen;
-
-            let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                let metadata_path = metadata_path.clone();
-                let file_manager = file_manager.clone();
-                Box::pin(async move {
-                    file_manager
-                        .stage_pending_metadata_progress(&metadata_path, staged_index)
-                        .await?;
-                    Ok(())
-                })
-            }));
-
-            destination_handler
-                .execute_events_batch_with_hook(
-                    &batch,
-                    tx_id,
-                    pending_tx.metadata.commit_timestamp,
-                    pending_tx.metadata.commit_lsn,
-                    pre_commit_hook,
-                )
-                .await?;
-            self.flush_staged_pending_progress().await?;
-        }
-
-        let duration = start_time.elapsed();
-        info!(
-            "Event-mode: processed {} events in {} batches in {:?} (tx_id: {})",
-            total_events, batch_count, duration, tx_id
-        );
-
-        self.finalize_transaction_file(
-            pending_tx,
-            lsn_tracker,
-            metrics_collector,
-            total_events,
             shared_lsn_feedback,
         )
         .await?;
@@ -1972,8 +1926,20 @@ impl TransactionManager {
         self.clear_staged_pending_progress(&pending_tx.file_path)
             .await;
 
+        // Decrement unconditionally to match the unconditional increment in
+        // `commit_transaction`: any transaction that reached the committed/pending
+        // state was counted, so it must be uncounted here regardless of
+        // `commit_lsn`. `fetch_update` applies a saturating decrement to the atomic itself, so a spurious finalize at count 0 cannot wrap the counter to `usize::MAX` in release builds (where `debug_assert!` is off).
+        let prev = self
+            .pending_tx_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        debug_assert!(prev > 0, "pending counter underflow");
+        let pending_count = prev.saturating_sub(1);
+
         if pending_tx.metadata.commit_lsn.is_some() {
-            let pending_count = self.list_pending_transactions().await?.len();
             lsn_tracker.update_consumer_state(
                 tx_id,
                 pending_tx.metadata.commit_timestamp,
@@ -1981,7 +1947,7 @@ impl TransactionManager {
             );
 
             debug!(
-                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (after deletion)",
+                "Updated LSN tracker consumer state: tx_id={}, pending_count={} (in-memory)",
                 tx_id, pending_count
             );
         }
@@ -1994,7 +1960,8 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use pg_walstream::ColumnValue;
+    use pg_walstream::{ColumnValue, RowData};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Create a minimal `TransactionManager` for unit-testing `format_value`
     /// and SQL generation helpers without filesystem side-effects.
@@ -2008,6 +1975,178 @@ mod tests {
         TransactionManager::new(&dir, dest, None, 10 * 1024 * 1024)
             .await
             .expect("test manager creation should succeed")
+    }
+
+    /// Build a `TransactionManager` in a unique temp dir for tests that need
+    /// real filesystem transaction lifecycle (begin/append/commit).
+    async fn test_manager_fs() -> (TransactionManager, std::path::PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pg2any_tx_lifecycle_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let mgr = TransactionManager::new(&dir, DestinationType::MySQL, None, 10 * 1024 * 1024)
+            .await
+            .expect("test manager creation should succeed");
+        (mgr, dir)
+    }
+
+    /// Begin a normal transaction, append one INSERT event, and flush buffers so
+    /// the transaction is ready to commit.
+    async fn seed_simple_transaction(manager: &TransactionManager, tx_id: u32) {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("test")),
+        ]);
+        let event = ChangeEvent::insert("public", "test", 12345, data, crate::types::Lsn(1));
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .expect("begin_transaction should succeed");
+        manager
+            .append_event(tx_id, &event)
+            .await
+            .expect("append_event should succeed");
+        manager
+            .flush_all_buffers()
+            .await
+            .expect("flush_all_buffers should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_returns_inmemory_metadata() {
+        let (manager, _tmp) = test_manager_fs().await;
+        let tx_id = 42;
+        seed_simple_transaction(&manager, tx_id).await;
+
+        let (path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+
+        // Returned in-memory metadata must match what was persisted to disk.
+        let on_disk = manager.read_metadata(&path).await.unwrap();
+        assert_eq!(metadata.transaction_id, tx_id);
+        assert_eq!(metadata.transaction_id, on_disk.transaction_id);
+        assert_eq!(metadata.commit_lsn, on_disk.commit_lsn);
+        assert_eq!(metadata.segments.len(), on_disk.segments.len());
+    }
+
+    #[tokio::test]
+    async fn test_pending_counter_tracks_commit_and_finalize() {
+        let (manager, _tmp) = test_manager_fs().await;
+        assert_eq!(manager.pending_count(), 0);
+
+        seed_simple_transaction(&manager, 1).await;
+        manager
+            .commit_transaction(1, Some(crate::types::Lsn(10)))
+            .await
+            .unwrap();
+        assert_eq!(manager.pending_count(), 1, "commit should increment");
+
+        // Counter must equal the authoritative dir-scan count.
+        let scanned = manager.list_pending_transactions().await.unwrap().len();
+        assert_eq!(manager.pending_count(), scanned);
+    }
+
+    /// Producer must write each persisted event as ONE decodable length-framed
+    /// MessagePack record to a `.mpk` segment. A multi-table TRUNCATE is a single
+    /// event => a single record (record-unit counting), unlike the old
+    /// SQL-statement counting where it rendered N statements.
+    #[tokio::test]
+    async fn test_statement_count_is_record_count() {
+        let (manager, _tmp) = test_manager_fs().await;
+        let tx_id = 7;
+
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+
+        // An ordinary INSERT (1 record) ...
+        let data = RowData::from_pairs(vec![("id", ColumnValue::text("1"))]);
+        let insert = ChangeEvent::insert("public", "test", 12345, data, crate::types::Lsn(1));
+        manager.append_event(tx_id, &insert).await.unwrap();
+
+        // ... alongside a multi-table TRUNCATE which is still ONE event/record.
+        let truncate = ChangeEvent {
+            event_type: EventType::Truncate(vec![
+                std::sync::Arc::from("public.a"),
+                std::sync::Arc::from("public.b"),
+                std::sync::Arc::from("public.c"),
+            ]),
+            lsn: crate::types::Lsn(2),
+            metadata: None,
+        };
+        manager.append_event(tx_id, &truncate).await.unwrap();
+
+        manager.flush_all_buffers().await.unwrap();
+        let (_path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+
+        // 2 events => 2 records (record-unit count).
+        let stored: usize = metadata.segments.iter().map(|s| s.statement_count).sum();
+        assert_eq!(stored, 2, "record count must be 1 per event (2 events)");
+
+        // The segment must decode back to exactly 2 records, then EOF.
+        let mut decoded = 0usize;
+        for seg in &metadata.segments {
+            let bytes = std::fs::read(&seg.path).unwrap();
+            let mut cur = std::io::Cursor::new(bytes);
+            while crate::storage::binary_record::decode_record(&mut cur)
+                .unwrap()
+                .is_some()
+            {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 2, "consumer must read back 2 binary records");
+    }
+
+    /// Producer writes a decodable `.mpk` segment: one INSERT event round-trips
+    /// to one record, and a second decode at EOF returns None.
+    #[tokio::test]
+    async fn test_producer_writes_decodable_binary_records() {
+        let (manager, _tmp) = test_manager_fs().await;
+        let tx_id = 7;
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("42")),
+            ("name", ColumnValue::text("Alice")),
+        ]);
+        let ev = ChangeEvent::insert("public", "users", 16384, data, crate::types::Lsn(5));
+        manager.append_event(tx_id, &ev).await.unwrap();
+        manager.flush_all_buffers().await.unwrap();
+        let (_path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(10)))
+            .await
+            .unwrap();
+
+        let seg = &metadata.segments[0].path;
+        assert_eq!(
+            seg.extension().and_then(|e| e.to_str()),
+            Some("mpk"),
+            "data segment must use .mpk extension"
+        );
+        let bytes = std::fs::read(seg).unwrap();
+        let mut cur = std::io::Cursor::new(bytes);
+        let got = crate::storage::binary_record::decode_record(&mut cur)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            got.event_type,
+            crate::types::EventType::Insert { .. }
+        ));
+        assert!(crate::storage::binary_record::decode_record(&mut cur)
+            .unwrap()
+            .is_none());
     }
 
     // ── SQL injection prevention ──────────────────────────────────────
@@ -2487,5 +2626,264 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── End-to-end binary format: producer → disk → consumer ──────────
+    //
+    // These exercise the full Phase 3 path: producer MessagePack-serializes events to
+    // `.mpk` segments, the consumer decodes records and either renders SQL
+    // (SQL destinations) or passes ChangeEvents through (event-mode), with
+    // record-unit crash resume.
+
+    use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
+    use std::sync::Mutex as StdMutex;
+
+    /// Mock destination that captures SQL batches OR event batches, configurable
+    /// for SQL-mode vs event-mode, used by the e2e consumer tests.
+    struct CapturingDestination {
+        event_mode: bool,
+        sql: Arc<StdMutex<Vec<String>>>,
+        events: Arc<StdMutex<Vec<ChangeEvent>>>,
+    }
+
+    impl CapturingDestination {
+        fn sql_mode() -> (Self, Arc<StdMutex<Vec<String>>>) {
+            let sql = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    event_mode: false,
+                    sql: sql.clone(),
+                    events: Arc::new(StdMutex::new(Vec::new())),
+                },
+                sql,
+            )
+        }
+
+        fn event_mode() -> (Self, Arc<StdMutex<Vec<ChangeEvent>>>) {
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    event_mode: true,
+                    sql: Arc::new(StdMutex::new(Vec::new())),
+                    events: events.clone(),
+                },
+                events,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DestinationHandler for CapturingDestination {
+        async fn connect(&mut self, _connection_string: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
+
+        async fn execute_sql_batch_with_hook(
+            &mut self,
+            commands: &[String],
+            pre_commit_hook: Option<PreCommitHook>,
+        ) -> Result<()> {
+            self.sql.lock().unwrap().extend_from_slice(commands);
+            if let Some(hook) = pre_commit_hook {
+                hook().await?;
+            }
+            Ok(())
+        }
+
+        fn supports_event_mode(&self) -> bool {
+            self.event_mode
+        }
+
+        async fn execute_events_batch_with_hook(
+            &mut self,
+            events: &[ChangeEvent],
+            _transaction_id: u32,
+            _commit_timestamp: DateTime<Utc>,
+            _commit_lsn: Option<Lsn>,
+            pre_commit_hook: Option<PreCommitHook>,
+        ) -> Result<()> {
+            self.events.lock().unwrap().extend_from_slice(events);
+            if let Some(hook) = pre_commit_hook {
+                hook().await?;
+            }
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn run_consumer(
+        manager: &Arc<TransactionManager>,
+        pending: &PendingTransactionFile,
+        handler: &mut Box<dyn DestinationHandler>,
+        batch_size: usize,
+    ) {
+        let tracker = LsnTracker::new(None).await;
+        let metrics = Arc::new(MetricsCollector::new());
+        let feedback = SharedLsnFeedback::new_shared();
+        let cancel = CancellationToken::new();
+        manager
+            .clone()
+            .process_transaction_file(
+                pending, handler, &cancel, &tracker, &metrics, batch_size, &feedback,
+            )
+            .await
+            .expect("process_transaction_file should succeed");
+    }
+
+    fn sample_events() -> Vec<ChangeEvent> {
+        vec![
+            ChangeEvent::insert(
+                "public",
+                "users",
+                100,
+                RowData::from_pairs(vec![("id", ColumnValue::text("1"))]),
+                crate::types::Lsn(1),
+            ),
+            ChangeEvent::insert(
+                "public",
+                "users",
+                100,
+                RowData::from_pairs(vec![("id", ColumnValue::text("2"))]),
+                crate::types::Lsn(2),
+            ),
+            ChangeEvent::insert(
+                "public",
+                "users",
+                100,
+                RowData::from_pairs(vec![("id", ColumnValue::text("3"))]),
+                crate::types::Lsn(3),
+            ),
+        ]
+    }
+
+    /// SQL destination: consumer renders the same SQL that `sql_renderer`
+    /// produces for each event, in order.
+    #[tokio::test]
+    async fn test_e2e_sql_destination_renders_in_order() {
+        let (mgr, dir) = test_manager_fs().await;
+        let manager = Arc::new(mgr);
+        let tx_id = 11;
+        let events = sample_events();
+
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+        for ev in &events {
+            manager.append_event(tx_id, ev).await.unwrap();
+        }
+        manager.flush_all_buffers().await.unwrap();
+        let (path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+        let pending = PendingTransactionFile {
+            file_path: path,
+            metadata,
+        };
+
+        let (dest, captured) = CapturingDestination::sql_mode();
+        let mut handler: Box<dyn DestinationHandler> = Box::new(dest);
+        run_consumer(&manager, &pending, &mut handler, 2).await;
+
+        // Expected SQL is exactly what sql_renderer produces for each event.
+        let ctx = manager.render_ctx();
+        let expected: Vec<String> = events
+            .iter()
+            .map(|ev| crate::sql_renderer::generate_sql_for_event(&ctx, ev).unwrap())
+            .collect();
+        assert_eq!(*captured.lock().unwrap(), expected);
+        let _ = dir;
+    }
+
+    /// Event-mode destination: consumer passes the decoded ChangeEvents through
+    /// to execute_events_batch_with_hook, in order.
+    #[tokio::test]
+    async fn test_e2e_event_mode_passes_events_in_order() {
+        let (mgr, _dir) = test_manager_fs().await;
+        let mut mgr = mgr;
+        mgr.set_event_mode(true); // selects RENDER MODE = event pass-through
+        let manager = Arc::new(mgr);
+        let tx_id = 12;
+        let events = sample_events();
+
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+        for ev in &events {
+            manager.append_event(tx_id, ev).await.unwrap();
+        }
+        manager.flush_all_buffers().await.unwrap();
+        let (path, metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+        let pending = PendingTransactionFile {
+            file_path: path,
+            metadata,
+        };
+
+        let (dest, captured) = CapturingDestination::event_mode();
+        let mut handler: Box<dyn DestinationHandler> = Box::new(dest);
+        run_consumer(&manager, &pending, &mut handler, 2).await;
+
+        let got = captured.lock().unwrap();
+        assert_eq!(got.len(), 3, "all 3 events passed through");
+        for (g, e) in got.iter().zip(events.iter()) {
+            assert_eq!(g.lsn, e.lsn);
+        }
+    }
+
+    /// Crash resume: with last_executed_command_index = 0 (record units), the
+    /// consumer skips exactly the first record and applies the remainder.
+    #[tokio::test]
+    async fn test_e2e_resume_skips_record_units() {
+        let (mgr, _dir) = test_manager_fs().await;
+        let manager = Arc::new(mgr);
+        let tx_id = 13;
+        let events = sample_events();
+
+        manager
+            .begin_transaction(tx_id, Utc::now(), "normal")
+            .await
+            .unwrap();
+        for ev in &events {
+            manager.append_event(tx_id, ev).await.unwrap();
+        }
+        manager.flush_all_buffers().await.unwrap();
+        let (path, mut metadata) = manager
+            .commit_transaction(tx_id, Some(crate::types::Lsn(100)))
+            .await
+            .unwrap();
+
+        // Simulate a prior run that already applied record index 0.
+        metadata.last_executed_command_index = Some(0);
+        manager
+            .write_pending_metadata(&path, &metadata)
+            .await
+            .unwrap();
+
+        let pending = PendingTransactionFile {
+            file_path: path,
+            metadata,
+        };
+
+        let (dest, captured) = CapturingDestination::sql_mode();
+        let mut handler: Box<dyn DestinationHandler> = Box::new(dest);
+        run_consumer(&manager, &pending, &mut handler, 10).await;
+
+        // Records 1 and 2 only (record 0 skipped).
+        let ctx = manager.render_ctx();
+        let expected: Vec<String> = events[1..]
+            .iter()
+            .map(|ev| crate::sql_renderer::generate_sql_for_event(&ctx, ev).unwrap())
+            .collect();
+        assert_eq!(*captured.lock().unwrap(), expected);
     }
 }

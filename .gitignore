@@ -20,6 +20,6 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-pg2any_last_lsn
+pg2any_last_lsn.*
 .github/instructions/*
 tests/chaos/scripts/*.log

@@ -79,6 +79,59 @@ fn create_insert_event(lsn: u64) -> ChangeEvent {
     ChangeEvent::insert("public", "test", 12345, data, Lsn::from(lsn))
 }
 
+/// INSERT event carrying a distinguishing `id` so the consumer's rendered SQL
+/// can be matched back to the exact source record. Used by the multi-segment
+/// crash-resume test to prove WHICH records were applied.
+fn create_insert_event_with_id(lsn: u64, id: usize) -> ChangeEvent {
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text(&id.to_string())),
+        ("name", ColumnValue::text(&format!("row-{id}"))),
+    ]);
+    ChangeEvent::insert("public", "test", 12345, data, Lsn::from(lsn))
+}
+
+/// Destination mock that CAPTURES every rendered SQL command it receives, so a
+/// test can assert exactly which records were applied (no duplicates, no skips).
+struct CapturingDestination {
+    commands: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl CapturingDestination {
+    fn new() -> Self {
+        Self {
+            commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl DestinationHandler for CapturingDestination {
+    async fn connect(&mut self, _connection_string: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
+
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        commands: &[String],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        {
+            let mut captured = self.commands.lock().unwrap();
+            captured.extend_from_slice(commands);
+        }
+        if let Some(hook) = pre_commit_hook {
+            hook().await?;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 async fn setup_pending_transaction_with_events(
     temp_dir: &TempDir,
     tx_id: u32,
@@ -109,13 +162,10 @@ async fn setup_pending_transaction_with_events(
 
     manager.flush_all_buffers().await.unwrap();
 
-    let pending_path = manager
+    let (pending_path, metadata) = manager
         .commit_transaction(tx_id, Some(Lsn(commit_lsn)))
         .await
         .unwrap();
-
-    let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-    let metadata = serde_json::from_str(&content).unwrap();
 
     let pending_tx = PendingTransactionFile {
         file_path: pending_path,
@@ -362,12 +412,10 @@ async fn test_mid_batch_cancellation_completes_drain() {
         let event = create_insert_event(*lsn);
         manager.append_event(*i, &event).await.unwrap();
         manager.flush_all_buffers().await.unwrap();
-        let pending_path = manager
+        let (pending_path, metadata) = manager
             .commit_transaction(*i, Some(Lsn(*lsn)))
             .await
             .unwrap();
-        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-        let metadata = serde_json::from_str(&content).unwrap();
         pending_txs.push(PendingTransactionFile {
             file_path: pending_path,
             metadata,
@@ -433,7 +481,7 @@ async fn test_committed_but_undelivered_recovered_on_restart() {
     let event = create_insert_event(55000);
     manager.append_event(42, &event).await.unwrap();
     manager.flush_all_buffers().await.unwrap();
-    let _pending_path = manager
+    let _pending = manager
         .commit_transaction(42, Some(Lsn(55000)))
         .await
         .unwrap();
@@ -558,12 +606,10 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
         let event = create_insert_event(*lsn);
         manager.append_event(*i, &event).await.unwrap();
         manager.flush_all_buffers().await.unwrap();
-        let pending_path = manager
+        let (pending_path, metadata) = manager
             .commit_transaction(*i, Some(Lsn(*lsn)))
             .await
             .unwrap();
-        let content = tokio::fs::read_to_string(&pending_path).await.unwrap();
-        let metadata = serde_json::from_str(&content).unwrap();
         pending_txs.push(PendingTransactionFile {
             file_path: pending_path,
             metadata,
@@ -605,4 +651,139 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
     let (tracker_restart, loaded_lsn) = LsnTracker::new_with_load(Some(lsn_path)).await;
     assert_eq!(loaded_lsn, Some(Lsn(40000)));
     assert!(50000 > tracker_restart.get());
+}
+
+/// Covers the most safety-critical resume path: a crash-resume checkpoint that
+/// lands INSIDE a later `.mpk` segment, exercising the per-segment record-unit
+/// skip arithmetic (`remaining_start_index -= segment.statement_count`, then the
+/// in-segment remainder skip) in `process_transaction_file`.
+///
+/// A tiny `segment_size_bytes` forces segment rotation so 10 INSERT events span >= 2
+/// segments. The checkpoint is set so resume must apply ONLY the un-applied
+/// suffix. We capture the rendered SQL and assert EXACTLY which records ran,
+/// proving no duplicate, no skip, and no off-by-one at the segment boundary.
+#[tokio::test]
+async fn test_multi_segment_crash_resume_applies_exact_suffix() {
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_multiseg");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    const COMMIT_LSN: u64 = 120_000;
+    const TX_ID: u32 = 700;
+    const RECORD_COUNT: usize = 10;
+
+    // Tiny segment size forces rotation roughly every record, yielding many
+    // segments. Each encoded INSERT record is well over 32 bytes.
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, None, 32)
+            .await
+            .unwrap(),
+    );
+
+    let timestamp = Utc::now();
+    manager
+        .begin_transaction(TX_ID, timestamp, "normal")
+        .await
+        .unwrap();
+
+    for id in 0..RECORD_COUNT {
+        let event = create_insert_event_with_id(COMMIT_LSN, id);
+        manager.append_event(TX_ID, &event).await.unwrap();
+    }
+    manager.flush_all_buffers().await.unwrap();
+
+    let (pending_path, metadata) = manager
+        .commit_transaction(TX_ID, Some(Lsn(COMMIT_LSN)))
+        .await
+        .unwrap();
+
+    // (1) Confirm rotation actually produced multiple segments AND that the
+    // total record count is split across them (so the cross-segment subtraction
+    // genuinely runs during resume).
+    assert!(
+        metadata.segments.len() >= 2,
+        "expected >= 2 segments to exercise cross-segment skip, got {}",
+        metadata.segments.len()
+    );
+    let total_records: usize = metadata.segments.iter().map(|s| s.statement_count).sum();
+    assert_eq!(
+        total_records, RECORD_COUNT,
+        "segment statement_counts must sum to the number of appended records"
+    );
+    // The checkpoint must land in a LATER segment (not segment 0) for this test
+    // to cover the subtraction. With last_executed_command_index = 6, records
+    // 0..=6 are already applied; only 7, 8, 9 must be applied on resume.
+    const LAST_EXECUTED: usize = 6;
+    assert!(
+        metadata.segments[0].statement_count <= LAST_EXECUTED,
+        "checkpoint {LAST_EXECUTED} must fall beyond segment 0 (len {}) so the \
+         per-segment subtraction runs",
+        metadata.segments[0].statement_count
+    );
+
+    // (2) Seed the resume checkpoint into the pending metadata on disk.
+    let pending_tx = PendingTransactionFile {
+        file_path: pending_path,
+        metadata,
+    };
+    let metadata_content = tokio::fs::read_to_string(&pending_tx.file_path)
+        .await
+        .unwrap();
+    let mut disk_metadata: pg2any_lib::transaction_manager::TransactionFileMetadata =
+        serde_json::from_str(&metadata_content).unwrap();
+    disk_metadata.last_executed_command_index = Some(LAST_EXECUTED);
+    tokio::fs::write(
+        &pending_tx.file_path,
+        serde_json::to_string(&disk_metadata).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // (3) Capture the rendered SQL the resume actually executes.
+    let mock = CapturingDestination::new();
+    let captured = mock.commands.clone();
+    let mut dest: Box<dyn DestinationHandler> = Box::new(mock);
+    let token = CancellationToken::new();
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+
+    manager
+        .clone()
+        .process_transaction_file(
+            &pending_tx,
+            &mut dest,
+            &token,
+            &lsn_tracker,
+            &metrics,
+            100,
+            &shared_feedback,
+        )
+        .await
+        .unwrap();
+
+    // (4) Assert EXACTLY records 7, 8, 9 were applied, in order. We match on the
+    // unique `name` value (`row-<id>`) rendered into each INSERT so records
+    // 0..=6 are provably skipped and 7..=9 provably applied with no duplicates.
+    // Scan every record marker across all captured SQL (the consumer may coalesce
+    // the homogeneous suffix into a single multi-value INSERT), preserving order.
+    let commands = captured.lock().unwrap();
+    let joined = commands.join("\n");
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for id in 0..RECORD_COUNT {
+        if let Some(pos) = joined.find(&format!("row-{id}")) {
+            found.push((pos, id));
+        }
+    }
+    found.sort_unstable();
+    let applied_ids: Vec<usize> = found.into_iter().map(|(_, id)| id).collect();
+
+    assert_eq!(
+        applied_ids,
+        vec![7, 8, 9],
+        "resume must apply exactly the un-applied suffix [7,8,9] in order; \
+         captured SQL: {commands:?}"
+    );
+
+    assert_eq!(lsn_tracker.get(), COMMIT_LSN);
 }

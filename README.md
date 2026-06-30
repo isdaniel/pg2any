@@ -66,13 +66,13 @@ The factory closure must return a fresh handler each call (it is invoked once fo
 - **Crash-safe persistence** - File-based producer-consumer with automatic crash recovery
 - **Resumable processing** - Restart from the exact position within large transaction files
 - **Streaming transactions** - Handles PostgreSQL protocol v2+ in-progress transaction streaming
-- **SQL compression** - Optional gzip compression for transaction files with streaming decompression
 - **Schema mapping** - Configurable PostgreSQL schema to destination database/schema translation
 - **Prometheus metrics** - Built-in HTTP metrics endpoint (feature: `metrics`)
 - **Graceful shutdown** - Coordinated producer-consumer shutdown with LSN persistence
 - **Bulk insert optimization** - LOAD DATA LOCAL INFILE for MySQL, TDS Bulk Load for SQL Server + session tuning for large batches
 - **DML coalescing** - Multi-value INSERT, CASE-WHEN UPDATE, OR-combined DELETE batching
 - **Smart batching** - Merges consecutive homogeneous INSERT-only transactions across boundaries for higher throughput
+- **Low-overhead commit path** - Per-transaction finalize avoids redundant work: no file re-read just to count statements, no `.meta` re-parse after writing it, and an in-memory pending counter instead of a per-transaction directory scan
 
 ## Quick Start
 
@@ -306,7 +306,6 @@ All configuration is via environment variables (ideal for containers) or the `Co
 | `CDC_QUERY_TIMEOUT` | `10` | Query timeout (seconds) |
 | `CDC_LAST_LSN_FILE` | `./pg2any_last_lsn` | Base path for LSN metadata file |
 | `CDC_TRANSACTION_FILE_BASE_PATH` | `./` | Base directory for transaction files |
-| `PG2ANY_ENABLE_COMPRESSION` | `false` | Enable gzip compression for SQL files |
 | `CDC_BULK_INSERT_THRESHOLD` | `500` | Minimum INSERT statements to trigger bulk path |
 | `RUST_LOG` | `pg2any=debug` | Log level |
 
@@ -374,7 +373,6 @@ metrics = ["hyper", "hyper-util", "http-body-util", "prometheus"]
 | serde / serde_json | Serialization |
 | prometheus | Metrics collection |
 | thiserror | Error handling |
-| `flate2` / `async-compression` | SQL file compression |
 
 ## License
 

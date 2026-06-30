@@ -14,7 +14,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        compression: ["true", "false"]
       fail-fast: false 
     
     runs-on: ${{ matrix.os }}
@@ -100,7 +99,6 @@ jobs:
         echo "Starting PGBench Chaos Integration Test"
         echo "=========================================="
         echo "OS: ${{ matrix.os }}"
-        echo "PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}"
         echo "This test will:"
         echo "  1. Initialize pgbench with scale factor 32"
         echo "  2. Run pgbench benchmark (100 clients, 8 threads)"
@@ -122,7 +120,6 @@ jobs:
         CDC_MYSQL_PASSWORD: test.123
         CDC_MYSQL_DB: cdc_db
         CDC_CONTAINER_NAME: cdc_application
-        PG2ANY_ENABLE_COMPRESSION: ${{ matrix.compression }}
         PGBENCH_SCALE: 32
         PGBENCH_CLIENTS: 100
         PGBENCH_THREADS: 8
@@ -210,7 +207,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: cdc-pgbench-logs-${{ matrix.os }}-${{ matrix.compression }}
+        name: cdc-pgbench-logs-${{ matrix.os }}
         path: cdc_application_log.txt
         retention-days: 30
     
@@ -218,7 +215,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: pgbench-results-${{ matrix.os }}-${{ matrix.compression }}
+        name: pgbench-results-${{ matrix.os }}
         path: tests/chaos/scripts/pgbench_chaos_results_*.log
         retention-days: 30
 

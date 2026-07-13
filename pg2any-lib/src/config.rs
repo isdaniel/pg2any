@@ -632,9 +632,7 @@ impl ConfigBuilder {
             ));
         }
 
-        if self.config.replication_slot_name.is_empty() {
-            return Err(CdcError::config("Replication slot name is required"));
-        }
+        crate::slot::validate_slot_name(&self.config.replication_slot_name)?;
 
         if self.config.publication_name.is_empty() {
             return Err(CdcError::config("Publication name is required"));

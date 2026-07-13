@@ -11,7 +11,7 @@ use pg_walstream::{LogicalReplicationStream, ReplicationStreamConfig};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Main CDC client for coordinating replication and destination writes.
 ///
@@ -80,8 +80,64 @@ impl CdcClient {
         }
 
         info!("Initializing LSN tracker for position tracking");
-        let (lsn_tracker, start_lsn) =
+        let (lsn_tracker, disk_lsn) =
             crate::lsn_tracker::create_lsn_tracker_with_load(lsn_file_path).await;
+
+        // Slot-first recovery: query pg_replication_slots for the server-side resume position, falling back to the on-disk LSN if the slot is gone or the query fails.
+        let slot_result = crate::slot::query_replication_slot(
+            &config.source_connection_string,
+            &config.replication_slot_name,
+            config.connection_timeout,
+        )
+        .await;
+        let query_err = slot_result.as_ref().err().map(|e| e.to_string());
+
+        let decision = crate::slot::reconcile_resume(
+            disk_lsn.map(|l| l.0),
+            slot_result.as_ref().map(Option::as_ref).map_err(|_| ()),
+        );
+
+        match decision.source {
+            crate::slot::ResumeSource::Slot => info!(
+                "Resuming from replication slot '{}': confirmed_flush={}, dedup_boundary={} (disk={})",
+                config.replication_slot_name,
+                pg_walstream::format_lsn(decision.start_lsn.unwrap_or(0)),
+                pg_walstream::format_lsn(decision.dedup_boundary),
+                disk_lsn
+                    .map(|l| pg_walstream::format_lsn(l.0))
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            crate::slot::ResumeSource::SlotDeletedFallback => warn!(
+                "Replication slot '{}' not found; resuming from on-disk LSN {}. If the slot was \
+                 deleted, WAL changes after this LSN up to now may be unrecoverable (a new slot \
+                 will be created at the current WAL position).",
+                config.replication_slot_name,
+                pg_walstream::format_lsn(decision.dedup_boundary),
+            ),
+            crate::slot::ResumeSource::QueryFailedFallback => warn!(
+                "Replication slot '{}' query failed ({}); resuming from on-disk LSN {}. The slot \
+                 likely still exists, so no WAL gap is expected.",
+                config.replication_slot_name,
+                query_err.as_deref().unwrap_or("unknown error"),
+                pg_walstream::format_lsn(decision.dedup_boundary),
+            ),
+            crate::slot::ResumeSource::Fresh => info!(
+                "No replication slot and no on-disk LSN; starting fresh from the current WAL position"
+            ),
+        }
+
+        if matches!(slot_result.as_ref(), Ok(Some(s)) if s.active) {
+            warn!(
+                "Replication slot '{}' is currently active (held by another connection); \
+                 starting replication may fail if a second consumer holds it",
+                config.replication_slot_name
+            );
+        }
+
+        // Seed the de-dup boundary (monotonic raise). shared_lsn_feedback is seeded from lsn_tracker.get() later in start_file_based_workflow.
+        lsn_tracker.commit_lsn(decision.dedup_boundary);
+
+        let start_lsn = decision.start_lsn.map(Lsn::new);
 
         info!("Creating replication stream");
         let stream_config = ReplicationStreamConfig::from(&config);

@@ -367,7 +367,9 @@ main() {
                 if [ $stall_count -ge 3 ]; then
                     log_error "Replication stalled at $current_count rows for 3 consecutive retries — CDC likely dead or stuck"
                     log_error "Attempting container restart to recover..."
-                    docker restart "$CONTAINER_NAME" 2>/dev/null || true
+                    # Graceful stop (matches chaos_script.sh): `docker restart` ses its own default 10s timeout and IGNORES the compose  stop_grace_period, which would SIGKILL a large-transaction drain mid-flight and cause replay on restart.
+                    docker stop --time 120 "$CONTAINER_NAME" 2>/dev/null || true
+                    docker start "$CONTAINER_NAME" 2>/dev/null || true
                     sleep 30
                     stall_count=0
                 fi

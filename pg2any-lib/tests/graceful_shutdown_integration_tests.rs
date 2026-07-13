@@ -599,3 +599,377 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
     assert_eq!(loaded_lsn, Some(Lsn(40000)));
     assert!(50000 > tracker_restart.get());
 }
+
+/// Handler that records the exact SQL commands it executes and cancels a shared
+/// token after `cancel_after_batches` batches — simulating SIGTERM arriving
+/// mid-transaction. Runs the pre-commit hook (like a real destination) so the
+/// resume checkpoint (`last_executed_command_index`) is staged and flushed.
+struct CancellingRecorder {
+    executed: Arc<std::sync::Mutex<Vec<String>>>,
+    token: CancellationToken,
+    cancel_after_batches: usize,
+    batch_counter: usize,
+}
+
+#[async_trait]
+impl DestinationHandler for CancellingRecorder {
+    async fn connect(&mut self, _connection_string: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_schema_mappings(&mut self, _mappings: HashMap<String, String>) {}
+
+    async fn execute_sql_batch_with_hook(
+        &mut self,
+        commands: &[String],
+        pre_commit_hook: Option<PreCommitHook>,
+    ) -> Result<()> {
+        // Record what actually got applied, in order.
+        {
+            let mut log = self.executed.lock().unwrap();
+            log.extend(commands.iter().cloned());
+        }
+
+        // Stage + (via the manager) flush the resume checkpoint, exactly as a
+        // real destination does. Must happen for THIS batch before we cancel,
+        // so the next-batch cancellation check resumes from the right index.
+        if let Some(hook) = pre_commit_hook {
+            hook().await?;
+        }
+
+        self.batch_counter += 1;
+        if self.batch_counter == self.cancel_after_batches {
+            self.token.cancel();
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn create_distinct_insert_event(id: usize, lsn: u64) -> ChangeEvent {
+    let data = RowData::from_pairs(vec![
+        ("id", ColumnValue::text(&id.to_string())),
+        ("name", ColumnValue::text(&format!("row-{id}"))),
+    ]);
+    ChangeEvent::insert("public", "test", 12345, data, Lsn::from(lsn))
+}
+
+/// Finding 1 verification: a large transaction that is cancelled mid-processing
+/// (SIGTERM) and then resumed (drain/restart) must apply every statement
+/// EXACTLY ONCE — no replay (duplicate key) and no loss.
+///
+/// This exercises the full producer-count -> consumer-skip path end to end with
+/// DISTINCT statements, so a mismatch between the producer's tracked
+/// `segment_statement_count` and the consumer's `SqlStreamParser` read count
+/// (the crash-resume skip arithmetic) surfaces as a duplicated or missing
+/// statement. The pre-existing resume tests use identical events and only count
+/// batches, so they cannot catch this class of position-tracking bug.
+#[tokio::test]
+async fn test_cancel_and_resume_applies_each_statement_exactly_once() {
+    const N: usize = 12;
+    const COMMIT_LSN: u64 = 123_000;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lsn_file = temp_dir.path().join("test_lsn_exactly_once");
+    let lsn_path = lsn_file.to_str().unwrap();
+
+    // Small segment size forces the producer to rotate across MULTIPLE segments,
+    // exercising both whole-segment skip and within-segment index skip on resume.
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, None, 160)
+            .await
+            .unwrap(),
+    );
+
+    manager
+        .begin_transaction(700, Utc::now(), "normal")
+        .await
+        .unwrap();
+    for id in 0..N {
+        manager
+            .append_event(700, &create_distinct_insert_event(id, COMMIT_LSN))
+            .await
+            .unwrap();
+    }
+    manager.flush_all_buffers().await.unwrap();
+    let (pending_path, metadata) = manager
+        .commit_transaction(700, Some(Lsn(COMMIT_LSN)))
+        .await
+        .unwrap();
+    // Sanity: the transaction really did span more than one segment.
+    assert!(
+        metadata.segments.len() > 1,
+        "test needs a multi-segment transaction, got {} segment(s)",
+        metadata.segments.len()
+    );
+    let pending_tx = PendingTransactionFile {
+        file_path: pending_path,
+        metadata,
+    };
+
+    let executed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let batch_size = 3;
+
+    // --- Run 1: process, but cancel after 2 batches (SIGTERM mid-transaction) ---
+    let token = CancellationToken::new();
+    let mut dest: Box<dyn DestinationHandler> = Box::new(CancellingRecorder {
+        executed: executed.clone(),
+        token: token.clone(),
+        cancel_after_batches: 2,
+        batch_counter: 0,
+    });
+
+    let result = manager
+        .clone()
+        .process_transaction_file(
+            &pending_tx,
+            &mut dest,
+            &token,
+            &lsn_tracker,
+            &metrics,
+            batch_size,
+            &shared_feedback,
+        )
+        .await;
+    assert!(
+        result.is_err() && result.unwrap_err().is_cancelled(),
+        "run 1 must stop with a cancellation error"
+    );
+    // LSN must NOT advance for a partially-applied transaction.
+    assert_eq!(lsn_tracker.get(), 0, "flush_lsn must not advance mid-tx");
+
+    // --- Run 2: drain/restart with a fresh, uncancelled token ---
+    let drain_token = CancellationToken::new();
+    let mut dest2: Box<dyn DestinationHandler> = Box::new(CancellingRecorder {
+        executed: executed.clone(),
+        token: drain_token.clone(),
+        cancel_after_batches: usize::MAX, // never cancel
+        batch_counter: 0,
+    });
+    manager
+        .clone()
+        .process_transaction_file(
+            &pending_tx,
+            &mut dest2,
+            &drain_token,
+            &lsn_tracker,
+            &metrics,
+            batch_size,
+            &shared_feedback,
+        )
+        .await
+        .expect("run 2 (drain) must complete");
+
+    // Transaction fully applied -> flush_lsn advances, file removed.
+    assert_eq!(lsn_tracker.get(), COMMIT_LSN);
+    assert!(manager
+        .list_pending_transactions()
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The core assertion: every distinct statement applied EXACTLY ONCE, in order.
+    let applied = executed.lock().unwrap().clone();
+    assert_eq!(
+        applied.len(),
+        N,
+        "expected {N} statements applied exactly once, got {} (replay or loss): {applied:#?}",
+        applied.len()
+    );
+    for (id, stmt) in applied.iter().enumerate() {
+        assert!(
+            stmt.contains(&format!("row-{id}")),
+            "statement {id} out of order / replayed / lost: {stmt:?}"
+        );
+    }
+}
+
+/// Build a transaction whose events include a multi-table TRUNCATE (one event
+/// that renders to MULTIPLE `;`-statements). Returns the committed pending file.
+async fn build_mixed_tx(
+    temp_dir: &TempDir,
+    tx_id: u32,
+    commit_lsn: u64,
+) -> (Arc<TransactionManager>, PendingTransactionFile) {
+    let manager = Arc::new(
+        TransactionManager::new(temp_dir.path(), DestinationType::MySQL, None, 160)
+            .await
+            .unwrap(),
+    );
+    manager
+        .begin_transaction(tx_id, Utc::now(), "normal")
+        .await
+        .unwrap();
+
+    // 5 distinct inserts, then a 3-table TRUNCATE (renders to 3 statements in a
+    // single appended event), then 6 more distinct inserts.
+    for id in 0..5 {
+        manager
+            .append_event(tx_id, &create_distinct_insert_event(id, commit_lsn))
+            .await
+            .unwrap();
+    }
+    let tables: Vec<std::sync::Arc<str>> = vec![
+        std::sync::Arc::from("public.ta"),
+        std::sync::Arc::from("public.tb"),
+        std::sync::Arc::from("public.tc"),
+    ];
+    manager
+        .append_event(tx_id, &ChangeEvent::truncate(tables, Lsn::from(commit_lsn)))
+        .await
+        .unwrap();
+    for id in 5..11 {
+        manager
+            .append_event(tx_id, &create_distinct_insert_event(id, commit_lsn))
+            .await
+            .unwrap();
+    }
+
+    manager.flush_all_buffers().await.unwrap();
+    let (pending_path, metadata) = manager
+        .commit_transaction(tx_id, Some(Lsn(commit_lsn)))
+        .await
+        .unwrap();
+    (
+        manager,
+        PendingTransactionFile {
+            file_path: pending_path,
+            metadata,
+        },
+    )
+}
+
+async fn process_recording(
+    manager: &Arc<TransactionManager>,
+    pending_tx: &PendingTransactionFile,
+    lsn_path: &str,
+    cancel_after_batches: usize,
+    batch_size: usize,
+) -> (Vec<String>, u64) {
+    let executed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
+    let shared_feedback = SharedLsnFeedback::new_shared();
+    let lsn_tracker = LsnTracker::new(Some(lsn_path)).await;
+    let token = CancellationToken::new();
+    let mut dest: Box<dyn DestinationHandler> = Box::new(CancellingRecorder {
+        executed: executed.clone(),
+        token: token.clone(),
+        cancel_after_batches,
+        batch_counter: 0,
+    });
+
+    // Loop process -> resume, mirroring drain: a cancellation re-runs with a
+    // fresh uncancelled token until the transaction is fully applied.
+    let mut cancelled = true;
+    let mut first = true;
+    while cancelled {
+        let tok = if first {
+            token.clone()
+        } else {
+            CancellationToken::new()
+        };
+        first = false;
+        match manager
+            .clone()
+            .process_transaction_file(
+                pending_tx,
+                &mut dest,
+                &tok,
+                &lsn_tracker,
+                &metrics,
+                batch_size,
+                &shared_feedback,
+            )
+            .await
+        {
+            Ok(()) => cancelled = false,
+            Err(e) if e.is_cancelled() => {
+                // swap in a non-cancelling recorder for the drain pass
+                dest = Box::new(CancellingRecorder {
+                    executed: executed.clone(),
+                    token: CancellationToken::new(),
+                    cancel_after_batches: usize::MAX,
+                    batch_counter: 0,
+                });
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    let applied = executed.lock().unwrap().clone();
+    (applied, lsn_tracker.get())
+}
+
+/// Finding 1 (multi-statement event): a transaction containing a multi-table
+/// TRUNCATE — one event that renders to several `;`-statements — must, after a
+/// mid-transaction cancel + resume, apply the EXACT same statements as a clean
+/// uninterrupted pass. If the producer's `count_rendered_statements` (which must
+/// count the TRUNCATE as 3, not 1) disagrees with the consumer's parser, the
+/// resume-skip lands on the wrong statement and this oracle comparison fails.
+#[tokio::test]
+async fn test_cancel_resume_with_multi_statement_truncate_matches_clean_pass() {
+    const COMMIT_LSN: u64 = 456_000;
+    let batch_size = 3;
+
+    // Oracle: one clean, uninterrupted pass.
+    let baseline_dir = TempDir::new().unwrap();
+    let (mgr_a, tx_a) = build_mixed_tx(&baseline_dir, 800, COMMIT_LSN).await;
+    assert!(
+        tx_a.metadata.segments.len() > 1,
+        "need a multi-segment tx to exercise segment skip"
+    );
+    let baseline_lsn = baseline_dir.path().join("lsn_a");
+    let (baseline, lsn_a) = process_recording(
+        &mgr_a,
+        &tx_a,
+        baseline_lsn.to_str().unwrap(),
+        usize::MAX, // never cancel
+        batch_size,
+    )
+    .await;
+    assert_eq!(lsn_a, COMMIT_LSN);
+    // Producer-tracked statement count must equal what a clean pass executes.
+    let producer_total: usize = tx_a
+        .metadata
+        .segments
+        .iter()
+        .map(|s| s.statement_count)
+        .sum();
+    assert_eq!(
+        baseline.len(),
+        producer_total,
+        "producer segment_statement_count sum ({producer_total}) != statements a clean pass executes ({})",
+        baseline.len()
+    );
+    // The TRUNCATE contributed 3 statements (not 1).
+    assert_eq!(baseline.len(), 5 + 3 + 6);
+
+    // Actual: cancel mid-transaction, then resume to completion.
+    for cancel_after in [1usize, 2, 3] {
+        let dir = TempDir::new().unwrap();
+        let (mgr_b, tx_b) = build_mixed_tx(&dir, 801, COMMIT_LSN).await;
+        let lsn_b = dir.path().join("lsn_b");
+        let (actual, lsn) = process_recording(
+            &mgr_b,
+            &tx_b,
+            lsn_b.to_str().unwrap(),
+            cancel_after,
+            batch_size,
+        )
+        .await;
+        assert_eq!(
+            lsn, COMMIT_LSN,
+            "flush_lsn must reach commit_lsn after drain"
+        );
+        assert_eq!(
+            actual, baseline,
+            "cancel_after={cancel_after}: resume applied a different statement sequence than a clean pass (replay/loss/misorder)"
+        );
+    }
+}

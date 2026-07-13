@@ -66,6 +66,9 @@ pub mod types;
 
 pub mod lsn_tracker;
 
+// Slot-first LSN recovery (queries pg_replication_slots, reconciles with disk)
+pub(crate) mod slot;
+
 // High-level client interface
 pub mod client;
 mod consumer;

@@ -20,6 +20,7 @@ pg2any is a Rust CDC (Change Data Capture) library that streams PostgreSQL WAL c
 - Producer and consumer are separate Tokio tasks communicating via `mpsc` channel
 - Transaction files are the source of truth for crash recovery - never skip file persistence
 - LSN tracking: `flush_lsn` = last WAL position committed to destination. Updated by consumer only.
+- Recovery resume position (`slot.rs::reconcile_resume`, called from `CdcClient::new`): query `pg_replication_slots` first (server-side `confirmed_flush_lsn` is the source of truth for logical replication resume), fall back to the on-disk LSN when the slot is gone. De-dup boundary = `max(confirmed_flush_lsn, disk_flush_lsn)` — seeds `LsnTracker` so `commit_lsn <= boundary` transactions are skipped (preserves the no-replay guarantee). Slot-deleted logs a WARNING: the WAL gap up to the new slot's creation LSN may be unrecoverable. Slot query is a short-lived libpq connection (`pg_walstream::PgReplicationConnection`) in `spawn_blocking` + timeout; query failure falls back to disk.
 - Shutdown coordination: `CancellationToken` + `oneshot` channel (producer -> consumer)
 - Destinations behind `DestinationHandler` trait; Kafka uses event mode, SQL destinations use SQL batch mode
 - Destinations are constructed via the per-Config registry (`Config::create_destination`). Built-ins self-register in `Config::default()`; external users add their own via `ConfigBuilder::custom_destination` (factory closure) or `ConfigBuilder::use_destination::<H>()` (for `H: Default`).

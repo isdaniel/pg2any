@@ -1,0 +1,38 @@
+name: Auto Tag
+
+# Runs AFTER the CI workflow finishes successfully on main. Gating on CI (rather
+# than on the raw push) means the tagged commit is already proven green. The tag
+# is pushed via RELEASE_PAT (not GITHUB_TOKEN) — a GITHUB_TOKEN push would NOT
+# fire release.yml, so the release/publish would never start.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  auto-tag:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the commit CI just passed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Tag if version is new
+        working-directory: pg2any-lib
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*= "//' | sed 's/".*//')
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists. Nothing to do."
+            exit 0
+          fi
+          echo "Creating and pushing ${TAG}."
+          git tag "${TAG}"
+          git push origin "${TAG}"

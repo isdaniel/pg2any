@@ -1,7 +1,7 @@
 # PostgreSQL CDC Makefile
 # Provides convenient commands for development and deployment
 
-.PHONY: help build start stop restart clean logs test check format docker-build docker-start docker-stop docker-clean \
+.PHONY: help build start stop restart clean logs test check format update-deps docker-build docker-start docker-stop docker-clean \
 	chaos-test-mysql-setup chaos-test-mysql chaos-test-mysql-clean chaos-test-mysql-full \
 	pgbench-test-mysql-setup pgbench-test-mysql pgbench-test-mysql-clean pgbench-test-mysql-full \
 	chaos-test-sqlserver-setup chaos-test-sqlserver chaos-test-sqlserver-clean chaos-test-sqlserver-full \
@@ -21,6 +21,7 @@ help:
 	@echo "  check          Check code with cargo check"
 	@echo "  test           Run tests"
 	@echo "  format         Format code with rustfmt"
+	@echo "  update-deps    Bump all Cargo.toml deps to latest stable (pinned)"
 	@echo "  run            Run the application locally"
 	@echo ""
 	@echo "Docker:"
@@ -104,6 +105,13 @@ test:
 
 audit:
 	cargo audit
+
+# Bump every workspace dep in Cargo.toml to the latest stable version,
+# pinned to its full minimum version. Drop --incompatible for compatible-only (no major bumps). Run `make check test` afterwards to confirm it still builds.
+update-deps:
+	@command -v cargo-upgrade >/dev/null 2>&1 || cargo install cargo-edit --locked
+	cargo upgrade --incompatible
+	cargo update
 
 format:
 	cargo fmt --all

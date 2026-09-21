@@ -200,7 +200,9 @@ jobs:
         retention-days: 30
 
     - name: Setup tmate session
-      if: failure()
+      # Interactive debug shell: manual runs only. On push/PR/schedule it just
+      # hangs the job for 15 minutes after a failure.
+      if: failure() && github.event_name == 'workflow_dispatch'
       timeout-minutes: 15
       uses: mxschmitt/action-tmate@v3
 

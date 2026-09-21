@@ -120,7 +120,7 @@ pub fn render_sql_for_event_into(
             key_columns,
             out,
         ),
-        EventType::Truncate(tables) => render_truncate_into(ctx, tables, out),
+        EventType::Truncate { tables, .. } => render_truncate_into(ctx, tables, out),
         _ => {
             // Skip non-DML events; ensure `out` ends empty.
             out.clear();
@@ -433,7 +433,7 @@ pub(crate) fn render_event(
             EventType::Insert { .. }
             | EventType::Update { .. }
             | EventType::Delete { .. }
-            | EventType::Truncate(_) => Ok(RenderedStatement::Event(Box::new(event.clone()))),
+            | EventType::Truncate { .. } => Ok(RenderedStatement::Event(Box::new(event.clone()))),
             _ => Ok(RenderedStatement::NoOp),
         };
     }
@@ -721,7 +721,11 @@ mod tests {
         let (d, m) = ctx();
         let rc = make_render_ctx(&d, &m);
         let event = ChangeEvent {
-            event_type: EventType::Truncate(vec![Arc::from("public.users")]),
+            event_type: EventType::Truncate {
+                tables: vec![Arc::from("public.users")],
+                cascade: false,
+                restart_identity: false,
+            },
             lsn: Lsn::new(0x300),
             metadata: None,
         };

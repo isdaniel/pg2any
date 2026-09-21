@@ -45,8 +45,11 @@ jobs:
     
     - name: Wait for services to be healthy
       run: |
-        echo "Waiting for services to become healthy..."
-        timeout 120 bash -c 'until docker ps | grep -q "healthy"; do sleep 5; done' || true
+        echo "Waiting for all 3 containers to report healthy..."
+        # grep -cx, not -c: "unhealthy" contains "healthy". No `|| true` either --
+        # a timeout or a container that never started must fail the job here,
+        # not silently leak into the test steps.
+        timeout 300 bash -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" cdc_postgres cdc_mysql cdc_application 2>/dev/null | grep -cx healthy)" = 3 ]; do sleep 5; done'
         docker-compose -f docker-compose.chaos-test.yml ps
         sleep 15
       working-directory: .
@@ -106,7 +109,7 @@ jobs:
         echo "=========================================="
         echo "PostgreSQL Logs (Last 100 lines)"
         echo "=========================================="
-        docker logs chaos_test_postgres --tail 100
+        docker logs cdc_postgres --tail 100
     
     - name: Show MySQL logs on failure
       if: failure()
@@ -145,7 +148,9 @@ jobs:
         retention-days: 30
 
     - name: Setup tmate session
-      if: failure()
+      # Interactive debug shell: manual runs only. On push/PR/schedule it just
+      # hangs the job for 15 minutes after a failure.
+      if: failure() && github.event_name == 'workflow_dispatch'
       timeout-minutes: 15
       uses: mxschmitt/action-tmate@v3
 

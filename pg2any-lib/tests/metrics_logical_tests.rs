@@ -69,6 +69,8 @@ fn create_test_delete_event() -> ChangeEvent {
 fn create_test_truncate_event() -> ChangeEvent {
     ChangeEvent::truncate(
         vec![Arc::from("users"), Arc::from("orders")],
+        false,
+        false,
         Lsn::from(400),
     )
 }

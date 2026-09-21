@@ -145,9 +145,12 @@ fn test_new_event_type_begin_commit() {
 fn test_new_event_type_truncate() {
     let tables: Vec<Arc<str>> = vec![Arc::from("public.users"), Arc::from("public.orders")];
 
-    let event = ChangeEvent::truncate(tables.clone(), Lsn::from(400));
+    let event = ChangeEvent::truncate(tables.clone(), false, false, Lsn::from(400));
     match event.event_type {
-        EventType::Truncate(event_tables) => {
+        EventType::Truncate {
+            tables: event_tables,
+            ..
+        } => {
             assert_eq!(event_tables, tables);
         }
         _ => panic!("Expected Truncate variant"),

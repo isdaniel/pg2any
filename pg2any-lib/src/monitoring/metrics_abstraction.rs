@@ -190,7 +190,7 @@ mod real_metrics {
                 EventType::Insert { table, .. }
                 | EventType::Update { table, .. }
                 | EventType::Delete { table, .. } => Cow::Borrowed(table.as_ref()),
-                EventType::Truncate(tables) => Cow::Owned(
+                EventType::Truncate { tables, .. } => Cow::Owned(
                     tables
                         .iter()
                         .map(|t| t.as_ref())

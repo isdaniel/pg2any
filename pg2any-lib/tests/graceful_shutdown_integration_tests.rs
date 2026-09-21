@@ -821,7 +821,10 @@ async fn build_mixed_tx(
         std::sync::Arc::from("public.tc"),
     ];
     manager
-        .append_event(tx_id, &ChangeEvent::truncate(tables, Lsn::from(commit_lsn)))
+        .append_event(
+            tx_id,
+            &ChangeEvent::truncate(tables, false, false, Lsn::from(commit_lsn)),
+        )
         .await
         .unwrap();
     for id in 5..11 {

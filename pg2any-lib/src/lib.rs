@@ -131,7 +131,6 @@ pub use pg_walstream::{
     XLogRecPtr,
     Xid,
     INVALID_XLOG_REC_PTR,
-    PG_EPOCH_OFFSET_SECS,
 };
 
 // Re-export SharedLsnFeedback from lsn_tracker (pg2any-lib's version with log_status method)

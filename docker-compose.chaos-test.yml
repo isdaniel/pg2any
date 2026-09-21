@@ -44,10 +44,15 @@ services:
       - --max_allowed_packet=536870912  # 512MB
       - --innodb_buffer_pool_size=2GB   # Reduced for testing environment
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "cdc_user", "-ptest.123"]
-      interval: 10s
+      # Must be TCP, not the unix socket: the entrypoint's temporary init server
+      # listens on the socket with port=0, so a socket ping reports healthy ~9s
+      # before the real server exists. cdc_app would then start against a MySQL
+      # that is about to be shut down.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "3306", "--protocol=TCP", "-u", "cdc_user", "-ptest.123"]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 60s
     networks:
       - chaos_test_network
 

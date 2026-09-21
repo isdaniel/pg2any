@@ -687,7 +687,7 @@ impl DestinationHandler for KafkaDestination {
                     let future = self.enqueue_event(&topic, key.as_deref(), &value).await?;
                     delivery_futures.push(future);
                 }
-                pg_walstream::EventType::Truncate(tables) => {
+                pg_walstream::EventType::Truncate { tables, .. } => {
                     for table_spec in tables.iter() {
                         let (schema, table) = match table_spec.split_once('.') {
                             Some((s, t)) if !t.contains('.') => (self.map_schema(s).to_owned(), t),

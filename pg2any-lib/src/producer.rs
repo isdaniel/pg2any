@@ -302,7 +302,7 @@ pub(crate) async fn run_producer(
                     EventType::Insert { .. }
                     | EventType::Update { .. }
                     | EventType::Delete { .. }
-                    | EventType::Truncate(_) => {
+                    | EventType::Truncate { .. } => {
                         let target_tx_id = if let Some((tx_id, _)) = current_normal_tx {
                             debug!("Appending DML to normal transaction {}", tx_id);
                             Some(tx_id)

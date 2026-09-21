@@ -601,7 +601,7 @@ impl TransactionManager {
                 EventType::Insert { .. }
                 | EventType::Update { .. }
                 | EventType::Delete { .. }
-                | EventType::Truncate(_) => {
+                | EventType::Truncate { .. } => {
                     Some(serde_json::to_string(event).map_err(|e| {
                         CdcError::generic(format!("Failed to serialize event: {e}"))
                     })?)
@@ -2210,11 +2210,15 @@ mod tests {
         // ... alongside a multi-table TRUNCATE that renders 3 statements in one
         // event-line.
         let truncate = ChangeEvent {
-            event_type: EventType::Truncate(vec![
-                std::sync::Arc::from("public.a"),
-                std::sync::Arc::from("public.b"),
-                std::sync::Arc::from("public.c"),
-            ]),
+            event_type: EventType::Truncate {
+                tables: vec![
+                    std::sync::Arc::from("public.a"),
+                    std::sync::Arc::from("public.b"),
+                    std::sync::Arc::from("public.c"),
+                ],
+                cascade: false,
+                restart_identity: false,
+            },
             lsn: crate::types::Lsn(2),
             metadata: None,
         };

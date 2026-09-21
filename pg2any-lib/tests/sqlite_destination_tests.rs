@@ -114,7 +114,7 @@ fn event_to_sql(event: &ChangeEvent) -> Option<String> {
 
             Some(format!("DELETE FROM \"{}\" WHERE {};", table, where_clause))
         }
-        EventType::Truncate(tables) => {
+        EventType::Truncate { tables, .. } => {
             if tables.is_empty() {
                 return None;
             }
@@ -498,7 +498,7 @@ async fn test_sqlite_destination_process_truncate_event() {
     assert_eq!(count, 3);
 
     // Create TRUNCATE event
-    let event = ChangeEvent::truncate(vec![Arc::from("main.users")], Lsn::from(400));
+    let event = ChangeEvent::truncate(vec![Arc::from("main.users")], false, false, Lsn::from(400));
 
     // Process the event using execute_sql_batch
     let tx = wrap_in_transaction(event);

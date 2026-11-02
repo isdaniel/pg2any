@@ -2221,6 +2221,7 @@ mod tests {
             },
             lsn: crate::types::Lsn(2),
             metadata: None,
+            xid: None,
         };
         manager.append_event(tx_id, &truncate).await.unwrap();
 

@@ -711,6 +711,7 @@ mod tests {
             },
             lsn: Lsn::new(0x200),
             metadata: None,
+            xid: None,
         };
         let result = render_event(&rc, &event, false, true).unwrap();
         assert!(matches!(result, RenderedStatement::NoOp));
@@ -728,6 +729,7 @@ mod tests {
             },
             lsn: Lsn::new(0x300),
             metadata: None,
+            xid: None,
         };
         let result = render_event(&rc, &event, false, false).unwrap();
         let expected = generate_sql_for_event(&rc, &event).unwrap();

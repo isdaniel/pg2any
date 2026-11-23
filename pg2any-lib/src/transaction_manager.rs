@@ -382,11 +382,10 @@ impl TransactionManager {
     /// wasn't counted at startup (the atomic itself never wraps to usize::MAX).
     fn decrement_pending_count(&self) -> usize {
         self.pending_tx_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                Some(val.saturating_sub(1))
+            .update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                val.saturating_sub(1)
             })
-            .map(|prev| prev.saturating_sub(1))
-            .unwrap_or(0)
+            .saturating_sub(1)
     }
 
     /// Flush all pending buffered writes

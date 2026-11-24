@@ -29,14 +29,14 @@ tiberius = { version = "0.13.0", features = ["tds73", "sql-browser-tokio", "time
 sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "uuid"] }
 mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls"] }
 flate2 = "1.1.11"
-async-compression = { version = "0.4.52", features = ["tokio", "gzip"] }
+async-compression = { version = "0.4.53", features = ["tokio", "gzip"] }
 rdkafka = { version = "0.40.0", features = ["cmake-build", "tokio"] }
 futures-util = "0.3.34"
 base64 = "0.23.1"
 
 # Monitoring and metrics
 prometheus = { version = "0.14.0", features = ["process"] }
-hyper = { version = "1.12.0", features = ["full"] }
+hyper = { version = "1.13.0", features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["full"] }
 http-body-util = "0.1.5"
 

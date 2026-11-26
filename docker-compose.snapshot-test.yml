@@ -1,0 +1,105 @@
+# Live services for the initial-snapshot end-to-end tests (`make snapshot-test-*`).
+#
+# PostgreSQL always runs; each destination sits behind a compose profile so a test run only
+# starts what it needs:
+#   docker compose -f docker-compose.snapshot-test.yml up -d --wait                    # postgres
+#   docker compose -f docker-compose.snapshot-test.yml --profile mysql up -d --wait    # + mysql
+# The mysql/sqlserver/kafka definitions are copied from the chaos-test compose files; each is
+# exercised by its pg2any-lib/tests/snapshot_e2e_<dest>.rs (sqlite needs no service).
+name: pg2any_snapshot_test
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: snapshot_test_postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test.123
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_wal_senders=10
+      -c max_connections=100
+
+  mysql:
+    profiles: ["mysql"]
+    image: mysql:8.0
+    container_name: snapshot_test_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test.123
+      MYSQL_DATABASE: cdc_db
+      MYSQL_USER: cdc_user
+      MYSQL_PASSWORD: test.123
+    ports:
+      - "3306:3306"
+    # local-infile lets the destination take its LOAD DATA LOCAL INFILE fast path.
+    command:
+      - --local-infile=1
+      - --max_allowed_packet=536870912
+    healthcheck:
+      # TCP, not the unix socket: the entrypoint's temporary init server answers on the socket
+      # about 9s before the real server exists.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "3306", "--protocol=TCP", "-u", "cdc_user", "-ptest.123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  sqlserver:
+    profiles: ["sqlserver"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: snapshot_test_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Test.123!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "(/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${SA_PASSWORD}\" -C -Q 'SELECT 1' -b || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$${SA_PASSWORD}\" -Q 'SELECT 1' -b) 2>/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+
+  kafka:
+    profiles: ["kafka"]
+    image: apache/kafka:3.7.0
+    container_name: snapshot_test_kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
+      # The snapshot e2e tests publish rows up to 64 MB (a 128 MB JSON message): the broker accepts
+      # a (compressed) batch up to 200 MiB, replicates it and takes a request of up to 300 MiB.
+      KAFKA_MESSAGE_MAX_BYTES: "209715200"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "209715200"
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: "314572800"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    # Host clients reach the broker through the EXTERNAL listener: 127.0.0.1:9094.
+    ports:
+      - "9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s

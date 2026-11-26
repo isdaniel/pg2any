@@ -13,6 +13,13 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+fn drain_settings() -> pg2any_lib::ConsumerSettings {
+    pg2any_lib::ConsumerSettings {
+        batch_size: 100,
+        group_commit_max_txns: 1,
+    }
+}
+
 struct MockDestination {
     executed_batches: Arc<AtomicUsize>,
     fail_on_batch: Option<usize>,
@@ -392,7 +399,7 @@ async fn test_mid_batch_cancellation_completes_drain() {
         &mut dest,
         &lsn_tracker,
         &metrics,
-        100,
+        &drain_settings(),
         &shared_feedback,
     )
     .await;
@@ -577,17 +584,26 @@ async fn test_drain_on_error_preserves_file_for_recovery() {
     let metrics = Arc::new(pg2any_lib::MetricsCollector::new());
     let shared_feedback = SharedLsnFeedback::new_shared();
 
-    pg2any_lib::drain_and_shutdown(
-        &mut commit_queue,
-        &mut rx_receiver,
-        &manager,
-        &mut dest,
-        &lsn_tracker,
-        &metrics,
-        100,
-        &shared_feedback,
+    // The drain has no time limit: against a destination that keeps failing it retries until the
+    // process manager kills the process, which the timeout stands in for here.
+    let drained = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        pg2any_lib::drain_and_shutdown(
+            &mut commit_queue,
+            &mut rx_receiver,
+            &manager,
+            &mut dest,
+            &lsn_tracker,
+            &metrics,
+            &drain_settings(),
+            &shared_feedback,
+        ),
     )
     .await;
+    assert!(
+        drained.is_err(),
+        "a drain that cannot apply everything keeps retrying instead of giving up"
+    );
 
     assert_eq!(lsn_tracker.get(), 40000);
 

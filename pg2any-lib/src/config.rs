@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Configuration for the CDC client
+///
+/// `Config::builder()` and `load_config_from_env` have different defaults for the replication slot
+/// (`pg2any_slot` / `cdc_slot`), the publication (`pg2any_pub` / `cdc_pub`) and `streaming`
+/// (off / on). Name the slot and publication to get the same one from either.
 #[derive(Clone)]
 pub struct Config {
     /// Source PostgreSQL connection string
@@ -25,64 +29,27 @@ pub struct Config {
     /// Publication name to subscribe to
     pub publication_name: String,
 
-    /// Protocol version to use (1-4)
-    pub protocol_version: u32,
-
-    /// Whether to use binary format
-    pub binary_format: bool,
-
-    /// Whether to stream in-progress transactions
+    /// Whether to stream in-progress transactions. Requests pgoutput protocol 2 (PostgreSQL 14+);
+    /// without it protocol 1 is requested. Protocols 3 and 4 only add two-phase and parallel
+    /// streaming, which pg2any does not support.
     pub streaming: bool,
-
-    /// Whether to include user messages
-    pub include_messages: bool,
-
-    /// Whether to include two-phase commit transactions
-    pub two_phase: bool,
-
-    /// Origin filtering
-    pub origin: OriginFilter,
 
     /// Connection timeout
     pub connection_timeout: Duration,
 
-    /// Query timeout
-    pub query_timeout: Duration,
-
     /// Heartbeat interval for sending feedback to PostgreSQL
     pub heartbeat_interval: Duration,
 
-    /// Maximum number of retry attempts for connection failures
-    pub max_retry_attempts: u32,
-
-    /// Initial retry delay (will be increased exponentially)
-    pub initial_retry_delay: Duration,
-
-    /// Maximum retry delay between attempts
-    pub max_retry_delay: Duration,
-
-    /// Retry multiplier for exponential backoff
-    pub retry_multiplier: f64,
-
-    /// Maximum total time to spend retrying before giving up
-    pub max_retry_duration: Duration,
-
-    /// Whether to add jitter to retry delays to prevent thundering herd
-    pub retry_jitter: bool,
-
     /// Transaction channel capacity between producer and consumer
     pub buffer_size: usize,
-
-    /// Table mapping for transformation between source and destination
-    pub table_mappings: HashMap<String, TableMapping>,
 
     /// Schema mapping from PostgreSQL schema to destination database/schema
     /// Maps source schema (e.g., "public") to destination schema/database (e.g., "cdc_db")
     pub schema_mappings: HashMap<String, String>,
 
-    /// Batch size for multi-value INSERT statements in destination database
-    /// Higher values improve throughput for large streaming transactions
-    /// but may increase memory usage. Default: 1000
+    /// Statements per destination batch. It is also the largest transaction the in-memory fast
+    /// path keeps in memory and the statement budget of one group commit. Higher values improve
+    /// throughput for large transactions but use more memory. Default: 1000
     pub batch_size: usize,
 
     /// Base path for transaction files (default: current directory)
@@ -93,16 +60,28 @@ pub struct Config {
     /// Maximum size in bytes for a single transaction segment file
     pub transaction_segment_size_bytes: usize,
 
-    /// Additional configuration options
-    pub extra_options: HashMap<String, String>,
-
     /// Minimum number of INSERT statements to trigger bulk insert mode
     pub bulk_insert_threshold: usize,
 
-    /// Maximum number of rows per multi-value INSERT statement.
-    /// SQL Server enforces a hard limit of 1000 rows per INSERT VALUES.
-    /// Set to 0 for no limit (e.g., MySQL/SQLite have no row count limit).
+    /// Maximum number of rows per multi-value INSERT statement. 0 keeps the destination's own
+    /// limit. SQL Server caps it at 1000 and SQLite at 500 (their hard limits); MySQL and Kafka
+    /// ignore it.
     pub max_rows_per_insert: usize,
+
+    /// Whether to run a one-time initial snapshot of existing table data before streaming
+    pub initial_snapshot: bool,
+
+    /// How the snapshot treats target tables that already contain data
+    pub snapshot_target_policy: SnapshotTargetPolicy,
+
+    /// Number of concurrent snapshot writer tasks
+    pub snapshot_writers: usize,
+
+    /// Snapshot in-memory buffer budget in bytes (minimum 1 MiB)
+    pub snapshot_buffer_bytes: usize,
+
+    /// Rows per snapshot batch written to the destination
+    pub snapshot_batch_rows: usize,
 
     /// Per-Config registry of destination factories keyed by `DestinationType::registry_key()`.
     /// Built-ins self-register in `Config::default()`; external users add their own via
@@ -116,7 +95,7 @@ pub struct Config {
 /// - URI style: `scheme://user:password@host/...` → password replaced with `********`
 /// - Key/value style (e.g. SQL Server ADO.NET): `key=value;...` → values for
 ///   `password`/`pwd` (case-insensitive) replaced with `********`
-fn sanitize_connection_string(s: &str) -> String {
+pub(crate) fn sanitize_connection_string(s: &str) -> String {
     if let Some(scheme_end) = s.find("://") {
         let after_scheme = scheme_end + 3;
         let authority_end = s[after_scheme..]
@@ -186,23 +165,10 @@ impl std::fmt::Debug for Config {
             .field("destination_connection_string", &sanitized_dest)
             .field("replication_slot_name", &self.replication_slot_name)
             .field("publication_name", &self.publication_name)
-            .field("protocol_version", &self.protocol_version)
-            .field("binary_format", &self.binary_format)
             .field("streaming", &self.streaming)
-            .field("include_messages", &self.include_messages)
-            .field("two_phase", &self.two_phase)
-            .field("origin", &self.origin)
             .field("connection_timeout", &self.connection_timeout)
-            .field("query_timeout", &self.query_timeout)
             .field("heartbeat_interval", &self.heartbeat_interval)
-            .field("max_retry_attempts", &self.max_retry_attempts)
-            .field("initial_retry_delay", &self.initial_retry_delay)
-            .field("max_retry_delay", &self.max_retry_delay)
-            .field("retry_multiplier", &self.retry_multiplier)
-            .field("max_retry_duration", &self.max_retry_duration)
-            .field("retry_jitter", &self.retry_jitter)
             .field("buffer_size", &self.buffer_size)
-            .field("table_mappings", &self.table_mappings)
             .field("schema_mappings", &self.schema_mappings)
             .field("batch_size", &self.batch_size)
             .field(
@@ -213,9 +179,13 @@ impl std::fmt::Debug for Config {
                 "transaction_segment_size_bytes",
                 &self.transaction_segment_size_bytes,
             )
-            .field("extra_options", &self.extra_options)
             .field("bulk_insert_threshold", &self.bulk_insert_threshold)
             .field("max_rows_per_insert", &self.max_rows_per_insert)
+            .field("initial_snapshot", &self.initial_snapshot)
+            .field("snapshot_target_policy", &self.snapshot_target_policy)
+            .field("snapshot_writers", &self.snapshot_writers)
+            .field("snapshot_buffer_bytes", &self.snapshot_buffer_bytes)
+            .field("snapshot_batch_rows", &self.snapshot_batch_rows)
             .field(
                 "destination_registry",
                 &format_args!("<{} entries>", self.destination_registry.len()),
@@ -224,72 +194,41 @@ impl std::fmt::Debug for Config {
     }
 }
 
-/// Origin filtering options
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OriginFilter {
-    /// Only changes with no origin
-    None,
-    /// Changes regardless of origin
-    Any,
-    /// Changes from specific origin
-    Origin(String),
+/// How the initial snapshot treats target tables that already contain rows
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotTargetPolicy {
+    /// Abort if any target table is non-empty
+    #[default]
+    FailIfNotEmpty,
+    /// Truncate target tables before loading
+    Truncate,
+    /// Load on top of existing rows
+    Append,
 }
 
-/// Table mapping configuration
-#[derive(Debug, Clone)]
-pub struct TableMapping {
-    /// Destination schema name
-    pub destination_schema: Option<String>,
+impl std::str::FromStr for SnapshotTargetPolicy {
+    type Err = CdcError;
 
-    /// Destination table name
-    pub destination_table: Option<String>,
-
-    /// Column mappings (source_column -> destination_column)
-    pub column_mappings: HashMap<String, String>,
-
-    /// Columns to exclude from replication
-    pub excluded_columns: Vec<String>,
-
-    /// Custom transformation rules
-    pub transformations: Vec<ColumnTransformation>,
-
-    /// Whether to include this table in replication
-    pub enabled: bool,
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "fail_if_not_empty" => Ok(Self::FailIfNotEmpty),
+            "truncate" => Ok(Self::Truncate),
+            "append" => Ok(Self::Append),
+            other => Err(CdcError::config(format!(
+                "Invalid snapshot target policy '{other}'. Expected one of: fail_if_not_empty, truncate, append"
+            ))),
+        }
+    }
 }
 
-/// Column transformation rules
-#[derive(Debug, Clone)]
-pub struct ColumnTransformation {
-    /// Source column name
-    pub source_column: String,
-
-    /// Destination column name
-    pub destination_column: String,
-
-    /// Transformation type
-    pub transformation: TransformationType,
-}
-
-/// Types of column transformations
-#[derive(Debug, Clone)]
-pub enum TransformationType {
-    /// Pass through without modification
-    Identity,
-
-    /// Convert to uppercase
-    Uppercase,
-
-    /// Convert to lowercase
-    Lowercase,
-
-    /// Custom function transformation
-    Function(String),
-
-    /// Static value replacement
-    Static(serde_json::Value),
-
-    /// Null replacement
-    Null,
+impl std::fmt::Display for SnapshotTargetPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FailIfNotEmpty => "fail_if_not_empty",
+            Self::Truncate => "truncate",
+            Self::Append => "append",
+        })
+    }
 }
 
 impl Default for Config {
@@ -338,30 +277,21 @@ impl Default for Config {
             destination_connection_string: String::new(),
             replication_slot_name: "pg2any_slot".to_string(),
             publication_name: "pg2any_pub".to_string(),
-            protocol_version: 1,
-            binary_format: false,
             streaming: false,
-            include_messages: false,
-            two_phase: false,
-            origin: OriginFilter::None,
             connection_timeout: Duration::from_secs(30),
-            query_timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10), // Send feedback every 10 seconds to prevent 60s timeout
-            max_retry_attempts: 5,
-            initial_retry_delay: Duration::from_secs(1),
-            max_retry_delay: Duration::from_secs(60),
-            retry_multiplier: 2.0,
-            max_retry_duration: Duration::from_secs(300), // 5 minutes total
-            retry_jitter: true,
             buffer_size: 1000,
-            table_mappings: HashMap::new(),
             schema_mappings: HashMap::new(),
             batch_size: 1000,
             transaction_file_base_path: ".".to_string(),
             transaction_segment_size_bytes: 64 * 1024 * 1024,
-            extra_options: HashMap::new(),
             bulk_insert_threshold: 500,
             max_rows_per_insert: 0,
+            initial_snapshot: false,
+            snapshot_target_policy: SnapshotTargetPolicy::default(),
+            snapshot_writers: 4,
+            snapshot_buffer_bytes: 16 * 1024 * 1024,
+            snapshot_batch_rows: 20000,
             destination_registry,
         }
     }
@@ -411,39 +341,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the protocol version (1-4)
-    pub fn protocol_version(mut self, version: u32) -> Self {
-        self.config.protocol_version = version;
-        self
-    }
-
-    /// Enable/disable binary format
-    pub fn binary_format(mut self, enabled: bool) -> Self {
-        self.config.binary_format = enabled;
-        self
-    }
-
     /// Enable/disable streaming of in-progress transactions
     pub fn streaming(mut self, enabled: bool) -> Self {
         self.config.streaming = enabled;
-        self
-    }
-
-    /// Enable/disable including user messages
-    pub fn include_messages(mut self, enabled: bool) -> Self {
-        self.config.include_messages = enabled;
-        self
-    }
-
-    /// Enable/disable two-phase commit transactions
-    pub fn two_phase(mut self, enabled: bool) -> Self {
-        self.config.two_phase = enabled;
-        self
-    }
-
-    /// Set origin filtering
-    pub fn origin(mut self, origin: OriginFilter) -> Self {
-        self.config.origin = origin;
         self
     }
 
@@ -453,51 +353,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set query timeout
-    pub fn query_timeout(mut self, timeout: Duration) -> Self {
-        self.config.query_timeout = timeout;
-        self
-    }
-
     /// Set heartbeat interval
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.config.heartbeat_interval = interval;
-        self
-    }
-
-    /// Set maximum number of retry attempts
-    pub fn max_retry_attempts(mut self, attempts: u32) -> Self {
-        self.config.max_retry_attempts = attempts;
-        self
-    }
-
-    /// Set initial retry delay
-    pub fn initial_retry_delay(mut self, delay: Duration) -> Self {
-        self.config.initial_retry_delay = delay;
-        self
-    }
-
-    /// Set maximum retry delay
-    pub fn max_retry_delay(mut self, delay: Duration) -> Self {
-        self.config.max_retry_delay = delay;
-        self
-    }
-
-    /// Set retry multiplier for exponential backoff
-    pub fn retry_multiplier(mut self, multiplier: f64) -> Self {
-        self.config.retry_multiplier = multiplier;
-        self
-    }
-
-    /// Set maximum retry duration
-    pub fn max_retry_duration(mut self, duration: Duration) -> Self {
-        self.config.max_retry_duration = duration;
-        self
-    }
-
-    /// Enable/disable retry jitter
-    pub fn retry_jitter(mut self, enabled: bool) -> Self {
-        self.config.retry_jitter = enabled;
         self
     }
 
@@ -510,14 +368,6 @@ impl ConfigBuilder {
     /// Higher values improve throughput for large streaming transactions
     pub fn batch_size(mut self, size: usize) -> Self {
         self.config.batch_size = size.max(1);
-        self
-    }
-
-    /// Add a table mapping
-    pub fn table_mapping<S: Into<String>>(mut self, table_name: S, mapping: TableMapping) -> Self {
-        self.config
-            .table_mappings
-            .insert(table_name.into(), mapping);
         self
     }
 
@@ -552,16 +402,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Add extra option
-    pub fn extra_option<K, V>(mut self, key: K, value: V) -> Self
-    where
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.config.extra_options.insert(key.into(), value.into());
-        self
-    }
-
     pub fn bulk_insert_threshold(mut self, threshold: usize) -> Self {
         self.config.bulk_insert_threshold = threshold;
         self
@@ -572,12 +412,42 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable/disable the one-time initial snapshot
+    pub fn initial_snapshot(mut self, enabled: bool) -> Self {
+        self.config.initial_snapshot = enabled;
+        self
+    }
+
+    /// Set how the snapshot treats non-empty target tables
+    pub fn snapshot_target_policy(mut self, policy: SnapshotTargetPolicy) -> Self {
+        self.config.snapshot_target_policy = policy;
+        self
+    }
+
+    /// Set the number of concurrent snapshot writers
+    pub fn snapshot_writers(mut self, writers: usize) -> Self {
+        self.config.snapshot_writers = writers;
+        self
+    }
+
+    /// Set the snapshot buffer budget in bytes
+    pub fn snapshot_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.config.snapshot_buffer_bytes = bytes;
+        self
+    }
+
+    /// Set the number of rows per snapshot batch
+    pub fn snapshot_batch_rows(mut self, rows: usize) -> Self {
+        self.config.snapshot_batch_rows = rows;
+        self
+    }
+
     /// Sentinel registry key used by `custom_destination` / `use_destination`.
     const CUSTOM_DESTINATION_KEY: &'static str = "__custom__";
 
     /// Inject a custom `DestinationHandler` factory and switch `destination_type`
     /// to `DestinationType::Custom`. The closure must return a fresh handler each
-    /// call (invoked once for the main pipeline and once for the consumer).
+    /// call (invoked once for the live pipeline and once per snapshot writer).
     ///
     /// ```ignore
     /// Config::builder()
@@ -638,24 +508,22 @@ impl ConfigBuilder {
             return Err(CdcError::config("Publication name is required"));
         }
 
-        if !(1..=4).contains(&self.config.protocol_version) {
-            return Err(CdcError::config("Protocol version must be between 1 and 4"));
-        }
-
-        if self.config.streaming && self.config.protocol_version < 2 {
-            return Err(CdcError::config(
-                "Streaming requires protocol version 2 or higher",
-            ));
-        }
-
-        if self.config.two_phase && self.config.protocol_version < 3 {
-            return Err(CdcError::config(
-                "Two-phase commit requires protocol version 3 or higher",
-            ));
-        }
-
         if self.config.buffer_size == 0 {
             return Err(CdcError::config("Buffer size must be greater than 0"));
+        }
+
+        if self.config.snapshot_writers == 0 {
+            return Err(CdcError::config("Snapshot writers must be greater than 0"));
+        }
+
+        if self.config.snapshot_buffer_bytes < 1024 * 1024 {
+            return Err(CdcError::config("Snapshot buffer must be at least 1 MiB"));
+        }
+
+        if self.config.snapshot_batch_rows == 0 {
+            return Err(CdcError::config(
+                "Snapshot batch rows must be greater than 0",
+            ));
         }
 
         Ok(())
@@ -666,6 +534,22 @@ impl Config {
     /// Create a new config builder
     pub fn builder() -> ConfigBuilder {
         ConfigBuilder::new()
+    }
+
+    /// Connect `handler` and apply this config's destination settings, the same for every handler
+    /// the live path and the snapshot open.
+    pub(crate) async fn connect_destination(
+        &self,
+        handler: &mut dyn DestinationHandler,
+    ) -> Result<()> {
+        handler.connect(&self.destination_connection_string).await?;
+        if !self.schema_mappings.is_empty() {
+            handler.set_schema_mappings(self.schema_mappings.clone());
+        }
+        if self.max_rows_per_insert > 0 {
+            handler.set_max_rows_per_insert(self.max_rows_per_insert);
+        }
+        Ok(())
     }
 
     /// Construct a destination handler by looking up `self.destination_type.registry_key()`
@@ -682,85 +566,175 @@ impl Config {
     }
 }
 
-impl Default for TableMapping {
-    fn default() -> Self {
-        Self {
-            destination_schema: None,
-            destination_table: None,
-            column_mappings: HashMap::new(),
-            excluded_columns: Vec::new(),
-            transformations: Vec::new(),
-            enabled: true,
-        }
-    }
-}
-
-impl TableMapping {
-    /// Create a new table mapping
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set destination schema
-    pub fn destination_schema<S: Into<String>>(mut self, schema: S) -> Self {
-        self.destination_schema = Some(schema.into());
-        self
-    }
-
-    /// Set destination table
-    pub fn destination_table<S: Into<String>>(mut self, table: S) -> Self {
-        self.destination_table = Some(table.into());
-        self
-    }
-
-    /// Add column mapping
-    pub fn column_mapping<S1, S2>(mut self, source: S1, destination: S2) -> Self
-    where
-        S1: Into<String>,
-        S2: Into<String>,
-    {
-        self.column_mappings
-            .insert(source.into(), destination.into());
-        self
-    }
-
-    /// Exclude column from replication
-    pub fn exclude_column<S: Into<String>>(mut self, column: S) -> Self {
-        self.excluded_columns.push(column.into());
-        self
-    }
-
-    /// Add column transformation
-    pub fn transformation(mut self, transformation: ColumnTransformation) -> Self {
-        self.transformations.push(transformation);
-        self
-    }
-
-    /// Enable/disable this mapping
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-}
-
 /// Convert from CDC config to replication stream config
 impl From<&Config> for pg_walstream::ReplicationStreamConfig {
     fn from(config: &Config) -> Self {
-        let streaming_mode = if config.streaming {
-            pg_walstream::StreamingMode::On
+        let (protocol_version, streaming_mode) = if config.streaming {
+            (2, pg_walstream::StreamingMode::On)
         } else {
-            pg_walstream::StreamingMode::Off
+            (1, pg_walstream::StreamingMode::Off)
         };
 
         pg_walstream::ReplicationStreamConfig::new(
             config.replication_slot_name.clone(),
             config.publication_name.clone(),
-            config.protocol_version,
+            protocol_version,
             streaming_mode,
             config.heartbeat_interval,
             config.connection_timeout,
             Duration::from_secs(30), // Health check interval
             RetryConfig::default(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_builder() -> ConfigBuilder {
+        Config::builder()
+            .source_connection_string("postgresql://u:p@localhost/db?replication=database")
+            .destination_connection_string("mysql://u:p@localhost/db")
+    }
+
+    #[test]
+    fn test_snapshot_defaults() {
+        let config = valid_builder().build().unwrap();
+        assert!(!config.initial_snapshot);
+        assert_eq!(
+            config.snapshot_target_policy,
+            SnapshotTargetPolicy::FailIfNotEmpty
+        );
+        assert_eq!(config.snapshot_writers, 4);
+        assert_eq!(config.snapshot_buffer_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.snapshot_batch_rows, 20000);
+    }
+
+    #[test]
+    fn test_snapshot_policy_from_str_rejects_unknown() {
+        assert!(matches!(
+            "bogus".parse::<SnapshotTargetPolicy>(),
+            Err(CdcError::Config(_))
+        ));
+        assert_eq!(
+            "fail_if_not_empty".parse::<SnapshotTargetPolicy>().unwrap(),
+            SnapshotTargetPolicy::FailIfNotEmpty
+        );
+        assert_eq!(
+            "truncate".parse::<SnapshotTargetPolicy>().unwrap(),
+            SnapshotTargetPolicy::Truncate
+        );
+        assert_eq!(
+            "append".parse::<SnapshotTargetPolicy>().unwrap(),
+            SnapshotTargetPolicy::Append
+        );
+        assert_eq!(SnapshotTargetPolicy::Truncate.to_string(), "truncate");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_writers() {
+        assert!(valid_builder().snapshot_writers(0).build().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_buffer_below_1_mib() {
+        assert!(valid_builder()
+            .snapshot_buffer_bytes(1024 * 1024 - 1)
+            .build()
+            .is_err());
+        assert!(valid_builder()
+            .snapshot_buffer_bytes(1024 * 1024)
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_batch_rows() {
+        assert!(valid_builder().snapshot_batch_rows(0).build().is_err());
+    }
+
+    #[test]
+    fn streaming_alone_builds_and_requests_protocol_2() {
+        let config = valid_builder().streaming(true).build().unwrap();
+        let stream = pg_walstream::ReplicationStreamConfig::from(&config);
+        assert_eq!(stream.protocol_version, 2);
+    }
+
+    #[test]
+    fn without_streaming_requests_protocol_1() {
+        let config = valid_builder().build().unwrap();
+        let stream = pg_walstream::ReplicationStreamConfig::from(&config);
+        assert_eq!(stream.protocol_version, 1);
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        connected: Option<String>,
+        schema_mappings: Option<HashMap<String, String>>,
+        max_rows: Option<usize>,
+    }
+
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Seen>>);
+
+    #[async_trait::async_trait]
+    impl DestinationHandler for Recorder {
+        async fn connect(&mut self, connection_string: &str) -> Result<()> {
+            self.0.lock().unwrap().connected = Some(connection_string.to_string());
+            Ok(())
+        }
+        fn set_schema_mappings(&mut self, mappings: HashMap<String, String>) {
+            self.0.lock().unwrap().schema_mappings = Some(mappings);
+        }
+        fn set_max_rows_per_insert(&mut self, max_rows: usize) {
+            self.0.lock().unwrap().max_rows = Some(max_rows);
+        }
+        async fn execute_sql_batch_with_hook(
+            &mut self,
+            _commands: &[String],
+            _hook: Option<crate::destinations::PreCommitHook>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_destination_connects_and_applies_the_destination_settings() {
+        let config = valid_builder()
+            .schema_mapping("public", "cdc_db")
+            .max_rows_per_insert(250)
+            .build()
+            .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
+        config
+            .connect_destination(&mut Recorder(seen.clone()))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.connected.as_deref(), Some("mysql://u:p@localhost/db"));
+        assert_eq!(
+            seen.schema_mappings.as_ref().unwrap().get("public"),
+            Some(&"cdc_db".to_string())
+        );
+        assert_eq!(seen.max_rows, Some(250));
+    }
+
+    #[tokio::test]
+    async fn connect_destination_leaves_unset_options_to_the_destination() {
+        let config = valid_builder().build().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
+        config
+            .connect_destination(&mut Recorder(seen.clone()))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.connected.is_some());
+        assert!(seen.schema_mappings.is_none(), "no mappings configured");
+        assert!(seen.max_rows.is_none(), "0 means the destination's limit");
     }
 }

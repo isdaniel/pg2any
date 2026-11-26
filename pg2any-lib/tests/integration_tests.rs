@@ -115,13 +115,11 @@ fn test_config_integration() {
         .destination_connection_string("mysql://test:test@localhost:3306/test".to_string())
         .replication_slot_name("test_slot".to_string())
         .publication_name("test_pub".to_string())
-        .protocol_version(2)
         .streaming(true)
         .connection_timeout(Duration::from_secs(30))
         .build()
         .unwrap();
 
-    assert_eq!(config.protocol_version, 2);
     assert!(config.streaming);
     assert_eq!(config.replication_slot_name, "test_slot");
 }

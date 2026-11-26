@@ -376,85 +376,11 @@ pub fn append_where_clause(
     Ok(())
 }
 
-/// Output of rendering a single `ChangeEvent`.
-///
-/// `TransactionManager` will eventually route batches of these to the
-/// appropriate `DestinationHandler` method (SQL, bulk-insert, event-mode,
-/// or no-op) without re-parsing SQL strings. Currently this enum is
-/// substrate for that future work; the active execute path still uses the
-/// legacy string-reparse routing in
-/// `transaction_manager.rs::execute_batch_with_bulk_detection`.
-#[allow(dead_code)] // substrate for upcoming routing change; exercised by tests
-#[derive(Debug)]
-pub enum RenderedStatement {
-    /// Plain SQL statement (DML or DDL) ready to send to the destination.
-    Sql(String),
-    /// Structured bulk-insert intent. Matches the shape of
-    /// `DestinationHandler::execute_bulk_insert_with_hook`.
-    BulkInsert {
-        table: String,
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-    },
-    /// Raw event passthrough for event-mode destinations (Kafka).
-    Event(Box<ChangeEvent>),
-    /// Event produced no statement (e.g. TRUNCATE on Kafka, or filtered).
-    NoOp,
-}
-
 /// Structured (table, columns, single-row) tuple for bulk insert routing.
-#[allow(dead_code)]
 pub(crate) struct InsertBulkParts {
     pub table: String,
     pub columns: Vec<String>,
     pub row: Vec<String>,
-}
-
-/// Render a single `ChangeEvent` into a structured statement.
-///
-/// `supports_bulk` should reflect the active destination handler's
-/// `supports_bulk_insert()`. When true and the event is an INSERT, the
-/// result is `RenderedStatement::BulkInsert`; otherwise the event is
-/// rendered as `RenderedStatement::Sql`.
-///
-/// `event_mode` should reflect the handler's `supports_event_mode()`.
-/// When true, INSERT/UPDATE/DELETE/TRUNCATE events are returned as
-/// `RenderedStatement::Event(...)` (with no SQL rendering); other event
-/// types become `NoOp`.
-#[allow(dead_code)]
-pub(crate) fn render_event(
-    ctx: &RenderContext,
-    event: &ChangeEvent,
-    supports_bulk: bool,
-    event_mode: bool,
-) -> Result<RenderedStatement> {
-    if event_mode {
-        return match &event.event_type {
-            EventType::Insert { .. }
-            | EventType::Update { .. }
-            | EventType::Delete { .. }
-            | EventType::Truncate { .. } => Ok(RenderedStatement::Event(Box::new(event.clone()))),
-            _ => Ok(RenderedStatement::NoOp),
-        };
-    }
-
-    if supports_bulk {
-        if let EventType::Insert { .. } = &event.event_type {
-            let parts = render_insert_as_bulk(ctx, event)?;
-            return Ok(RenderedStatement::BulkInsert {
-                table: parts.table,
-                columns: parts.columns,
-                rows: vec![parts.row],
-            });
-        }
-    }
-
-    let sql = generate_sql_for_event(ctx, event)?;
-    if sql.is_empty() {
-        Ok(RenderedStatement::NoOp)
-    } else {
-        Ok(RenderedStatement::Sql(sql))
-    }
 }
 
 /// Render a single INSERT event into the structured tuple form expected by
@@ -467,7 +393,6 @@ pub(crate) fn render_event(
 /// `` `public`.`users` ``); each column name and value is rendered with
 /// the same dialect helpers used by `generate_insert_sql`, so the strings
 /// are byte-identical to what would appear in the `VALUES (...)` tuple.
-#[allow(dead_code)]
 pub(crate) fn render_insert_as_bulk(
     ctx: &RenderContext,
     event: &ChangeEvent,
@@ -510,55 +435,11 @@ pub(crate) fn render_insert_as_bulk(
     })
 }
 
-/// Coalesce a consecutive run of `RenderedStatement::BulkInsert` items
-/// targeting the same `(table, columns)` into a single BulkInsert with
-/// all rows accumulated. Stops at the first item that breaks the run.
-///
-/// Returns the coalesced BulkInsert and the number of items consumed,
-/// or `None` if the first item is not a BulkInsert.
-#[allow(dead_code)]
-pub(crate) fn coalesce_bulk_inserts(
-    items: &[RenderedStatement],
-) -> Option<(RenderedStatement, usize)> {
-    let (first_table, first_cols, mut all_rows) = match items.first()? {
-        RenderedStatement::BulkInsert {
-            table,
-            columns,
-            rows,
-        } => (table.clone(), columns.clone(), rows.clone()),
-        _ => return None,
-    };
-
-    let mut consumed = 1;
-    for item in &items[1..] {
-        match item {
-            RenderedStatement::BulkInsert {
-                table,
-                columns,
-                rows,
-            } if table == &first_table && columns == &first_cols => {
-                all_rows.extend(rows.iter().cloned());
-                consumed += 1;
-            }
-            _ => break,
-        }
-    }
-
-    Some((
-        RenderedStatement::BulkInsert {
-            table: first_table,
-            columns: first_cols,
-            rows: all_rows,
-        },
-        consumed,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::destinations::dialects::MySqlDialect;
-    use crate::types::{ChangeEvent, EventType, ReplicaIdentity, RowData};
+    use crate::types::{ChangeEvent, ReplicaIdentity, RowData};
     use pg_walstream::{ColumnValue, Lsn};
     use std::sync::Arc;
 
@@ -582,27 +463,6 @@ mod tests {
             ("name", ColumnValue::text("alice")),
         ]);
         ChangeEvent::insert("public", "users", 42, data, Lsn::new(0x100))
-    }
-
-    fn sample_update() -> ChangeEvent {
-        let new_data = RowData::from_pairs(vec![
-            ("id", ColumnValue::text("1")),
-            ("name", ColumnValue::text("bob")),
-        ]);
-        let old_data = RowData::from_pairs(vec![
-            ("id", ColumnValue::text("1")),
-            ("name", ColumnValue::text("alice")),
-        ]);
-        ChangeEvent::update(
-            "public",
-            "users",
-            42,
-            Some(old_data),
-            new_data,
-            ReplicaIdentity::Default,
-            vec![Arc::from("id")],
-            Lsn::new(0x101),
-        )
     }
 
     fn sample_delete() -> ChangeEvent {
@@ -637,170 +497,5 @@ mod tests {
         let owned2 = generate_sql_for_event(&rc, &event2).unwrap();
         render_sql_for_event_into(&rc, &event2, &mut buf).unwrap();
         assert_eq!(buf, owned2);
-    }
-
-    #[test]
-    fn render_event_insert_sql_form() {
-        let (d, m) = ctx();
-        let rc = make_render_ctx(&d, &m);
-        let event = sample_insert();
-        let result = render_event(&rc, &event, false, false).unwrap();
-        let expected = generate_sql_for_event(&rc, &event).unwrap();
-        match result {
-            RenderedStatement::Sql(s) => assert_eq!(s, expected),
-            other => panic!("expected Sql, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn render_event_insert_bulk_form_matches_legacy_parse() {
-        let (d, m) = ctx();
-        let rc = make_render_ctx(&d, &m);
-        let event = sample_insert();
-
-        let bulk_form = render_event(&rc, &event, true, false).unwrap();
-        let sql_form = match &event.event_type {
-            EventType::Insert {
-                schema,
-                table,
-                data,
-                ..
-            } => generate_insert_sql(&rc, schema, table, data).unwrap(),
-            _ => unreachable!(),
-        };
-        let parsed =
-            crate::destinations::bulk_insert::detect_bulk_insert_batch(&[sql_form]).unwrap();
-
-        match &bulk_form {
-            RenderedStatement::BulkInsert {
-                table,
-                columns,
-                rows,
-            } => {
-                assert_eq!(table, &parsed.table);
-                assert_eq!(columns, &parsed.columns);
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0], parsed.rows[0]);
-            }
-            other => panic!("expected BulkInsert, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn render_event_update_event_mode_returns_event() {
-        let (d, m) = ctx();
-        let rc = make_render_ctx(&d, &m);
-        let event = sample_update();
-        let result = render_event(&rc, &event, false, true).unwrap();
-        match result {
-            RenderedStatement::Event(_) => {}
-            other => panic!("expected Event, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn render_event_relation_event_mode_is_noop() {
-        let (d, m) = ctx();
-        let rc = make_render_ctx(&d, &m);
-        // Begin is one of the non-DML event types -> NoOp in event mode.
-        let event = ChangeEvent {
-            event_type: EventType::Begin {
-                transaction_id: 1,
-                final_lsn: Lsn::new(0x200),
-                commit_timestamp: chrono::Utc::now(),
-            },
-            lsn: Lsn::new(0x200),
-            metadata: None,
-            xid: None,
-        };
-        let result = render_event(&rc, &event, false, true).unwrap();
-        assert!(matches!(result, RenderedStatement::NoOp));
-    }
-
-    #[test]
-    fn render_event_truncate_sql_form() {
-        let (d, m) = ctx();
-        let rc = make_render_ctx(&d, &m);
-        let event = ChangeEvent {
-            event_type: EventType::Truncate {
-                tables: vec![Arc::from("public.users")],
-                cascade: false,
-                restart_identity: false,
-            },
-            lsn: Lsn::new(0x300),
-            metadata: None,
-            xid: None,
-        };
-        let result = render_event(&rc, &event, false, false).unwrap();
-        let expected = generate_sql_for_event(&rc, &event).unwrap();
-        match result {
-            RenderedStatement::Sql(s) => assert_eq!(s, expected),
-            other => panic!("expected Sql, got {:?}", other),
-        }
-    }
-
-    fn bulk(table: &str, columns: &[&str], rows: Vec<Vec<&str>>) -> RenderedStatement {
-        RenderedStatement::BulkInsert {
-            table: table.to_string(),
-            columns: columns.iter().map(|s| s.to_string()).collect(),
-            rows: rows
-                .into_iter()
-                .map(|r| r.into_iter().map(|s| s.to_string()).collect())
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn coalesce_empty_returns_none() {
-        assert!(coalesce_bulk_inserts(&[]).is_none());
-    }
-
-    #[test]
-    fn coalesce_first_sql_returns_none() {
-        let items = vec![RenderedStatement::Sql(
-            "INSERT INTO x VALUES (1);".to_string(),
-        )];
-        assert!(coalesce_bulk_inserts(&items).is_none());
-    }
-
-    #[test]
-    fn coalesce_single_bulk() {
-        let items = vec![bulk("`t`", &["`a`"], vec![vec!["1"]])];
-        let (out, consumed) = coalesce_bulk_inserts(&items).unwrap();
-        assert_eq!(consumed, 1);
-        match out {
-            RenderedStatement::BulkInsert { rows, .. } => assert_eq!(rows.len(), 1),
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn coalesce_three_same_table() {
-        let items = vec![
-            bulk("`t`", &["`a`"], vec![vec!["1"]]),
-            bulk("`t`", &["`a`"], vec![vec!["2"]]),
-            bulk("`t`", &["`a`"], vec![vec!["3"]]),
-        ];
-        let (out, consumed) = coalesce_bulk_inserts(&items).unwrap();
-        assert_eq!(consumed, 3);
-        match out {
-            RenderedStatement::BulkInsert { rows, .. } => assert_eq!(rows.len(), 3),
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn coalesce_stops_at_different_table() {
-        let items = vec![
-            bulk("`t`", &["`a`"], vec![vec!["1"]]),
-            bulk("`t`", &["`a`"], vec![vec!["2"]]),
-            bulk("`other`", &["`a`"], vec![vec!["3"]]),
-        ];
-        let (out, consumed) = coalesce_bulk_inserts(&items).unwrap();
-        assert_eq!(consumed, 2);
-        match out {
-            RenderedStatement::BulkInsert { rows, .. } => assert_eq!(rows.len(), 2),
-            _ => panic!(),
-        }
     }
 }

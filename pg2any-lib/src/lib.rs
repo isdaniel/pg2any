@@ -69,6 +69,9 @@ pub mod lsn_tracker;
 // Slot-first LSN recovery (queries pg_replication_slots, reconciles with disk)
 pub(crate) mod slot;
 
+// Initial snapshot (marker, pipeline, target prep)
+pub(crate) mod snapshot;
+
 // High-level client interface
 pub mod client;
 mod consumer;
@@ -89,8 +92,8 @@ pub mod monitoring;
 // Public API exports
 pub use app::{run_cdc_app, CdcApp, CdcAppConfig};
 pub use client::CdcClient;
-pub use config::{Config, ConfigBuilder};
-pub use consumer::drain_and_shutdown;
+pub use config::{Config, ConfigBuilder, SnapshotTargetPolicy};
+pub use consumer::{drain_and_shutdown, ConsumerSettings, GROUP_COMMIT_MAX_TXNS};
 pub use env::load_config_from_env;
 pub use error::CdcError;
 pub use lsn_tracker::{create_lsn_tracker_with_load, LsnTracker};
@@ -163,7 +166,7 @@ pub use crate::destinations::dialect::SqlDialect;
 pub use crate::destinations::dialects::{
     AnsiDialect, KafkaDialect, MySqlDialect, SqlServerDialect, SqliteDialect,
 };
-pub use crate::sql_renderer::{RenderContext, RenderedStatement};
+pub use crate::sql_renderer::RenderContext;
 
 // Conditionally export metrics server functionality
 #[cfg(feature = "metrics")]

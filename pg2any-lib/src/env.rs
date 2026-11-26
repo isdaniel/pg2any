@@ -3,28 +3,46 @@
 //! This module provides functions to load configuration from environment variables
 //! and setup various aspects of the CDC application.
 
-use crate::{CdcError, Config, DestinationType};
+use crate::{CdcError, Config, DestinationType, SnapshotTargetPolicy};
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// Variables that used to be read and no longer are, with why. Setting one only logs a warning,
+/// so existing env files keep starting.
+const REMOVED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "CDC_PROTOCOL_VERSION",
+        "the protocol version follows CDC_STREAMING (2 when streaming, else 1)",
+    ),
+    (
+        "CDC_BINARY_FORMAT",
+        "binary pgoutput was never supported, so it had no effect",
+    ),
+    ("CDC_QUERY_TIMEOUT", "it had no effect"),
+    (
+        "CDC_SQLSERVER_LIVE_BULK_LOAD",
+        "the SQL Server live bulk load is always on",
+    ),
+];
 
 /// Load configuration from environment variables
 ///
 /// This function reads all CDC-related environment variables and builds a Config instance.
 /// It provides sensible defaults for all optional configuration values.
 ///
+/// The defaults below are the ones of this function. `Config::builder()` has its own: the slot is
+/// `pg2any_slot`, the publication `pg2any_pub` and `streaming` is `false`. Moving a deployment
+/// between the two without naming the slot and publication changes the slot it uses.
+///
 /// # Environment Variables
 ///
-/// ## Source PostgreSQL Configuration
+/// ## Required
 /// - `CDC_SOURCE_CONNECTION_STRING`: Complete PostgreSQL connection string with replication parameter
-///   (default: constructed from individual parameters below)
+/// - `CDC_DEST_URI`: Destination connection string, broker list (Kafka) or file path (SQLite)
 ///
 /// ## Destination Configuration
-/// - `CDC_DEST_TYPE`: Destination type ("MySQL", "SqlServer", or "SQLite", default: "MySQL")
-/// - `CDC_DEST_URI`: Destination URI/host/file path (default: "localhost" for databases, "./cdc_target.db" for SQLite)
-/// - `CDC_DEST_PORT`: Destination port (default: "3306" for MySQL, "1433" for SqlServer) - Not used for SQLite
-/// - `CDC_DEST_DB`: Destination database name (default: "cdc_target") - For SQLite, this is the database file path
-/// - `CDC_DEST_USER`: Destination username (default: "cdc_user") - Not used for SQLite
-/// - `CDC_DEST_PASSWORD`: Destination password (default: "cdc_password") - Not used for SQLite
+/// - `CDC_DEST_TYPE`: "MySQL", "SqlServer", "SQLite" or "Kafka", case-insensitive (default: "MySQL").
+///   Any other value is an error.
 ///
 /// ## Schema Mapping Configuration
 /// - `CDC_SCHEMA_MAPPING`: Comma-separated list of schema mappings in format "source:dest"
@@ -33,55 +51,66 @@ use std::time::Duration;
 /// ## CDC Configuration
 /// - `CDC_REPLICATION_SLOT`: Replication slot name (default: "cdc_slot")
 /// - `CDC_PUBLICATION`: Publication name (default: "cdc_pub")
-/// - `CDC_PROTOCOL_VERSION`: Protocol version (default: "1")
-/// - `CDC_BINARY_FORMAT`: Use binary format (default: "false")
-/// - `CDC_STREAMING`: Enable streaming (default: "true")
+/// - `CDC_STREAMING`: Stream in-progress transactions, needs PostgreSQL 14+ (default: "true")
 ///
 /// ## Timeout Configuration
 /// - `CDC_CONNECTION_TIMEOUT`: Connection timeout in seconds (default: "30")
-/// - `CDC_QUERY_TIMEOUT`: Query timeout in seconds (default: "10")
 ///
 /// ## Performance Configuration
 /// - `CDC_CHANNEL_CAPACITY`: Capacity of the transaction channel between producer and consumer (default: "1000")
 ///   Controls how many complete transactions can be queued. Larger values handle burst traffic better but use more memory.
 ///   Recommended: 1000-5000 for typical workloads, 10000+ for high-throughput scenarios.
-/// - `CDC_BATCH_SIZE`: Number of rows per batch INSERT statement (default: "1000")
-///   Higher values improve throughput for large streaming transactions (e.g., 400k+ inserts).
+/// - `CDC_BATCH_SIZE`: Statements per destination batch (default: "1000")
+///   Also the largest transaction the in-memory fast path keeps in memory and the statement budget
+///   of one group commit. Higher values improve throughput for large transactions.
 ///   Recommended: 1000-5000 for typical workloads, adjust based on MySQL max_allowed_packet.
-/// - `CDC_MAX_ROWS_PER_INSERT`: Maximum rows per multi-value INSERT statement (default: "0" = no limit)
-///   SQL Server enforces a hard limit of 1000. Set to 1000 for SQL Server destinations.
-///   When set to 0, the destination's own default applies (SQL Server defaults to 1000 internally).
+/// - `CDC_BULK_INSERT_THRESHOLD`: Minimum INSERT statements in a batch to use the bulk path (default: "500")
+/// - `CDC_MAX_ROWS_PER_INSERT`: Maximum rows per multi-value INSERT statement (default: "0" = destination limit)
+///   SQL Server caps it at 1000 and SQLite at 500; MySQL and Kafka ignore it.
+/// - `CDC_TRANSACTION_SEGMENT_SIZE_MB`: Largest transaction segment file in megabytes (default: "64")
+/// - `CDC_TRANSACTION_FILE_BASE_PATH`: Directory of the transaction files and the snapshot marker (default: ".")
+///
+/// ## Initial Snapshot Configuration
+/// - `CDC_INITIAL_SNAPSHOT`: Run a one-time snapshot of existing table data before streaming (default: "false")
+/// - `CDC_SNAPSHOT_TARGET_POLICY`: Handling of non-empty target tables: "fail_if_not_empty", "truncate",
+///   or "append" (default: "fail_if_not_empty")
+/// - `CDC_SNAPSHOT_WRITERS`: Number of concurrent snapshot writers, must be > 0 (default: "4")
+/// - `CDC_SNAPSHOT_BUFFER_MB`: Snapshot buffer budget in megabytes, must be >= 1 (default: "16")
+/// - `CDC_SNAPSHOT_BATCH_ROWS`: Rows per snapshot batch, must be > 0 (default: "20000")
+///
+/// ## Read elsewhere
+/// `CDC_LAST_LSN_FILE` (LSN position file), `PG2ANY_ENABLE_COMPRESSION` (gzip transaction files)
+/// and the `CDC_KAFKA_*` options are read by the components that use them, not by this function,
+/// so they cannot be set through `ConfigBuilder`.
+///
+/// ## Removed
+/// `CDC_PROTOCOL_VERSION`, `CDC_BINARY_FORMAT`, `CDC_QUERY_TIMEOUT` and
+/// `CDC_SQLSERVER_LIVE_BULK_LOAD` are ignored with a warning.
 ///
 /// # Errors
 ///
-/// Returns `CdcError` if any required configuration is invalid or missing critical values.
+/// Returns `CdcError::Config` if a required variable is missing or any value is invalid.
 pub fn load_config_from_env() -> Result<Config, CdcError> {
     tracing::info!("Loading configuration from environment variables");
 
-    // Source PostgreSQL configuration
-    let source_connection_string = std::env::var("CDC_SOURCE_CONNECTION_STRING").expect(
-        "CDC_SOURCE_CONNECTION_STRING environment variable is required. Example: postgresql://user:password@host:port/dbname?replication=database",
-    );
-
-    // Destination configuration
-    let dest_type_str = std::env::var("CDC_DEST_TYPE").unwrap_or_else(|_| "MySQL".to_string());
-    let dest_type = match dest_type_str.as_str() {
-        "MySQL" | "mysql" => DestinationType::MySQL,
-        "SqlServer" | "sqlserver" => DestinationType::SqlServer,
-        "SQLite" | "sqlite" => DestinationType::SQLite,
-        "Kafka" | "kafka" => DestinationType::Kafka,
-        _ => {
-            tracing::warn!(
-                "Unknown destination type '{}', defaulting to MySQL",
-                dest_type_str
-            );
-            DestinationType::MySQL
+    for (key, why) in REMOVED_ENV_VARS {
+        if std::env::var_os(key).is_some() {
+            tracing::warn!("Environment variable {key} is ignored: {why}");
         }
-    };
+    }
 
-    let destination_connection_string = std::env::var("CDC_DEST_URI").expect(
-        "CDC_DEST_URI environment variable is required. Example for MySQL mysql://replicator:pass.123@127.0.0.1:3306/publif or ./cdc_target.db for SQLite ..etc",
-    );
+    let source_connection_string = required_env(
+        "CDC_SOURCE_CONNECTION_STRING",
+        "postgresql://user:password@host:port/dbname?replication=database",
+    )?;
+    let destination_connection_string = required_env(
+        "CDC_DEST_URI",
+        "mysql://replicator:pass.123@127.0.0.1:3306/publif, ./cdc_target.db for SQLite or broker:9092 for Kafka",
+    )?;
+
+    let dest_type = parse_destination_type(
+        &std::env::var("CDC_DEST_TYPE").unwrap_or_else(|_| "MySQL".to_string()),
+    )?;
 
     // Schema mapping configuration
     let schema_mappings = parse_schema_mapping_env("CDC_SCHEMA_MAPPING")?;
@@ -93,14 +122,9 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let replication_slot =
         std::env::var("CDC_REPLICATION_SLOT").unwrap_or_else(|_| "cdc_slot".to_string());
     let publication = std::env::var("CDC_PUBLICATION").unwrap_or_else(|_| "cdc_pub".to_string());
-
-    let protocol_version = parse_u32_env("CDC_PROTOCOL_VERSION", 1)?;
-    let binary_format = parse_bool_env("CDC_BINARY_FORMAT", false)?;
     let streaming = parse_bool_env("CDC_STREAMING", true)?;
 
-    // Timeout configurations
     let connection_timeout_secs = parse_u64_env("CDC_CONNECTION_TIMEOUT", 30)?;
-    let query_timeout_secs = parse_u64_env("CDC_QUERY_TIMEOUT", 10)?;
     let buffer_size =
         parse_usize_env_with_fallback("CDC_CHANNEL_CAPACITY", "CDC_BUFFER_SIZE", 1000)?;
     let batch_size =
@@ -111,23 +135,27 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
     let bulk_insert_threshold = parse_usize_env("CDC_BULK_INSERT_THRESHOLD", 500)?;
     let max_rows_per_insert = parse_usize_env("CDC_MAX_ROWS_PER_INSERT", 0)?;
 
+    // Initial snapshot configuration
+    let initial_snapshot = parse_bool_env("CDC_INITIAL_SNAPSHOT", false)?;
+    let snapshot_target_policy = match std::env::var("CDC_SNAPSHOT_TARGET_POLICY") {
+        Ok(value) => value.parse::<SnapshotTargetPolicy>()?,
+        Err(_) => SnapshotTargetPolicy::default(),
+    };
+    let snapshot_writers = parse_usize_env("CDC_SNAPSHOT_WRITERS", 4)?;
+    let snapshot_buffer_mb = parse_usize_env("CDC_SNAPSHOT_BUFFER_MB", 16)?;
+    let snapshot_buffer_bytes = snapshot_buffer_mb.saturating_mul(1024 * 1024);
+    let snapshot_batch_rows = parse_usize_env("CDC_SNAPSHOT_BATCH_ROWS", 20000)?;
+
     // Transaction file persistence configuration
     let transaction_file_base_path =
         std::env::var("CDC_TRANSACTION_FILE_BASE_PATH").unwrap_or_else(|_| ".".to_string());
 
     tracing::info!(
-        "CDC Config - Slot: {}, Publication: {}, Protocol: {}, Streaming: {}, Binary: {}",
+        "CDC Config - Slot: {}, Publication: {}, Streaming: {}, Connection timeout: {}s",
         replication_slot,
         publication,
-        protocol_version,
         streaming,
-        binary_format
-    );
-
-    tracing::info!(
-        "Timeouts - Connection: {}s, Query: {}s",
-        connection_timeout_secs,
-        query_timeout_secs
+        connection_timeout_secs
     );
 
     tracing::info!(
@@ -154,11 +182,8 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .destination_connection_string(destination_connection_string)
         .replication_slot_name(replication_slot)
         .publication_name(publication)
-        .protocol_version(protocol_version)
-        .binary_format(binary_format)
         .streaming(streaming)
         .connection_timeout(Duration::from_secs(connection_timeout_secs))
-        .query_timeout(Duration::from_secs(query_timeout_secs))
         .schema_mappings(schema_mappings)
         .buffer_size(buffer_size)
         .batch_size(batch_size)
@@ -166,10 +191,40 @@ pub fn load_config_from_env() -> Result<Config, CdcError> {
         .transaction_segment_size_bytes(segment_size_bytes)
         .bulk_insert_threshold(bulk_insert_threshold)
         .max_rows_per_insert(max_rows_per_insert)
+        .initial_snapshot(initial_snapshot)
+        .snapshot_target_policy(snapshot_target_policy)
+        .snapshot_writers(snapshot_writers)
+        .snapshot_buffer_bytes(snapshot_buffer_bytes)
+        .snapshot_batch_rows(snapshot_batch_rows)
         .build()?;
 
     tracing::info!("Configuration loaded successfully");
     Ok(config)
+}
+
+fn required_env(key: &str, example: &str) -> Result<String, CdcError> {
+    std::env::var(key).map_err(|_| {
+        CdcError::config(format!(
+            "{key} environment variable is required. Example: {example}"
+        ))
+    })
+}
+
+fn parse_destination_type(value: &str) -> Result<DestinationType, CdcError> {
+    [
+        ("mysql", DestinationType::MySQL),
+        ("sqlserver", DestinationType::SqlServer),
+        ("sqlite", DestinationType::SQLite),
+        ("kafka", DestinationType::Kafka),
+    ]
+    .into_iter()
+    .find(|(name, _)| value.eq_ignore_ascii_case(name))
+    .map(|(_, destination)| destination)
+    .ok_or_else(|| {
+        CdcError::config(format!(
+            "Unknown CDC_DEST_TYPE '{value}'. Expected one of: MySQL, SqlServer, SQLite, Kafka"
+        ))
+    })
 }
 
 // Helper functions for parsing environment variables
@@ -213,16 +268,6 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool, CdcError> {
         Ok(value) => value.parse::<bool>().map_err(|e| {
             CdcError::config(format!("Invalid boolean value for {key}: {value} ({e})"))
         }),
-        Err(_) => Ok(default),
-    }
-}
-
-/// Parse a u32 environment variable with a default value
-fn parse_u32_env(key: &str, default: u32) -> Result<u32, CdcError> {
-    match std::env::var(key) {
-        Ok(value) => value
-            .parse::<u32>()
-            .map_err(|e| CdcError::config(format!("Invalid u32 value for {key}: {value} ({e})"))),
         Err(_) => Ok(default),
     }
 }

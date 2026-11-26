@@ -10,7 +10,10 @@
 	pgbench-test-sqlite-setup pgbench-test-sqlite pgbench-test-sqlite-clean pgbench-test-sqlite-full \
 	chaos-test-kafka-setup chaos-test-kafka chaos-test-kafka-clean chaos-test-kafka-full \
 	pgbench-test-kafka-setup pgbench-test-kafka pgbench-test-kafka-clean pgbench-test-kafka-full \
-	chaos-test-full pgbench-test-full
+	chaos-test-full pgbench-test-full \
+	before-git-push snapshot-unit-test \
+	snapshot-test snapshot-test-up snapshot-test-sqlite snapshot-test-mysql snapshot-test-sqlserver snapshot-test-kafka snapshot-test-clean \
+	snapshot-bench-sqlite snapshot-bench-mysql snapshot-bench-sqlserver snapshot-bench-kafka
 
 # Default target
 help:
@@ -23,6 +26,8 @@ help:
 	@echo "  format         Format code with rustfmt"
 	@echo "  update-deps    Bump all Cargo.toml deps to latest stable (pinned)"
 	@echo "  run            Run the application locally"
+	@echo "  before-git-push  What CI checks: check, build, format, audit, test, doc-check,"
+	@echo "                 then the snapshot unit tests and all four snapshot e2e suites (needs docker, ~25 min)"
 	@echo ""
 	@echo "Docker:"
 	@echo "  docker-build   Build Docker services"
@@ -91,6 +96,20 @@ help:
 	@echo "  chaos-test-full              Run chaos tests for all destinations"
 	@echo "  pgbench-test-full            Run pgbench tests for all destinations"
 	@echo ""
+	@echo "Initial Snapshot Testing (needs docker; containers are kept after a failure):"
+	@echo "  snapshot-unit-test           Snapshot unit tests that need no services (as the CI job does)"
+	@echo "  snapshot-test-up             Start the PostgreSQL source (docker-compose.snapshot-test.yml)"
+	@echo "  snapshot-test-sqlite         Run snapshot end-to-end tests against SQLite"
+	@echo "  snapshot-test-mysql          Run snapshot end-to-end tests against MySQL"
+	@echo "  snapshot-test-sqlserver      Run snapshot end-to-end tests against SQL Server"
+	@echo "  snapshot-test-kafka          Run snapshot end-to-end tests against Kafka"
+	@echo "  snapshot-test-clean          Remove the snapshot test containers"
+	@echo "  snapshot-bench-sqlite        Snapshot throughput benchmark against SQLite"
+	@echo "  snapshot-bench-mysql         Snapshot throughput benchmark against MySQL"
+	@echo "  snapshot-bench-sqlserver     Snapshot throughput benchmark against SQL Server"
+	@echo "  snapshot-bench-kafka         Snapshot throughput benchmark against Kafka"
+	@echo "  snapshot-test                Run all destinations, then clean up"
+	@echo ""
 
 # Development commands
 build:
@@ -123,7 +142,9 @@ run:
 doc-check:
 	cargo doc --no-deps --all-features
 
-before-git-push: check build format audit test doc-check
+# The fast checks first, then what the snapshot CI workflow runs: its unit job and, with docker, the
+# four end-to-end suites. A failing e2e run leaves its containers up for inspection (snapshot-test-clean).
+before-git-push: check build format audit test doc-check snapshot-unit-test snapshot-test
 
 # Docker commands
 docker-build:
@@ -477,3 +498,63 @@ chaos-test-full: chaos-test-mysql-full chaos-test-sqlserver-full chaos-test-sqli
 
 pgbench-test-full: pgbench-test-mysql-full pgbench-test-sqlserver-full pgbench-test-sqlite-full pgbench-test-kafka-full
 	@echo "All pgbench tests complete!"
+
+# Initial snapshot end-to-end tests. The tests live in pg2any-lib/tests/snapshot_e2e_*.rs and are
+# #[ignore]d; they run here against the containers of docker-compose.snapshot-test.yml.
+# Containers are removed only by snapshot-test-clean, so a failing run can be inspected.
+SNAPSHOT_COMPOSE = docker compose -f docker-compose.snapshot-test.yml
+SNAPSHOT_PG_URL ?= postgresql://postgres:test.123@127.0.0.1:5432/postgres?replication=database
+SNAPSHOT_MYSQL_URL ?= mysql://cdc_user:test.123@127.0.0.1:3306/cdc_db
+SNAPSHOT_SQLSERVER_URL ?= Server=tcp:127.0.0.1,1433;Database=cdc_db;User Id=sa;Password=Test.123!;TrustServerCertificate=true
+SNAPSHOT_KAFKA_BROKERS ?= 127.0.0.1:9094
+SNAPSHOT_TEST_ARGS = -- --ignored --test-threads=1 --nocapture --skip bench_
+# Throughput benchmarks (bench_snapshot_throughput_<dest>): same services, only the `bench_` tests.
+# `make snapshot-bench-mysql SNAPSHOT_BENCH_CARGO_FLAGS=--release` measures an optimised build.
+SNAPSHOT_BENCH_CARGO_FLAGS ?=
+SNAPSHOT_BENCH_ARGS = -- --ignored --test-threads=1 --nocapture bench_
+
+# The `unit` job of .github/workflows/snapshot_integration_test.yml: no services needed.
+snapshot-unit-test:
+	cd pg2any-lib && cargo test --lib snapshot
+	cd pg2any-lib && cargo test --lib --features kafka destinations::kafka
+	cd pg2any-lib && cargo test --features kafka --test snapshot_e2e_kafka
+
+snapshot-test-up:
+	$(SNAPSHOT_COMPOSE) up -d --wait
+
+snapshot-test-sqlite: snapshot-test-up
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' cargo test --test snapshot_e2e_sqlite $(SNAPSHOT_TEST_ARGS)
+
+snapshot-test-mysql:
+	$(SNAPSHOT_COMPOSE) --profile mysql up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_MYSQL_URL='$(SNAPSHOT_MYSQL_URL)' cargo test --test snapshot_e2e_mysql $(SNAPSHOT_TEST_ARGS)
+
+snapshot-test-sqlserver:
+	$(SNAPSHOT_COMPOSE) --profile sqlserver up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_SQLSERVER_URL='$(SNAPSHOT_SQLSERVER_URL)' cargo test --test snapshot_e2e_sqlserver $(SNAPSHOT_TEST_ARGS)
+
+snapshot-test-kafka:
+	$(SNAPSHOT_COMPOSE) --profile kafka up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_KAFKA_BROKERS='$(SNAPSHOT_KAFKA_BROKERS)' cargo test --features kafka --test snapshot_e2e_kafka $(SNAPSHOT_TEST_ARGS)
+
+snapshot-bench-sqlite: snapshot-test-up
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' cargo test $(SNAPSHOT_BENCH_CARGO_FLAGS) --test snapshot_e2e_sqlite $(SNAPSHOT_BENCH_ARGS)
+
+snapshot-bench-mysql:
+	$(SNAPSHOT_COMPOSE) --profile mysql up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_MYSQL_URL='$(SNAPSHOT_MYSQL_URL)' cargo test $(SNAPSHOT_BENCH_CARGO_FLAGS) --test snapshot_e2e_mysql $(SNAPSHOT_BENCH_ARGS)
+
+snapshot-bench-sqlserver:
+	$(SNAPSHOT_COMPOSE) --profile sqlserver up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_SQLSERVER_URL='$(SNAPSHOT_SQLSERVER_URL)' cargo test $(SNAPSHOT_BENCH_CARGO_FLAGS) --test snapshot_e2e_sqlserver $(SNAPSHOT_BENCH_ARGS)
+
+snapshot-bench-kafka:
+	$(SNAPSHOT_COMPOSE) --profile kafka up -d --wait
+	cd pg2any-lib && PG2ANY_TEST_PG_URL='$(SNAPSHOT_PG_URL)' PG2ANY_TEST_KAFKA_BROKERS='$(SNAPSHOT_KAFKA_BROKERS)' cargo test $(SNAPSHOT_BENCH_CARGO_FLAGS) --features kafka --test snapshot_e2e_kafka $(SNAPSHOT_BENCH_ARGS)
+
+snapshot-test-clean:
+	$(SNAPSHOT_COMPOSE) --profile mysql --profile sqlserver --profile kafka down -v --remove-orphans
+
+snapshot-test:
+	$(MAKE) -j1 snapshot-test-sqlite snapshot-test-mysql snapshot-test-sqlserver snapshot-test-kafka
+	$(MAKE) snapshot-test-clean

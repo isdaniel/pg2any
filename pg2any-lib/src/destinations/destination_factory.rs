@@ -9,13 +9,21 @@ use chrono::{DateTime, Utc};
 use pg_walstream::ChangeEvent;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
+/// One source transaction's events, as handed to `execute_events_group_with_hook`.
+pub struct EventTransaction<'a> {
+    pub transaction_id: u32,
+    pub commit_timestamp: DateTime<Utc>,
+    pub commit_lsn: Option<Lsn>,
+    pub events: &'a [ChangeEvent],
+}
+
 pub type PreCommitHook =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
 
 /// Factory closure for constructing a destination handler.
 ///
-/// `Fn` (not `FnOnce`) — the consumer creates an additional handler during
-/// `start_file_based_workflow`, so the factory may be invoked multiple times.
+/// `Fn` (not `FnOnce`): the factory is invoked once for the live pipeline (the recovery and the
+/// consumer share that handler) and once per snapshot writer.
 pub type DestinationFactoryFn = Arc<dyn Fn() -> Result<Box<dyn DestinationHandler>> + Send + Sync>;
 
 /// Trait for database destination handlers
@@ -112,6 +120,20 @@ pub trait DestinationHandler: Send + Sync {
         ))
     }
 
+    /// Group commit: apply several whole transactions (ascending `commit_lsn`) in one go. There
+    /// is no resume checkpoint: on error the caller retries the transactions one by one, so a
+    /// destination must either deliver the whole group or fail without delivering any of it
+    /// (or tolerate a repeat, like Kafka). The default delivers nothing and returns
+    /// `Unsupported`: the caller then applies the transactions one by one.
+    async fn execute_events_group_with_hook(
+        &mut self,
+        _group: &[EventTransaction<'_>],
+    ) -> Result<()> {
+        Err(CdcError::unsupported(
+            "Grouped event delivery not supported by this destination",
+        ))
+    }
+
     fn supports_bulk_insert(&self) -> bool {
         false
     }
@@ -132,4 +154,48 @@ pub trait DestinationHandler: Send + Sync {
         self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
             .await
     }
+
+    /// Snapshot: whether the destination table `schema.table` holds no rows.
+    /// `schema` is the already-mapped destination schema. Errors when the table
+    /// is missing or unreadable. Destinations that do not override this cannot
+    /// be used with `SnapshotTargetPolicy::FailIfNotEmpty`.
+    async fn snapshot_table_is_empty(&mut self, _schema: &str, _table: &str) -> Result<bool> {
+        Err(CdcError::unsupported(
+            "destination does not support snapshot target checks",
+        ))
+    }
+
+    /// Snapshot: clear the destination table `schema.table` (mapped schema).
+    /// A dialect without TRUNCATE (e.g. Kafka) makes this a no-op.
+    async fn snapshot_truncate_table(&mut self, schema: &str, table: &str) -> Result<()> {
+        match self.dialect().truncate_table_sql(schema, table) {
+            None => Ok(()),
+            Some(sql) => self.execute_sql_batch_with_hook(&[sql], None).await,
+        }
+    }
+
+    /// Snapshot: apply a batch of row events captured at `consistent_point`.
+    async fn execute_snapshot_events_batch(
+        &mut self,
+        events: &[ChangeEvent],
+        consistent_point: Lsn,
+    ) -> Result<()> {
+        self.execute_events_batch_with_hook(events, 0, Utc::now(), Some(consistent_point), None)
+            .await
+    }
+
+    /// Key columns of a source table (`schema.table` as named in the source), for destinations
+    /// that key records (Kafka overrides). Given for snapshot rows and, at start, for the live
+    /// path's inserts.
+    fn set_snapshot_key_columns(&mut self, _source_table_key: &str, _columns: Vec<Arc<str>>) {}
+
+    /// Maximum concurrent snapshot writers; SQLite and Kafka override to 1.
+    fn max_snapshot_writers(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Snapshot: called once on every snapshot writer handler before its first batch, so a
+    /// destination can enable fast paths that are only safe for the snapshot's rendered rows, or
+    /// drop checks that only the live path needs (SQL Server's triggers and constraints).
+    fn begin_snapshot_writes(&mut self) {}
 }

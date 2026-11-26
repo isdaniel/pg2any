@@ -10,7 +10,7 @@ pg2any is a Rust library and application for real-time PostgreSQL Change Data Ca
 PostgreSQL WAL --> Producer (reads WAL, writes files) --> File System --> Consumer (reads files, executes SQL) --> Destination
 ```
 
-**Core pattern**: File-based producer-consumer with crash recovery. Transactions are persisted to disk before execution, enabling restart from exact position.
+**Core pattern**: File-based producer-consumer with crash recovery. Transactions are persisted to disk before execution, enabling restart from exact position. (Exceptions: the opt-in initial snapshot bypasses transaction files and recovers via `snapshot_marker.json`, and small transactions stay in memory; see CLAUDE.md.)
 
 ### Three-Directory Transaction Store
 
@@ -123,14 +123,14 @@ pg2any implements coordinated producer-consumer shutdown with zero data loss:
 
 1. **Signal** (SIGINT/SIGTERM) → `CancellationToken` cancelled
 2. **Producer** exits WAL read loop → flushes buffers → drops mpsc sender → sends oneshot
-3. **Consumer** receives oneshot → breaks main loop → calls `drain_and_shutdown()`
-4. **Drain** uses a fresh (uncancellable) token → processes ALL remaining queued transactions
+3. **Consumer** receives oneshot → breaks main loop → calls `drain_and_shutdown()`. If the cancel interrupts the consumer while it is applying, it first runs `wait_for_producer` (keeps receiving until the producer stopped) so a transaction committed during shutdown is not left behind
+4. **Drain** uses a fresh (uncancellable) token → processes ALL remaining queued transactions, retrying a failing destination with backoff until everything is applied (no time limit of its own: the process manager's stop timeout is the only bound; unapplied files replay on the next start)
 5. **Finalize** each transaction: commit to destination → update `flush_lsn` → persist to disk → delete file
-6. **Client.stop()** joins handles → sends final ACK to PostgreSQL → closes destination → final persist
+6. **Client.stop()** joins handles → sends final ACK to PostgreSQL → closes destination → final persist → returns the drain error, if any
 
 ### Invariant
 
-The on-disk LSN metadata represents the last transaction **fully applied** to the destination. On restart, any transaction with `commit_lsn <= flush_lsn` is skipped (position-tracking deduplication). Files in `sql_pending_tx/` with `commit_lsn > flush_lsn` are replayed.
+Every transaction the producer committed before it stopped is applied before exit (data still in PostgreSQL stays in the slot). The on-disk LSN metadata represents the last transaction **fully applied** to the destination. On restart, any transaction with `commit_lsn <= flush_lsn` is skipped (position-tracking deduplication). Files in `sql_pending_tx/` with `commit_lsn > flush_lsn` are replayed. A batch the destination committed just before the crash is replayed too; during startup recovery (and, because of the in-memory fast path, for the first few batches after it) a batch of only inserts skips its duplicate-key rows (logged at WARN); a batch with updates or deletes stays an error.
 
 ### Why NOT duplicate-key ignore
 
@@ -147,6 +147,8 @@ Position-tracking (not `ON CONFLICT DO NOTHING` / `INSERT IGNORE`) is the correc
 | Crash mid-transaction | Files in `sql_received_tx/` | Incomplete transactions cleaned up |
 | Crash after commit, before execute | Files in `sql_pending_tx/` | Replayed from start (or `last_executed_command_index`) |
 | Crash after partial execution | File in `sql_pending_tx/` with progress | Resumed from checkpoint |
+| Crash with in-memory transactions pending | Nothing for in-memory transactions | PostgreSQL re-sends them (the slot never advanced past an unapplied one) |
+| Crash after a group commit, before the LSN persist | The group's files in `sql_pending_tx/` | The whole group is replayed (all-or-nothing); after the persist it is skipped |
 
 ## Error Handling
 
@@ -173,6 +175,13 @@ The consumer-side uses a tiered optimization strategy for batch INSERT operation
 4. **TDS Bulk Load** (SQL Server, configurable) - Uses tiberius's native `bulk_insert()` API for streaming row insertion via TDS protocol. Falls back to multi-value INSERT if bulk load fails or table metadata retrieval fails.
 
 Config env vars: `CDC_BULK_INSERT_THRESHOLD`
+
+### Group commit, the in-memory fast path and the SQL Server bulk load (always on)
+
+- Group commit (always on, no setting; const `GROUP_COMMIT_MAX_TXNS` = 128): the consumer merges the small transactions that are already queued, never waiting for more, into ONE destination transaction (no pre-commit hook, no checkpoint; on failure the same transactions are applied one by one; LSN persisted once before the files are deleted). Kafka (event mode) sends a group with one delivery wait.
+- Group commit exceptions: on MySQL a group never contains a TRUNCATE (implicit commit; applied one by one instead); coalesced UPDATE statements never merge an update of a row an earlier one in the same statement wrote (REPLICA IDENTITY FULL chains, key changes). On MySQL (SET assigns left to right) an UPDATE that changes a WHERE column while a later column also changes is not coalesced. The startup replay grace is spent only by completed batches, never by failed attempts.
+- In-memory fast path (no setting): small ordinary transactions (at most one batch) stay in memory instead of transaction files while the in-memory text is below the const `MEMORY_FAST_PATH_BUDGET_BYTES` (64 MiB) and spill to files beyond one batch or the budget. Safe because the slot only advances after apply.
+- SQL Server bulk load (no setting): quoted integers are converted to the column's integer type and the live path requests KEEP_NULLS + FIRE_TRIGGERS + CHECK_CONSTRAINTS; the snapshot's writers ask for KEEP_NULLS only.
 
 ## Common Patterns
 

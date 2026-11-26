@@ -8,7 +8,8 @@
 //! lever. We set it to `max(confirmed_flush_lsn, disk)`.
 
 use crate::error::{CdcError, Result};
-use pg_walstream::{parse_lsn, PgReplicationConnection};
+use pg_walstream::{parse_lsn, quote_literal, PgReplicationConnection};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
@@ -21,6 +22,8 @@ pub(crate) struct SlotStatus {
     pub(crate) restart_lsn: Option<u64>,
     /// `active`: whether another connection currently holds the slot.
     pub(crate) active: bool,
+    /// `wal_status = 'lost'` (PG13+): the slot's WAL has been removed. `false` when not queried.
+    pub(crate) wal_lost: bool,
 }
 
 /// Where the resume position came from (for logging).
@@ -116,13 +119,34 @@ pub(crate) fn validate_slot_name(slot_name: &str) -> Result<()> {
 
 /// Build the `pg_replication_slots` lookup. The name is validated to `[a-z0-9_]`
 /// by [`validate_slot_name`] before we get here, so interpolation is safe; the
-/// single-quote escape stays as belt-and-suspenders.
-fn build_slot_query(slot_name: &str) -> String {
+/// single-quote escape stays as belt-and-suspenders. `wal_status` is selected
+/// last and only on request: the column does not exist before PostgreSQL 13.
+fn build_slot_query(slot_name: &str, include_wal_status: bool) -> String {
     let escaped = slot_name.replace('\'', "''");
+    let wal_status = if include_wal_status {
+        ", wal_status"
+    } else {
+        ""
+    };
     format!(
-        "SELECT restart_lsn, confirmed_flush_lsn, active \
+        "SELECT restart_lsn, confirmed_flush_lsn, active{wal_status} \
          FROM pg_replication_slots WHERE slot_name = '{escaped}'"
     )
+}
+
+/// Build the guarded drop. Selecting from `pg_replication_slots` makes a missing
+/// slot a zero-row no-op instead of a server error we would have to string-match.
+fn build_drop_slot_query(slot_name: &str) -> Result<String> {
+    validate_slot_name(slot_name)?;
+    Ok(format!(
+        "SELECT pg_drop_replication_slot(slot_name) \
+         FROM pg_replication_slots WHERE slot_name = '{slot_name}'"
+    ))
+}
+
+/// `wal_status = 'lost'` means the slot's required WAL has been removed.
+fn parse_wal_lost(value: Option<String>) -> bool {
+    value.is_some_and(|s| s.trim() == "lost")
 }
 
 /// Parse an LSN text field from `pg_replication_slots` (e.g. `"16/B374D848"`).
@@ -146,9 +170,13 @@ fn parse_active_field(value: Option<String>) -> bool {
 
 /// Blocking query. Returns `Ok(None)` when the slot does not exist.
 /// The connection and result are dropped (RAII) before returning — no leak.
-fn query_slot_blocking(conninfo: &str, slot_name: &str) -> Result<Option<SlotStatus>> {
+fn query_slot_blocking(
+    conninfo: &str,
+    slot_name: &str,
+    include_wal_status: bool,
+) -> Result<Option<SlotStatus>> {
     let mut conn = PgReplicationConnection::connect(conninfo)?;
-    let result = conn.exec(&build_slot_query(slot_name))?;
+    let result = conn.exec(&build_slot_query(slot_name, include_wal_status))?;
 
     if result.ntuples() == 0 {
         return Ok(None);
@@ -158,7 +186,23 @@ fn query_slot_blocking(conninfo: &str, slot_name: &str) -> Result<Option<SlotSta
         restart_lsn: parse_lsn_field(result.get_value(0, 0)),
         confirmed_flush_lsn: parse_lsn_field(result.get_value(0, 1)),
         active: parse_active_field(result.get_value(0, 2)),
+        wal_lost: include_wal_status && parse_wal_lost(result.get_value(0, 3)),
     }))
+}
+
+/// Run a blocking libpq call on a blocking thread, bounded by `timeout`.
+async fn run_blocking<T: Send + 'static>(
+    what: &str,
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(join_err)) => Err(CdcError::generic(format!("{what} task failed: {join_err}"))),
+        Err(_elapsed) => Err(CdcError::connection(format!(
+            "{what} timed out after {timeout:?}"
+        ))),
+    }
 }
 
 /// Query `pg_replication_slots` for `slot_name` on a short-lived connection.
@@ -169,39 +213,261 @@ fn query_slot_blocking(conninfo: &str, slot_name: &str) -> Result<Option<SlotSta
 ///
 /// On timeout the blocking thread is left to finish and drop on its own — the
 /// blocking `connect`/`exec` cannot be cancelled mid-call.
+///
+/// `include_wal_status` also selects `wal_status` to fill [`SlotStatus::wal_lost`];
+/// leave it `false` on servers older than PostgreSQL 13.
 // ponytail: timeout stops us waiting, not the blocking call; acceptable for a one-shot startup probe.
 pub(crate) async fn query_replication_slot(
     conninfo: &str,
     slot_name: &str,
     timeout: Duration,
+    include_wal_status: bool,
 ) -> Result<Option<SlotStatus>> {
     validate_slot_name(slot_name)?;
     let conninfo = conninfo.to_string();
     let slot_name = slot_name.to_string();
     debug!("Querying pg_replication_slots for slot '{}'", slot_name);
 
-    let handle = tokio::task::spawn_blocking(move || query_slot_blocking(&conninfo, &slot_name));
+    run_blocking("replication slot query", timeout, move || {
+        query_slot_blocking(&conninfo, &slot_name, include_wal_status)
+    })
+    .await
+}
 
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(join_err)) => Err(CdcError::generic(format!(
-            "replication slot query task failed: {join_err}"
-        ))),
-        Err(_elapsed) => Err(CdcError::connection(format!(
-            "replication slot query timed out after {timeout:?}"
-        ))),
+/// Drop `slot_name` on a short-lived connection. A missing slot is `Ok`; an
+/// active slot is a server error and surfaces as `Err`. Used by the snapshot's recover and
+/// re-sync paths (`coordinator::drop_source_slot`).
+pub(crate) async fn drop_replication_slot(
+    conninfo: &str,
+    slot_name: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let sql = build_drop_slot_query(slot_name)?;
+    let conninfo = conninfo.to_string();
+    debug!("Dropping replication slot '{}'", slot_name);
+
+    run_blocking("replication slot drop", timeout, move || {
+        PgReplicationConnection::connect(&conninfo)?.exec(&sql)?;
+        Ok(())
+    })
+    .await
+}
+
+/// Builds the lookup of the columns pgoutput flags as key columns in a relation message: the
+/// replica identity key, which is the primary key under `DEFAULT`, the chosen index under `USING
+/// INDEX`, every column under `FULL` and nothing under `NOTHING`. Ordered by column number, the
+/// order of a relation message's columns. Names are quoted with `quote_literal`, which is safe
+/// under any `standard_conforming_strings` setting (`E'..'` for a backslash) and refuses a NUL.
+fn build_replica_identity_keys_query(tables: &[(String, String)]) -> Result<String> {
+    let list = tables
+        .iter()
+        .map(|(schema, table)| {
+            Ok(format!(
+                "({}, {})",
+                quote_literal(schema)?,
+                quote_literal(table)?
+            ))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    Ok(replica_identity_keys_sql(&format!(
+        "(n.nspname, c.relname) IN ({})",
+        list.join(", ")
+    )))
+}
+
+/// The same lookup for every table of `publication`.
+fn build_publication_identity_keys_query(publication: &str) -> Result<String> {
+    Ok(replica_identity_keys_sql(&format!(
+        "(n.nspname, c.relname) IN (SELECT schemaname, tablename FROM pg_publication_tables \
+         WHERE pubname = {})",
+        quote_literal(publication)?
+    )))
+}
+
+// `indkey` also lists the INCLUDE columns, which pgoutput does not flag as key: only the first
+// `indnkeyatts` entries are key columns (PostgreSQL 11+).
+fn replica_identity_keys_sql(table_filter: &str) -> String {
+    format!(
+        "SELECT n.nspname, c.relname, a.attname \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+         WHERE {table_filter} \
+         AND (c.relreplident = 'f' OR a.attnum IN ( \
+             SELECT u.k FROM pg_index i, unnest(i.indkey::int2[]) WITH ORDINALITY AS u(k, n) \
+             WHERE i.indrelid = c.oid AND u.n <= i.indnkeyatts \
+             AND ((c.relreplident = 'd' AND i.indisprimary) \
+               OR (c.relreplident = 'i' AND i.indisreplident)))) \
+         ORDER BY n.nspname, c.relname, a.attnum"
+    )
+}
+
+/// Groups `(schema, table, column)` rows, already ordered, into `"schema.table"` -> columns.
+fn group_key_columns(
+    rows: impl IntoIterator<Item = (String, String, String)>,
+) -> Vec<(String, Vec<Arc<str>>)> {
+    let mut grouped: Vec<(String, Vec<Arc<str>>)> = Vec::new();
+    for (schema, table, column) in rows {
+        let key = format!("{schema}.{table}");
+        match grouped.last_mut() {
+            Some((last, columns)) if *last == key => columns.push(Arc::from(column)),
+            _ => grouped.push((key, vec![Arc::from(column)])),
+        }
     }
+    grouped
+}
+
+/// Replica-identity key columns of `tables` (source `(schema, table)`), keyed `"schema.table"`;
+/// a table without key columns is absent. The snapshot's own relation descriptors carry no key
+/// flags, so a destination that keys its records (Kafka) asks the source catalog, on a
+/// short-lived connection, bounded by `timeout`.
+pub(crate) async fn query_replica_identity_keys(
+    conninfo: &str,
+    tables: &[(String, String)],
+    timeout: Duration,
+) -> Result<Vec<(String, Vec<Arc<str>>)>> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    run_identity_keys_query(
+        conninfo,
+        build_replica_identity_keys_query(tables)?,
+        timeout,
+    )
+    .await
+}
+
+/// Replica-identity key columns of every table of `publication`, for a live destination that
+/// keys its records (Kafka) and would otherwise learn a table's key only from its first
+/// UPDATE/DELETE, leaving earlier inserts unkeyed.
+pub(crate) async fn query_publication_identity_keys(
+    conninfo: &str,
+    publication: &str,
+    timeout: Duration,
+) -> Result<Vec<(String, Vec<Arc<str>>)>> {
+    run_identity_keys_query(
+        conninfo,
+        build_publication_identity_keys_query(publication)?,
+        timeout,
+    )
+    .await
+}
+
+async fn run_identity_keys_query(
+    conninfo: &str,
+    sql: String,
+    timeout: Duration,
+) -> Result<Vec<(String, Vec<Arc<str>>)>> {
+    let conninfo = conninfo.to_string();
+    run_blocking("replica identity key query", timeout, move || {
+        let mut conn = PgReplicationConnection::connect(&conninfo)?;
+        let result = conn.exec(&sql)?;
+        let cell = |row, col| result.get_value(row, col).unwrap_or_default();
+        Ok(group_key_columns(
+            (0..result.ntuples()).map(|row| (cell(row, 0), cell(row, 1), cell(row, 2))),
+        ))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn key_query_lists_every_table_quoted_and_orders_by_column_number() {
+        let sql = build_replica_identity_keys_query(&[
+            ("public".into(), "users".into()),
+            ("o'brien".into(), "Snap Mixed".into()),
+        ])
+        .unwrap();
+        assert!(
+            sql.contains("IN (('public', 'users'), ('o''brien', 'Snap Mixed'))"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("ORDER BY n.nspname, c.relname, a.attnum"),
+            "{sql}"
+        );
+        for identity in [
+            "relreplident = 'f'",
+            "relreplident = 'd' AND i.indisprimary",
+            "relreplident = 'i' AND i.indisreplident",
+        ] {
+            assert!(sql.contains(identity), "{identity} missing from {sql}");
+        }
+    }
+
+    #[test]
+    fn key_query_ignores_include_columns() {
+        let sql = build_replica_identity_keys_query(&[("public".into(), "t".into())]).unwrap();
+        assert!(sql.contains("u.n <= i.indnkeyatts"), "{sql}");
+    }
+
+    #[test]
+    fn publication_key_query_filters_by_quoted_publication_name() {
+        let sql = build_publication_identity_keys_query("my'pub").unwrap();
+        assert!(
+            sql.contains("FROM pg_publication_tables WHERE pubname = 'my''pub')"),
+            "{sql}"
+        );
+        assert!(sql.contains("relreplident = 'f'"), "{sql}");
+        assert!(
+            sql.ends_with("ORDER BY n.nspname, c.relname, a.attnum"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn replica_identity_key_query_uses_escape_strings_for_backslashes() {
+        let sql =
+            build_replica_identity_keys_query(&[("public".into(), r"back\slash".into())]).unwrap();
+        assert!(sql.contains(r"IN (('public',  E'back\\slash'))"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn replica_identity_key_query_rejects_a_nul_before_connecting() {
+        let tables = [("public".to_string(), "bad\0name".to_string())];
+        assert!(build_replica_identity_keys_query(&tables).is_err());
+        let err = query_replica_identity_keys("not a conninfo", &tables, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn key_rows_are_grouped_per_table_in_order() {
+        let row = |s: &str, t: &str, c: &str| (s.to_string(), t.to_string(), c.to_string());
+        let grouped = group_key_columns([
+            row("public", "a", "tenant"),
+            row("public", "a", "id"),
+            row("public", "b", "id"),
+        ]);
+        let names: Vec<(&str, Vec<&str>)> = grouped
+            .iter()
+            .map(|(k, cols)| (k.as_str(), cols.iter().map(|c| &**c).collect()))
+            .collect();
+        assert_eq!(
+            names,
+            [("public.a", vec!["tenant", "id"]), ("public.b", vec!["id"])]
+        );
+        assert!(group_key_columns([]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_tables_means_no_query() {
+        let keys = query_replica_identity_keys("not a conninfo", &[], Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert!(keys.is_empty());
+    }
+
     fn slot(confirmed: Option<u64>, restart: Option<u64>, active: bool) -> SlotStatus {
         SlotStatus {
             confirmed_flush_lsn: confirmed,
             restart_lsn: restart,
             active,
+            wal_lost: false,
         }
     }
 
@@ -325,7 +591,7 @@ mod tests {
 
     #[test]
     fn build_query_contains_slot_and_columns() {
-        let sql = build_slot_query("pg2any_slot");
+        let sql = build_slot_query("pg2any_slot", false);
         assert!(sql.contains("pg_replication_slots"));
         assert!(sql.contains("restart_lsn"));
         assert!(sql.contains("confirmed_flush_lsn"));
@@ -335,8 +601,35 @@ mod tests {
     #[test]
     fn build_query_escapes_single_quote() {
         // Defensive: PG slot names are [a-z0-9_], but never interpolate raw.
-        let sql = build_slot_query("a'b");
+        let sql = build_slot_query("a'b", false);
         assert!(sql.contains("slot_name = 'a''b'"));
+    }
+
+    #[test]
+    fn slot_query_selects_wal_status_only_when_requested() {
+        // `wal_status` only exists on PG13+, so it must not appear unless asked for.
+        assert!(!build_slot_query("pg2any_slot", false).contains("wal_status"));
+        assert!(build_slot_query("pg2any_slot", true).contains("wal_status"));
+    }
+
+    #[test]
+    fn wal_status_lost_sets_wal_lost() {
+        assert!(parse_wal_lost(Some("lost".to_string())));
+        assert!(parse_wal_lost(Some(" lost ".to_string()))); // trimmed
+        for ok in ["reserved", "extended", "unreserved"] {
+            assert!(!parse_wal_lost(Some(ok.to_string())), "{ok}");
+        }
+        assert!(!parse_wal_lost(None)); // NULL (e.g. physical slot / not queried)
+    }
+
+    #[test]
+    fn drop_sql_rejects_invalid_slot_name() {
+        assert!(build_drop_slot_query("").is_err());
+        assert!(build_drop_slot_query("bad'; DROP").is_err());
+        assert!(build_drop_slot_query("MySlot").is_err());
+        let sql = build_drop_slot_query("pg2any_slot").unwrap();
+        assert!(sql.contains("pg_drop_replication_slot"));
+        assert!(sql.contains("slot_name = 'pg2any_slot'"));
     }
 
     #[test]
@@ -387,7 +680,7 @@ mod tests {
         // and before it can reach SQL interpolation. Uses an unroutable host to
         // prove we never even attempt to connect.
         let dsn = "host=192.0.2.1 port=5432 dbname=postgres user=postgres";
-        let res = query_replication_slot(dsn, "bad'; DROP", Duration::from_secs(5)).await;
+        let res = query_replication_slot(dsn, "bad'; DROP", Duration::from_secs(5), false).await;
         assert!(
             res.is_err(),
             "invalid slot name must be rejected, got {res:?}"
@@ -400,7 +693,7 @@ mod tests {
         // This is the path that makes the caller fall back to the on-disk LSN;
         // it must return Err rather than panic or hang.
         let dsn = "host=127.0.0.1 port=1 dbname=postgres user=postgres connect_timeout=1";
-        let res = query_replication_slot(dsn, "any_slot", Duration::from_secs(5)).await;
+        let res = query_replication_slot(dsn, "any_slot", Duration::from_secs(5), false).await;
         assert!(
             res.is_err(),
             "connect failure should map to Err (fallback trigger), got {res:?}"
@@ -410,11 +703,54 @@ mod tests {
     #[tokio::test]
     async fn query_replication_slot_unreachable_host_is_err() {
         let dsn = "host=192.0.2.1 port=5432 dbname=postgres user=postgres";
-        let res = query_replication_slot(dsn, "any_slot", Duration::from_millis(200)).await;
+        let res = query_replication_slot(dsn, "any_slot", Duration::from_millis(200), false).await;
         assert!(
             res.is_err(),
             "unreachable host should map to Err (fallback trigger), got {res:?}"
         );
+    }
+
+    // A covering index lists its INCLUDE columns in `indkey`, but pgoutput flags only the key
+    // columns, so an INSERT key containing them would differ from the key of its UPDATE/DELETE.
+    #[tokio::test]
+    async fn identity_keys_exclude_include_columns_live() {
+        let Ok(dsn) = std::env::var("PG2ANY_TEST_SOURCE_DSN") else {
+            eprintln!("PG2ANY_TEST_SOURCE_DSN not set; skipping live identity key test");
+            return;
+        };
+        let d = dsn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c = PgReplicationConnection::connect(&d).expect("connect for setup");
+            c.exec("DROP TABLE IF EXISTS pg2any_it_include")
+                .expect("drop");
+            c.exec(
+                "CREATE TABLE pg2any_it_include (id int, payload text, \
+                 PRIMARY KEY (id) INCLUDE (payload))",
+            )
+            .expect("create table");
+        })
+        .await
+        .expect("setup task");
+
+        let keys = query_replica_identity_keys(
+            &dsn,
+            &[("public".to_string(), "pg2any_it_include".to_string())],
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("key query");
+
+        let d = dsn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c = PgReplicationConnection::connect(&d).expect("connect for cleanup");
+            let _ = c.exec("DROP TABLE IF EXISTS pg2any_it_include");
+        })
+        .await
+        .expect("cleanup task");
+
+        let columns: Vec<&str> = keys[0].1.iter().map(|c| &**c).collect();
+        assert_eq!(keys[0].0, "public.pg2any_it_include");
+        assert_eq!(columns, ["id"]);
     }
 
     // Live-Postgres roundtrip. Gated on `PG2ANY_TEST_SOURCE_DSN` (a
@@ -446,7 +782,7 @@ mod tests {
         .expect("setup task");
 
         // Slot exists: query returns Some, and all three columns map correctly.
-        let status = query_replication_slot(&dsn, IT_SLOT, Duration::from_secs(10))
+        let status = query_replication_slot(&dsn, IT_SLOT, Duration::from_secs(10), true)
             .await
             .expect("query should succeed")
             .expect("slot should be found");
@@ -466,6 +802,7 @@ mod tests {
             !status.active,
             "a freshly created, unstreamed slot should not be active"
         );
+        assert!(!status.wal_lost, "a fresh slot's WAL cannot be lost");
 
         // reconcile: with the slot present, we resume from the slot.
         let decision = reconcile_resume(Some(1), Ok(Some(&status)));
@@ -485,7 +822,7 @@ mod tests {
         .await
         .expect("teardown task");
 
-        let gone = query_replication_slot(&dsn, IT_SLOT, Duration::from_secs(10))
+        let gone = query_replication_slot(&dsn, IT_SLOT, Duration::from_secs(10), false)
             .await
             .expect("query should succeed");
         assert!(gone.is_none(), "slot should be gone after drop");

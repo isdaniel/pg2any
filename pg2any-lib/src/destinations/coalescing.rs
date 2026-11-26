@@ -10,6 +10,7 @@
 // - DELETE batching → OR-combined:   `DELETE FROM t WHERE (...) OR (...);`
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 /// Identifier quoting style used by the target database.
 ///
@@ -375,6 +376,103 @@ struct ParsedUpdate<'a> {
     where_pairs: Option<Vec<(&'a str, &'a str)>>,
 }
 
+/// The rows an UPDATE group writes, indexed so that `hits_row_of_group` does not scan the whole group.
+#[derive(Default)]
+struct GroupRows<'a> {
+    where_clauses: HashSet<&'a str>,
+    /// (column, value a member SETs it to) -> members; the first occurrence of a column per member.
+    written: HashMap<(&'a str, &'a str), Vec<usize>>,
+}
+
+impl<'a> GroupRows<'a> {
+    fn push(&mut self, member: usize, u: &ParsedUpdate<'a>) {
+        self.where_clauses.insert(u.where_clause);
+        let mut seen = HashSet::with_capacity(u.set_pairs.len());
+        for &(c, v) in &u.set_pairs {
+            if seen.insert(c) {
+                self.written.entry((c, v)).or_default().push(member);
+            }
+        }
+    }
+}
+
+/// Whether `g`'s new values satisfy the equality pairs of a WHERE (it SETs at least one of the
+/// WHERE's columns to the WHERE's value and none to another one).
+fn writes_where(g: &ParsedUpdate<'_>, pairs: &[(&str, &str)]) -> bool {
+    let mut matched = false;
+    for (c, v) in pairs {
+        if let Some((_, sv)) = g.set_pairs.iter().find(|(sc, _)| sc == c) {
+            if sv != v {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// The CASE/JOIN rewrite evaluates every WHERE against the rows as they were before the
+/// statement, so an UPDATE that targets a row an earlier member of the group writes would miss
+/// it and its value would be lost: the same WHERE, or a WHERE the member's new values satisfy
+/// (REPLICA IDENTITY FULL chains, key changes). Such an UPDATE starts a new statement.
+fn hits_row_of_group<'a>(
+    rows: &GroupRows<'a>,
+    group: &[ParsedUpdate<'a>],
+    nu: &ParsedUpdate<'a>,
+    quote_style: QuoteStyle,
+) -> bool {
+    // shortcut: a WHERE that is not plain equality/IS NULL cannot be compared, so it never joins a group
+    let Some(pairs) = comparable_where(nu, quote_style) else {
+        return true;
+    };
+    if rows.where_clauses.contains(nu.where_clause) {
+        return true;
+    }
+    // Every member SETs the same columns (`columns_match`), so a member can only be hit if it wrote
+    // the WHERE's value into each SET column the WHERE names: take the shortest such member list.
+    let mut candidates: Option<&Vec<usize>> = None;
+    for pair in pairs.iter() {
+        if !group[0].set_pairs.iter().any(|(c, _)| *c == pair.0) {
+            continue;
+        }
+        match rows.written.get(pair) {
+            None => return false,
+            Some(m) if candidates.is_none_or(|best| m.len() < best.len()) => candidates = Some(m),
+            Some(_) => {}
+        }
+    }
+    candidates.is_some_and(|c| c.iter().any(|&m| writes_where(&group[m], &pairs)))
+}
+
+/// MySQL assigns the SET columns left to right, so in the CASE rewrite a column's CASE reads the NEW
+/// value of the columns assigned before it and misses its row (the ELSE keeps the old value). That
+/// loses data only when the missing column is itself being changed: an UPDATE that changes a column
+/// its own WHERE reads (REPLICA IDENTITY FULL, key change) while a LATER column is assigned a value
+/// other than the one its WHERE reads is therefore never coalesced there. A later column assigned
+/// the value it already holds is safe.
+fn changes_where_column(u: &ParsedUpdate<'_>, quote_style: QuoteStyle) -> bool {
+    comparable_where(u, quote_style).is_none_or(|pairs| {
+        let reads = |col: &str| pairs.iter().find(|(c, _)| *c == col).map(|(_, v)| *v);
+        u.set_pairs.iter().enumerate().any(|(i, (col, val))| {
+            reads(col).is_some_and(|read| read != *val)
+                && u.set_pairs[i + 1..]
+                    .iter()
+                    .any(|(later, to)| reads(later) != Some(*to))
+        })
+    })
+}
+
+/// The WHERE of `u` as `col = value` pairs (`IS NULL` read as `col = NULL`); `None` if it is more.
+fn comparable_where<'b, 'a>(
+    u: &'b ParsedUpdate<'a>,
+    quote_style: QuoteStyle,
+) -> Option<Cow<'b, [(&'a str, &'a str)]>> {
+    match &u.where_pairs {
+        Some(p) => Some(Cow::Borrowed(p.as_slice())),
+        None => parse_where_pairs(u.where_clause, quote_style, true).map(Cow::Owned),
+    }
+}
+
 /// Parse an UPDATE statement into table, SET pairs, and WHERE clause.
 fn parse_update_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedUpdate<'_>> {
     let trimmed = sql.trim();
@@ -433,9 +531,18 @@ fn parse_update_parts(sql: &str, quote_style: QuoteStyle) -> Option<ParsedUpdate
 ///
 /// These rejections are fallback signals; the caller re-uses the CASE-WHEN path,
 /// which works for any WHERE shape.
-fn parse_where_equality_pairs<'a>(
+fn parse_where_equality_pairs(
+    where_clause: &str,
+    quote_style: QuoteStyle,
+) -> Option<Vec<(&str, &str)>> {
+    parse_where_pairs(where_clause, quote_style, false)
+}
+
+/// `allow_is_null`: read `col IS NULL` as the pair `(col, NULL)` instead of rejecting it.
+fn parse_where_pairs<'a>(
     where_clause: &'a str,
     quote_style: QuoteStyle,
+    allow_is_null: bool,
 ) -> Option<Vec<(&'a str, &'a str)>> {
     let bytes = where_clause.as_bytes();
     let open = quote_style.open_char();
@@ -538,6 +645,10 @@ fn parse_where_equality_pairs<'a>(
         }
         // Must be `=` — reject `IS NULL`, `!=`, `<`, `>`, `LIKE`, etc.
         if q >= cb.len() || cb[q] != b'=' {
+            if allow_is_null && chunk[q..].trim().eq_ignore_ascii_case("IS NULL") {
+                pairs.push((col, "NULL"));
+                continue;
+            }
             return None;
         }
         q += 1;
@@ -998,14 +1109,25 @@ pub(crate) fn coalesce_commands<'a>(
             // ── UPDATE coalescing (CASE-WHEN) ───────────────────────────
             ParsedCmd::Update(first_update) => {
                 let table = first_update.table;
+                let mysql = quote_style == QuoteStyle::Backtick;
+                let solo = comparable_where(&first_update, quote_style).is_none()
+                    || (mysql && changes_where_column(&first_update, quote_style));
+                let mut rows = GroupRows::default();
+                if !solo {
+                    rows.push(0, &first_update);
+                }
                 let mut group: Vec<ParsedUpdate<'a>> = vec![first_update];
                 let mut group_size = commands[start_i].len();
                 i += 1;
 
-                while i < commands.len() && group.len() < effective_max {
+                while i < commands.len() && group.len() < effective_max && !solo {
                     let next = classify(&commands[i], quote_style);
                     if let ParsedCmd::Update(nu) = next {
-                        if nu.table == table && columns_match(&group[0].set_pairs, &nu.set_pairs) {
+                        if nu.table == table
+                            && columns_match(&group[0].set_pairs, &nu.set_pairs)
+                            && !(mysql && changes_where_column(&nu, quote_style))
+                            && !hits_row_of_group(&rows, &group, &nu, quote_style)
+                        {
                             // Estimate additional size: new WHEN clauses per column + OR in WHERE.
                             let num_cols = nu.set_pairs.len();
                             let avg_val_len: usize =
@@ -1017,6 +1139,7 @@ pub(crate) fn coalesce_commands<'a>(
                                 + nu.where_clause.len();
                             if group_size + additional <= safety_limit {
                                 group_size += additional;
+                                rows.push(group.len(), &nu);
                                 group.push(nu);
                                 i += 1;
                                 continue;
@@ -2437,5 +2560,380 @@ mod tests {
         // VALUES-JOIN rejects → CASE-WHEN fallback.
         assert_eq!(result.len(), 1);
         assert!(result[0].contains("CASE"));
+    }
+
+    /// A first UPDATE whose WHERE cannot be compared (a range) may cover a row a later equality
+    /// UPDATE targets: in a CASE the first matching branch would win and the later value be lost.
+    /// It stays standalone on every dialect, not only on MySQL.
+    #[test]
+    fn test_coalesce_a_first_update_with_a_non_comparable_where_stays_standalone() {
+        for (style, t, v, id) in [
+            (QuoteStyle::Backtick, "`t`", "`v`", "`id`"),
+            (QuoteStyle::DoubleQuote, "\"t\"", "\"v\"", "\"id\""),
+            (QuoteStyle::Bracket, "[t]", "[v]", "[id]"),
+        ] {
+            let commands = vec![
+                format!("UPDATE {t} SET {v} = 'first' WHERE {id} > 0;"),
+                format!("UPDATE {t} SET {v} = 'second' WHERE {id} = 1;"),
+            ];
+            assert_eq!(
+                coalesce_commands(&commands, u64::MAX, style, 0),
+                commands,
+                "{style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coalesce_updates_never_merge_two_updates_of_the_same_row() {
+        for (style, open, close) in [
+            (QuoteStyle::Backtick, '`', '`'),
+            (QuoteStyle::DoubleQuote, '"', '"'),
+            (QuoteStyle::Bracket, '[', ']'),
+        ] {
+            let update = |v: &str, id: u32| {
+                format!("UPDATE {open}t{close} SET {open}v{close} = '{v}' WHERE {open}id{close} = {id};")
+            };
+            let commands = vec![
+                update("a", 1),
+                update("b", 2),
+                update("c", 1),
+                update("d", 3),
+            ];
+            let result = coalesce_commands(&commands, 67108864, style, usize::MAX);
+            // [1, 2] then [1, 3]: the second update of row 1 starts a new statement, in order.
+            assert_eq!(result.len(), 2, "{result:?}");
+            assert!(result[0].contains("'a'") && result[0].contains("'b'"));
+            assert!(!result[0].contains("'c'"));
+            assert!(result[1].contains("'c'") && result[1].contains("'d'"));
+        }
+    }
+    #[test]
+    fn test_coalesce_updates_never_merge_an_update_of_a_row_an_earlier_one_wrote() {
+        for (style, open, close) in [
+            (QuoteStyle::Backtick, '`', '`'),
+            (QuoteStyle::DoubleQuote, '"', '"'),
+            (QuoteStyle::Bracket, '[', ']'),
+        ] {
+            let q = |c: &str| format!("{open}{c}{close}");
+            // REPLICA IDENTITY FULL chain: the second WHERE is the first one's new row.
+            let full = vec![
+                format!(
+                    "UPDATE {} SET {} = '1', {} = 'b' WHERE {} = '1' AND {} = 'a';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id"),
+                    q("v")
+                ),
+                format!(
+                    "UPDATE {} SET {} = '1', {} = 'c' WHERE {} = '1' AND {} = 'b';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id"),
+                    q("v")
+                ),
+            ];
+            assert_eq!(
+                coalesce_commands(&full, u64::MAX, style, usize::MAX).len(),
+                2,
+                "{style:?}"
+            );
+            // Key change chain: 1 -> 2, then 2 -> 3.
+            let key = vec![
+                format!(
+                    "UPDATE {} SET {} = '2', {} = 'b' WHERE {} = '1';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id")
+                ),
+                format!(
+                    "UPDATE {} SET {} = '3', {} = 'c' WHERE {} = '2';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id")
+                ),
+            ];
+            assert_eq!(
+                coalesce_commands(&key, u64::MAX, style, usize::MAX).len(),
+                2,
+                "{style:?}"
+            );
+            // NULL chain: the second WHERE (`IS NULL`) is the first one's new row.
+            let null = vec![
+                format!(
+                    "UPDATE {} SET {} = '1', {} = NULL WHERE {} = '1' AND {} = 'a';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id"),
+                    q("v")
+                ),
+                format!(
+                    "UPDATE {} SET {} = '1', {} = 'c' WHERE {} = '1' AND {} IS NULL;",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id"),
+                    q("v")
+                ),
+            ];
+            assert_eq!(
+                coalesce_commands(&null, u64::MAX, style, usize::MAX).len(),
+                2,
+                "{style:?}"
+            );
+            // Different rows still share one statement.
+            let rows = vec![
+                format!(
+                    "UPDATE {} SET {} = '1', {} = 'b' WHERE {} = '1';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id")
+                ),
+                format!(
+                    "UPDATE {} SET {} = '2', {} = 'c' WHERE {} = '2';",
+                    q("t"),
+                    q("id"),
+                    q("v"),
+                    q("id")
+                ),
+            ];
+            assert_eq!(
+                coalesce_commands(&rows, u64::MAX, style, usize::MAX).len(),
+                1,
+                "{style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coalesce_mysql_keeps_updates_that_change_a_where_column_apart() {
+        let q = |c: &str| format!("`{c}`");
+        let key = |id: &str, to: &str, v: &str| {
+            format!(
+                "UPDATE {} SET {} = '{to}', {} = '{v}' WHERE {} = '{id}';",
+                q("t"),
+                q("id"),
+                q("v"),
+                q("id")
+            )
+        };
+        // Two different rows that change their key: MySQL would read the new key in the v CASE.
+        let rows = vec![key("1", "11", "b"), key("2", "22", "c")];
+        assert_eq!(
+            coalesce_commands(&rows, u64::MAX, QuoteStyle::Backtick, usize::MAX).len(),
+            2
+        );
+        // The standard-SQL dialects assign from the old row, so they still share one statement.
+        for style in [QuoteStyle::DoubleQuote, QuoteStyle::Bracket] {
+            let (o, c) = if style == QuoteStyle::Bracket {
+                ('[', ']')
+            } else {
+                ('"', '"')
+            };
+            let k = |id: &str, to: &str, v: &str| {
+                format!("UPDATE {o}t{c} SET {o}id{c} = '{to}', {o}v{c} = '{v}' WHERE {o}id{c} = '{id}';")
+            };
+            assert_eq!(
+                coalesce_commands(
+                    &[k("1", "11", "b"), k("2", "22", "c")],
+                    u64::MAX,
+                    style,
+                    usize::MAX
+                )
+                .len(),
+                1,
+                "{style:?}"
+            );
+        }
+        // REPLICA IDENTITY FULL, two changed columns: `b` reads `a`, which was already rewritten.
+        let full = |id: &str, a: (&str, &str), b: (&str, &str)| {
+            format!(
+                "UPDATE {} SET {} = '{id}', {} = '{}', {} = '{}' WHERE {} = '{id}' AND {} = '{}' AND {} = '{}';",
+                q("t"), q("id"), q("a"), a.1, q("b"), b.1, q("id"), q("a"), a.0, q("b"), b.0
+            )
+        };
+        let full_rows = vec![
+            full("1", ("x1", "y1"), ("p1", "q1")),
+            full("2", ("x2", "y2"), ("p2", "q2")),
+        ];
+        assert_eq!(
+            coalesce_commands(&full_rows, u64::MAX, QuoteStyle::Backtick, usize::MAX).len(),
+            2
+        );
+        // Only the key is read and it does not change: the rewrite stays valid.
+        let same = |id: &str, v: &str| {
+            format!(
+                "UPDATE {} SET {} = '{id}', {} = '{v}' WHERE {} = '{id}';",
+                q("t"),
+                q("id"),
+                q("v"),
+                q("id")
+            )
+        };
+        assert_eq!(
+            coalesce_commands(
+                &[same("1", "b"), same("2", "c")],
+                u64::MAX,
+                QuoteStyle::Backtick,
+                usize::MAX
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_coalesce_mysql_coalesces_one_changed_column_but_not_two() {
+        let q = |c: &str| format!("`{c}`");
+        // (id, a, b, c) with REPLICA IDENTITY FULL; `old` and `new` are the a/b/c values.
+        let full = |id: &str, old: [&str; 3], new: [&str; 3]| {
+            format!(
+                "UPDATE {} SET {} = '{id}', {} = '{}', {} = '{}', {} = '{}' WHERE {} = '{id}' AND {} = '{}' AND {} = '{}' AND {} = '{}';",
+                q("t"), q("id"), q("a"), new[0], q("b"), new[1], q("c"), new[2],
+                q("id"), q("a"), old[0], q("b"), old[1], q("c"), old[2]
+            )
+        };
+        let n = |cmds: Vec<String>| {
+            coalesce_commands(&cmds, u64::MAX, QuoteStyle::Backtick, usize::MAX).len()
+        };
+        // Only `a`, a non-last column, changes: b and c are assigned what they already hold.
+        let only_a = vec![
+            full("1", ["x1", "y1", "z1"], ["w1", "y1", "z1"]),
+            full("2", ["x2", "y2", "z2"], ["w2", "y2", "z2"]),
+        ];
+        assert_eq!(n(only_a), 1);
+        // Only the last column changes.
+        let only_c = vec![
+            full("1", ["x1", "y1", "z1"], ["x1", "y1", "w1"]),
+            full("2", ["x2", "y2", "z2"], ["x2", "y2", "w2"]),
+        ];
+        assert_eq!(n(only_c), 1);
+        // `a` and `c` change around the unchanged `b`: c's CASE would read the new `a`.
+        let a_and_c = vec![
+            full("1", ["x1", "y1", "z1"], ["w1", "y1", "v1"]),
+            full("2", ["x2", "y2", "z2"], ["w2", "y2", "v2"]),
+        ];
+        assert_eq!(n(a_and_c), 2);
+        // `a` and `b` change.
+        let a_and_b = vec![
+            full("1", ["x1", "y1", "z1"], ["w1", "v1", "z1"]),
+            full("2", ["x2", "y2", "z2"], ["w2", "v2", "z2"]),
+        ];
+        assert_eq!(n(a_and_b), 2);
+    }
+
+    /// The decision before the index existed: scan every member of the group.
+    fn hits_row_pairwise(
+        group: &[ParsedUpdate<'_>],
+        nu: &ParsedUpdate<'_>,
+        quote_style: QuoteStyle,
+    ) -> bool {
+        let Some(pairs) = comparable_where(nu, quote_style) else {
+            return true;
+        };
+        group.iter().any(|g| {
+            g.where_clause == nu.where_clause || {
+                let (mut matched, mut contradicted) = (false, false);
+                for (c, v) in pairs.iter() {
+                    if let Some((_, sv)) = g.set_pairs.iter().find(|(sc, _)| sc == c) {
+                        if sv == v {
+                            matched = true;
+                        } else {
+                            contradicted = true;
+                            break;
+                        }
+                    }
+                }
+                matched && !contradicted
+            }
+        })
+    }
+
+    #[test]
+    fn test_group_row_index_agrees_with_pairwise_check() {
+        // xorshift64*, fixed seed: the same >100k decisions on every run
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut below = move |n: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        };
+        let cols = ["id", "a", "b", "c"];
+        let style = QuoteStyle::DoubleQuote;
+        let mut compared = 0usize;
+        let mut hits = 0usize;
+        let mut biggest = 0usize;
+        for _ in 0..4000 {
+            let ncols = 1 + below(4) as usize;
+            let nvals = 2 + below(30);
+            let sqls: Vec<String> = (0..40)
+                .map(|_| {
+                    let val = |b: &mut dyn FnMut(u64) -> u64| match b(8) {
+                        0 => "NULL".to_string(),
+                        _ => format!("'{}'", b(nvals)),
+                    };
+                    let set: Vec<String> = cols[..ncols]
+                        .iter()
+                        .map(|c| format!("\"{c}\" = {}", val(&mut below)))
+                        .collect();
+                    let conds: Vec<String> = (0..1 + below(3))
+                        .map(|_| {
+                            let c = ["id", "a", "b", "c", "z"][below(5) as usize];
+                            match below(8) {
+                                0 => format!("\"{c}\" IS NULL"),
+                                1 => format!("\"{c}\" > '{}'", below(nvals)),
+                                2 => format!("(\"{c}\" = '1' OR \"id\" = '2')"),
+                                _ => format!("\"{c}\" = '{}'", below(nvals)),
+                            }
+                        })
+                        .collect();
+                    format!(
+                        "UPDATE \"t\" SET {} WHERE {};",
+                        set.join(", "),
+                        conds.join(" AND ")
+                    )
+                })
+                .collect();
+            let mut pool = sqls
+                .iter()
+                .map(|s| parse_update_parts(s, style).expect("generated UPDATE parses"));
+            let first = pool.next().unwrap();
+            let mut rows = GroupRows::default();
+            rows.push(0, &first);
+            let mut group = vec![first];
+            for nu in pool {
+                let indexed = hits_row_of_group(&rows, &group, &nu, style);
+                let pairwise = hits_row_pairwise(&group, &nu, style);
+                assert_eq!(
+                    indexed,
+                    pairwise,
+                    "WHERE {} against a group of {}",
+                    nu.where_clause,
+                    group.len()
+                );
+                compared += 1;
+                if indexed {
+                    hits += 1;
+                } else {
+                    rows.push(group.len(), &nu);
+                    group.push(nu);
+                }
+            }
+            biggest = biggest.max(group.len());
+        }
+        assert!(compared >= 100_000, "{compared}");
+        // the generator must exercise both outcomes and groups big enough for the index to matter
+        assert!(
+            hits > 10_000 && compared - hits > 10_000,
+            "hits {hits} of {compared}"
+        );
+        assert!(biggest >= 20, "biggest group {biggest}");
     }
 }

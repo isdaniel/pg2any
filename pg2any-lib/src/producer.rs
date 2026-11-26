@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{CdcError, Result};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
 use crate::transaction_manager::{PendingTransactionFile, TransactionManager};
 use crate::types::{EventType, Lsn};
@@ -54,6 +54,12 @@ pub(crate) async fn handle_transaction_commit(
             Err(e)
         }
     }
+}
+
+/// What a failed read of the source stream means: `None` when the shutdown cancelled the read
+/// (the producer then stops cleanly), the error itself when the source failed for good.
+fn source_failure(cancelled: bool, error: pg_walstream::ReplicationError) -> Option<CdcError> {
+    (!cancelled && !error.is_cancelled()).then(|| CdcError::from(error))
 }
 
 /// File-based producer task: reads events from the PostgreSQL replication stream
@@ -124,6 +130,8 @@ pub(crate) async fn run_producer(
             );
         }
     }
+
+    let mut source_error: Option<CdcError> = None;
 
     while !cancellation_token.is_cancelled() {
         let event_result = {
@@ -343,8 +351,14 @@ pub(crate) async fn run_producer(
                 }
             }
             Err(e) => {
-                error!("Error reading from replication stream: {}", e);
-                metrics_collector.record_error("replication_stream_error", "producer");
+                match source_failure(cancellation_token.is_cancelled(), e) {
+                    None => info!("Producer: read of the replication stream cancelled by shutdown"),
+                    Some(e) => {
+                        error!("Error reading from replication stream: {}", e);
+                        metrics_collector.record_error("replication_stream_error", "producer");
+                        source_error = Some(e);
+                    }
+                }
                 break;
             }
         }
@@ -378,6 +392,12 @@ pub(crate) async fn run_producer(
 
     metrics_collector.update_source_connection_status(false);
 
+    // The source gave up: end the client (the consumer drains what was committed, `stop()` reports
+    // this error) instead of leaving a process that replicates nothing and looks healthy.
+    if source_error.is_some() {
+        cancellation_token.cancel();
+    }
+
     if producer_shutdown_signal.send(()).is_err() {
         warn!("Producer: Failed to send shutdown signal (consumer may have already stopped)");
     } else {
@@ -385,5 +405,26 @@ pub(crate) async fn run_producer(
     }
 
     info!("Producer shutdown complete");
-    Ok(())
+    source_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg_walstream::ReplicationError;
+
+    #[test]
+    fn a_read_cancelled_by_the_shutdown_is_not_a_failure() {
+        assert!(source_failure(true, ReplicationError::timeout("t")).is_none());
+        assert!(source_failure(false, ReplicationError::cancelled("c")).is_none());
+    }
+
+    #[test]
+    fn a_source_that_gave_up_is_a_failure() {
+        let failure = source_failure(false, ReplicationError::timeout("retries exhausted"));
+        assert!(
+            matches!(failure, Some(CdcError::Replication(_))),
+            "{failure:?}"
+        );
+    }
 }

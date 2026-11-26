@@ -1,0 +1,135 @@
+# Initial-snapshot integration tests.
+#
+# `unit` runs everything that needs no services. `e2e` runs one leg per destination via
+# `make snapshot-test-<dest>`, which brings up PostgreSQL plus that destination from
+# docker-compose.snapshot-test.yml (`up -d --wait`) and then runs the #[ignore]d
+# pg2any-lib/tests/snapshot_e2e_<dest>.rs tests against them.
+name: Snapshot Integration Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes the running one; pushes to branches always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  unit:
+    name: Snapshot unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev cmake libcurl4-openssl-dev pkg-config libssl-dev
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Cache target directory
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-snapshot-unit-target-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-snapshot-unit-target-
+
+    - name: Snapshot library tests
+      working-directory: pg2any-lib
+      run: cargo test --lib snapshot
+
+    - name: Kafka destination unit tests
+      working-directory: pg2any-lib
+      run: cargo test --lib --features kafka destinations::kafka
+
+    - name: Kafka harness tests (no services; includes the topic-deletion guard)
+      working-directory: pg2any-lib
+      run: cargo test --features kafka --test snapshot_e2e_kafka
+
+  e2e:
+    name: Snapshot e2e (${{ matrix.dest }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        dest: [sqlite, mysql, sqlserver, kafka]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev cmake libcurl4-openssl-dev pkg-config libssl-dev
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Cache target directory
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-snapshot-${{ matrix.dest }}-target-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-snapshot-${{ matrix.dest }}-target-
+
+    - name: Run snapshot e2e tests
+      # pipefail so a failing make is not masked by tee.
+      shell: bash
+      run: make snapshot-test-${{ matrix.dest }} 2>&1 | tee snapshot-e2e-${{ matrix.dest }}.log
+
+    # Must run before the clean step: `down -v` removes the containers and their logs.
+    - name: Collect service logs
+      if: failure()
+      run: |
+        docker compose -f docker-compose.snapshot-test.yml --profile mysql --profile sqlserver --profile kafka ps -a || true
+        docker compose -f docker-compose.snapshot-test.yml --profile mysql --profile sqlserver --profile kafka logs --no-color > snapshot-services-${{ matrix.dest }}.log 2>&1 || true
+
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: snapshot-e2e-logs-${{ matrix.dest }}
+        path: |
+          snapshot-e2e-${{ matrix.dest }}.log
+          snapshot-services-${{ matrix.dest }}.log
+        if-no-files-found: ignore
+        retention-days: 14
+
+    - name: Remove snapshot test containers
+      if: always()
+      run: make snapshot-test-clean

@@ -39,4 +39,6 @@ pub use sqlite::SQLiteDestination;
 pub use kafka::KafkaDestination;
 
 // Re-export factory and trait
-pub use destination_factory::{DestinationFactoryFn, DestinationHandler, PreCommitHook};
+pub use destination_factory::{
+    DestinationFactoryFn, DestinationHandler, EventTransaction, PreCommitHook,
+};

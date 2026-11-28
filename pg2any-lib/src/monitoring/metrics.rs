@@ -129,6 +129,34 @@ lazy_static! {
         "pg2any_full_transactions_processed_total",
         "Total number of complete transactions (final batches) successfully processed"
     ).expect("metric can be created");
+
+    // =============================================================================
+    // Initial Snapshot Metrics
+    // =============================================================================
+
+    /// Total rows copied by the initial snapshot
+    pub static ref SNAPSHOT_ROWS_TOTAL: Counter = register_counter!(
+        "pg2any_snapshot_rows_total",
+        "Total number of rows copied by the initial snapshot"
+    ).expect("metric can be created");
+
+    /// Total bytes copied by the initial snapshot
+    pub static ref SNAPSHOT_BYTES_TOTAL: Counter = register_counter!(
+        "pg2any_snapshot_bytes_total",
+        "Total number of bytes copied by the initial snapshot"
+    ).expect("metric can be created");
+
+    /// Tables with at least one batch written by the initial snapshot so far
+    pub static ref SNAPSHOT_TABLES_DONE: Gauge = register_gauge!(
+        "pg2any_snapshot_tables_done",
+        "Number of tables with at least one batch written by the initial snapshot so far"
+    ).expect("metric can be created");
+
+    /// Whether the initial snapshot is running (1) or not (0)
+    pub static ref SNAPSHOT_IN_PROGRESS: Gauge = register_gauge!(
+        "pg2any_snapshot_in_progress",
+        "Whether the initial snapshot is currently running"
+    ).expect("metric can be created");
 }
 
 /// Initialize all metrics with the global registry
@@ -192,6 +220,22 @@ pub fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
     REGISTRY
         .register(Box::new(FULL_TRANSACTIONS_PROCESSED_TOTAL.clone()))
         .map_err(|e| format!("Failed to register FULL_TRANSACTIONS_PROCESSED_TOTAL: {e}"))?;
+
+    REGISTRY
+        .register(Box::new(SNAPSHOT_ROWS_TOTAL.clone()))
+        .map_err(|e| format!("Failed to register SNAPSHOT_ROWS_TOTAL: {e}"))?;
+
+    REGISTRY
+        .register(Box::new(SNAPSHOT_BYTES_TOTAL.clone()))
+        .map_err(|e| format!("Failed to register SNAPSHOT_BYTES_TOTAL: {e}"))?;
+
+    REGISTRY
+        .register(Box::new(SNAPSHOT_TABLES_DONE.clone()))
+        .map_err(|e| format!("Failed to register SNAPSHOT_TABLES_DONE: {e}"))?;
+
+    REGISTRY
+        .register(Box::new(SNAPSHOT_IN_PROGRESS.clone()))
+        .map_err(|e| format!("Failed to register SNAPSHOT_IN_PROGRESS: {e}"))?;
 
     debug!("All metrics registered successfully");
     Ok(())

@@ -1,7 +1,7 @@
 #[cfg(feature = "sqlite")]
 pub(crate) async fn execute_sqlx_batch_with_hook(
     pool: &sqlx::SqlitePool,
-    commands: &[std::borrow::Cow<'_, str>],
+    commands: Vec<std::borrow::Cow<'_, str>>,
     pre_commit_hook: Option<super::destination_factory::PreCommitHook>,
     db_name: &str,
 ) -> crate::error::Result<()> {
@@ -9,9 +9,13 @@ pub(crate) async fn execute_sqlx_batch_with_hook(
         crate::error::CdcError::generic(format!("{db_name} BEGIN transaction failed: {e}"))
     })?;
 
-    for (idx, sql) in commands.iter().enumerate() {
-        let owned = sql.to_string();
+    let total = commands.len();
+    for (idx, sql) in commands.into_iter().enumerate() {
+        let owned = sql.into_owned();
+        // The values are inlined, so a statement is never run twice. Caching it would keep up to
+        // a connection's statement-cache capacity (100) of megabyte-sized batches alive.
         if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(owned))
+            .persistent(false)
             .execute(&mut *tx)
             .await
         {
@@ -24,7 +28,7 @@ pub(crate) async fn execute_sqlx_batch_with_hook(
             return Err(crate::error::CdcError::generic(format!(
                 "{db_name} execute_sql_batch failed at command {}/{}: {}",
                 idx + 1,
-                commands.len(),
+                total,
                 e
             )));
         }

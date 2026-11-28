@@ -105,6 +105,16 @@ pub trait MetricsCollectorTrait: Send + Sync {
         transaction: &crate::types::Transaction,
         destination_type: &str,
     );
+
+    /// Record initial-snapshot copy progress as CUMULATIVE totals for the current run.
+    ///
+    /// Implementations advance their counters by the positive difference from the
+    /// last value seen; a lower or equal (stale) value is ignored. The tables gauge
+    /// likewise never moves down on a stale report.
+    fn record_snapshot_progress(&self, _rows: u64, _bytes: u64, _tables_done: u64) {}
+
+    /// Mark the initial snapshot as running (`true`) or finished/aborted (`false`)
+    fn set_snapshot_in_progress(&self, _active: bool) {}
 }
 
 /// Abstract processing timer trait
@@ -148,6 +158,13 @@ mod real_metrics {
         events_in_window: AtomicU64,
         window_start_nanos: AtomicU64,
         window_duration: Duration,
+        // Highest cumulative snapshot values seen; a stale (lagging) report never moves
+        // a counter or lowers the tables gauge. Never reset: a second snapshot on the same
+        // collector would under-count until it passes the first's totals (shortcut: only
+        // one snapshot per process exists today).
+        snapshot_rows_seen: AtomicU64,
+        snapshot_bytes_seen: AtomicU64,
+        snapshot_tables_seen: AtomicU64,
     }
 
     impl MetricsCollector {
@@ -173,6 +190,9 @@ mod real_metrics {
                 events_in_window: AtomicU64::new(0),
                 window_start_nanos: AtomicU64::new(0), // Will be set relative to start_time
                 window_duration: Duration::from_secs(60), // 1-minute window for rate calculation
+                snapshot_rows_seen: AtomicU64::new(0),
+                snapshot_bytes_seen: AtomicU64::new(0),
+                snapshot_tables_seen: AtomicU64::new(0),
             }
         }
 
@@ -348,6 +368,27 @@ mod real_metrics {
                 transaction.transaction_id, transaction.event_count(), destination_type
             );
         }
+
+        fn record_snapshot_progress(&self, rows: u64, bytes: u64, tables_done: u64) {
+            let prev = self.snapshot_rows_seen.fetch_max(rows, Ordering::Relaxed);
+            if rows > prev {
+                SNAPSHOT_ROWS_TOTAL.inc_by((rows - prev) as f64);
+            }
+            let prev = self.snapshot_bytes_seen.fetch_max(bytes, Ordering::Relaxed);
+            if bytes > prev {
+                SNAPSHOT_BYTES_TOTAL.inc_by((bytes - prev) as f64);
+            }
+            let prev = self
+                .snapshot_tables_seen
+                .fetch_max(tables_done, Ordering::Relaxed);
+            if tables_done > prev {
+                SNAPSHOT_TABLES_DONE.set(tables_done as f64);
+            }
+        }
+
+        fn set_snapshot_in_progress(&self, active: bool) {
+            SNAPSHOT_IN_PROGRESS.set(if active { 1.0 } else { 0.0 });
+        }
     }
 
     /// Real processing timer that wraps the actual timer
@@ -489,4 +530,51 @@ pub fn gather_metrics() -> CdcResult<String> {
 #[cfg(not(feature = "metrics"))]
 pub fn gather_metrics() -> CdcResult<String> {
     Ok("# Metrics not available - metrics feature disabled\n".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn snapshot_metrics_are_cumulative_and_ignore_stale_values() {
+        use crate::monitoring::metrics::{SNAPSHOT_BYTES_TOTAL, SNAPSHOT_ROWS_TOTAL};
+
+        let _ = init_metrics();
+        let collector = MetricsCollector::new();
+        // The metrics are process-global: no other test may call `record_snapshot_progress`.
+        let rows_before = SNAPSHOT_ROWS_TOTAL.get();
+        let bytes_before = SNAPSHOT_BYTES_TOTAL.get();
+
+        collector.record_snapshot_progress(100, 2048, 1);
+        collector.record_snapshot_progress(250, 4096, 2);
+        // A lagging snapshot never moves a counter or lowers the tables gauge.
+        collector.record_snapshot_progress(10, 10, 0);
+        collector.set_snapshot_in_progress(true);
+
+        assert_eq!(SNAPSHOT_ROWS_TOTAL.get() - rows_before, 250.0);
+        assert_eq!(SNAPSHOT_BYTES_TOTAL.get() - bytes_before, 4096.0);
+        let text = gather_metrics().unwrap();
+        assert!(text.contains("pg2any_snapshot_rows_total "), "{text}");
+        assert!(text.contains("pg2any_snapshot_bytes_total "), "{text}");
+        assert!(text.contains("pg2any_snapshot_tables_done 2\n"), "{text}");
+        assert!(text.contains("pg2any_snapshot_in_progress 1\n"), "{text}");
+
+        collector.set_snapshot_in_progress(false);
+        let text = gather_metrics().unwrap();
+        assert!(text.contains("pg2any_snapshot_in_progress 0\n"), "{text}");
+    }
+
+    // Compile-only: the hooks exist as defaulted trait methods on the no-op collector.
+    #[cfg(not(feature = "metrics"))]
+    #[test]
+    fn snapshot_hooks_are_defaulted_trait_methods_that_do_not_panic() {
+        let collector = MetricsCollector::new();
+
+        collector.record_snapshot_progress(100, 2048, 1);
+        collector.set_snapshot_in_progress(true);
+        collector.set_snapshot_in_progress(false);
+    }
 }

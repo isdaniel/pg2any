@@ -40,7 +40,7 @@ use crate::destinations::dialect::SqlDialect;
 use crate::destinations::dialects::{
     AnsiDialect, KafkaDialect, MySqlDialect, SqlServerDialect, SqliteDialect,
 };
-use crate::destinations::{DestinationHandler, PreCommitHook};
+use crate::destinations::{DestinationHandler, EventTransaction, PreCommitHook};
 use crate::error::{CdcError, Result};
 use crate::lsn_tracker::{LsnTracker, SharedLsnFeedback};
 use crate::monitoring::{MetricsCollector, MetricsCollectorTrait};
@@ -53,7 +53,7 @@ use pg_walstream::ColumnValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::{self, File};
@@ -70,6 +70,14 @@ const PENDING_TX_DIR: &str = "sql_pending_tx";
 const DATA_TX_DIR: &str = "sql_data_tx";
 /// Default buffer size for event accumulation (8MB)
 const DEFAULT_BUFFER_SIZE: usize = 8 * MB;
+
+/// In-memory fast path: a small ordinary transaction (at most one destination batch) stays in memory
+/// instead of transaction files while the text of all active and committed-but-unapplied in-memory
+/// transactions is below this many bytes; anything larger, or arriving when the budget is used up,
+/// spills to files and goes the normal route. One value for every deployment: it bounds the memory
+/// the fast path can hold, and a bigger budget only means more transactions PostgreSQL must re-send
+/// after a crash.
+pub(crate) const MEMORY_FAST_PATH_BUDGET_BYTES: usize = 64 * MB;
 
 fn dialect_for(dt: &DestinationType) -> &'static dyn SqlDialect {
     match dt {
@@ -95,6 +103,28 @@ fn dialect_for(dt: &DestinationType) -> &'static dyn SqlDialect {
         }
     }
 }
+
+/// Every dialect renders an insert as `INSERT INTO ...` (`sql_renderer::render_insert_into`).
+fn is_insert(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..6)
+        .is_some_and(|head| head.eq_ignore_ascii_case("INSERT"))
+}
+
+/// Whether `e` is the destination rejecting an INSERT on an existing key. The destinations
+/// stringify their driver errors, so the server's own error code is matched in the text.
+fn is_duplicate_key_error(dt: &DestinationType, e: &CdcError) -> bool {
+    let text = e.to_string();
+    match dt {
+        DestinationType::MySQL => text.contains("ERROR 1062 (23000)"),
+        DestinationType::SqlServer => {
+            text.contains("(code: 2627,") || text.contains("(code: 2601,")
+        }
+        DestinationType::SQLite => text.contains("UNIQUE constraint failed"),
+        _ => false,
+    }
+}
+
 struct BufferedEventWriter {
     /// File path being written to
     file_path: PathBuf,
@@ -113,6 +143,17 @@ impl BufferedEventWriter {
         Self {
             file_path,
             buffer: String::with_capacity(max_buffer_size),
+            max_buffer_size,
+            writer: None,
+        }
+    }
+
+    /// Like `new`, but the buffer grows on demand: a small in-memory transaction should not
+    /// allocate the full flush threshold up front.
+    fn lazy(file_path: PathBuf, max_buffer_size: usize) -> Self {
+        Self {
+            file_path,
+            buffer: String::new(),
             max_buffer_size,
             writer: None,
         }
@@ -201,6 +242,12 @@ pub struct TransactionFileMetadata {
     pub transaction_type: String,
 }
 
+/// Position-tracking de-dup: a transaction is already applied when its commit LSN is at or
+/// below the (non-zero) flush LSN.
+pub(crate) fn is_already_applied(commit_lsn: u64, flush_lsn: u64) -> bool {
+    flush_lsn > 0 && commit_lsn <= flush_lsn
+}
+
 /// Default transaction type ("normal" for backward compatibility)
 fn default_transaction_type() -> String {
     "normal".to_string()
@@ -263,6 +310,54 @@ struct ActiveTransactionState {
     writer: BufferedEventWriter,
     /// Reused render buffer for SQL-mode events, avoids a per-event allocation.
     render_buf: String,
+    /// `Some` while the transaction lives only in memory (no file exists yet).
+    memory: Option<MemoryTx>,
+}
+
+/// Byte budget of the in-memory fast path: the text of every active or committed-but-unapplied
+/// in-memory transaction. A reservation that does not fit makes that transaction spill to files
+/// instead of waiting, so the WAL reader never stalls on it and memory stays bounded.
+#[derive(Debug)]
+struct MemoryBudget {
+    limit: usize,
+    used: AtomicUsize,
+    /// A transaction with more statements than one destination batch holds spills: only a
+    /// single-batch transaction is applied atomically, which is what makes a crash (lost memory,
+    /// the slot re-sends it) safe without a resume checkpoint.
+    max_statements: usize,
+}
+
+impl MemoryBudget {
+    fn try_reserve(&self, bytes: usize) -> bool {
+        self.used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used + bytes <= self.limit).then_some(used + bytes)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used
+            .update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.saturating_sub(bytes)
+            });
+    }
+}
+
+/// An active transaction kept in memory (its text is `ActiveTransactionState::writer`'s buffer).
+struct MemoryTx {
+    reserved: usize,
+    timestamp: DateTime<Utc>,
+    transaction_type: String,
+}
+
+/// A committed, unapplied in-memory transaction, keyed by the stem of its virtual file names.
+struct MemoryPayload {
+    text: Arc<[u8]>,
+    reserved: usize,
+    metadata: TransactionFileMetadata,
+    /// Set once `persist_memory_payloads` wrote this transaction's files (see there).
+    on_disk: bool,
 }
 
 struct StatementProcessingState<'a> {
@@ -305,6 +400,16 @@ pub struct TransactionManager {
     /// finalized). Seeded at startup from the dir scan; kept in sync on
     /// commit (+1) and finalize/delete (-1). Avoids a per-transaction dir scan.
     pending_tx_count: AtomicUsize,
+    /// Batches that may still skip duplicate-key inserts because the destination already committed
+    /// them before the crash (see `replay_skipping_duplicates` and `set_replay_grace`).
+    replay_budget: AtomicUsize,
+    /// An event-mode destination answered `Unsupported` to a grouped delivery: groups are not
+    /// formed any more, every transaction goes to it on its own.
+    event_group_unsupported: AtomicBool,
+    /// In-memory fast path (see `set_memory_fast_path`); `None` = every transaction uses files.
+    memory_budget: Option<Arc<MemoryBudget>>,
+    /// Committed in-memory transactions awaiting apply, by `memory_key`.
+    memory_payloads: std::sync::Mutex<HashMap<String, MemoryPayload>>,
 }
 
 impl TransactionManager {
@@ -349,7 +454,79 @@ impl TransactionManager {
             bulk_insert_threshold: 500,
             dialect,
             pending_tx_count: AtomicUsize::new(0),
+            replay_budget: AtomicUsize::new(0),
+            event_group_unsupported: AtomicBool::new(false),
+            memory_budget: None,
+            memory_payloads: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Keep small ordinary transactions in memory instead of writing, reading and deleting
+    /// files for each of them: up to `budget_bytes` of text in total, and only transactions of at
+    /// most `max_statements` statements (one destination batch). Anything bigger, streaming
+    /// transactions and whatever does not fit the budget use files exactly as before.
+    ///
+    /// A crash loses the in-memory transactions that were not applied yet, which is safe: the
+    /// replication slot only advances past a transaction after the destination applied it, so
+    /// PostgreSQL sends it again. The exception is one that precedes a file transaction: that
+    /// one is written to files first (`persist_memory_payloads`), or recovery would apply the
+    /// later file and hide it from PostgreSQL's re-send.
+    pub fn set_memory_fast_path(&mut self, budget_bytes: usize, max_statements: usize) {
+        self.memory_budget = Some(Arc::new(MemoryBudget {
+            limit: budget_bytes,
+            used: AtomicUsize::new(0),
+            max_statements,
+        }));
+    }
+
+    /// Bytes of in-memory transaction text held right now (0 without the fast path).
+    pub fn memory_in_use(&self) -> usize {
+        self.memory_budget
+            .as_ref()
+            .map_or(0, |budget| budget.used.load(Ordering::Relaxed))
+    }
+
+    /// Returns the budget held by an open transaction that a BEGIN for the same id replaced (a
+    /// reconnect re-sends from the slot's confirmed position).
+    fn release_replaced(&self, replaced: Option<ActiveTransactionState>) {
+        if let (Some(mem), Some(budget)) =
+            (replaced.and_then(|old| old.memory), &self.memory_budget)
+        {
+            budget.release(mem.reserved);
+        }
+    }
+
+    /// `mem-<tx>-<lsn>` stem of a virtual in-memory transaction path, `None` for a real file.
+    fn memory_key(path: &Path) -> Option<&str> {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| stem.starts_with("mem-"))
+    }
+
+    fn memory_text(&self, path: &Path) -> Option<Arc<[u8]>> {
+        let key = Self::memory_key(path)?;
+        let payloads = self
+            .memory_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        payloads.get(key).map(|payload| payload.text.clone())
+    }
+
+    /// Drops the in-memory transaction of `path` and returns its budget. `None` for a real file;
+    /// `Some(on_disk)` for a `mem-` path: whether files exist for it (written by
+    /// `persist_memory_payloads`, or recovered from disk after a restart).
+    fn release_memory_payload(&self, path: &Path) -> Option<bool> {
+        let key = Self::memory_key(path)?;
+        let removed = self
+            .memory_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+        let on_disk = removed.as_ref().is_none_or(|payload| payload.on_disk);
+        if let (Some(payload), Some(budget)) = (removed, &self.memory_budget) {
+            budget.release(payload.reserved);
+        }
+        Some(on_disk)
     }
 
     /// Set schema mappings for SQL generation
@@ -370,6 +547,32 @@ impl TransactionManager {
     /// Current in-memory count of committed-but-not-finalized pending transactions.
     pub fn pending_count(&self) -> usize {
         self.pending_tx_count.load(Ordering::Relaxed)
+    }
+
+    /// The first `batches` batches applied from now on that fail on a duplicate key are re-applied
+    /// statement by statement, skipping the duplicates (a crash left them committed but unrecorded);
+    /// `0` closes the grace. The consumer applies one transaction, or group, at a time and in
+    /// order, so the batches a crash can leave in doubt are the first ones after the resume
+    /// position: from a pending file at startup recovery (always on, no setting), or, for the
+    /// in-memory fast path, as live work that PostgreSQL re-sends because the transaction has no
+    /// file. Any later duplicate is a real error.
+    pub fn set_replay_grace(&self, batches: usize) {
+        self.replay_budget.store(batches, Ordering::Relaxed);
+    }
+
+    /// Whether the grace has a unit left (does not spend it).
+    fn replay_open(&self) -> bool {
+        self.replay_budget.load(Ordering::Relaxed) > 0
+    }
+
+    /// Spends one unit of the grace, if any is left. Called once per batch that completed, never
+    /// for a failed attempt: a retry after a connection error must not burn the grace.
+    fn spend_replay_grace(&self) {
+        let _ = self
+            .replay_budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            });
     }
 
     /// Seed the pending counter at startup from the authoritative dir scan.
@@ -397,6 +600,9 @@ impl TransactionManager {
         let mut total_bytes = 0;
 
         for (_, tx_state) in transactions.iter_mut() {
+            if tx_state.memory.is_some() {
+                continue;
+            }
             let buffer_size = tx_state.writer.buffer_size();
             if buffer_size > 0 {
                 tx_state.writer.flush().await?;
@@ -473,19 +679,79 @@ impl TransactionManager {
         let data_file_path = self.get_segment_data_file_path(tx_id, 0);
         let metadata_path = self.get_received_tx_path(tx_id);
 
-        // Create the SQL data file in sql_data_tx/
+        // Ordinary transactions start in memory when the fast path is on; streaming ones are
+        // big by nature and always use files.
+        if self.memory_budget.is_some() && transaction_type == "normal" {
+            let mut transactions = self.active_transactions.lock().await;
+            let replaced = transactions.insert(
+                tx_id,
+                ActiveTransactionState {
+                    segments: vec![data_file_path.clone()],
+                    segment_statement_counts: vec![0],
+                    current_segment_index: 0,
+                    current_segment_size_bytes: 0,
+                    writer: BufferedEventWriter::lazy(data_file_path.clone(), self.buffer_size),
+                    render_buf: String::new(),
+                    memory: Some(MemoryTx {
+                        reserved: 0,
+                        timestamp,
+                        transaction_type: transaction_type.to_string(),
+                    }),
+                },
+            );
+            self.release_replaced(replaced);
+            debug!("Started in-memory transaction {}", tx_id);
+            return Ok(data_file_path);
+        }
+
+        self.create_transaction_files(tx_id, timestamp, transaction_type)
+            .await?;
+
+        let mut transactions = self.active_transactions.lock().await;
+        let replaced = transactions.insert(
+            tx_id,
+            ActiveTransactionState {
+                segments: vec![data_file_path.clone()],
+                segment_statement_counts: vec![0],
+                current_segment_index: 0,
+                current_segment_size_bytes: 0,
+                writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
+                render_buf: String::new(),
+                memory: None,
+            },
+        );
+        self.release_replaced(replaced);
+
+        info!(
+            "Started transaction {}: data={:?}, metadata={:?}",
+            tx_id, data_file_path, metadata_path
+        );
+
+        // Return the data file path for appending events
+        Ok(data_file_path)
+    }
+
+    /// Creates the data file in `sql_data_tx/` and the metadata in `sql_received_tx/`.
+    async fn create_transaction_files(
+        &self,
+        tx_id: u32,
+        timestamp: DateTime<Utc>,
+        transaction_type: &str,
+    ) -> Result<()> {
+        let data_file_path = self.get_segment_data_file_path(tx_id, 0);
+        let metadata_path = self.get_received_tx_path(tx_id);
+
         File::create(&data_file_path).await?;
 
         debug!("Created data file: {:?}", data_file_path);
 
-        // Create metadata file in sql_received_tx/
         let metadata = TransactionFileMetadata {
             transaction_id: tx_id,
             commit_timestamp: timestamp,
             commit_lsn: None,
             destination_type: self.destination_type.clone(),
             segments: vec![TransactionSegment {
-                path: data_file_path.clone(),
+                path: data_file_path,
                 statement_count: 0,
             }],
             current_segment_index: 0,
@@ -498,28 +764,7 @@ impl TransactionManager {
         let mut metadata_file = File::create(&metadata_path).await?;
         metadata_file.write_all(metadata_json.as_bytes()).await?;
         metadata_file.flush().await?;
-
-        // Create a buffered writer for this transaction
-        let mut transactions = self.active_transactions.lock().await;
-        transactions.insert(
-            tx_id,
-            ActiveTransactionState {
-                segments: vec![data_file_path.clone()],
-                segment_statement_counts: vec![0],
-                current_segment_index: 0,
-                current_segment_size_bytes: 0,
-                writer: BufferedEventWriter::new(data_file_path.clone(), self.buffer_size),
-                render_buf: String::new(),
-            },
-        );
-
-        info!(
-            "Started transaction {}: data={:?}, metadata={:?}",
-            tx_id, data_file_path, metadata_path
-        );
-
-        // Return the data file path for appending events
-        Ok(data_file_path)
+        Ok(())
     }
 
     /// Update metadata for an in-progress transaction with segment info
@@ -635,6 +880,48 @@ impl TransactionManager {
         };
 
         let line_bytes = line.len() + 1; // include newline
+
+        // Count statements EXACTLY as the consumer will read them back, computed
+        // in-memory from the already-rendered `line` (no file re-read — that would
+        // undo the Fix 1.1 perf win). The producer-tracked count is authoritative
+        // for `TransactionSegment.statement_count`, which drives crash-resume
+        // segment-skip arithmetic measured in parser-statement units. A single
+        // event-line can render MULTIPLE `;`-terminated statements (e.g. a
+        // multi-table TRUNCATE), so a naive +1 would under-count and cause the
+        // consumer to re-execute already-applied statements after a mid-tx crash.
+        let stmt_count = if self.event_mode {
+            // Event mode mirrors `write_raw_lines_from_file`: one non-empty
+            // physical line == one event (normally exactly 1).
+            line.split('\n').filter(|l| !l.trim().is_empty()).count()
+        } else {
+            // SQL mode mirrors `write_transaction_from_file` / the consumer's
+            // `SqlStreamParser` read path.
+            Self::count_rendered_statements(line)?
+        };
+        // In-memory fast path: keep the line in the writer's buffer while it fits the budget and
+        // one destination batch; otherwise create the files now and continue as a file transaction.
+        let mut spilled = false;
+        if let (Some(mem), Some(budget)) = (tx_state.memory.as_mut(), self.memory_budget.as_ref()) {
+            let statements = tx_state.segment_statement_counts[0] + stmt_count;
+            if statements <= budget.max_statements && budget.try_reserve(line_bytes) {
+                mem.reserved += line_bytes;
+                tx_state.writer.append(line);
+                tx_state.segment_statement_counts[0] = statements;
+                return Ok(());
+            }
+            spilled = true;
+        }
+        if spilled {
+            if let Some(mem) = tx_state.memory.take() {
+                self.create_transaction_files(tx_id, mem.timestamp, &mem.transaction_type)
+                    .await?;
+                if let Some(budget) = &self.memory_budget {
+                    budget.release(mem.reserved);
+                }
+                debug!("Transaction {} spilled from memory to files", tx_id);
+            }
+        }
+
         let estimated_size =
             tx_state.current_segment_size_bytes + tx_state.writer.buffer_size() + line_bytes;
 
@@ -672,24 +959,7 @@ impl TransactionManager {
             );
         }
 
-        // Count statements EXACTLY as the consumer will read them back, computed
-        // in-memory from the already-rendered `line` (no file re-read — that would
-        // undo the Fix 1.1 perf win). The producer-tracked count is authoritative
-        // for `TransactionSegment.statement_count`, which drives crash-resume
-        // segment-skip arithmetic measured in parser-statement units. A single
-        // event-line can render MULTIPLE `;`-terminated statements (e.g. a
-        // multi-table TRUNCATE), so a naive +1 would under-count and cause the
-        // consumer to re-execute already-applied statements after a mid-tx crash.
-        let stmt_count = if self.event_mode {
-            // Event mode mirrors `write_raw_lines_from_file`: one non-empty
-            // physical line == one event (normally exactly 1).
-            line.split('\n').filter(|l| !l.trim().is_empty()).count()
-        } else {
-            // SQL mode mirrors `write_transaction_from_file` / the consumer's
-            // `SqlStreamParser` read path.
-            Self::count_rendered_statements(line)?
-        };
-        let should_flush = tx_state.writer.append(line);
+        let should_flush = tx_state.writer.append(line) || spilled;
         if let Some(count) = tx_state
             .segment_statement_counts
             .get_mut(tx_state.current_segment_index)
@@ -820,6 +1090,113 @@ impl TransactionManager {
         })
     }
 
+    /// Commits a transaction that is still in memory: nothing is written; the text stays in
+    /// `memory_payloads` under virtual `mem-<tx>-<lsn>` paths until the consumer applied it.
+    /// `None` when `tx_id` is not an in-memory transaction.
+    async fn commit_memory_transaction(
+        &self,
+        tx_id: u32,
+        commit_lsn: Option<Lsn>,
+    ) -> Option<(PathBuf, TransactionFileMetadata)> {
+        let mut state = {
+            let mut transactions = self.active_transactions.lock().await;
+            transactions.get(&tx_id)?.memory.as_ref()?;
+            transactions.remove(&tx_id)?
+        };
+        let mem = state.memory.take()?;
+        let statement_count = state.segment_statement_counts[0];
+        let stem = format!("mem-{tx_id}-{}", commit_lsn.map_or(0, |lsn| lsn.0));
+        let pending_path = self
+            .base_path
+            .join(PENDING_TX_DIR)
+            .join(format!("{stem}.meta"));
+        let data_path = self.base_path.join(DATA_TX_DIR).join(format!("{stem}.sql"));
+        let text: Arc<[u8]> = Arc::from(std::mem::take(&mut state.writer.buffer).into_bytes());
+        let metadata = TransactionFileMetadata {
+            transaction_id: tx_id,
+            commit_timestamp: mem.timestamp,
+            commit_lsn,
+            destination_type: self.destination_type.clone(),
+            segments: vec![TransactionSegment {
+                path: data_path,
+                statement_count,
+            }],
+            current_segment_index: 0,
+            last_executed_command_index: None,
+            last_update_timestamp: None,
+            transaction_type: mem.transaction_type,
+        };
+
+        let previous = self
+            .memory_payloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                stem,
+                MemoryPayload {
+                    text,
+                    reserved: mem.reserved,
+                    metadata: metadata.clone(),
+                    on_disk: false,
+                },
+            );
+        // The same transaction committed twice (a re-send): its older copy's budget is returned.
+        if let (Some(old), Some(budget)) = (previous, &self.memory_budget) {
+            budget.release(old.reserved);
+        }
+        self.pending_tx_count.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            "Committed in-memory transaction {} ({} statements, LSN: {:?})",
+            tx_id, statement_count, commit_lsn
+        );
+        Some((pending_path, metadata))
+    }
+
+    /// Writes the files of every committed in-memory transaction that has none yet. Called before
+    /// a transaction is committed to files: after a crash recovery applies that file and raises
+    /// the position past the lost in-memory transactions committed before it, so PostgreSQL's
+    /// re-send of them would be dropped as already applied. Files keep recovery in commit order.
+    async fn persist_memory_payloads(&self) -> Result<()> {
+        let mut todo: Vec<(String, Arc<[u8]>, TransactionFileMetadata)> = {
+            let payloads = self
+                .memory_payloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            payloads
+                .iter()
+                .filter(|(_, payload)| !payload.on_disk)
+                .map(|(stem, p)| (stem.clone(), p.text.clone(), p.metadata.clone()))
+                .collect()
+        };
+        // Oldest first: a crash part-way through must leave the files of the EARLIER transactions,
+        // never only a later one (recovery would raise the position past the lost earlier ones).
+        todo.sort_by_key(|(_, _, metadata)| metadata.commit_lsn.map_or(0, |lsn| lsn.0));
+        for (stem, text, metadata) in todo {
+            let meta_path = self
+                .base_path
+                .join(PENDING_TX_DIR)
+                .join(format!("{stem}.meta"));
+            fs::write(&metadata.segments[0].path, &text).await?;
+            self.write_pending_metadata(&meta_path, &metadata).await?;
+            let still_pending = {
+                let mut payloads = self
+                    .memory_payloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                payloads
+                    .get_mut(&stem)
+                    .map(|payload| payload.on_disk = true)
+            };
+            if still_pending.is_none() {
+                // Applied while the files were being written: nobody else will delete them.
+                let _ = fs::remove_file(&meta_path).await;
+                let _ = fs::remove_file(&metadata.segments[0].path).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Move metadata from sql_received_tx to sql_pending_tx
     /// Flushes any pending buffered events before marking transaction as committed
     ///
@@ -831,6 +1208,13 @@ impl TransactionManager {
         tx_id: u32,
         commit_lsn: Option<Lsn>,
     ) -> Result<(PathBuf, TransactionFileMetadata)> {
+        if let Some(committed) = self.commit_memory_transaction(tx_id, commit_lsn).await {
+            return Ok(committed);
+        }
+        if self.memory_budget.is_some() {
+            self.persist_memory_payloads().await?;
+        }
+
         let received_metadata_path = self.get_received_tx_path(tx_id);
         let pending_metadata_path = self.get_pending_tx_path(tx_id);
 
@@ -1170,6 +1554,7 @@ impl TransactionManager {
                 segment_statement_counts,
                 current_segment_index,
                 current_segment_size_bytes: current_size,
+                memory: None,
                 writer: BufferedEventWriter::new(current_segment_path, self.buffer_size),
                 render_buf: String::new(),
             },
@@ -1180,8 +1565,16 @@ impl TransactionManager {
 
     /// Delete a pending transaction (metadata and data files) after successful execution
     pub async fn delete_pending_transaction(&self, metadata_file_path: &Path) -> Result<()> {
+        let memory = self.release_memory_payload(metadata_file_path);
+        if memory == Some(false) {
+            return Ok(());
+        }
         // Read metadata to get data file path
-        let metadata = self.read_metadata(metadata_file_path).await?;
+        let metadata = match self.read_metadata(metadata_file_path).await {
+            Ok(metadata) => metadata,
+            Err(_) if memory.is_some() => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let data_file_paths = if !metadata.segments.is_empty() {
             metadata
                 .segments
@@ -1270,16 +1663,37 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
+    /// Pre-commit hook staging the resume checkpoint of a pending transaction file.
+    /// `None` for group commits, which are all-or-nothing and need no checkpoint.
+    fn progress_hook(
+        self: &Arc<Self>,
+        metadata_path: Option<&Path>,
+        staged_index: usize,
+    ) -> Option<PreCommitHook> {
+        let metadata_path = metadata_path?.to_path_buf();
+        let manager = self.clone();
+        Some(Box::new(move || {
+            Box::pin(async move {
+                manager
+                    .stage_pending_metadata_progress(&metadata_path, staged_index)
+                    .await?;
+                Ok(())
+            })
+        }))
+    }
+
     async fn execute_batch_with_bulk_detection(
         self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        metadata_path: &Path,
+        metadata_path: Option<&Path>,
         commands: &[String],
         last_executed_index: usize,
         batch_idx: usize,
         metrics_collector: &Arc<MetricsCollector>,
         bulk_insert_threshold: usize,
     ) -> Result<()> {
+        // Spent once per completed batch here, not in `execute_sql_batch`: a bulk load that
+        // succeeds returns below without reaching it and would leave the grace open indefinitely.
         if commands.len() >= bulk_insert_threshold && destination_handler.supports_bulk_insert() {
             if let Some(parsed) =
                 crate::destinations::bulk_insert::detect_bulk_insert_batch(commands)
@@ -1292,20 +1706,7 @@ impl TransactionManager {
                 );
 
                 let batch_start_time = Instant::now();
-                let metadata_path_owned = metadata_path.to_path_buf();
-                let file_manager_for_hook = self.clone();
-                let staged_index = last_executed_index;
-
-                let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-                    let metadata_path = metadata_path_owned;
-                    let file_manager_for_hook = file_manager_for_hook;
-                    Box::pin(async move {
-                        file_manager_for_hook
-                            .stage_pending_metadata_progress(&metadata_path, staged_index)
-                            .await?;
-                        Ok(())
-                    })
-                }));
+                let pre_commit_hook = self.progress_hook(metadata_path, last_executed_index);
 
                 match destination_handler
                     .execute_bulk_insert_with_hook(
@@ -1325,6 +1726,7 @@ impl TransactionManager {
                             duration
                         );
                         self.flush_staged_pending_progress().await?;
+                        self.spend_replay_grace();
                         return Ok(());
                     }
                     Err(e) => {
@@ -1345,52 +1747,51 @@ impl TransactionManager {
             batch_idx,
             metrics_collector,
         )
-        .await
+        .await?;
+        self.spend_replay_grace();
+        Ok(())
     }
 
     async fn execute_sql_batch(
         self: &Arc<Self>,
         destination_handler: &mut Box<dyn DestinationHandler>,
-        metadata_path: &Path,
+        metadata_path: Option<&Path>,
         commands: &[String],
         last_executed_index: usize,
         batch_idx: usize,
         metrics_collector: &Arc<MetricsCollector>,
     ) -> Result<()> {
         let batch_start_time = Instant::now();
-        let metadata_path = metadata_path.to_path_buf();
-        let metadata_path_for_log = metadata_path.clone();
-        let file_manager_for_hook = self.clone();
-        let staged_index = last_executed_index;
-
-        let pre_commit_hook: Option<PreCommitHook> = Some(Box::new(move || {
-            let metadata_path = metadata_path.clone();
-            let file_manager_for_hook = file_manager_for_hook.clone();
-            Box::pin(async move {
-                file_manager_for_hook
-                    .stage_pending_metadata_progress(&metadata_path, staged_index)
-                    .await?;
-                Ok(())
-            })
-        }));
+        let pre_commit_hook = self.progress_hook(metadata_path, last_executed_index);
 
         if let Err(e) = destination_handler
             .execute_sql_batch_with_hook(commands, pre_commit_hook)
             .await
         {
-            error!(
-                "Failed to execute SQL batch {} from file {}: {}",
-                batch_idx,
-                metadata_path_for_log.display(),
-                e
-            );
-            metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+            if self.replay_open()
+                && is_duplicate_key_error(&self.destination_type, &e)
+                && commands.iter().all(|c| is_insert(c))
+            {
+                self.replay_skipping_duplicates(
+                    destination_handler,
+                    metadata_path,
+                    commands,
+                    last_executed_index,
+                )
+                .await?;
+            } else {
+                error!(
+                    "Failed to execute SQL batch {} (transaction file {:?}): {}",
+                    batch_idx, metadata_path, e
+                );
+                metrics_collector.record_error("transaction_file_execution_failed", "consumer");
 
-            info!(
-                "Batch and checkpoint rolled back together, will retry from last committed position on restart"
-            );
+                info!(
+                    "Batch and checkpoint rolled back together, will retry from last committed position on restart"
+                );
 
-            return Err(e);
+                return Err(e);
+            }
         }
 
         let batch_duration = batch_start_time.elapsed();
@@ -1403,6 +1804,55 @@ impl TransactionManager {
 
         self.flush_staged_pending_progress().await?;
 
+        Ok(())
+    }
+
+    /// Recovery re-applies the batch that was in flight when the process died. A destination that
+    /// had already committed it (the server finishes a COMMIT it received, even when the client is
+    /// killed) rejects its inserts as duplicates and the whole batch rolls back, so apply it
+    /// statement by statement and skip those: the row is already there. Only for a batch of
+    /// inserts: replaying UPDATE/DELETE one by one is not atomic and can undo the committed result.
+    /// It skips any duplicate, not only when all statements are duplicates: after a genuine key
+    /// conflict applied the rest, requiring that would fail every restart.
+    async fn replay_skipping_duplicates(
+        self: &Arc<Self>,
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        metadata_path: Option<&Path>,
+        commands: &[String],
+        last_executed_index: usize,
+    ) -> Result<()> {
+        let mut skipped = 0usize;
+        for command in commands {
+            match destination_handler
+                .execute_sql_batch_with_hook(std::slice::from_ref(command), None)
+                .await
+            {
+                Err(e) if is_duplicate_key_error(&self.destination_type, &e) => {
+                    skipped += 1;
+                    // Only the table and columns (up to VALUES), never row data or a whole statement
+                    // of an unknown shape; `{:?}` escapes control characters, so a hostile
+                    // identifier cannot forge log lines.
+                    let head = command
+                        .to_ascii_uppercase()
+                        .find(" VALUES")
+                        .map_or("<unrecognised INSERT>", |at| &command[..at]);
+                    warn!(
+                        "Replay skipped a duplicate key ({:?}): {e}",
+                        head.chars().take(200).collect::<String>()
+                    );
+                }
+                other => other?,
+            }
+        }
+        warn!(
+            "Recovery replay: {} of {} statement(s) hit a duplicate key and were skipped, assuming the destination committed them before the crash",
+            skipped,
+            commands.len()
+        );
+        if let Some(path) = metadata_path {
+            self.stage_pending_metadata_progress(path, last_executed_index)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1453,7 +1903,7 @@ impl TransactionManager {
 
                         self.execute_batch_with_bulk_detection(
                             destination_handler,
-                            &pending_tx.file_path,
+                            Some(&pending_tx.file_path),
                             state.batch,
                             last_executed_index,
                             *state.batch_count,
@@ -1492,6 +1942,22 @@ impl TransactionManager {
         batch_size: usize,
         state: &mut StatementProcessingState<'_>,
     ) -> Result<()> {
+        if let Some(text) = self.memory_text(segment_path) {
+            return self
+                .process_reader_statements(
+                    std::io::Cursor::new(text),
+                    0,
+                    start_index,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                    metrics_collector,
+                    batch_size,
+                    state,
+                )
+                .await;
+        }
+
         let is_compressed = segment_path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1582,24 +2048,11 @@ impl TransactionManager {
         batch_size: usize,
         shared_lsn_feedback: &Arc<SharedLsnFeedback>,
     ) -> Result<()> {
-        // Skip transactions already applied (position-tracking based deduplication)
-        if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            let current_flush_lsn = lsn_tracker.get();
-            if commit_lsn.0 <= current_flush_lsn && current_flush_lsn > 0 {
-                info!(
-                    "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
-                    pending_tx.metadata.transaction_id,
-                    commit_lsn,
-                    pg_walstream::format_lsn(current_flush_lsn)
-                );
-                if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
-                    warn!("Failed to delete duplicate pending file: {}", e);
-                }
-                // Keep the monitoring counter accurate in real-time: this counted
-                // pending tx is being removed without going through finalize.
-                self.decrement_pending_count();
-                return Ok(());
-            }
+        if self
+            .discard_if_already_applied(pending_tx, lsn_tracker)
+            .await
+        {
+            return Ok(());
         }
 
         if self.event_mode {
@@ -1619,7 +2072,11 @@ impl TransactionManager {
         let start_time = Instant::now();
         let tx_id = pending_tx.metadata.transaction_id;
 
-        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        let latest_metadata = if Self::memory_key(&pending_tx.file_path).is_some() {
+            pending_tx.metadata.clone()
+        } else {
+            self.read_metadata(&pending_tx.file_path).await?
+        };
         let start_index = latest_metadata
             .last_executed_command_index
             .map(|idx| idx + 1)
@@ -1701,7 +2158,7 @@ impl TransactionManager {
 
             self.execute_batch_with_bulk_detection(
                 destination_handler,
-                &pending_tx.file_path,
+                Some(&pending_tx.file_path),
                 &batch,
                 last_executed_index,
                 batch_count,
@@ -1757,6 +2214,257 @@ impl TransactionManager {
         )
         .await?;
 
+        Ok(())
+    }
+
+    /// Position-tracking de-dup: drop a pending transaction whose `commit_lsn` is at or below the
+    /// flush LSN. Returns `true` when it was already applied (and its files were removed).
+    async fn discard_if_already_applied(
+        self: &Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        lsn_tracker: &Arc<LsnTracker>,
+    ) -> bool {
+        let Some(commit_lsn) = pending_tx.metadata.commit_lsn else {
+            return false;
+        };
+        let current_flush_lsn = lsn_tracker.get();
+        if !is_already_applied(commit_lsn.0, current_flush_lsn) {
+            return false;
+        }
+        info!(
+            "Skipping already-applied transaction {} (commit_lsn {} <= flush_lsn {})",
+            pending_tx.metadata.transaction_id,
+            commit_lsn,
+            pg_walstream::format_lsn(current_flush_lsn)
+        );
+        if let Err(e) = self.delete_pending_transaction(&pending_tx.file_path).await {
+            warn!("Failed to delete duplicate pending file: {}", e);
+        }
+        // Keep the monitoring counter accurate in real-time: this counted
+        // pending tx is being removed without going through finalize.
+        self.decrement_pending_count();
+        true
+    }
+
+    /// Statement (SQL mode) or event (event mode) count of `tx` when it may join a group commit:
+    /// a fresh transaction with a known count. `None` means it has to be processed on its own.
+    pub(crate) fn groupable_statement_count(&self, tx: &PendingTransactionFile) -> Option<usize> {
+        let m = &tx.metadata;
+        if m.commit_lsn.is_none() || m.last_executed_command_index.is_some() {
+            return None;
+        }
+        if self.event_mode && self.event_group_unsupported.load(Ordering::Relaxed) {
+            return None;
+        }
+        if m.segments.is_empty() || m.segments.iter().any(|s| s.statement_count == 0) {
+            return None;
+        }
+        Some(m.segments.iter().map(|s| s.statement_count).sum())
+    }
+
+    /// All events of a pending event-mode transaction (JSON line per event, all segments).
+    async fn read_all_events(&self, tx: &PendingTransactionFile) -> Result<Vec<ChangeEvent>> {
+        let mut events = Vec::new();
+        for segment in &tx.metadata.segments {
+            let reader: Box<dyn AsyncRead + Send + Unpin> =
+                if let Some(text) = self.memory_text(&segment.path) {
+                    Box::new(std::io::Cursor::new(text))
+                } else {
+                    let file = tokio::fs::File::open(&segment.path).await.map_err(|e| {
+                        CdcError::generic(format!("Failed to open segment {:?}: {e}", segment.path))
+                    })?;
+                    let compressed = segment
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
+                    if compressed {
+                        let mut decoder = GzipDecoder::new(BufReader::new(file));
+                        decoder.multiple_members(true);
+                        Box::new(decoder)
+                    } else {
+                        Box::new(file)
+                    }
+                };
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.map_err(|e| {
+                CdcError::generic(format!("Failed to read segment {:?}: {e}", segment.path))
+            })? {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                events.push(serde_json::from_str(line).map_err(|e| {
+                    CdcError::generic(format!(
+                        "Corrupted event line in segment {:?}: {e}. Stopping to prevent silent data loss.",
+                        segment.path
+                    ))
+                })?);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Apply several whole source transactions (ascending `commit_lsn`, each accepted by
+    /// `groupable_statement_count`) as ONE destination transaction.
+    ///
+    /// All-or-nothing: on any error nothing was committed and no file or LSN state changed, so
+    /// the caller may retry the transactions one by one. After the destination commits, the LSN
+    /// is advanced to the last `commit_lsn` and persisted once, BEFORE the files are deleted: a
+    /// crash before the persist replays the whole group, after it skips the whole group.
+    pub async fn process_transaction_group(
+        self: Arc<Self>,
+        group: &[PendingTransactionFile],
+        destination_handler: &mut Box<dyn DestinationHandler>,
+        cancellation_token: &CancellationToken,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) -> Result<()> {
+        let start_time = Instant::now();
+
+        let mut todo: Vec<&PendingTransactionFile> = Vec::with_capacity(group.len());
+        for tx in group {
+            if !self.discard_if_already_applied(tx, lsn_tracker).await {
+                todo.push(tx);
+            }
+        }
+        let Some(last_tx) = todo.last() else {
+            return Ok(());
+        };
+        let last_commit_lsn = last_tx.metadata.commit_lsn.ok_or_else(|| {
+            CdcError::generic("Group commit transaction without commit_lsn".to_string())
+        })?;
+
+        let applied_units = if self.event_mode {
+            let mut per_tx: Vec<Vec<ChangeEvent>> = Vec::with_capacity(todo.len());
+            for tx in &todo {
+                let events = self.read_all_events(tx).await?;
+                let expected: usize = tx.metadata.segments.iter().map(|s| s.statement_count).sum();
+                if events.len() != expected {
+                    return Err(CdcError::generic(format!(
+                        "Group commit: transaction {} has {} events, metadata says {expected}",
+                        tx.metadata.transaction_id,
+                        events.len()
+                    )));
+                }
+                per_tx.push(events);
+            }
+            if cancellation_token.is_cancelled() {
+                return Err(CdcError::cancelled(
+                    "Group commit cancelled by shutdown signal",
+                ));
+            }
+            let events_group: Vec<EventTransaction<'_>> = todo
+                .iter()
+                .zip(&per_tx)
+                .map(|(tx, events)| EventTransaction {
+                    transaction_id: tx.metadata.transaction_id,
+                    commit_timestamp: tx.metadata.commit_timestamp,
+                    commit_lsn: tx.metadata.commit_lsn,
+                    events,
+                })
+                .collect();
+            if let Err(e) = destination_handler
+                .execute_events_group_with_hook(&events_group)
+                .await
+            {
+                if matches!(e, CdcError::Unsupported(_)) {
+                    // Not a failure: this destination takes one transaction at a time.
+                    self.event_group_unsupported.store(true, Ordering::Relaxed);
+                } else {
+                    metrics_collector.record_error("transaction_file_execution_failed", "consumer");
+                }
+                return Err(e);
+            }
+            per_tx.iter().map(Vec::len).sum()
+        } else {
+            let mut statements: Vec<String> = Vec::new();
+            let (mut command_index, mut processed_count, mut batch_count) =
+                (0usize, 0usize, 0usize);
+            for tx in &todo {
+                let expected: usize = tx.metadata.segments.iter().map(|s| s.statement_count).sum();
+                let before = statements.len();
+                for segment in &tx.metadata.segments {
+                    // `usize::MAX` as batch size: nothing executes here, statements are only collected.
+                    let mut state = StatementProcessingState {
+                        batch: &mut statements,
+                        current_command_index: &mut command_index,
+                        processed_count: &mut processed_count,
+                        batch_count: &mut batch_count,
+                    };
+                    self.process_segment_statements(
+                        &segment.path,
+                        0,
+                        tx,
+                        destination_handler,
+                        cancellation_token,
+                        metrics_collector,
+                        usize::MAX,
+                        &mut state,
+                    )
+                    .await?;
+                }
+                let read = statements.len() - before;
+                if read != expected {
+                    return Err(CdcError::generic(format!(
+                        "Group commit: transaction {} has {read} statements, metadata says {expected}",
+                        tx.metadata.transaction_id
+                    )));
+                }
+            }
+
+            if cancellation_token.is_cancelled() {
+                return Err(CdcError::cancelled(
+                    "Group commit cancelled by shutdown signal",
+                ));
+            }
+
+            // MySQL commits implicitly at TRUNCATE (DDL): a later failure would leave the earlier
+            // transactions committed while the caller re-applies them one by one (duplicate keys).
+            if self.destination_type == DestinationType::MySQL
+                && statements.iter().any(|s| {
+                    s.get(..8)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("TRUNCATE"))
+                })
+            {
+                return Err(CdcError::unsupported(
+                    "group contains a TRUNCATE, which MySQL commits implicitly",
+                ));
+            }
+
+            self.execute_batch_with_bulk_detection(
+                destination_handler,
+                None,
+                &statements,
+                statements.len() - 1,
+                1,
+                metrics_collector,
+                self.bulk_insert_threshold,
+            )
+            .await?;
+            statements.len()
+        };
+
+        self.record_applied_lsn(
+            last_tx.metadata.transaction_id,
+            last_commit_lsn,
+            lsn_tracker,
+            shared_lsn_feedback,
+        )
+        .await;
+        for tx in &todo {
+            self.cleanup_applied_file(tx, lsn_tracker, metrics_collector, 0)
+                .await;
+        }
+
+        info!(
+            "Group commit applied {} transactions ({} statements/events) in {:?}, flush_lsn -> {}",
+            todo.len(),
+            applied_units,
+            start_time.elapsed(),
+            last_commit_lsn
+        );
         Ok(())
     }
 
@@ -1855,7 +2563,11 @@ impl TransactionManager {
         let tx_id = pending_tx.metadata.transaction_id;
         let start_time = Instant::now();
 
-        let latest_metadata = self.read_metadata(&pending_tx.file_path).await?;
+        let latest_metadata = if Self::memory_key(&pending_tx.file_path).is_some() {
+            pending_tx.metadata.clone()
+        } else {
+            self.read_metadata(&pending_tx.file_path).await?
+        };
         let segments = if !latest_metadata.segments.is_empty() {
             latest_metadata.segments
         } else {
@@ -1877,6 +2589,26 @@ impl TransactionManager {
         let mut events_seen = 0usize;
 
         for segment in &segments {
+            if let Some(text) = self.memory_text(&segment.path) {
+                let lines = BufReader::new(std::io::Cursor::new(text)).lines();
+                self.process_event_lines(
+                    lines,
+                    &segment.path,
+                    &mut batch,
+                    &mut batch_count,
+                    &mut total_events,
+                    &mut events_seen,
+                    skip_until,
+                    batch_size,
+                    tx_id,
+                    pending_tx,
+                    destination_handler,
+                    cancellation_token,
+                )
+                .await?;
+                continue;
+            }
+
             let is_compressed = segment
                 .path
                 .extension()
@@ -2003,35 +2735,61 @@ impl TransactionManager {
     ) -> Result<()> {
         let tx_id = pending_tx.metadata.transaction_id;
 
-        // PROTOCOL COMPLIANCE: Update LSN and send ACK ONLY after successful apply
         if let Some(commit_lsn) = pending_tx.metadata.commit_lsn {
-            info!(
-                "Transaction {} successfully applied to destination, commit_lsn: {}",
-                tx_id, commit_lsn
-            );
-
-            // 1. Update confirmed_flush_lsn (last successfully applied LSN)
-            lsn_tracker.commit_lsn(commit_lsn.0);
-
-            // 2. Update apply_lsn and flush_lsn - transaction is now delivered to destination
-            shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
-            shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
-
-            // 3. Persist LSN to disk immediately for crash safety
-            if let Err(e) = lsn_tracker.persist_async().await {
-                warn!("Failed to persist LSN after transaction {}: {}", tx_id, e);
-            }
-
-            info!(
-                "Updated apply_lsn and flush_lsn to {} (transaction {} delivered to destination)",
-                commit_lsn, tx_id
-            );
+            self.record_applied_lsn(tx_id, commit_lsn, lsn_tracker, shared_lsn_feedback)
+                .await;
         } else {
             warn!(
                 "Transaction {} has no commit_lsn, cannot send ACK (this should not happen for committed transactions)",
                 tx_id
             );
         }
+
+        self.cleanup_applied_file(pending_tx, lsn_tracker, metrics_collector, total_commands)
+            .await;
+        Ok(())
+    }
+
+    /// Advance and persist the applied position after the destination committed.
+    async fn record_applied_lsn(
+        &self,
+        tx_id: u32,
+        commit_lsn: Lsn,
+        lsn_tracker: &Arc<LsnTracker>,
+        shared_lsn_feedback: &Arc<SharedLsnFeedback>,
+    ) {
+        info!(
+            "Transaction {} successfully applied to destination, commit_lsn: {}",
+            tx_id, commit_lsn
+        );
+
+        // 1. Update confirmed_flush_lsn (last successfully applied LSN)
+        lsn_tracker.commit_lsn(commit_lsn.0);
+
+        // 2. Update apply_lsn and flush_lsn - transaction is now delivered to destination
+        shared_lsn_feedback.update_applied_lsn(commit_lsn.0);
+        shared_lsn_feedback.update_flushed_lsn(commit_lsn.0);
+
+        // 3. Persist LSN to disk immediately for crash safety
+        if let Err(e) = lsn_tracker.persist_async().await {
+            warn!("Failed to persist LSN after transaction {}: {}", tx_id, e);
+        }
+
+        info!(
+            "Updated apply_lsn and flush_lsn to {} (transaction {} delivered to destination)",
+            commit_lsn, tx_id
+        );
+    }
+
+    /// Metrics, file removal and pending-count bookkeeping of an applied transaction.
+    async fn cleanup_applied_file(
+        self: &Arc<Self>,
+        pending_tx: &PendingTransactionFile,
+        lsn_tracker: &Arc<LsnTracker>,
+        metrics_collector: &Arc<MetricsCollector>,
+        total_commands: usize,
+    ) {
+        let tx_id = pending_tx.metadata.transaction_id;
 
         // Record metrics - create a transaction object for metrics recording
         let destination_type_str = pending_tx.metadata.destination_type.to_string();
@@ -2085,8 +2843,6 @@ impl TransactionManager {
                 tx_id, pending_count
             );
         }
-
-        Ok(())
     }
 }
 
@@ -2726,5 +3482,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dedup_boundary_semantics() {
+        // After a snapshot the tracker is seeded with the slot's consistent point. The stored
+        // commit LSN is the commit record's end position, so streamed transactions are above it.
+        let consistent_point = 0x1000;
+        assert!(
+            is_already_applied(consistent_point, consistent_point),
+            "a commit LSN at or below the consistent point is already in the snapshot"
+        );
+        assert!(is_already_applied(consistent_point - 1, consistent_point));
+        assert!(
+            !is_already_applied(consistent_point + 1, consistent_point),
+            "the first transaction after the consistent point must be applied"
+        );
+        assert!(
+            !is_already_applied(1, 0),
+            "an unseeded tracker (flush_lsn 0) never skips"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_grace_is_spent_batch_by_batch_and_can_be_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = TransactionManager::new(dir.path(), DestinationType::SQLite, None, 1024)
+            .await
+            .unwrap();
+        assert!(!m.replay_open());
+        m.set_replay_grace(2);
+        assert!(m.replay_open(), "peeking does not spend");
+        assert!(m.replay_open());
+        m.spend_replay_grace();
+        m.spend_replay_grace();
+        assert!(!m.replay_open());
+        m.spend_replay_grace();
+        assert!(!m.replay_open(), "never goes below zero");
+        m.set_replay_grace(3);
+        assert!(m.replay_open());
+        m.set_replay_grace(0);
+        assert!(!m.replay_open());
+    }
+
+    #[test]
+    fn only_batches_of_inserts_are_replayed_statement_by_statement() {
+        for insert in [
+            "INSERT INTO `db`.`t` (`id`) VALUES (1);",
+            "INSERT INTO [dbo].[t] ([id]) VALUES (1);",
+            "INSERT INTO \"t\" (\"id\") VALUES (1);",
+            "  insert into t (id) values (1);",
+        ] {
+            assert!(is_insert(insert), "{insert}");
+        }
+        for other in [
+            "UPDATE `db`.`t` SET `id` = 2 WHERE `id` = 1;",
+            "DELETE FROM [dbo].[t] WHERE [id] = 1;",
+            "TRUNCATE TABLE t;",
+            "INS",
+            "",
+        ] {
+            assert!(!is_insert(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn duplicate_key_errors_are_recognised_per_destination() {
+        let err = |text: &str| CdcError::generic(text);
+        let mysql = err("MySQL execute_sql_batch failed at command 1/1: Server error: `ERROR 1062 (23000): Duplicate entry '2000248' for key 'snap_items.PRIMARY''");
+        let sqlserver = err("SQL Server execute_sql_batch failed at command 1/1: Token error: 'Violation of PRIMARY KEY constraint 'PK__snap_ite__3213E83F97604F0C'. Cannot insert duplicate key in object 'dbo.snap_items'. The duplicate key value is (1000092).' on server eca65bd17fa9 executing  on line 1 (code: 2627, state: 1, class: 14)");
+        let sqlite = err("SQLite execute_sql_batch failed at command 1/1: error returned from database: (code: 1555) UNIQUE constraint failed: items.id");
+        let other = err("MySQL execute_sql_batch failed at command 1/1: Server error: `ERROR 1406 (22001): Data too long for column 'name' at row 1062'");
+
+        assert!(is_duplicate_key_error(&DestinationType::MySQL, &mysql));
+        assert!(is_duplicate_key_error(
+            &DestinationType::SqlServer,
+            &sqlserver
+        ));
+        assert!(is_duplicate_key_error(&DestinationType::SQLite, &sqlite));
+        assert!(!is_duplicate_key_error(&DestinationType::MySQL, &other));
+        assert!(!is_duplicate_key_error(&DestinationType::MySQL, &sqlserver));
+        assert!(!is_duplicate_key_error(&DestinationType::Kafka, &mysql));
     }
 }

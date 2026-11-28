@@ -13,6 +13,10 @@ use tracing::{debug, info};
 // SQLite Destination Implementation
 // ============================================================================
 
+/// SQLite's default `SQLITE_MAX_COMPOUND_SELECT`: the coalesced UPDATE statements join their rows
+/// with `UNION ALL`, so a group is never larger than this.
+const MAX_ROWS_PER_INSERT: usize = 500;
+
 /// SQLite destination implementation with batch INSERT/UPDATE/DELETE support
 ///
 /// This implementation uses sqlx for database operations with async support.
@@ -29,8 +33,17 @@ impl SQLiteDestination {
         Self {
             pool: None,
             database_path: None,
-            max_rows_per_insert: 500,
+            max_rows_per_insert: MAX_ROWS_PER_INSERT,
         }
+    }
+}
+
+impl SQLiteDestination {
+    /// The identifiers go through the dialect's quoting, which doubles an embedded quote.
+    fn snapshot_probe_sql(&self, schema: &str, table: &str) -> String {
+        let mut qualified = String::new();
+        self.dialect().qualify_table(schema, table, &mut qualified);
+        format!("SELECT 1 FROM {qualified} LIMIT 1")
     }
 }
 
@@ -105,7 +118,7 @@ impl DestinationHandler for SQLiteDestination {
 
     fn set_max_rows_per_insert(&mut self, max_rows: usize) {
         if max_rows > 0 {
-            self.max_rows_per_insert = max_rows;
+            self.max_rows_per_insert = max_rows.min(MAX_ROWS_PER_INSERT);
         }
     }
 
@@ -149,7 +162,7 @@ impl DestinationHandler for SQLiteDestination {
             );
         }
 
-        super::common::execute_sqlx_batch_with_hook(pool, &coalesced, pre_commit_hook, "SQLite")
+        super::common::execute_sqlx_batch_with_hook(pool, coalesced, pre_commit_hook, "SQLite")
             .await
     }
 
@@ -170,8 +183,33 @@ impl DestinationHandler for SQLiteDestination {
             None,
             Some(self.max_rows_per_insert),
         );
-        self.execute_sql_batch_with_hook(&sqls, pre_commit_hook)
+        // Already chunked by `max_rows_per_insert`: coalescing would only copy each statement.
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("SQLite pool not initialized"))?;
+        let statements = sqls.into_iter().map(std::borrow::Cow::Owned).collect();
+        super::common::execute_sqlx_batch_with_hook(pool, statements, pre_commit_hook, "SQLite")
             .await
+    }
+
+    async fn snapshot_table_is_empty(&mut self, schema: &str, table: &str) -> Result<bool> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("SQLite pool not initialized"))?;
+        let sql = self.snapshot_probe_sql(schema, table);
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                CdcError::generic(format!("SQLite snapshot emptiness probe failed: {e}"))
+            })?;
+        Ok(row.is_none())
+    }
+
+    fn max_snapshot_writers(&self) -> usize {
+        1
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -182,5 +220,142 @@ impl DestinationHandler for SQLiteDestination {
         self.database_path = None;
         info!("SQLite connection closed successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_probe_quotes_hostile_identifiers() {
+        let destination = SQLiteDestination::new();
+        assert_eq!(
+            destination.snapshot_probe_sql("main", "Snap\"Mixed"),
+            "SELECT 1 FROM \"Snap\"\"Mixed\" LIMIT 1"
+        );
+        assert_eq!(
+            destination.snapshot_probe_sql("main", "x\"; DROP TABLE users; --"),
+            "SELECT 1 FROM \"x\"\"; DROP TABLE users; --\" LIMIT 1"
+        );
+    }
+
+    async fn connected(dir: &tempfile::TempDir) -> SQLiteDestination {
+        let mut dest = SQLiteDestination::new();
+        let path = dir.path().join("snap.db");
+        dest.connect(path.to_str().unwrap()).await.unwrap();
+        dest
+    }
+
+    #[tokio::test]
+    async fn snapshot_table_is_empty_true_then_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dest = connected(&dir).await;
+        dest.execute_sql_batch_with_hook(
+            &["CREATE TABLE \"users\" (id INTEGER PRIMARY KEY);".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(dest
+            .snapshot_table_is_empty("public", "users")
+            .await
+            .unwrap());
+
+        dest.execute_sql_batch_with_hook(
+            &["INSERT INTO \"users\" (id) VALUES (1);".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!dest
+            .snapshot_table_is_empty("public", "users")
+            .await
+            .unwrap());
+    }
+
+    // Each batch inlines its values, so its text is unique; a cached statement per batch would
+    // keep up to 100 batches (megabytes each) alive per connection.
+    #[tokio::test]
+    async fn batches_do_not_fill_the_statement_cache() {
+        use sqlx::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let mut dest = connected(&dir).await;
+        dest.execute_sql_batch_with_hook(
+            &["CREATE TABLE \"users\" (id INTEGER PRIMARY KEY);".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        for id in 1..=3 {
+            dest.execute_bulk_insert_with_hook(
+                "\"users\"",
+                &["id".to_string()],
+                &[vec![id.to_string()]],
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let conn = dest.pool.as_ref().unwrap().acquire().await.unwrap();
+        assert_eq!(conn.cached_statements_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_table_is_empty_errors_for_missing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dest = connected(&dir).await;
+
+        assert!(dest
+            .snapshot_table_is_empty("public", "no_such_table")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_truncate_table_removes_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dest = connected(&dir).await;
+        dest.execute_sql_batch_with_hook(
+            &[
+                "CREATE TABLE \"users\" (id INTEGER PRIMARY KEY);".to_string(),
+                "INSERT INTO \"users\" (id) VALUES (1), (2);".to_string(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!dest
+            .snapshot_table_is_empty("public", "users")
+            .await
+            .unwrap());
+
+        dest.snapshot_truncate_table("public", "users")
+            .await
+            .unwrap();
+
+        assert!(dest
+            .snapshot_table_is_empty("public", "users")
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn max_snapshot_writers_is_one() {
+        assert_eq!(SQLiteDestination::new().max_snapshot_writers(), 1);
+    }
+
+    #[test]
+    fn max_rows_per_insert_is_capped_at_the_compound_select_limit() {
+        let mut destination = SQLiteDestination::new();
+        destination.set_max_rows_per_insert(5000);
+        assert_eq!(destination.max_rows_per_insert, 500);
+        destination.set_max_rows_per_insert(10);
+        assert_eq!(destination.max_rows_per_insert, 10);
+        destination.set_max_rows_per_insert(0);
+        assert_eq!(destination.max_rows_per_insert, 10);
     }
 }

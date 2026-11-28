@@ -24,6 +24,11 @@ pub struct MySQLDestination {
     schema_mappings: HashMap<String, String>,
     max_allowed_packet: u64,
     load_data_available: bool,
+    /// Set for snapshot writers: LOAD DATA LOCAL skips duplicate-key rows and truncates or changes
+    /// misfit values like IGNORE, and a snapshot must fail instead. The live path only warns.
+    strict_load_data: bool,
+    load_data_skip_warned: bool,
+    load_data_fallback_warned: bool,
 }
 
 impl MySQLDestination {
@@ -34,6 +39,9 @@ impl MySQLDestination {
             schema_mappings: HashMap::new(),
             max_allowed_packet: 67108864,
             load_data_available: false,
+            strict_load_data: false,
+            load_data_skip_warned: false,
+            load_data_fallback_warned: false,
         }
     }
 }
@@ -195,6 +203,10 @@ impl DestinationHandler for MySQLDestination {
         self.load_data_available
     }
 
+    fn begin_snapshot_writes(&mut self) {
+        self.strict_load_data = true;
+    }
+
     fn dialect(&self) -> &'static dyn SqlDialect {
         use crate::destinations::dialects::MySqlDialect;
         static D: MySqlDialect = MySqlDialect;
@@ -229,6 +241,22 @@ impl DestinationHandler for MySQLDestination {
             .await
     }
 
+    async fn snapshot_table_is_empty(&mut self, schema: &str, table: &str) -> Result<bool> {
+        let sql = self.snapshot_probe_sql(schema, table);
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| CdcError::generic("MySQL pool not initialized"))?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| CdcError::generic(format!("Failed to get MySQL connection: {e}")))?;
+        let row: Option<u8> = conn.query_first(sql).await.map_err(|e| {
+            CdcError::generic(format!("MySQL snapshot emptiness probe failed: {e}"))
+        })?;
+        Ok(row.is_none())
+    }
+
     async fn close(&mut self) -> Result<()> {
         if let Some(pool) = self.pool.take() {
             pool.disconnect()
@@ -242,6 +270,12 @@ impl DestinationHandler for MySQLDestination {
 }
 
 impl MySQLDestination {
+    fn snapshot_probe_sql(&self, schema: &str, table: &str) -> String {
+        let mut qualified = String::new();
+        self.dialect().qualify_table(schema, table, &mut qualified);
+        format!("SELECT 1 FROM {qualified} LIMIT 1")
+    }
+
     async fn check_load_data_available(&self) -> Result<bool> {
         let pool = self
             .pool
@@ -293,12 +327,7 @@ impl MySQLDestination {
             .await
             .map_err(|e| CdcError::generic(format!("MySQL START TRANSACTION failed: {e}")))?;
 
-        let col_spec = columns.join(", ");
-        let load_sql = format!(
-            "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE {} \
-             FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' ({})",
-            table, col_spec
-        );
+        let load_sql = load_data_sql(table, columns);
 
         *self.infile_data.lock().unwrap() = Some(bytes::Bytes::from(tsv_data));
 
@@ -308,7 +337,15 @@ impl MySQLDestination {
         };
 
         if let Err(e) = result {
-            debug!("LOAD DATA LOCAL INFILE failed, falling back to multi-value INSERT: {e}");
+            if self.load_data_fallback_warned {
+                debug!("LOAD DATA LOCAL INFILE into {table} failed, falling back to multi-value INSERT: {e}");
+            } else {
+                self.load_data_fallback_warned = true;
+                warn!(
+                    "LOAD DATA LOCAL INFILE into {table} failed, falling back to multi-value \
+                     INSERT (later failures on this handler are logged at debug level): {e}"
+                );
+            }
             let _ = tx.rollback().await;
 
             let sqls = super::bulk_insert::build_chunked_multi_value_inserts(
@@ -321,6 +358,22 @@ impl MySQLDestination {
             return self
                 .execute_sql_batch_with_hook(&sqls, pre_commit_hook)
                 .await;
+        }
+
+        let affected = tx.affected_rows();
+        let warnings = tx.get_warnings();
+        let info = tx.info().into_owned();
+        if let Some(problem) = load_data_mismatch(table, row_count, affected, warnings, &info) {
+            if self.strict_load_data {
+                let _ = tx.rollback().await;
+                return Err(CdcError::generic(problem));
+            }
+            if !self.load_data_skip_warned {
+                self.load_data_skip_warned = true;
+                warn!("{problem} (further occurrences on this handler are logged at debug level)");
+            } else {
+                debug!("{problem}");
+            }
         }
 
         if let Some(hook) = pre_commit_hook {
@@ -337,12 +390,52 @@ impl MySQLDestination {
             .map_err(|e| CdcError::generic(format!("MySQL COMMIT failed after LOAD DATA: {e}")))?;
 
         info!(
-            "LOAD DATA complete: {} rows loaded into {}",
-            row_count, table
+            "LOAD DATA complete: {} of {} rows loaded into {}",
+            affected, row_count, table
         );
 
         Ok(())
     }
+}
+
+/// LOCAL makes LOAD DATA behave like IGNORE: rows that violate a unique or primary key are
+/// skipped, and values that do not fit their column (too long, out of range, invalid date) are
+/// stored truncated or changed, all without an error. Only the affected-row count and the
+/// warning count reveal it.
+fn load_data_mismatch(
+    table: &str,
+    sent: usize,
+    affected: u64,
+    warnings: u16,
+    info: &str,
+) -> Option<String> {
+    if affected == sent as u64 {
+        return (warnings > 0).then(|| {
+            format!(
+                "LOAD DATA LOCAL INFILE into {table} loaded {sent} row(s) with {warnings} \
+                 warning(s) ({info}): values that do not fit their column (too long, out of \
+                 range, invalid date) are stored truncated or changed without an error"
+            )
+        });
+    }
+    Some(format!(
+        "LOAD DATA LOCAL INFILE into {table} sent {sent} row(s) but the server inserted \
+         {affected} ({info}): rows that violate a unique or primary key (including text keys \
+         that collide under a case-insensitive collation) are skipped without an error; use \
+         CDC_SNAPSHOT_TARGET_POLICY=append only into tables that are empty or hold no \
+         colliding keys"
+    ))
+}
+
+/// The TSV is always UTF-8. Without `CHARACTER SET`, LOAD DATA reads it in the session's
+/// `character_set_database`: the database default on a fresh connection but the server default on
+/// a pooled one, so a latin1 server default turns `é` into `Ã©` with no warning.
+fn load_data_sql(table: &str, columns: &[String]) -> String {
+    format!(
+        "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE {table} CHARACTER SET utf8mb4 \
+         FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' ({})",
+        columns.join(", ")
+    )
 }
 
 fn generate_tsv_buffer(rows: &[Vec<String>]) -> Vec<u8> {
@@ -498,6 +591,83 @@ mod tests {
         assert!(destination.pool.is_none());
         assert!(destination.infile_data.lock().unwrap().is_none());
         assert!(!destination.load_data_available);
+    }
+
+    #[test]
+    fn load_data_mismatch_reports_skipped_rows_only() {
+        assert_eq!(load_data_mismatch("`d`.`t`", 3, 3, 0, "Records: 3"), None);
+
+        let msg = load_data_mismatch(
+            "`d`.`t`",
+            3,
+            2,
+            1,
+            "Records: 3  Deleted: 0  Skipped: 1  Warnings: 1",
+        )
+        .unwrap();
+        assert!(msg.contains("`d`.`t`"), "{msg}");
+        assert!(msg.contains("sent 3 row(s)"), "{msg}");
+        assert!(msg.contains("inserted 2"), "{msg}");
+        assert!(msg.contains("Skipped: 1"), "{msg}");
+        assert!(msg.contains("append"), "{msg}");
+        assert!(
+            load_data_mismatch("t", 0, 1, 0, "").is_some(),
+            "more is also wrong"
+        );
+    }
+
+    #[test]
+    fn load_data_mismatch_reports_warnings_when_every_row_was_inserted() {
+        let msg = load_data_mismatch(
+            "`d`.`t`",
+            3,
+            3,
+            2,
+            "Records: 3  Deleted: 0  Skipped: 0  Warnings: 2",
+        )
+        .unwrap();
+        assert!(msg.contains("`d`.`t`"), "{msg}");
+        assert!(msg.contains("2 warning(s)"), "{msg}");
+        assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn begin_snapshot_writes_makes_load_data_strict() {
+        let mut destination = MySQLDestination::new();
+        assert!(!destination.strict_load_data);
+        destination.begin_snapshot_writes();
+        assert!(destination.strict_load_data);
+    }
+
+    #[test]
+    fn load_data_declares_the_utf8_file_charset() {
+        assert_eq!(
+            load_data_sql("`d`.`t`", &["`a`".to_string(), "`b`".to_string()]),
+            "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `d`.`t` CHARACTER SET utf8mb4 \
+             FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' (`a`, `b`)"
+        );
+    }
+
+    #[test]
+    fn snapshot_probe_uses_limit_and_backticks() {
+        let destination = MySQLDestination::new();
+        assert_eq!(
+            destination.snapshot_probe_sql("cdc_db", "Snap`Mixed"),
+            "SELECT 1 FROM `cdc_db`.`Snap``Mixed` LIMIT 1"
+        );
+        assert_eq!(
+            destination.snapshot_probe_sql("cdc_db", "x`; DROP TABLE users; --"),
+            "SELECT 1 FROM `cdc_db`.`x``; DROP TABLE users; --` LIMIT 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_probe_without_a_pool_is_an_error() {
+        let mut destination = MySQLDestination::new();
+        assert!(destination
+            .snapshot_table_is_empty("cdc_db", "t")
+            .await
+            .is_err());
     }
 
     #[test]

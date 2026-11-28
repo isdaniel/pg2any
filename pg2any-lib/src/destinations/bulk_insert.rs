@@ -10,18 +10,6 @@ pub struct ParsedBulkInsert {
     pub rows: Vec<Vec<String>>,
 }
 
-/// Parse the INSERT prefix from a single SQL statement.
-/// Returns `(prefix_str, columns, table)` if the statement is a valid INSERT.
-pub fn extract_insert_prefix(sql: &str) -> Option<(String, Vec<String>, String)> {
-    parse_insert_prefix(sql)
-}
-
-/// Extract just the VALUES tuple from a statement whose prefix is already known.
-/// `values_suffix` should be the part of the statement after the prefix (e.g., "(1, 'hello');").
-pub fn extract_values_from_suffix(values_suffix: &str) -> Option<Vec<String>> {
-    parse_values_tuple(values_suffix)
-}
-
 pub fn detect_bulk_insert_batch(statements: &[String]) -> Option<ParsedBulkInsert> {
     if statements.is_empty() {
         return None;
@@ -104,19 +92,14 @@ pub fn build_chunked_multi_value_inserts(
     let mut row_count = 0;
 
     for row in rows {
-        let mut tuple = String::from("(");
-        for (j, val) in row.iter().enumerate() {
-            if j > 0 {
-                tuple.push_str(", ");
-            }
-            tuple.push_str(val);
-        }
-        tuple.push(')');
+        // "(" + values joined by ", " + ")"
+        let tuple_len =
+            2 + row.iter().map(String::len).sum::<usize>() + 2 * row.len().saturating_sub(1);
 
         let addition_len = if row_count == 0 {
-            tuple.len()
+            tuple_len
         } else {
-            2 + tuple.len() // ", " + tuple
+            2 + tuple_len // ", " + tuple
         };
 
         if row_count > 0 && (current.len() + addition_len + 1 > max || row_count >= max_row_count) {
@@ -129,7 +112,16 @@ pub fn build_chunked_multi_value_inserts(
         if row_count > 0 {
             current.push_str(", ");
         }
-        current.push_str(&tuple);
+        // Written straight into the statement: a row can be tens of megabytes.
+        current.reserve(tuple_len);
+        current.push('(');
+        for (j, val) in row.iter().enumerate() {
+            if j > 0 {
+                current.push_str(", ");
+            }
+            current.push_str(val);
+        }
+        current.push(')');
         row_count += 1;
     }
 
